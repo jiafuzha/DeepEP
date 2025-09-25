@@ -92,7 +92,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu', 'csrc/kernels/pcie.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
@@ -157,6 +157,9 @@ if __name__ == '__main__':
         packages=setuptools.find_packages(
             include=['deep_ep']
         ),
+        install_requires=[
+            'pynvml',
+        ],
         ext_modules=[
             CUDAExtension(
                 name='deep_ep_cpp',
