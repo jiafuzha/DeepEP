@@ -17,16 +17,14 @@ def get_nvshmem_host_lib_name(base_dir):
 
 def get_extension_hybrid_ep_cpp():
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    USE_GB200 = os.getenv("USE_GB200", "False")
     enable_multinode = os.getenv("HYBRID_EP_MULTINODE", "0") != "0"
     assert not enable_multinode, "Multinode is not supported yet"
 
+    # Default to Blackwell series
+    os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '10.0')
+
     # Basic compile arguments
     compile_args = {
-        "cxx": [
-            "-std=c++17",
-            "-O3",
-        ],
         "nvcc": [
             "-std=c++17",
             "-Xcompiler",
@@ -36,32 +34,48 @@ def get_extension_hybrid_ep_cpp():
             "--shared",
         ],
     }
-    if USE_GB200 == "True":
-        compile_args["nvcc"].append("-DUSE_GB200")
 
     sources = [
-        os.path.join(current_dir, "csrc/hybrid_ep.cu"),
+        os.path.join(current_dir, "csrc/hybrid_ep/hybrid_ep.cu"),
+        os.path.join(current_dir, "csrc/hybrid_ep/allocator/allocator.cu"),
+        os.path.join(current_dir, "csrc/hybrid_ep/jit/compiler.cu"),
+        os.path.join(current_dir, "csrc/hybrid_ep/pybind_hybrid_ep.cu"),
     ]
     include_dirs = [
-        os.path.join(current_dir, "csrc"),
+        os.path.join(current_dir, "csrc/hybrid_ep"),
     ]
     extra_link_args = [
         "-lnvtx3interop",
     ]
     libraries = ["cuda"]
 
+    # Add dependency for jit
+    compile_args["nvcc"].append(f'-DBASE_PATH="{current_dir}"')
+    compile_args["nvcc"].append(f'-DSM_ARCH="{os.environ["TORCH_CUDA_ARCH_LIST"]}"')
+    if enable_multinode:
+        compile_args["nvcc"].append("-DHYBRID_EP_BUILD_MULTINODE_ENABLE")
+
+    print(f'Build summary:')
+    print(f' > Sources: {sources}')
+    print(f' > Includes: {include_dirs}')
+    print(f' > Libraries: {libraries}')
+    print(f' > Compilation flags: {compile_args}')
+    print(f' > Link flags: {extra_link_args}')
+    print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
+    print()
+
     extension_hybrid_ep_cpp = CUDAExtension(
-            "hybrid_ep_cpp",
-            sources=sources,
-            include_dirs=include_dirs,
-            libraries=libraries,
-            extra_compile_args=compile_args,
-            extra_link_args=extra_link_args,
-        )
+        "hybrid_ep_cpp",
+        sources=sources,
+        include_dirs=include_dirs,
+        libraries=libraries,
+        extra_compile_args=compile_args,
+        extra_link_args=extra_link_args,
+    )
 
     return extension_hybrid_ep_cpp
 
-if __name__ == '__main__':
+def get_extension_deep_ep_cpp():
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -115,6 +129,10 @@ if __name__ == '__main__':
 
         # CUDA 12 flags
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+        
+        # Ensure device linking and CUDA device runtime when RDC is enabled
+        if '-rdc=true' in nvcc_flags and '-dlink' not in nvcc_dlink:
+            nvcc_dlink.append('-dlink')
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
@@ -145,6 +163,18 @@ if __name__ == '__main__':
     print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
+    extension_deep_ep_cpp = CUDAExtension(
+        name='deep_ep_cpp',
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        sources=sources,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args
+    )
+
+    return extension_deep_ep_cpp
+
+if __name__ == '__main__':
     # noinspection PyBroadException
     try:
         cmd = ['git', 'rev-parse', '--short', 'HEAD']
@@ -162,14 +192,7 @@ if __name__ == '__main__':
             'pynvml',
         ],
         ext_modules=[
-            CUDAExtension(
-                name='deep_ep_cpp',
-                include_dirs=include_dirs,
-                library_dirs=library_dirs,
-                sources=sources,
-                extra_compile_args=extra_compile_args,
-                extra_link_args=extra_link_args
-            ),
+            get_extension_deep_ep_cpp(),
             get_extension_hybrid_ep_cpp()
         ],
         cmdclass={
