@@ -7,14 +7,17 @@ Executor::Executor(int local_rank, int node_rank) : local_rank(local_rank), node
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 Executor::metadata_preprocess_core(
-    hybrid_ep::tmp_state_t *preprocessing_tmp,
     HybridEpConfigInstance config, 
+    hybrid_ep::tmp_state_t *preprocessing_tmp,
     torch::Tensor global_routing_map,
     int num_of_tokens_per_rank
 ) {
   nvtxRangePushA("metadata_preprocess_core in hybrid-ep");
   // padding for the routing map
   const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
+
+  auto num_of_expert = global_routing_map.size(-1);
+  assert(num_of_expert == config.num_of_experts_per_rank * config.num_of_ranks_per_node * config.num_of_nodes);
 
   // Construt the output tensor of the metadata preprocessing kernel.
   auto sparse_to_dense_map =
@@ -112,7 +115,16 @@ Executor::dispatch_postprocess(HybridEpConfigInstance config, DispatchBuffers& d
     torch::Tensor row_id_map, tokens_per_expert;
 
     if(args.num_dispatched_tokens == 0 ) {
-        // Fast return if there are no tokens to dispatch
+        // Fast return empty tensors if there are no tokens to dispatch
+        dispatched_tokens = torch::empty({0, config.hidden_dim}, torch::dtype(args.hidden.dtype()).device(torch::kCUDA));
+        if(config.forward_dispatch_api) {
+            dispatched_probs = torch::empty({0}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        }
+        if(config.token_data_type == TOKEN_DATA_TYPE::UINT8) {
+            dispatched_scaling_factor = torch::empty({0, config.hidden_dim / 128}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        }
+        row_id_map = torch::empty({0, config.num_of_experts_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+        tokens_per_expert = torch::full({config.num_of_experts_per_rank}, 0, torch::dtype(torch::kInt32).device(torch::kCUDA));
         return std::make_tuple(dispatched_tokens, dispatched_probs, dispatched_scaling_factor, row_id_map, tokens_per_expert);
     }
 
@@ -123,12 +135,7 @@ Executor::dispatch_postprocess(HybridEpConfigInstance config, DispatchBuffers& d
         int num_dispatched_tokens = args.num_dispatched_tokens;
         int num_permuted_tokens = args.num_permuted_tokens;
         torch::Tensor num_dispatched_tokens_tensor = args.num_dispatched_tokens_tensor.value();
-        // If args.num_dispatched_tokens >= 0, which means that the sync-free model is used.
-        // Otherwise, we will use the values in args.num_dispatched_tokens_tensor.
-        if (num_dispatched_tokens < 0) {
-          num_dispatched_tokens = num_dispatched_tokens_tensor.item<int32_t>();
-        }
-    
+
         if (args.row_id_map.has_value()) {
           // The row_id_map is valid, which means that the cached model is used.
           // Then we will use the values in args directly.
@@ -179,7 +186,7 @@ Executor::dispatch_postprocess(HybridEpConfigInstance config, DispatchBuffers& d
         size_t sizeof_token_data_type = get_token_data_type_size(dispatch_buffers.data_type);
         dispatched_tokens = torch::empty({args.num_dispatched_tokens, config.hidden_dim}, torch::dtype(args.hidden.dtype()).device(torch::kCUDA));
         auto res_sz = args.num_dispatched_tokens * config.hidden_dim * sizeof_token_data_type;
-        CUDA_CHECK(cudaMemcpyAsync(dispatched_tokens.data_ptr(), dispatch_buffers.expert_output_token,res_sz, cudaMemcpyDeviceToDevice, args.stream));
+        CUDA_CHECK(cudaMemcpyAsync(dispatched_tokens.data_ptr(), dispatch_buffers.expert_output_token, res_sz, cudaMemcpyDeviceToDevice, args.stream));
 
         if(config.forward_dispatch_api) {
             dispatched_probs = torch::empty({args.num_dispatched_tokens,
