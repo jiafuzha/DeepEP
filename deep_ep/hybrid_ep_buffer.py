@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 import torch
 import os
+import shutil
 import hybrid_ep_cpp
 
 
@@ -40,10 +41,11 @@ class HybridEPBuffer:
         num_local_experts: int,
         use_fp8: bool = False,
         # Device-SM occupancy setting
-        num_sms_dispatch_api: int = 32,
-        num_sms_combine_api: int = 32,
-        num_sms_preprocessing_api: int = 128,
-        nvlink_domain_size: int = None,
+        num_sms_dispatch_api: int = None,
+        num_sms_combine_api: int = None,
+        num_sms_preprocessing_api: int = None,
+        use_mnnvl: bool = None,
+        ib_dev_name_list: list[str] = [],
     ):
         self.group = group
         self.rank = self.group.rank()
@@ -56,13 +58,15 @@ class HybridEPBuffer:
         global_ranks = torch.distributed.get_process_group_ranks(self.group)
         rank_stride = global_ranks[1] - global_ranks[0]
         # Number of ranks in the first nvlink domain.
-        if nvlink_domain_size is None:
-            nvlink_domain_size = int(os.getenv("NVLINK_DOMAIN_SIZE", "8"))
+        if use_mnnvl is None:
+            use_mnnvl = os.getenv("USE_MNNVL", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+        if int(os.getenv("NVLINK_DOMAIN_SIZE", "8")) > 8: # For compatibility 
+            use_mnnvl = True
+        self.nvlink_domain_size = 72 if use_mnnvl else 8
         assert (
-            rank_stride <= nvlink_domain_size
+            rank_stride <= self.nvlink_domain_size
         ), "The rank stride should be less than or equal to the nvlink domain size."
-        num_of_ranks_per_node = min(nvlink_domain_size // rank_stride, self.group_size)
-        self.nvlink_domain_size = nvlink_domain_size
+        num_of_ranks_per_node = min(self.nvlink_domain_size // rank_stride, self.group_size)
 
         assert (
             self.group_size % num_of_ranks_per_node == 0
@@ -80,6 +84,13 @@ class HybridEPBuffer:
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         sm_count = props.multi_processor_count
+        if num_sms_preprocessing_api is None:
+            num_sms_preprocessing_api = 128
+        # Inter-node case should use less SMs for the dispatch and combine APIs.
+        if num_sms_dispatch_api is None:
+            num_sms_dispatch_api = 32 if self.num_of_nodes == 1 else 16
+        if num_sms_combine_api is None:
+            num_sms_combine_api = 32 if self.num_of_nodes == 1 else 16
         assert (
             sm_count >= num_sms_preprocessing_api
             and sm_count >= num_sms_dispatch_api
@@ -92,10 +103,12 @@ class HybridEPBuffer:
         # Initialize the BufferConfig for the hybrid-ep buffer allocation.
         self.config = hybrid_ep_cpp.BufferConfig()
         self.config.hidden_dim = hidden_dim
-        self.config.max_num_of_tokens_per_rank = max(max_num_of_tokens_per_rank, 1024)
+        self.config.max_num_of_tokens_per_rank = max_num_of_tokens_per_rank
         self.config.num_of_experts_per_rank = num_local_experts
         self.config.num_of_ranks_per_node = self.num_of_ranks_per_node
         self.config.num_of_nodes = self.num_of_nodes
+        self.config.num_of_blocks_dispatch_api = self.num_sms_dispatch_api
+        self.config.num_of_blocks_combine_api = self.num_sms_combine_api
         # The SMs of preprocessing, chunk size of dispatch and combine will affact the size of intermediate buffers.
         self.config.num_of_blocks_preprocessing_api = self.num_sms_preprocessing_api
         # The fp8/bf16/fp16 data is communicated in the uint8/uint16 format.
@@ -111,10 +124,17 @@ class HybridEPBuffer:
 
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
-            self.config, self.local_rank, self.node_rank, self.group_size, os.path.dirname(os.path.abspath(__file__))
+            self.group, 
+            self.config, 
+            self.local_rank, 
+            self.node_rank, 
+            self.group_size, 
+            os.path.dirname(os.path.abspath(__file__)), 
+            ib_dev_name_list, 
+            load_cached_kernels = False, 
+            use_shared_buffer = True,
+            enable_fabric = use_mnnvl, # If use_mnnvl is True, the fabric memory handle will be used.
         )
-        # Exchange IPC addresses using C++ distributed communication
-        self.runtime.exchange_ipc_address(self.group)
 
     def empty_jit_cache(self):
         '''
@@ -147,6 +167,8 @@ class HybridEPBuffer:
             if max_num_of_tokens_per_rank is not None
             else self.config.max_num_of_tokens_per_rank
         )
+        if self.num_of_nodes > 1:
+            assert self.config.max_num_of_tokens_per_rank == max_num_of_tokens_per_rank, "Dynamic sequence length is not supported in the multi-node case."
         config.max_num_of_tokens_per_rank = max(
             config.max_num_of_tokens_per_rank, self.config.max_num_of_tokens_per_rank
         )
@@ -184,9 +206,14 @@ class HybridEPBuffer:
         config.num_of_blocks_combine_api = self.num_sms_combine_api
         config.device_side_sync_combine_api = True
         # Combine stages config:
-        config.num_of_stages_g2s_combine_api = int(
-            os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "10")
-        )
+        if self.config.num_of_nodes > 1:
+            config.num_of_stages_g2s_combine_api = int(
+                os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "5")
+            )
+        else:
+            config.num_of_stages_g2s_combine_api = int(
+                os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "10")
+            )
         config.num_of_stages_s2g_combine_api = int(
             os.getenv("NUM_OF_STAGES_S2G_COMBINE_API", "2")
         )
@@ -202,8 +229,6 @@ class HybridEPBuffer:
 
         # Use the runtime kernel config to update the buffer.
         reallocated = self.runtime.update_buffer(config)
-        if reallocated:
-            self.runtime.exchange_ipc_address(self.group)
         return config
 
     def dispatch(
@@ -333,8 +358,8 @@ class HybridEPBuffer:
             sparse_to_dense_map,
             rdma_to_attn_map,
             attn_to_rdma_map,
-            num_dispatched_tokens_tensor,
-            local_expert_routing_map,
+            _,
+            _,
             num_of_tokens,
             config,
         ) = handle
@@ -439,9 +464,13 @@ class HybridEPBuffer:
                 )
                 if use_host_meta:
                     # Put the num_dispatched_tokens_tensor on the CPU pinned memory, because this tensor also will be used in the GPU kernel
-                    num_dispatched_tokens_tensor = (
-                        num_dispatched_tokens_tensor.cpu().pin_memory()
+                    num_dispatched_tokens_tensor_pinned = torch.empty(
+                        num_dispatched_tokens_tensor.shape,
+                        device="cpu",
+                        dtype=num_dispatched_tokens_tensor.dtype,
+                        pin_memory=True,
                     )
+                    num_dispatched_tokens_tensor_pinned.copy_(num_dispatched_tokens_tensor, False)
             else:
                 (
                     sparse_to_dense_map,

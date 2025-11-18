@@ -25,7 +25,7 @@ This document introduces the Hybrid Expert Parallel (Hybrid-EP) implementation t
 
 ### Hardware Optimizations
 - **TMA Instructions**: Leverage Tensor Memory Accelerator instructions for minimal SM overhead
-- **RDMA Integration**: High-efficiency inter-node communication (coming soon)*
+- **RDMA Integration**: High-efficiency inter-node communication
 - **Pipeline Architecture**: Warp-level pipeline parallelism within execution blocks
 
 ### Supported Data Types
@@ -40,6 +40,35 @@ This document introduces the Hybrid Expert Parallel (Hybrid-EP) implementation t
 *RDMA features are currently under final testing and will be released shortly.
 
 ## 📊 Performance Results
+
+### H100 Platform
+
+**HybridEP Performance Results (IB Bandwidth in GB/s):**
+
+**Test Configuration:**
+- Device: H100
+- Tokens: 4096
+- Hidden Dimension: 7168
+- TopK: 8
+- Router: Random Uniform
+- Local Experts: 8
+- SM Count: 4/8/16
+- Ranks: 16/32/64
+
+**Note**: All bandwidth values represent algorithm bandwidth.
+
+| Ranks | SM Count | Torch API ||| Kernel Only |||
+|-------|----------|-----------|-----------|-----------|-----------|-----------|-----------|
+|       |          | **Dispatch (FP8)** | **Dispatch (BF16)** | **Combine** | **Dispatch (FP8)** | **Dispatch (BF16)** | **Combine** |
+| 16    | 4       | 28.09	| 37.08 |	42.47 |	34.00 |	44.40 |	52.00    |
+|       | 8       | 44.87	| 57.74 |	56.96 |	62.00 |	76.80 |	68.00    |
+|       | 16      | 48.26	| 54.47 |	53.35 |	68.48 |	71.71 |	62.95    |
+| 32    | 4       | 32.58	| 44.88 |	43.60 |	38.50 |	52.60 |	51.00    |
+|       | 8       | 41.23	| 46.54 |	50.68 |	51.30 |	54.50 |	56.40    |
+|       | 16      | 42.10	| 47.36 |	52.53 |	55.35 |	57.69 |	57.46    |
+| 64    | 4       | 30.42	| 40.63 |	41.00 |	37.50 |	48.00 |	46.00    |
+|       | 8       | 35.71	| 41.46 |	47.68 |	46.63 |	50.55 |	51.03    |
+|       | 16      | 35.01	| 41.24 |	46.57 |	46.52 |	49.97 |	49.77    |
 
 ### B200 Platform
 
@@ -120,13 +149,13 @@ This document introduces the Hybrid Expert Parallel (Hybrid-EP) implementation t
 ```
 csrc/hybrid_ep/
 ├── hybrid_ep.cu                   # Main CUDA implementation
-├── hybrid_ep.cuh                  # Header definitions
+├── internode.cu                   # Main RDMA CUDA implementation
 ├── pybind_hybrid_ep.cu            # PyBind bindings
 ├── config.cuh                     # Config definitions required by hybrid-EP kernels
-├── utils.cuh                      # Utility helpers and macros
 ├── allocator/                     # Allocator for memory accessible by remote ranks
 ├── backend/                       # Core Hybrid-EP kernel implementations
-│   └── hybrid_ep_backend.cuh
+│   ├── hybrid_ep_backend.cuh
+│   └── utils.cuh                  # Utility helpers and macros
 ├── executor/                      # Kernel runner
 ├── extension/                     # Useful extensions
 └── jit/                           # JIT compiler
@@ -144,11 +173,40 @@ Follow the same build process as the main branch. No additional dependencies req
 
 ## 🚀 Usage Guide
 
+### Installation
+
+#### Intra-node and MNNVL Installation
+For intra-node communication and MNNVL support, you can install directly by specifying the GPU architecture:
+
+```bash
+export TORCH_ARCH_LIST="9.0;10.0"  # Adjust based on your GPU architecture
+pip install .
+```
+
+#### Multi-node RDMA Installation
+For multi-node support with RDMA, additional configuration is required, make sure RDMA core libraries are properly installed and the path points to the directory containing the RDMA headers and libraries.
+
+```bash
+export HYBRID_EP_MULTINODE=1
+export RDMA_CORE_HOME=/path/to/rdma-core  # Path to your RDMA core installation
+export TORCH_ARCH_LIST="9.0;10.0"  # Adjust based on your GPU architecture
+pip install .
+```
+
+
 ### Quick Start
+
+> **⚠️ Important Note for RDMA Inter-node Configuration**  
+> Currently, the RDMA inter-node kernel implementation requires manual specification of nic names for each GPU. You need to provide the mapping between GPUs and their corresponding IB device names via the `--ib-dev-name-list` parameter. See `tests/test_hybrid_ep.py` for detailed usage examples.
+>  In addition, when using the RDMA part, after setting num-tokens-per-rank during initialization, all subsequent communications must use the same value. Currently, dynamic sequence length is not supported.
+>
+> **Automatic topology detection will be supported soon.**
+> **Dynamic sequence length will be supported soon.**
+
 Refer to `tests/test_hybrid_ep.py` for comprehensive usage examples including:
 - Multi-node configuration
 - Intra-node testing scenarios
-- Inter-node testing will come soon
+- Inter-node testing scenarios
 - Performance benchmarking setups
 
 ### Important Configuration Note
@@ -206,11 +264,9 @@ Here are important parameter settings in `csrc/hybrid_ep/config.cuh`. You can mo
 - Comprehensive performance improvements
 
 ### 🚧 Upcoming Features
+- **Automatic Topology Detection**: Automatic detection of GPU-NIC mapping for RDMA inter-node communication, eliminating the need for manual `--ib-dev-name-list` configuration
 - **Low Latency Mode**: Enhanced performance for latency-critical workloads
-- **RDMA Integration**: High-performance inter-node communication
-
-### ⚠️ Current Limitations
-- RDMA functionality not yet available (under final testing)
+- Performance optimization
 
 ### 🎯 Migration Notes
 This implementation maintains full backward compatibility with DeepEP. Users can seamlessly integrate Hybrid-EP into existing workflows without code modifications.
