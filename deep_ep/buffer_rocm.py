@@ -44,6 +44,7 @@ class Buffer:
                  use_fabric: bool = False,
                  explicitly_destroy: bool = False,
                  enable_shrink: bool = False,
+                 convert_stand_alone: bool = True,
                  comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
         """
         Initialize the communication buffer.
@@ -62,6 +63,7 @@ class Buffer:
             allow_mnnvl: whether to allow MNNVL
             use_fabric: whether to use fabric API for memory buffers.
             enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
+            convert_stand_alone: whether to use standalone conversion kernels for MORI input/output format conversion.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
@@ -94,6 +96,7 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+        self.convert_stand_alone = convert_stand_alone
         self.multi_node = self.group_size > Buffer.MAX_GPU_PER_NODE
 
         # Register default process group for mori shmem (required)
@@ -585,18 +588,32 @@ class Buffer:
             rdma_block_num,
         )
 
-        convert_stand_alone = True
-        if convert_stand_alone:
+        if self.convert_stand_alone:
             # Call mori dispatch (topk_weights can be None)
             dispatch_out_x, dispatch_out_topk_weights, _, dispatch_out_topk_idx, dispatch_out_count = \
-                self.mori_op.dispatch(x, topk_weights, None, topk_idx)
+                self.mori_op.dispatch(
+                    input=x,
+                    weights=topk_weights,
+                    scales=None,
+                    indices=topk_idx,
+                )
             packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range = \
                 self.mori_op.convert_dispatch_output(
-                    dispatch_out_x, dispatch_out_topk_idx, 80, 16
+                    dispatch_out_x=dispatch_out_x,
+                    dispatch_out_topk_idx=dispatch_out_topk_idx,
+                    block_num=80,
+                    warp_per_block=16,
                 )
         else:
             packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range = \
-                self.mori_op.dispatch_standard_moe(x, topk_weights, None, topk_idx, 64, 16)
+                self.mori_op.dispatch_standard_moe(
+                    input=x,
+                    weights=topk_weights,
+                    scales=None,
+                    indices=topk_idx,
+                    block_num=64,
+                    warp_per_block=16,
+                )
 
         # Create handle for combine (store necessary info)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
@@ -646,12 +663,29 @@ class Buffer:
         else:
             combine_block_num, combine_warp_per_block = 64, 8
 
-        convert_stand_alone = True
-        if convert_stand_alone:
-            combine_input = self.mori_op.convert_combine_input(x, packed_recv_src_info, packed_recv_layout_range, 80, 16)
-            combined_x, _ = self.mori_op.combine(combine_input, None, topk_idx, combine_block_num, combine_warp_per_block)
+        if self.convert_stand_alone:
+            combine_input = self.mori_op.convert_combine_input(
+                packed_recv_x=x,
+                packed_recv_src_info=packed_recv_src_info,
+                packed_recv_layout_range=packed_recv_layout_range,
+                block_num=80,
+                warp_per_block=16,
+            )
+            combined_x, _ = self.mori_op.combine(
+                input=combine_input,
+                weights=None,
+                indices=topk_idx,
+                block_num=combine_block_num,
+                warp_per_block=combine_warp_per_block,
+            )
         else:
-            combined_x, _ = self.mori_op.combine_standard_moe(x, None, topk_idx, 64, 8)
+            combined_x, _ = self.mori_op.combine_standard_moe(
+                input=x,
+                weights=None,
+                indices=topk_idx,
+                block_num=64,
+                warp_per_block=8,
+            )
 
         # Create event and hook
         def hook():
@@ -724,7 +758,12 @@ class Buffer:
         # dispatch_out_x, dispatch_out_topk_weights, _, dispatch_out_topk_idx, dispatch_out_count = \
         #     self.mori_op.dispatch(x, topk_weights, None, topk_idx)
         packed_recv_x, packed_recv_topk_weights, _, packed_recv_topk_idx, packed_recv_count = \
-            self.mori_op.dispatch(x, topk_weights, None, topk_idx)
+            self.mori_op.dispatch(
+                input=x,
+                weights=topk_weights,
+                scales=None,
+                indices=topk_idx,
+            )
 
         # Create handle for combine (store necessary info)
         handle = (num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
@@ -783,7 +822,14 @@ class Buffer:
         else:
             combine_block_num, combine_warp_per_block = 64, 8
         use_external_inp_buf = 0 if zero_copy else 1
-        combined_x, _ = self.mori_op.combine(x, None, topk_idx, combine_block_num, combine_warp_per_block, use_external_inp_buf)
+        combined_x, _ = self.mori_op.combine(
+            input=x,
+            weights=None,
+            indices=topk_idx,
+            block_num=combine_block_num,
+            warp_per_block=combine_warp_per_block,
+            use_external_inp_buf=use_external_inp_buf,
+        )
 
         # Create event and hook
         def hook():
@@ -833,4 +879,4 @@ class Buffer:
                 `[num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden]`, you should fill this buffer
                 by yourself.
         """
-        return self.mori_op.get_registered_combine_input_buffer(self.mori_config.data_type)
+        return self.mori_op.get_registered_combine_input_buffer(dtype=self.mori_config.data_type)

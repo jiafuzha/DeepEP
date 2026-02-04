@@ -51,6 +51,7 @@ def test_main(num_tokens: int,
             # Cannot call dispatch multiple times without a matching combine.
             # num_times += 1
             for _i in range((num_times % 2) + 1):
+                # NOTE: MORI backend requires topk_weights parameter, unlike original DeepEP API
                 packed_recv_x, packed_recv_count, handle, event, hook = \
                     buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=dispatch_use_fp8,
                                                 async_finish=False, return_recv_hook=return_recv_hook,
@@ -109,6 +110,7 @@ def test_main(num_tokens: int,
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
             # Check combine correctness
+            # NOTE: MORI backend DeepEP-compatible API does not support zero_copy
             for zero_copy in (False, ):
                 if zero_copy:
                     buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
@@ -187,7 +189,7 @@ def test_main(num_tokens: int,
     for return_recv_hook in (False, ):
         group.barrier()
 
-        convert_stand_alone = True
+        convert_stand_alone = buffer.convert_stand_alone
         kernel_names = [
             'EpDispatchInterNodeV1Kernel' if multi_node else 'EpDispatchIntraNodeKernel',
             'EpCombineInterNodeV1Kernel' if multi_node else 'EpCombineIntraNodeKernel',
@@ -229,7 +231,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
-    buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=num_experts // num_ranks)
+    # NOTE: DeepEP uses num_experts // num_ranks as num_qps_per_rank, but MORI backend requires 4
+    buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=4, convert_stand_alone=True)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
     do_pressure_test = False
