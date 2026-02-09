@@ -9,7 +9,9 @@
 
 class CustomAllgather {
 public:
-    void init(int rank_idx, int num_of_ranks_per_node, int num_of_experts_per_rank, int num_of_tokens_per_rank, int num_of_nodes, ExtendedMemoryAllocator* allocator, pybind11::object process_group);
+    CustomAllgather() = default;
+    ~CustomAllgather();
+    void init(pybind11::object process_group, int rank_idx, BufferConfig buffer_config, ExtendedMemoryAllocator* allocator);
     void update(BufferConfig buffer_config);
     void allocate_ag_buffer();
     void open_ag_handles();
@@ -18,12 +20,12 @@ public:
     void * get_output_buffer();
 private:
     // Required pre-allocated buffers
-    void* dst_buffer;
-    void** dst_buffers_all_ranks;
-    void** dst_buffers_all_ranks_gpu;
-    int64_t* iter_id_ptr;
-    unsigned long long* flag_nvl_ptr;
-    unsigned long long* flag_sm_ptr;
+    void* dst_buffer = nullptr;
+    void** dst_buffers_all_ranks = nullptr;
+    void** dst_buffers_all_ranks_gpu = nullptr;
+    int64_t* iter_id_ptr = nullptr;
+    unsigned long long* flag_nvl_ptr = nullptr;
+    unsigned long long* flag_sm_ptr = nullptr;
     torch::Tensor ag_handles;
 
     // Meta-data
@@ -32,6 +34,6 @@ private:
     int num_of_experts_per_rank;
     int num_of_tokens_per_rank;
     int num_of_nodes;
-    ExtendedMemoryAllocator* allocator;
+    ExtendedMemoryAllocator *allocator;
     pybind11::object process_group;
 };

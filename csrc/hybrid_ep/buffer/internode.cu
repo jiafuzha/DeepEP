@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
 // All rights reserved
 #include "internode.cuh"
+#include <sstream>
+#include <cstdlib>
+#include <unordered_map>
 
 // Functions realted to get RDMA context.
 static ibv_device *ctx_find_dev(const char *ib_devname) {
@@ -24,6 +27,48 @@ static ibv_device *ctx_find_dev(const char *ib_devname) {
     return NULL;
   }
   return ib_dev;
+}
+
+// Get NIC name with optional manual mapping from environment variables.
+// If HYBRID_EP_ENABLE_MANUAL_NIC_MAPPING=1, parse HYBRID_EP_NIC_MAPPING
+// Format: "0:mlx5_0:1,1:mlx5_1:1,..." (gpu_id:nic_name:port)
+static void get_nic_name(const std::vector<int>& gpu_idx_vec, int local_device_idx, const char** net_name) {
+  static thread_local std::string nic_name_storage;
+  
+  const char* manual_mapping_env = std::getenv("HYBRID_EP_ENABLE_MANUAL_NIC_MAPPING");
+  if (manual_mapping_env != nullptr && std::string(manual_mapping_env) == "1") {
+    const char* nic_mapping_env = std::getenv("HYBRID_EP_NIC_MAPPING");
+    if (nic_mapping_env == nullptr) {
+      fprintf(stderr, "[Error] HYBRID_EP_ENABLE_MANUAL_NIC_MAPPING=1 but HYBRID_EP_NIC_MAPPING is not set\n");
+      assert(false);
+    }
+    
+    std::unordered_map<int, std::string> device_mapping;
+    std::string mapping_str(nic_mapping_env);
+    std::stringstream ss(mapping_str);
+    std::string entry;
+    while (std::getline(ss, entry, ',')) {
+      size_t first_colon = entry.find(':');
+      if (first_colon == std::string::npos) {
+        fprintf(stderr, "[Error] Invalid mapping format '%s' in HYBRID_EP_NIC_MAPPING. Expected format: '<device_id>:<nic_name>'\n", entry.c_str());
+        assert(false);
+      }
+      int device_id = std::stoi(entry.substr(0, first_colon));
+      std::string nic_name = entry.substr(first_colon + 1);  // Keep the rest as NIC name (including :1)
+      device_mapping[device_id] = nic_name;
+    }
+    
+    auto it = device_mapping.find(local_device_idx);
+    if (it == device_mapping.end()) {
+      fprintf(stderr, "[Error] Device %d not found in HYBRID_EP_NIC_MAPPING\n", 
+              local_device_idx);
+      assert(false);
+    }
+    nic_name_storage = it->second;
+    *net_name = nic_name_storage.c_str();
+  } else {
+    hybrid_ep::get_nic(gpu_idx_vec, local_device_idx, net_name);
+  }
 }
 
 // Functions related to initialization of gverbs_context.
@@ -287,8 +332,8 @@ void RDMACoordinator::init(
     gpu_idx_vec.push_back(i);
   }
   // Get name of ibv device.
-  const char *net_name;
-  hybrid_ep::get_nic(gpu_idx_vec, local_device_idx, &net_name);
+  const char *net_name = nullptr;
+  get_nic_name(gpu_idx_vec, local_device_idx, &net_name);
   // Find ib device and get ibv_context.
   struct ibv_device *ib_dev = ctx_find_dev(net_name);
 
@@ -310,7 +355,8 @@ void RDMACoordinator::init(
   rdma_initialized = true;
 }
 
-void RDMACoordinator::allocate_dispatch_rdma_buffers(DispatchBuffers &dispatch_buffers) {
+void RDMACoordinator::allocate_dispatch_buffers(){
+  dispatch_buffers.data_type = buffer_config.token_data_type;
   size_t sizeof_token_data_type = get_token_data_type_size(dispatch_buffers.data_type);
 
   // Calculate rdma buffers sizes
@@ -354,8 +400,8 @@ void RDMACoordinator::allocate_dispatch_rdma_buffers(DispatchBuffers &dispatch_b
                         rdma_inter_node_group_flags_elts * sizeof(uint64_t)));
   CUDA_CHECK(cudaMemset(dispatch_buffers.attn_input_flags, 0, 
                         rdma_inter_node_group_flags_elts * sizeof(uint64_t)));
-                    
-  // Allocate RDMA flags
+
+  // Allocate RDMA flags here because it is needed by the device_sync kernel.
   CUDA_CHECK(cudaMalloc((void**)&dispatch_buffers.expected_rdma_flag_value, sizeof(uint64_t)));
   CUDA_CHECK(cudaMemset(dispatch_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
 
@@ -484,7 +530,7 @@ void RDMACoordinator::allocate_dispatch_rdma_buffers(DispatchBuffers &dispatch_b
   buffer_allocated = true;
 }
 
-void RDMACoordinator::allocate_combine_rdma_buffers(CombineBuffers &combine_buffers) {
+void RDMACoordinator::allocate_combine_buffers(){
   // Calculate rdma buffers sizes
   auto rdma_intra_node_red_token_elts = buffer_config.max_num_of_tokens_per_rank *
                                         (buffer_config.num_of_nodes - 1) * buffer_config.hidden_dim;
@@ -515,8 +561,8 @@ void RDMACoordinator::allocate_combine_rdma_buffers(CombineBuffers &combine_buff
                         rdma_inter_node_group_flags_elts * sizeof(uint64_t)));
   CUDA_CHECK(cudaMemset(combine_buffers.attn_output_flags, 0, 
                         rdma_inter_node_group_flags_elts * sizeof(uint64_t)));
-  
-  // Allocate RDMA flags
+
+  // Allocate RDMA flags here because it is needed by the device_sync kernel.
   CUDA_CHECK(cudaMalloc((void**)&combine_buffers.expected_rdma_flag_value, sizeof(uint64_t)));
   CUDA_CHECK(cudaMemset(combine_buffers.expected_rdma_flag_value, 0, sizeof(uint64_t)));
 
@@ -676,6 +722,23 @@ void RDMACoordinator::destroy() {
   FREE_CPU_MEMORY(combine_mr_info_h);
   FREE_CUDA_MEMORY(combine_gverbs_ctx.d_qps_gpu);
   FREE_CUDA_MEMORY(combine_mr_info_d);
+
+  FREE_CUDA_MEMORY(dispatch_buffers.rdma_inter_node_group_token);
+  FREE_CUDA_MEMORY(dispatch_buffers.rdma_inter_node_group_prob);
+  FREE_CUDA_MEMORY(dispatch_buffers.rdma_inter_node_group_scaling_factor);
+  FREE_CUDA_MEMORY(dispatch_buffers.rdma_inter_node_group_flags);
+  FREE_CUDA_MEMORY(dispatch_buffers.attn_input_flags);
+  FREE_CUDA_MEMORY(dispatch_buffers.attn_input_token);
+  FREE_CUDA_MEMORY(dispatch_buffers.attn_input_prob);
+  FREE_CUDA_MEMORY(dispatch_buffers.attn_input_scaling_factor);
+  FREE_CUDA_MEMORY(dispatch_buffers.expected_rdma_flag_value);
+  FREE_CUDA_MEMORY(combine_buffers.rdma_intra_node_red_token);
+  FREE_CUDA_MEMORY(combine_buffers.rdma_intra_node_red_prob);
+  FREE_CUDA_MEMORY(combine_buffers.rdma_inter_node_group_token);
+  FREE_CUDA_MEMORY(combine_buffers.rdma_inter_node_group_prob);
+  FREE_CUDA_MEMORY(combine_buffers.rdma_inter_node_group_flags);
+  FREE_CUDA_MEMORY(combine_buffers.attn_output_flags);
+  FREE_CUDA_MEMORY(combine_buffers.expected_rdma_flag_value);
 
   // If we use doca_gpu_verbs_destroy_qp_hl and re-allocate RDMA resources, "part or all of the requested memory range is already mapped" occurs. Do not know why now, so just comment it out.
   // int num_of_dispatch_qps = (buffer_config.num_of_nodes - 1) * buffer_config.num_of_blocks_dispatch_api;
