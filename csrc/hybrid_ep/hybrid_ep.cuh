@@ -11,6 +11,7 @@
 #include <c10/util/Optional.h>
 #include <torch/torch.h>
 #include <vector>
+#include <memory>
 #include <algorithm>
 #include <string>
 
@@ -69,7 +70,11 @@ public:
 private:
   ExtendedMemoryAllocator remote_allocator;
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
-  RDMACoordinator rdma_coordinator;
+#ifdef USE_NIXL
+  NIXLCoordinator internode_coordinator;
+#else
+  RDMACoordinator internode_coordinator;
+#endif
 #endif
   NVLCoordinator nvl_coordinator;
   BufferConfig buffer_config;
