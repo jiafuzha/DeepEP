@@ -2,8 +2,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #include "compiler.cuh"
+#include <any>
+#include <cstdio>
 #include <unistd.h>
 #include <pwd.h>
+#include <sys/types.h>
+#include <stdexcept>
 
 inline std::string get_env(std::string name) {
     const char* env = std::getenv(name.c_str());
@@ -55,6 +59,19 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id):
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
     // Add the dependency of the inter-node jit
     flags += " -DHYBRID_EP_BUILD_MULTINODE_ENABLE";
+#ifdef USE_NIXL
+    flags += " -DUSE_NIXL";
+    std::string nixl_home = get_env("NIXL_HOME");
+    if (nixl_home.empty()) nixl_home = "/usr/local/nixl";
+    std::string ucx_home = get_env("UCX_HOME");
+    if (ucx_home.empty()) ucx_home = "/usr";
+    include += " -I" + nixl_home + "/include ";
+    include += " -I" + nixl_home + "/include/gpu/ucx ";
+    include += " -I" + ucx_home + "/include ";
+    std::string nixl_lib = nixl_home + "/lib/x86_64-linux-gnu";
+    library += " -L" + nixl_lib + " -lnixl -lnixl_build -lnixl_common ";
+    library += " -Xlinker -rpath -Xlinker " + nixl_lib + " ";
+#else
     std::string rdma_core_home = RDMA_CORE_HOME;
     if (!rdma_core_home.empty()) {
         include += " -I" + rdma_core_home + "/include ";
@@ -76,6 +93,7 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id):
         + doca_obj_path + "/doca_verbs_umem.o "
         + doca_obj_path + "/doca_gpunetio_gdrcopy.o "
         + doca_obj_path + "/doca_gpunetio_log.o ";
+#endif
 #endif
 
     inter_node_flags = flags + " " + include + " " + library;
@@ -118,7 +136,11 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
     // Choose the flags based on the number of nodes
     std::string compile_command;
     if(num_of_nodes > 1) {
+#ifdef USE_NIXL
+        compile_command = nvcc_path + " " + inter_node_flags + extra_flags + " " + source_path + " -o " + output_path;
+#else
         compile_command = nvcc_path + " " + inter_node_flags + extra_flags + " " + source_path + " " + objs + " -o " + output_path;
+#endif
     }else {
         compile_command = nvcc_path + " " + intra_node_flags + extra_flags + " " + source_path + " -o " + output_path;
     }
@@ -371,7 +393,15 @@ void KernelCache::run_dispatch_kernel(
     // Cast the function pointer to the correct type
     using DispatchFuncPtr = void (*)(
         hybrid_ep::dispatch_kernel_param_t<DATA_TYPE>, cudaStream_t);
-    auto func_ptr = std::any_cast<DispatchFuncPtr>(dispatch_instance);
+    DispatchFuncPtr func_ptr;
+    try {
+        func_ptr = std::any_cast<DispatchFuncPtr>(dispatch_instance);
+    } catch (const std::bad_any_cast& e) {
+        throw std::runtime_error(
+            "Kernel cache type mismatch for dispatch (key=" + dispatch_kernel_key +
+            "): expected " + (sizeof(DATA_TYPE) == 1 ? "uint8_t" : "uint16_t") +
+            " kernel. Original error: " + std::string(e.what()));
+    }
 
     // Run the kernel
     func_ptr(param, stream);
@@ -426,4 +456,3 @@ void KernelCache::run_combine_kernel(
 }
 
 
-  
