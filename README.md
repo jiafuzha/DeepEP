@@ -81,7 +81,7 @@ pip install "nvidia-nccl-cu13>=2.30.4" --no-deps
 
 ### Install NVSHMEM dependency
 
-DeepEP also depends on NVSHMEM to provide support for legacy methods. Please refer to our [NVSHMEM Installation Guide](third-party/README.md) for instructions.
+DeepEP also depends on NVSHMEM to provide support for legacy methods. Please refer to our [NVSHMEM Installation Guide](docs/nvshmem.md) for instructions.
 
 ### Development
 
