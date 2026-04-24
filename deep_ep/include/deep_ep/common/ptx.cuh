@@ -1,6 +1,8 @@
 #pragma once
 
+#ifdef __CUDACC__
 #include <cuda/barrier>
+#endif
 #include <cuda_bf16.h>
 
 #include <deep_ep/common/compiled.cuh>
@@ -9,7 +11,13 @@
 namespace deep_ep::elastic::ptx {
 
 /// Declarations
+#ifdef __CUDACC__
 using mbarrier = cuda::barrier<cuda::thread_scope_block>;
+#else
+// Host-side placeholder with the same size/alignment as cuda::barrier<thread_scope_block>
+// (a single uint64_t atomic), so that sizeof(mbarrier) is consistent across host and device.
+struct alignas(8) mbarrier { uint64_t __placeholder; };
+#endif
 using arrival_phase = uint32_t;
 
 // More than TMA, `longlong4` requires 32 bytes aligned
