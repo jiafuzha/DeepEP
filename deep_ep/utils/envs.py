@@ -17,6 +17,9 @@ _local_rank = None
 _local_seed = 0
 _global_seed = 0
 
+# Default NIC name for RDMA operations, configurable via environment variable
+_DEFAULT_NIC_NAME = os.getenv('EP_NIC_NAME', 'mlx5_0')
+
 
 def init_seed(global_seed: int) -> None:
     """
@@ -217,7 +220,7 @@ def get_nvlink_gbs(factor: float = 0.9) -> float:
 
 
 @functools.lru_cache()
-def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
+def check_fast_rdma_atomic_support(nic_name: str = _DEFAULT_NIC_NAME) -> bool:
     """
     Check whether the NIC supports fast RDMA atomic operations (MT4131 or newer).
 
@@ -240,7 +243,7 @@ def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
 
 
 @functools.lru_cache()
-def get_rdma_gbs(nic_name: str = 'mlx5_0') -> float:
+def get_rdma_gbs(nic_name: str = _DEFAULT_NIC_NAME) -> float:
     """
     Get the RDMA bandwidth in GB/s, cached.
 
