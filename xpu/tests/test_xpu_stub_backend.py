@@ -6,14 +6,14 @@ import xpu.deep_ep_cpp_xpu as backend
 
 def test_stub_buffer_metadata_and_handles():
     buf = backend.Buffer(
-        rank=9,
-        num_ranks=16,
-        num_nvl_bytes=128,
-        num_rdma_bytes=256,
-        low_latency_mode=False,
-        explicitly_destroy=False,
-        enable_shrink=False,
-        use_fabric=False,
+        9,      # rank
+        16,     # num_ranks
+        128,    # num_nvl_bytes
+        256,    # num_rdma_bytes
+        False,  # low_latency_mode
+        False,  # explicitly_destroy
+        False,  # enable_shrink
+        False,  # use_fabric
     )
 
     assert buf.get_num_rdma_ranks() == 2
@@ -32,14 +32,14 @@ def test_stub_buffer_metadata_and_handles():
 
 def test_stub_buffer_tensor_views_and_sync_destroy():
     buf = backend.Buffer(
-        rank=0,
-        num_ranks=1,
-        num_nvl_bytes=64,
-        num_rdma_bytes=64,
-        low_latency_mode=False,
-        explicitly_destroy=False,
-        enable_shrink=False,
-        use_fabric=False,
+        0,      # rank
+        1,      # num_ranks
+        64,     # num_nvl_bytes
+        64,     # num_rdma_bytes
+        False,  # low_latency_mode
+        False,  # explicitly_destroy
+        False,  # enable_shrink
+        False,  # use_fabric
     )
 
     assert not buf.is_available()
@@ -61,14 +61,14 @@ def test_stub_buffer_tensor_views_and_sync_destroy():
 
 def test_stub_stream_and_size_hint_api():
     buf = backend.Buffer(
-        rank=0,
-        num_ranks=1,
-        num_nvl_bytes=0,
-        num_rdma_bytes=0,
-        low_latency_mode=False,
-        explicitly_destroy=False,
-        enable_shrink=False,
-        use_fabric=False,
+        0,      # rank
+        1,      # num_ranks
+        0,      # num_nvl_bytes
+        0,      # num_rdma_bytes
+        False,  # low_latency_mode
+        False,  # explicitly_destroy
+        False,  # enable_shrink
+        False,  # use_fabric
     )
 
     stream = buf.get_comm_stream()

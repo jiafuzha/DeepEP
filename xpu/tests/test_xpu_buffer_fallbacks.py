@@ -50,7 +50,11 @@ def _make_buffer_for_low_latency_fallback_tests() -> Buffer:
 
 
 def _config() -> Config:
-    return Config(num_sms=20, ctas_per_sm=1, nvl_chunk_size=128, rdma_channels=1, bytes_per_element=2)
+    return Config(num_sms=20, 
+                  num_max_nvl_chunked_send_tokens=6,
+                  num_max_nvl_chunked_recv_tokens=256,
+                  num_max_rdma_chunked_send_tokens=6,
+                  num_max_rdma_chunked_recv_tokens=256)
 
 
 def test_internode_dispatch_fallback_single_rank(monkeypatch):
