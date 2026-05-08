@@ -46,6 +46,7 @@ struct XpuLocalMemHandle {
 constexpr uint32_t kXpuLocalMemHandleMagic = 0x58495043u;  // "XIPC"
 constexpr uint16_t kXpuLocalMemHandleVersion = 1;
 constexpr uint16_t kXpuLocalMemHandleKindDeviceAllocation = 1;
+constexpr uint16_t kXpuLocalMemHandleKindFabricHint = 2;
 
 inline uint64_t fnv1a64_mix(uint64_t seed, uint64_t value) {
     constexpr uint64_t kFnvOffset = 1469598103934665603ull;
@@ -110,11 +111,15 @@ inline void validate_xpu_live_allocation(void* ptr, size_t size, uint64_t genera
 static_assert(sizeof(XpuLocalMemHandle) <= sizeof(XpuIpcMemHandle::opaque),
               "XpuLocalMemHandle must fit inside XpuIpcMemHandle opaque payload");
 
-inline void encode_xpu_local_handle(XpuIpcMemHandle* handle, void* ptr, size_t size, uint64_t generation) {
+inline void encode_xpu_local_handle(XpuIpcMemHandle* handle,
+                                    void* ptr,
+                                    size_t size,
+                                    uint64_t generation,
+                                    uint16_t kind) {
     XpuLocalMemHandle local{};
     local.magic = kXpuLocalMemHandleMagic;
     local.version = kXpuLocalMemHandleVersion;
-    local.kind = kXpuLocalMemHandleKindDeviceAllocation;
+    local.kind = kind;
     local.flags = 0;
     local.reserved0 = 0;
     local.generation = generation;
@@ -131,7 +136,9 @@ inline XpuLocalMemHandle decode_xpu_local_handle(const XpuIpcMemHandle& handle) 
     std::memcpy(&local, handle.opaque, sizeof(local));
     EP_HOST_ASSERT(local.magic == kXpuLocalMemHandleMagic and "Invalid XPU local IPC handle magic");
     EP_HOST_ASSERT(local.version == kXpuLocalMemHandleVersion and "Unsupported XPU local IPC handle version");
-    EP_HOST_ASSERT(local.kind == kXpuLocalMemHandleKindDeviceAllocation and "Unsupported XPU local IPC handle kind");
+    EP_HOST_ASSERT((local.kind == kXpuLocalMemHandleKindDeviceAllocation or
+                    local.kind == kXpuLocalMemHandleKindFabricHint) and
+                   "Unsupported XPU local IPC handle kind");
     EP_HOST_ASSERT(local.flags == 0 and "Unsupported XPU local IPC handle flags");
     EP_HOST_ASSERT(local.reserved0 == 0 and "Invalid XPU local IPC handle reserved payload");
     EP_HOST_ASSERT(local.generation > 0 and "XPU local IPC handle has invalid generation payload");
@@ -257,7 +264,8 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
         meta = it->second;
     }
     mem_handle->size = meta.first;
-    encode_xpu_local_handle(&mem_handle->inner.xpu_ipc_mem_handle, ptr, meta.first, meta.second);
+    const auto handle_kind = use_fabric ? kXpuLocalMemHandleKindFabricHint : kXpuLocalMemHandleKindDeviceAllocation;
+    encode_xpu_local_handle(&mem_handle->inner.xpu_ipc_mem_handle, ptr, meta.first, meta.second, handle_kind);
 #else
     size_t size = 0;
     CU_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr));
@@ -279,6 +287,9 @@ void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
 #if defined(DEEPEP_USE_XPU)
     EP_HOST_ASSERT(ptr != nullptr and mem_handle != nullptr and "XPU IPC handle import got null input");
     const auto local = decode_xpu_local_handle(mem_handle->inner.xpu_ipc_mem_handle);
+    const auto expected_kind = use_fabric ? kXpuLocalMemHandleKindFabricHint : kXpuLocalMemHandleKindDeviceAllocation;
+    EP_HOST_ASSERT(local.kind == expected_kind and
+                   "XPU IPC handle kind mismatch between exporter/importer transport mode");
     EP_HOST_ASSERT(local.size > 0 and "XPU IPC handle import got invalid allocation size");
     EP_HOST_ASSERT(mem_handle->size == static_cast<size_t>(local.size) and
                    "XPU IPC handle import size mismatch");
@@ -354,7 +365,7 @@ inline runtime_data_type_t get_runtime_dtype(torch::ScalarType scalar_type) {
 
 inline void runtime_device_synchronize() {
 #if defined(DEEPEP_USE_XPU)
-    backend::get_current_stream().synchronize();
+    c10::xpu::syncStreamsOnDevice();
 #else
     CUDA_CHECK(cudaDeviceSynchronize());
 #endif
@@ -472,7 +483,7 @@ inline void runtime_free_host(void* ptr) {
 inline void runtime_get_device(int* device_id) {
 #if defined(DEEPEP_USE_XPU)
     EP_HOST_ASSERT(device_id != nullptr and "XPU get-device got null pointer");
-    *device_id = static_cast<int>(backend::get_current_stream().device_index());
+    *device_id = static_cast<int>(c10::xpu::current_device());
 #else
     CUDA_CHECK(cudaGetDevice(device_id));
 #endif
@@ -587,7 +598,7 @@ Buffer::Buffer(int rank,
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
-    if (num_rdma_ranks > 0) {
+    if (num_rdma_bytes > 0) {
         runtime_malloc_host_mapped(reinterpret_cast<void**>(const_cast<int**>(&moe_recv_rdma_counter)),
                        reinterpret_cast<void**>(&moe_recv_rdma_counter_mapped),
                        sizeof(int));
@@ -597,7 +608,8 @@ Buffer::Buffer(int rank,
 
 Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy) {
-        destroy();
+        if (not destroyed)
+            destroy();
     } else if (not destroyed) {
         printf("WARNING: destroy() was not called before DeepEP buffer destruction, which can leak resources.\n");
         fflush(stdout);
@@ -658,7 +670,8 @@ torch::Stream Buffer::get_comm_stream() const {
 }
 
 void Buffer::destroy() {
-    EP_HOST_ASSERT(not destroyed);
+    if (destroyed)
+        return;
 
     // Synchronize
     runtime_device_synchronize();
@@ -699,7 +712,8 @@ void Buffer::destroy() {
 
     // Free chunked mode staffs
     runtime_free_host(const_cast<int*>(moe_recv_expert_counter));
-    runtime_free_host(const_cast<int*>(moe_recv_rdma_counter));
+    if (moe_recv_rdma_counter != nullptr)
+        runtime_free_host(const_cast<int*>(moe_recv_rdma_counter));
 
     destroyed = true;
     available = false;
@@ -964,6 +978,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
     int num_memset_int = num_channels * num_ranks * 4;
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
     if (cached_mode) {
         num_recv_tokens = cached_num_recv_tokens;
         rank_prefix_matrix = cached_rank_prefix_matrix.value();
@@ -1033,6 +1051,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
     }
+#if defined(DEEPEP_USE_XPU)
+    }
+#endif
 
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
@@ -1070,6 +1091,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
         <= num_nvl_bytes);
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
@@ -1098,6 +1123,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
                         config.num_max_nvl_chunked_recv_tokens);
+#if defined(DEEPEP_USE_XPU)
+    }
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1328,6 +1356,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream) {
 #ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(num_rdma_bytes > 0 and "internode_dispatch requires RDMA buffer bytes > 0");
+
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
@@ -1706,6 +1736,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     bool async,
     bool allocate_on_comm_stream) {
 #ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(num_rdma_bytes > 0 and "internode_combine requires RDMA buffer bytes > 0");
+
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
 
@@ -1925,6 +1957,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool async,
                              bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(num_rdma_bytes > 0 and "low_latency_dispatch requires RDMA buffer bytes > 0");
+
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
@@ -2068,6 +2102,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     bool return_recv_hook,
     const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(num_rdma_bytes > 0 and "low_latency_combine requires RDMA buffer bytes > 0");
+
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks

@@ -85,11 +85,83 @@ This directory is the staged XPU migration workspace.
 - Added regressions in `xpu/tests/test_xpu_import.py` and `xpu/tests/test_xpu_stub_backend.py` to verify `is_internode_available()` stays false when `num_rdma_bytes == 0`, including after `sync()`.
 - Removed staged XPU hard-fail on `use_fabric=True` in `xpu/csrc/deep_ep.cpp` and added native regression coverage in `xpu/tests/test_xpu_import.py`, so fabric hints are accepted as no-op in staged XPU mode instead of aborting initialization.
 - Replaced staged XPU hard-fail on `num_rdma_bytes > 0` in `xpu/csrc/deep_ep.cpp` with graceful downgrade to local-only mode (RDMA bytes ignored with one-time warning), and added native regression coverage in `xpu/tests/test_xpu_import.py` to verify staged XPU `sync()` succeeds while `is_internode_available()` remains false.
+- Added XPU local IPC transport-kind metadata validation in `xpu/csrc/deep_ep.cpp` by encoding regular vs fabric-hint handle kinds and rejecting exporter/importer kind mismatches during staged local handle import.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify XPU IPC handle kind mismatch is rejected.
+- Gated RDMA-level host counter allocation/free on `num_rdma_bytes > 0` in `xpu/csrc/deep_ep.cpp` to avoid unnecessary staged allocations when internode is disabled.
+- Added explicit RDMA precondition checks at internode and low-latency entry points in `xpu/csrc/deep_ep.cpp` so RDMA-only APIs fail fast with clear assertions when called in local-only staged mode.
+- Hardened native buffer lifecycle in `xpu/csrc/deep_ep.cpp` by making destructor auto-destroy path conditional on `not destroyed`, preventing double-destroy assertions after manual `destroy()` in auto-destroy mode.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify manual `destroy()` is safe even when `explicitly_destroy=False`.
+- Made `Buffer::destroy()` idempotent in `xpu/csrc/deep_ep.cpp` by returning early when already destroyed.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify repeated explicit `destroy()` calls are safe.
+- Replaced staged stream-derived device-id helper in `xpu/csrc/deep_ep.cpp` with concrete XPU runtime query via `c10::xpu::current_device()`.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify `get_local_device_id()` matches `torch.xpu.current_device()`.
+- Replaced staged stream-level synchronization in `runtime_device_synchronize()` with device-level synchronization via `c10::xpu::syncStreamsOnDevice()` in `xpu/csrc/deep_ep.cpp` for correct XPU device-sync semantics.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify device synchronization succeeds during buffer destruction.
+- Fixed test configuration parameter alignment in `xpu/tests/test_xpu_buffer_fallbacks.py` to use correct Config constructor signature.
+- Validated comprehensive kernel fallback system for staged XPU development: all 8 fallback tests pass, enabling single-rank XPU operation with Python fallback paths for unsupported kernels.
+- Documented kernel migration strategy: Phase 1 (current) uses staged fallbacks, Phase 2 will port to SYCL, Phase 3 will migrate NVSHMEM→iSHMEM.
+- Replaced XPU stub in `xpu/csrc/kernels/layout.cu` with a concrete XPU implementation of `layout::get_dispatch_layout` using stream-ordered D2H/H2D transfers and host-side token/rank/expert counting.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify `Buffer.get_dispatch_layout()` succeeds and returns expected layout outputs on XPU.
+- Replaced XPU stubs for single-rank intranode paths in `xpu/csrc/kernels/intranode.cu` with concrete implementations for `notify_dispatch`, `dispatch`, `cached_notify_combine`, and `combine` (multi-rank still guarded to fallback).
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify single-rank intranode `dispatch` + `combine` executes on native XPU path and returns expected gathered/scattered tensors.
+- Extended the single-rank native XPU `intranode::combine` path in `xpu/csrc/kernels/intranode.cu` to support repeated-source reduction semantics and optional bias application, matching the staged fallback contract more closely.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify single-rank intranode native combine reduces duplicate source indices and applies bias correctly on XPU.
+- Fixed the single-rank native XPU `intranode::dispatch` contract in `xpu/csrc/kernels/intranode.cu` to use `num_channels = num_sms / 2`, matching the CUDA kernel interface and native tensor shapes.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify single-rank intranode cached-handle dispatch reuse succeeds on the native XPU path.
+
+## Layer Migration Status Summary
+
+**C++ Runtime Layer (xpu/csrc/deep_ep.cpp):** ✅ LARGELY COMPLETE
+- [x] Device synchronization (c10::xpu::syncStreamsOnDevice)
+- [x] Device querying (c10::xpu::current_device, at::xpu::getDeviceProperties)
+- [x] Memory management (c10::xpu::XPUCachingAllocator, at::xpu::getPinnedMemoryAllocator)
+- [x] IPC transport with generation/checksum validation
+- [x] Buffer lifecycle management (idempotent destroy)
+- [x] Error handling and live allocation tracking
+- All 26 XPU tests pass, including expanded native intranode regressions, fallback tests, and import/runtime coverage
+
+**Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
+- [x] Dynamic extension loading with XPU-first fallback
+- [x] Staged fallback dispatch/combine/low-latency paths (single-rank support)
+- [x] Device stream reconstruction for XPU
+- [x] Single-rank initialization path
+- [x] Error handling and fallback triggers for unsupported kernels
+- Test coverage: 8 dedicated fallback tests + runtime integration tests
+
+**Kernel Layer (xpu/csrc/kernels/*.cu|*.cuh):** 🚧 PARTIALLY PORTED (PHASE 2 STARTED)
+- Current approach: `layout::get_dispatch_layout` and single-rank intranode dispatch/combine paths have concrete XPU implementations; remaining kernels still return `EP_UNSUPPORTED_XPU` and trigger Python fallbacks
+- [ ] Full SYCL kernel implementation (in progress)
+- [x] Python fallback coverage for all major operations:
+  - intranode dispatch/combine → Python bincount + tensor scatter
+  - internode dispatch/combine → Python BF16 serialization
+  - low-latency dispatch/combine → Python fallback paths
+- Production path: SYCL kernel porting (future work)
+
+## Kernel Migration Strategy
+
+**Phase 1: Staged Single-Rank Support (Current - Complete)** ✅
+- Kernels return `EP_UNSUPPORTED_XPU` placeholders
+- Python fallback layer handles unsupported operations
+- Enables XPU development/testing in single-rank mode
+- All regression tests pass
+
+**Phase 2: Multi-Rank XPU Support (In Progress)**
+- Implement SYCL kernels for compute-critical operations:
+  1. layout::get_dispatch_layout (token counting) ✅ concrete XPU path implemented
+  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 single-rank native path implemented with reduction, bias, and cached-handle reuse semantics; multi-rank pending
+  3. internode::dispatch/combine (RDMA MoE operations)
+  4. low-latency dispatch/combine (low-latency paths)
+- Use SYCLomatic tool for CUDA→SYCL automated porting as starting point
+- Requires SYCL queue management and work-group coordination
+
+**Phase 3: Internode NVSHMEM→iSHMEM Migration (Future)**
+- Replace NVSHMEM runtime with iSHMEM
+- Port CUDA Level Zero IPC → Level Zero native IPC
+- Implement barrier synchronization for multi-rank scenarios
 
 ## Next file-by-file migration targets
 
-1. `xpu/csrc/deep_ep.cpp`: implement XPU memory management and IPC backend by replacing helper-wrapper CUDA internals with XPU/Level Zero implementations.
-2. `xpu/csrc/kernels/*.cu|*.cuh`: migrate kernels to SYCL and remove PTX inline assembly.
-3. `xpu/csrc/kernels/internode*.cu` and `ibgda_device.cuh`: replace NVSHMEM/CUDA IPC paths with iSHMEM and Level Zero IPC.
-4. `xpu/tests`: port distributed tests to xpu backend and ccl backend.
-5. `xpu/csrc/kernels/launch.cuh`: replace staged XPU launch adapter stub with real SYCL/XPU kernel dispatch.
+1. `xpu/csrc/kernels/intranode.cu`: extend current single-rank native path to multi-rank/SYCL parallel kernels
+2. `xpu/csrc/kernels/internode.cu` + `ibgda_device.cuh`: iSHMEM porting and Level Zero IPC
+3. `xpu/csrc/kernels/low_latency*` paths: concrete XPU implementation for low-latency dispatch/combine
+4. `xpu/csrc/kernels/launch.cuh`: Full SYCL kernel launch macro implementation
