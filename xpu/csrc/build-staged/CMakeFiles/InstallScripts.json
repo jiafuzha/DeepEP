@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/root/jiafuzha/code-repo/DeepEP/xpu/csrc/build-staged/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

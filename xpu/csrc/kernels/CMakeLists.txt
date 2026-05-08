@@ -1,3 +1,9 @@
+if (DEEPEP_USE_XPU)
+    # XPU mode uses host-side migration stubs and must not require CUDA/NVSHMEM libs here.
+    set(EP_CUDA_LIBRARIES "" PARENT_SCOPE)
+    return()
+endif()
+
 function(add_deep_ep_library target_name source_file)
     add_library(${target_name} STATIC ${source_file})
     set_target_properties(${target_name} PROPERTIES

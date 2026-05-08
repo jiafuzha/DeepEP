@@ -1,0 +1,3 @@
+/root/jiafuzha/code-repo/DeepEP/xpu/csrc/build-staged/CMakeFiles/deep_ep_cpp_xpu.dir
+/root/jiafuzha/code-repo/DeepEP/xpu/csrc/build-staged/CMakeFiles/edit_cache.dir
+/root/jiafuzha/code-repo/DeepEP/xpu/csrc/build-staged/CMakeFiles/rebuild_cache.dir
