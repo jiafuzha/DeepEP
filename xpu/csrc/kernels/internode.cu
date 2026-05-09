@@ -17,6 +17,8 @@ namespace deep_ep {
 
 namespace internode {
 
+#if defined(DEEPEP_USE_XPU)
+
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -381,7 +383,7 @@ void dispatch(void* recv_x,
               int num_channels,
               bool) {
     EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= NUM_MAX_NVL_PEERS);
-    EP_HOST_ASSERT(recv_x != nullptr and recv_src_meta != nullptr and x != nullptr and is_token_in_rank != nullptr);
+    EP_HOST_ASSERT(recv_x != nullptr and x != nullptr and is_token_in_rank != nullptr);
     EP_HOST_ASSERT(hidden_int4 >= 0 and num_channels > 0);
 
     const size_t row_bytes = static_cast<size_t>(hidden_int4) * sizeof(int4);
@@ -489,7 +491,7 @@ void dispatch(void* recv_x,
 
         if (!host_recv_x.empty())
             xpu_blocking_memcpy(stream, recv_x, host_recv_x.data(), host_recv_x.size());
-        if (!host_recv_src_meta.empty())
+        if (recv_src_meta != nullptr && !host_recv_src_meta.empty())
             xpu_blocking_memcpy(stream, recv_src_meta, host_recv_src_meta.data(), host_recv_src_meta.size() * sizeof(XpuInternodeSourceMeta));
         if (!host_recv_x_scales.empty())
             xpu_blocking_memcpy(stream, recv_x_scales, host_recv_x_scales.data(), host_recv_x_scales.size() * sizeof(float));
@@ -644,7 +646,7 @@ void dispatch(void* recv_x,
 
         if (!host_recv_x.empty())
             xpu_blocking_memcpy(dst.stream, dst.recv_x, host_recv_x.data(), host_recv_x.size());
-        if (!host_recv_src_meta.empty())
+        if (dst.recv_src_meta != nullptr && !host_recv_src_meta.empty())
             xpu_blocking_memcpy(dst.stream, dst.recv_src_meta, host_recv_src_meta.data(), host_recv_src_meta.size() * sizeof(XpuInternodeSourceMeta));
         if (!host_recv_x_scales.empty())
             xpu_blocking_memcpy(dst.stream, dst.recv_x_scales, host_recv_x_scales.data(), host_recv_x_scales.size() * sizeof(float));
@@ -658,235 +660,6 @@ void dispatch(void* recv_x,
             xpu_blocking_memcpy(dst.stream, dst.recv_gbl_channel_prefix_matrix, host_gbl_channel_prefix.data(), host_gbl_channel_prefix.size() * sizeof(int));
         if (dst.send_nvl_head != nullptr && !host_send_nvl_head.empty())
             xpu_blocking_memcpy(dst.stream, dst.send_nvl_head, host_send_nvl_head.data(), host_send_nvl_head.size() * sizeof(int));
-    }
-
-    state->generation++;
-    lock.unlock();
-    state->cv.notify_all();
-}
-
-void cached_notify(int,
-                   int,
-                   int,
-                   int,
-                   int,
-                   int,
-                   int num_combined_tokens,
-                   int* combined_rdma_head,
-                   const int*,
-                   const int*,
-                   int* combined_nvl_head,
-                   void*,
-                   int,
-                   void**,
-                   int,
-                   int**,
-                   int,
-                   runtime_stream_t stream,
-                   int64_t,
-                   int64_t,
-                   bool,
-                   bool) {
-    if (combined_rdma_head != nullptr && num_combined_tokens > 0)
-        xpu_blocking_memset(stream, combined_rdma_head, 0, static_cast<size_t>(num_combined_tokens) * sizeof(int));
-    if (combined_nvl_head != nullptr && num_combined_tokens > 0) {
-        xpu_blocking_memset(
-            stream, combined_nvl_head, 0, static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(NUM_MAX_NVL_PEERS) * sizeof(int));
-    }
-}
-
-void combine(runtime_data_type_t type,
-             void* combined_x,
-             float* combined_topk_weights,
-             const bool* is_combined_token_in_rank,
-             const void* x,
-             const float* topk_weights,
-             const void* bias_0,
-             const void* bias_1,
-             const int*,
-             const int*,
-             const void* src_meta,
-             const int*,
-             const int*,
-             const int*,
-             int num_tokens,
-             int num_combined_tokens,
-             int hidden,
-             int num_topk,
-             void*,
-             int,
-             int,
-             void**,
-             int,
-             int,
-             int rank,
-             int num_ranks,
-             runtime_stream_t stream,
-             int,
-             bool) {
-    EP_HOST_ASSERT(type == RUNTIME_R_16BF && "staged XPU internode combine currently supports BF16 only");
-    EP_HOST_ASSERT(combined_x != nullptr && x != nullptr && src_meta != nullptr);
-
-    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
-    const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
-    std::vector<uint8_t> host_x(x_bytes, 0);
-    if (x_bytes > 0)
-        xpu_blocking_memcpy(stream, host_x.data(), x, x_bytes);
-
-    std::vector<XpuInternodeSourceMeta> host_src_meta(static_cast<size_t>(num_tokens), XpuInternodeSourceMeta{-1, -1});
-    if (num_tokens > 0)
-        xpu_blocking_memcpy(stream, host_src_meta.data(), src_meta, static_cast<size_t>(num_tokens) * sizeof(XpuInternodeSourceMeta));
-
-    const size_t mask_elems = static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_ranks);
-    std::vector<uint8_t> host_mask(mask_elems, 1);
-    if (is_combined_token_in_rank != nullptr && mask_elems > 0)
-        xpu_blocking_memcpy(stream, host_mask.data(), is_combined_token_in_rank, mask_elems * sizeof(uint8_t));
-
-    std::vector<float> host_topk_weights;
-    if (topk_weights != nullptr && combined_topk_weights != nullptr && num_topk > 0) {
-        const size_t topk_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk);
-        host_topk_weights.resize(topk_elems);
-        xpu_blocking_memcpy(stream, host_topk_weights.data(), topk_weights, topk_elems * sizeof(float));
-    }
-
-    if (num_ranks == 1) {
-        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), nv_bfloat16(0));
-        std::vector<float> host_combined_weights;
-        if (combined_topk_weights != nullptr && num_topk > 0)
-            host_combined_weights.assign(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_topk), 0.f);
-
-        for (int i = 0; i < num_tokens; ++i) {
-            const auto meta = host_src_meta[static_cast<size_t>(i)];
-            const int dst_idx = meta.src_token_idx;
-            if (dst_idx < 0 || dst_idx >= num_combined_tokens)
-                continue;
-            if (!host_mask.empty() && host_mask[static_cast<size_t>(dst_idx)] == 0)
-                continue;
-
-            auto* dst_row = host_combined_x.data() + static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden);
-            auto* src_row = reinterpret_cast<const nv_bfloat16*>(host_x.data() + static_cast<size_t>(i) * row_bytes);
-            for (int h = 0; h < hidden; ++h)
-                dst_row[h] = dst_row[h] + src_row[h];
-
-            if (!host_combined_weights.empty()) {
-                for (int k = 0; k < num_topk; ++k) {
-                    host_combined_weights[static_cast<size_t>(dst_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)] +=
-                        host_topk_weights[static_cast<size_t>(i) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)];
-                }
-            }
-        }
-
-        const auto host_bias_0 = xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden);
-        const auto host_bias_1 = xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden);
-        auto apply_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
-            if (host_bias.empty())
-                return;
-            for (int token = 0; token < num_combined_tokens; ++token) {
-                if (!host_mask.empty() && host_mask[static_cast<size_t>(token)] == 0)
-                    continue;
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
-                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
-                for (int h = 0; h < hidden; ++h)
-                    dst_row[h] = dst_row[h] + bias_row[h];
-            }
-        };
-        apply_bias(host_bias_0);
-        apply_bias(host_bias_1);
-
-        if (!host_combined_x.empty())
-            xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
-        if (!host_combined_weights.empty())
-            xpu_blocking_memcpy(stream, combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
-        return;
-    }
-
-    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden, num_topk, 1);
-    auto state = get_xpu_internode_state(xpu_internode_combine_states, xpu_internode_combine_states_mu, group_key, num_ranks);
-    std::unique_lock<std::mutex> lock(state->mu);
-    const size_t generation = state->generation;
-    state->arrivals[static_cast<size_t>(rank)] = XpuInternodeCombineArrival{stream,
-                                                                            rank,
-                                                                            num_ranks,
-                                                                            num_tokens,
-                                                                            num_combined_tokens,
-                                                                            hidden,
-                                                                            num_topk,
-                                                                            combined_x,
-                                                                            combined_topk_weights,
-                                                                            std::move(host_x),
-                                                                            std::move(host_src_meta),
-                                                                            std::move(host_mask),
-                                                                            std::move(host_topk_weights),
-                                                                            xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden),
-                                                                            xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden)};
-    state->arrived++;
-    if (state->arrived < num_ranks) {
-        state->cv.wait(lock, [&] { return state->generation != generation; });
-        return;
-    }
-
-    std::vector<XpuInternodeCombineArrival> arrivals;
-    arrivals.reserve(static_cast<size_t>(num_ranks));
-    for (auto& arrival_opt : state->arrivals) {
-        EP_HOST_ASSERT(arrival_opt.has_value());
-        arrivals.push_back(std::move(arrival_opt.value()));
-        arrival_opt.reset();
-    }
-    state->arrived = 0;
-
-    for (int owner_rank = 0; owner_rank < num_ranks; ++owner_rank) {
-        auto& owner = arrivals[static_cast<size_t>(owner_rank)];
-        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden), nv_bfloat16(0));
-        std::vector<float> host_combined_weights;
-        if (owner.combined_topk_weights != nullptr && owner.num_topk > 0)
-            host_combined_weights.assign(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.num_topk), 0.f);
-
-        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-            const auto& src = arrivals[static_cast<size_t>(src_rank)];
-            for (int token = 0; token < src.num_tokens; ++token) {
-                const auto meta = src.src_meta[static_cast<size_t>(token)];
-                if (meta.src_rank != owner_rank || meta.src_token_idx < 0 || meta.src_token_idx >= owner.num_combined_tokens)
-                    continue;
-                if (!owner.is_combined_token_in_rank.empty() &&
-                    owner.is_combined_token_in_rank[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] == 0)
-                    continue;
-
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.hidden);
-                auto* src_row = reinterpret_cast<const nv_bfloat16*>(src.x.data() + static_cast<size_t>(token) * row_bytes);
-                for (int h = 0; h < owner.hidden; ++h)
-                    dst_row[h] = dst_row[h] + src_row[h];
-
-                if (!host_combined_weights.empty()) {
-                    for (int k = 0; k < owner.num_topk; ++k) {
-                        host_combined_weights[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)] +=
-                            src.topk_weights[static_cast<size_t>(token) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)];
-                    }
-                }
-            }
-        }
-
-        auto apply_owner_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
-            if (host_bias.empty())
-                return;
-            for (int token = 0; token < owner.num_combined_tokens; ++token) {
-                bool active = false;
-                for (int src_rank = 0; src_rank < num_ranks; ++src_rank)
-                    active = active || (owner.is_combined_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] != 0);
-                if (!active)
-                    continue;
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
-                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
-                for (int h = 0; h < owner.hidden; ++h)
-                    dst_row[h] = dst_row[h] + bias_row[h];
-            }
-        };
-        apply_owner_bias(owner.bias_0);
-        apply_owner_bias(owner.bias_1);
-
-        if (!host_combined_x.empty())
-            xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
-        if (!host_combined_weights.empty())
-            xpu_blocking_memcpy(owner.stream, owner.combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
     }
 
     state->generation++;

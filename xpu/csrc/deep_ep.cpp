@@ -1287,19 +1287,13 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         backend::set_current_stream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
-#if defined(DEEPEP_USE_XPU)
-    {
-        pybind11::gil_scoped_release no_gil;
-#endif
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
-#if defined(DEEPEP_USE_XPU)
+    // Wait previous tasks to be finished.
+    // internode_dispatch already releases the GIL at entry on XPU.
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
     }
-#endif
 
     int num_topk = 0;
     auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -1546,19 +1540,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         backend::set_current_stream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
-#if defined(DEEPEP_USE_XPU)
-    {
-        pybind11::gil_scoped_release no_gil;
-#endif
-        if (previous_event.has_value()) {
-            stream_wait(comm_stream, previous_event.value());
-        } else {
-            stream_wait(comm_stream, compute_stream);
-        }
-#if defined(DEEPEP_USE_XPU)
+    // Wait previous tasks to be finished.
+    // NOTE: internode_dispatch already releases GIL at function entry.
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
     }
-#endif
 
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1, num_rdma_recv_tokens = -1;
