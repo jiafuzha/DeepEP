@@ -14,81 +14,679 @@ namespace internode_ll {
 
 #if defined(DEEPEP_USE_XPU)
 
-void clean_low_latency_buffer(int*, int, int*, int, int, int, int*, int*, runtime_stream_t) {
-    EP_UNSUPPORTED_XPU("internode_ll clean_low_latency_buffer");
+#include <algorithm>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+struct XpuLowLatencyDispatchArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_tokens;
+    int hidden;
+    int num_max_dispatch_tokens_per_rank;
+    int num_topk;
+    int num_experts;
+    int num_local_experts;
+    bool use_fp8;
+    bool use_ue8m0;
+    void* packed_recv_x;
+    void* packed_recv_x_scales;
+    int* packed_recv_src_info;
+    int64_t* packed_recv_layout_range;
+    int* packed_recv_count;
+    int* cumulative_local_expert_recv_stats;
+    int64_t* dispatch_wait_recv_cost_stats;
+    int* clean_meta;
+    int num_clean_int;
+    std::vector<uint8_t> x;
+    std::vector<topk_idx_t> topk_idx;
+};
+
+struct XpuLowLatencyCombineArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_combined_tokens;
+    int hidden;
+    int num_max_dispatch_tokens_per_rank;
+    int num_topk;
+    int num_experts;
+    int num_local_experts;
+    void* combined_x;
+    int64_t* combine_wait_recv_cost_stats;
+    int* clean_meta;
+    int num_clean_int;
+    std::vector<uint8_t> x;
+    std::vector<float> topk_weights;
+    std::vector<int> src_info;
+    std::vector<int64_t> layout_range;
+};
+
+template <typename Arrival>
+struct XpuLowLatencyRendezvousState {
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t generation = 0;
+    int arrived = 0;
+    std::vector<std::optional<Arrival>> arrivals;
+};
+
+template <typename Arrival>
+std::shared_ptr<XpuLowLatencyRendezvousState<Arrival>> get_xpu_low_latency_state(
+    std::unordered_map<uint64_t, std::shared_ptr<XpuLowLatencyRendezvousState<Arrival>>>& states,
+    std::mutex& states_mu,
+    uint64_t key,
+    int num_ranks) {
+    std::lock_guard<std::mutex> guard(states_mu);
+    auto& state = states[key];
+    if (state == nullptr)
+        state = std::make_shared<XpuLowLatencyRendezvousState<Arrival>>();
+    if (state->arrivals.empty())
+        state->arrivals.resize(static_cast<size_t>(num_ranks));
+    return state;
 }
 
-void dispatch(void*,
-              void*,
-              int*,
-              int64_t*,
-              int*,
-              int*,
-              int*,
-              int64_t*,
-              void*,
-              int*,
-              void*,
-              const void*,
-              const topk_idx_t*,
-              int*,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              bool,
-              bool,
-              bool,
-              void*,
-              int,
-              runtime_stream_t,
-              int) {
-    EP_UNSUPPORTED_XPU("internode_ll dispatch");
+inline uint64_t xpu_low_latency_group_key(int num_ranks,
+                                          int hidden,
+                                          int num_max_dispatch_tokens_per_rank,
+                                          int num_topk,
+                                          int num_experts) {
+    uint64_t key = static_cast<uint64_t>(static_cast<uint32_t>(num_ranks));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(hidden));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(num_max_dispatch_tokens_per_rank));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(num_topk));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(num_experts));
+    return key;
 }
 
-void combine(void*,
+std::mutex xpu_low_latency_dispatch_states_mu;
+std::unordered_map<uint64_t, std::shared_ptr<XpuLowLatencyRendezvousState<XpuLowLatencyDispatchArrival>>> xpu_low_latency_dispatch_states;
+std::mutex xpu_low_latency_combine_states_mu;
+std::unordered_map<uint64_t, std::shared_ptr<XpuLowLatencyRendezvousState<XpuLowLatencyCombineArrival>>> xpu_low_latency_combine_states;
+
+inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* src, size_t bytes) {
+    if (bytes == 0)
+        return;
+    auto event = stream.queue().memcpy(dst, src, bytes);
+    event.wait_and_throw();
+}
+
+inline void xpu_blocking_memset(runtime_stream_t stream, void* ptr, int value, size_t bytes) {
+    if (bytes == 0)
+        return;
+    auto event = stream.queue().memset(ptr, value, bytes);
+    event.wait_and_throw();
+}
+
+inline bool xpu_low_latency_should_execute_recv(int phases) {
+    return (phases & LOW_LATENCY_RECV_PHASE) != 0;
+}
+
+inline int xpu_encode_src_info(int token_idx, int topk_pos, int num_topk) {
+    return token_idx * num_topk + topk_pos;
+}
+
+inline void xpu_decode_src_info(int encoded, int num_topk, int& token_idx, int& topk_pos) {
+    token_idx = encoded / num_topk;
+    topk_pos = encoded % num_topk;
+}
+
+}  // namespace
+
+void clean_low_latency_buffer(int* clean_0,
+                              int num_clean_int_0,
+                              int* clean_1,
+                              int num_clean_int_1,
+                              int,
+                              int,
+                              int*,
+                              int* sync_buffer_ptr,
+                              runtime_stream_t stream) {
+    EP_HOST_ASSERT(clean_0 != nullptr || num_clean_int_0 == 0);
+    EP_HOST_ASSERT(clean_1 != nullptr || num_clean_int_1 == 0);
+    xpu_blocking_memset(stream, clean_0, 0, static_cast<size_t>(num_clean_int_0) * sizeof(int));
+    xpu_blocking_memset(stream, clean_1, 0, static_cast<size_t>(num_clean_int_1) * sizeof(int));
+    if (sync_buffer_ptr != nullptr)
+        xpu_blocking_memcpy(stream, sync_buffer_ptr, sync_buffer_ptr, sizeof(int));
+}
+
+void dispatch(void* packed_recv_x,
+              void* packed_recv_x_scales,
+              int* packed_recv_src_info,
+              int64_t* packed_recv_layout_range,
+              int* packed_recv_count,
+              int*,
+              int* cumulative_local_expert_recv_stats,
+              int64_t* dispatch_wait_recv_cost_stats,
+              void*,
+              int*,
+              void*,
+              const void* x,
+              const topk_idx_t* topk_idx,
+              int* clean_meta,
+              int num_clean_int,
+              int num_tokens,
+              int hidden,
+              int num_max_dispatch_tokens_per_rank,
+              int num_topk,
+              int num_experts,
+              int rank,
+              int num_ranks,
+              bool use_fp8,
+              bool,
+              bool use_ue8m0,
+              void*,
+              int,
+              runtime_stream_t stream,
+              int phases) {
+    EP_HOST_ASSERT(packed_recv_x != nullptr);
+    EP_HOST_ASSERT(packed_recv_src_info != nullptr);
+    EP_HOST_ASSERT(packed_recv_layout_range != nullptr);
+    EP_HOST_ASSERT(packed_recv_count != nullptr);
+    EP_HOST_ASSERT(x != nullptr);
+    EP_HOST_ASSERT(topk_idx != nullptr);
+    EP_HOST_ASSERT(num_tokens >= 0 and hidden >= 0 and num_max_dispatch_tokens_per_rank >= 0 and num_topk > 0 and num_experts > 0);
+
+    if (!xpu_low_latency_should_execute_recv(phases))
+        return;
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
+    const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
+    std::vector<uint8_t> host_x(x_bytes, 0);
+    if (x_bytes > 0)
+        xpu_blocking_memcpy(stream, host_x.data(), x, x_bytes);
+
+    std::vector<topk_idx_t> host_topk_idx(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk), static_cast<topk_idx_t>(-1));
+    if (!host_topk_idx.empty())
+        xpu_blocking_memcpy(stream, host_topk_idx.data(), topk_idx, host_topk_idx.size() * sizeof(topk_idx_t));
+
+    const int num_local_experts = num_experts / num_ranks;
+    EP_HOST_ASSERT(num_experts % num_ranks == 0 and num_local_experts > 0);
+
+    if (num_ranks == 1) {
+        std::vector<uint8_t> host_packed_recv_x(
+            static_cast<size_t>(num_local_experts) * static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank) * row_bytes, 0);
+        std::vector<int> host_packed_recv_src_info(
+            static_cast<size_t>(num_local_experts) * static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank), -1);
+        std::vector<int64_t> host_packed_recv_layout_range(static_cast<size_t>(num_local_experts) * static_cast<size_t>(num_ranks), 0);
+        std::vector<int> host_packed_recv_count(static_cast<size_t>(num_local_experts), 0);
+
+        for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+            for (int topk_pos = 0; topk_pos < num_topk; ++topk_pos) {
+                const int expert_idx =
+                    static_cast<int>(host_topk_idx[static_cast<size_t>(token_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(topk_pos)]);
+                if (expert_idx < 0 || expert_idx >= num_experts)
+                    continue;
+                const int local_expert = expert_idx;
+                const int slot = host_packed_recv_count[static_cast<size_t>(local_expert)];
+                if (slot >= num_ranks * num_max_dispatch_tokens_per_rank)
+                    continue;
+
+                std::memcpy(host_packed_recv_x.data() +
+                                (static_cast<size_t>(local_expert) * static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank) +
+                                 static_cast<size_t>(slot)) *
+                                    row_bytes,
+                            host_x.data() + static_cast<size_t>(token_idx) * row_bytes,
+                            row_bytes);
+                host_packed_recv_src_info[static_cast<size_t>(local_expert) * static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank) +
+                                          static_cast<size_t>(slot)] = xpu_encode_src_info(token_idx, topk_pos, num_topk);
+                host_packed_recv_count[static_cast<size_t>(local_expert)] = slot + 1;
+            }
+        }
+
+        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert)
+            host_packed_recv_layout_range[static_cast<size_t>(local_expert) * static_cast<size_t>(num_ranks)] =
+                host_packed_recv_count[static_cast<size_t>(local_expert)];
+
+        xpu_blocking_memcpy(stream, packed_recv_x, host_packed_recv_x.data(), host_packed_recv_x.size());
+        xpu_blocking_memcpy(stream,
+                           packed_recv_src_info,
+                           host_packed_recv_src_info.data(),
+                           host_packed_recv_src_info.size() * sizeof(int));
+        xpu_blocking_memcpy(stream,
+                           packed_recv_layout_range,
+                           host_packed_recv_layout_range.data(),
+                           host_packed_recv_layout_range.size() * sizeof(int64_t));
+        xpu_blocking_memcpy(stream,
+                           packed_recv_count,
+                           host_packed_recv_count.data(),
+                           host_packed_recv_count.size() * sizeof(int));
+
+        if (use_fp8 and packed_recv_x_scales != nullptr) {
+            const int scale_hidden = std::max(1, hidden / (use_ue8m0 ? 512 : 128));
+            const int tokens_per_expert = num_ranks * num_max_dispatch_tokens_per_rank;
+            const size_t num_scale_elems = static_cast<size_t>(num_local_experts) * static_cast<size_t>(tokens_per_expert) * static_cast<size_t>(scale_hidden);
+            if (!use_ue8m0) {
+                std::vector<float> host_scales(num_scale_elems, 1.f);
+                xpu_blocking_memcpy(stream,
+                                   packed_recv_x_scales,
+                                   host_scales.data(),
+                                   host_scales.size() * sizeof(float));
+            } else {
+                std::vector<int> host_scales(num_scale_elems, 1);
+                xpu_blocking_memcpy(stream,
+                                   packed_recv_x_scales,
+                                   host_scales.data(),
+                                   host_scales.size() * sizeof(int));
+            }
+        }
+
+        if (cumulative_local_expert_recv_stats != nullptr) {
+            std::vector<int> host_cumulative(static_cast<size_t>(num_local_experts), 0);
+            xpu_blocking_memcpy(stream,
+                               host_cumulative.data(),
+                               cumulative_local_expert_recv_stats,
+                               host_cumulative.size() * sizeof(int));
+            for (int local_expert = 0; local_expert < num_local_experts; ++local_expert)
+                host_cumulative[static_cast<size_t>(local_expert)] += host_packed_recv_count[static_cast<size_t>(local_expert)];
+            xpu_blocking_memcpy(stream,
+                               cumulative_local_expert_recv_stats,
+                               host_cumulative.data(),
+                               host_cumulative.size() * sizeof(int));
+        }
+
+        if (dispatch_wait_recv_cost_stats != nullptr) {
+            const int64_t zero = 0;
+            xpu_blocking_memcpy(stream, dispatch_wait_recv_cost_stats, &zero, sizeof(int64_t));
+        }
+
+        if (clean_meta != nullptr and num_clean_int > 0)
+            xpu_blocking_memset(stream, clean_meta, 0, static_cast<size_t>(num_clean_int) * sizeof(int));
+        return;
+    }
+
+    const uint64_t group_key =
+        xpu_low_latency_group_key(num_ranks, hidden, num_max_dispatch_tokens_per_rank, num_topk, num_experts);
+    auto state =
+        get_xpu_low_latency_state(xpu_low_latency_dispatch_states, xpu_low_latency_dispatch_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuLowLatencyDispatchArrival{stream,
+                                                                               rank,
+                                                                               num_ranks,
+                                                                               num_tokens,
+                                                                               hidden,
+                                                                               num_max_dispatch_tokens_per_rank,
+                                                                               num_topk,
+                                                                               num_experts,
+                                                                               num_local_experts,
+                                                                               use_fp8,
+                                                                               use_ue8m0,
+                                                                               packed_recv_x,
+                                                                               packed_recv_x_scales,
+                                                                               packed_recv_src_info,
+                                                                               packed_recv_layout_range,
+                                                                               packed_recv_count,
+                                                                               cumulative_local_expert_recv_stats,
+                                                                               dispatch_wait_recv_cost_stats,
+                                                                               clean_meta,
+                                                                               num_clean_int,
+                                                                               std::move(host_x),
+                                                                               std::move(host_topk_idx)};
+    state->arrived++;
+
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuLowLatencyDispatchArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+        auto& dst = arrivals[static_cast<size_t>(dst_rank)];
+        const int tokens_per_expert_total = dst.num_ranks * dst.num_max_dispatch_tokens_per_rank;
+        std::vector<uint8_t> host_packed_recv_x(
+            static_cast<size_t>(dst.num_local_experts) * static_cast<size_t>(tokens_per_expert_total) * row_bytes, 0);
+        std::vector<int> host_packed_recv_src_info(
+            static_cast<size_t>(dst.num_local_experts) * static_cast<size_t>(tokens_per_expert_total), -1);
+        std::vector<int64_t> host_packed_recv_layout_range(
+            static_cast<size_t>(dst.num_local_experts) * static_cast<size_t>(dst.num_ranks), 0);
+        std::vector<int> host_packed_recv_count(static_cast<size_t>(dst.num_local_experts), 0);
+
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int token_idx = 0; token_idx < src.num_tokens; ++token_idx) {
+                for (int topk_pos = 0; topk_pos < src.num_topk; ++topk_pos) {
+                    const int expert_idx =
+                        static_cast<int>(src.topk_idx[static_cast<size_t>(token_idx) * static_cast<size_t>(src.num_topk) +
+                                                      static_cast<size_t>(topk_pos)]);
+                    if (expert_idx < 0 || expert_idx >= src.num_experts)
+                        continue;
+                    const int owner_rank = expert_idx / src.num_local_experts;
+                    if (owner_rank != dst_rank)
+                        continue;
+                    const int local_expert = expert_idx - owner_rank * src.num_local_experts;
+                    const int slot = host_packed_recv_count[static_cast<size_t>(local_expert)];
+                    if (slot >= tokens_per_expert_total)
+                        continue;
+
+                    std::memcpy(host_packed_recv_x.data() +
+                                    (static_cast<size_t>(local_expert) * static_cast<size_t>(tokens_per_expert_total) +
+                                     static_cast<size_t>(slot)) *
+                                        row_bytes,
+                                src.x.data() + static_cast<size_t>(token_idx) * row_bytes,
+                                row_bytes);
+                    host_packed_recv_src_info[static_cast<size_t>(local_expert) * static_cast<size_t>(tokens_per_expert_total) +
+                                              static_cast<size_t>(slot)] =
+                        xpu_encode_src_info(token_idx, topk_pos, src.num_topk);
+                    host_packed_recv_count[static_cast<size_t>(local_expert)] = slot + 1;
+                }
+            }
+            for (int local_expert = 0; local_expert < dst.num_local_experts; ++local_expert) {
+                host_packed_recv_layout_range[static_cast<size_t>(local_expert) * static_cast<size_t>(dst.num_ranks) +
+                                              static_cast<size_t>(src_rank)] =
+                    host_packed_recv_count[static_cast<size_t>(local_expert)];
+            }
+        }
+
+        xpu_blocking_memcpy(dst.stream, dst.packed_recv_x, host_packed_recv_x.data(), host_packed_recv_x.size());
+        xpu_blocking_memcpy(dst.stream,
+                           dst.packed_recv_src_info,
+                           host_packed_recv_src_info.data(),
+                           host_packed_recv_src_info.size() * sizeof(int));
+        xpu_blocking_memcpy(dst.stream,
+                           dst.packed_recv_layout_range,
+                           host_packed_recv_layout_range.data(),
+                           host_packed_recv_layout_range.size() * sizeof(int64_t));
+        xpu_blocking_memcpy(dst.stream,
+                           dst.packed_recv_count,
+                           host_packed_recv_count.data(),
+                           host_packed_recv_count.size() * sizeof(int));
+
+        if (dst.use_fp8 and dst.packed_recv_x_scales != nullptr) {
+            const int scale_hidden = std::max(1, dst.hidden / (dst.use_ue8m0 ? 512 : 128));
+            const size_t num_scale_elems = static_cast<size_t>(dst.num_local_experts) *
+                                           static_cast<size_t>(tokens_per_expert_total) * static_cast<size_t>(scale_hidden);
+            if (!dst.use_ue8m0) {
+                std::vector<float> host_scales(num_scale_elems, 1.f);
+                xpu_blocking_memcpy(dst.stream,
+                                   dst.packed_recv_x_scales,
+                                   host_scales.data(),
+                                   host_scales.size() * sizeof(float));
+            } else {
+                std::vector<int> host_scales(num_scale_elems, 1);
+                xpu_blocking_memcpy(dst.stream,
+                                   dst.packed_recv_x_scales,
+                                   host_scales.data(),
+                                   host_scales.size() * sizeof(int));
+            }
+        }
+
+        if (dst.cumulative_local_expert_recv_stats != nullptr) {
+            std::vector<int> host_cumulative(static_cast<size_t>(dst.num_local_experts), 0);
+            xpu_blocking_memcpy(dst.stream,
+                               host_cumulative.data(),
+                               dst.cumulative_local_expert_recv_stats,
+                               host_cumulative.size() * sizeof(int));
+            for (int local_expert = 0; local_expert < dst.num_local_experts; ++local_expert)
+                host_cumulative[static_cast<size_t>(local_expert)] += host_packed_recv_count[static_cast<size_t>(local_expert)];
+            xpu_blocking_memcpy(dst.stream,
+                               dst.cumulative_local_expert_recv_stats,
+                               host_cumulative.data(),
+                               host_cumulative.size() * sizeof(int));
+        }
+
+        if (dst.dispatch_wait_recv_cost_stats != nullptr) {
+            const int64_t zero = 0;
+            xpu_blocking_memcpy(dst.stream, dst.dispatch_wait_recv_cost_stats, &zero, sizeof(int64_t));
+        }
+
+        if (dst.clean_meta != nullptr and dst.num_clean_int > 0)
+            xpu_blocking_memset(dst.stream, dst.clean_meta, 0, static_cast<size_t>(dst.num_clean_int) * sizeof(int));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
+    return;
+}
+
+void combine(void* combined_x,
              void*,
              int*,
              void*,
-             const void*,
+             const void* x,
              const topk_idx_t*,
-             const float*,
-             const int*,
-             const int64_t*,
+             const float* topk_weights,
+             const int* src_info,
+             const int64_t* layout_range,
              int*,
-             int64_t*,
-             int*,
-             int,
-             int,
-             int,
-             int,
-             int,
-             int,
-             int,
-             int,
-             bool,
+             int64_t* combine_wait_recv_cost_stats,
+             int* clean_meta,
+             int num_clean_int,
+             int num_combined_tokens,
+             int hidden,
+             int num_max_dispatch_tokens_per_rank,
+             int num_topk,
+             int num_experts,
+             int rank,
+             int num_ranks,
+             bool use_logfmt,
              void*,
              int,
-             runtime_stream_t,
-             int,
+             runtime_stream_t stream,
+             int phases,
              bool) {
-    EP_UNSUPPORTED_XPU("internode_ll combine");
+    EP_HOST_ASSERT(combined_x != nullptr);
+    EP_HOST_ASSERT(x != nullptr);
+    EP_HOST_ASSERT(topk_weights != nullptr);
+    EP_HOST_ASSERT(src_info != nullptr);
+    EP_HOST_ASSERT(num_combined_tokens >= 0 and hidden >= 0 and num_max_dispatch_tokens_per_rank >= 0 and num_topk > 0 and num_experts > 0);
+
+    if (!xpu_low_latency_should_execute_recv(phases))
+        return;
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
+    const int num_local_experts = num_experts / num_ranks;
+    EP_HOST_ASSERT(num_experts % num_ranks == 0 and num_local_experts > 0);
+    const size_t packed_rows = static_cast<size_t>(num_local_experts) *
+                               static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank);
+
+    std::vector<uint8_t> host_x(packed_rows * row_bytes, 0);
+    if (!host_x.empty())
+        xpu_blocking_memcpy(stream, host_x.data(), x, host_x.size());
+
+    std::vector<float> host_topk_weights(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_topk), 0.f);
+    if (!host_topk_weights.empty())
+        xpu_blocking_memcpy(stream, host_topk_weights.data(), topk_weights, host_topk_weights.size() * sizeof(float));
+
+    std::vector<int> host_src_info(packed_rows, -1);
+    if (!host_src_info.empty())
+        xpu_blocking_memcpy(stream, host_src_info.data(), src_info, host_src_info.size() * sizeof(int));
+
+    std::vector<int64_t> host_layout_range(static_cast<size_t>(num_local_experts) * static_cast<size_t>(num_ranks), 0);
+    if (!host_layout_range.empty())
+        xpu_blocking_memcpy(stream, host_layout_range.data(), layout_range, host_layout_range.size() * sizeof(int64_t));
+
+    if (num_ranks == 1) {
+        std::vector<float> host_combined_accum(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), 0.f);
+        const auto* host_x_bf16 = reinterpret_cast<const nv_bfloat16*>(host_x.data());
+        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+            const int end = static_cast<int>(host_layout_range[static_cast<size_t>(local_expert) * static_cast<size_t>(num_ranks)]);
+            for (int slot = 0; slot < end; ++slot) {
+                const int encoded = host_src_info[static_cast<size_t>(local_expert) *
+                                                      static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank) +
+                                                  static_cast<size_t>(slot)];
+                if (encoded < 0)
+                    continue;
+
+                int token_idx = -1;
+                int topk_pos = -1;
+                xpu_decode_src_info(encoded, num_topk, token_idx, topk_pos);
+                if (token_idx < 0 || token_idx >= num_combined_tokens || topk_pos < 0 || topk_pos >= num_topk)
+                    continue;
+
+                const float weight =
+                    host_topk_weights[static_cast<size_t>(token_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(topk_pos)];
+                const size_t packed_row = static_cast<size_t>(local_expert) *
+                                              static_cast<size_t>(num_ranks * num_max_dispatch_tokens_per_rank) +
+                                          static_cast<size_t>(slot);
+                for (int h = 0; h < hidden; ++h) {
+                    host_combined_accum[static_cast<size_t>(token_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] +=
+                        static_cast<float>(host_x_bf16[packed_row * static_cast<size_t>(hidden) + static_cast<size_t>(h)]) * weight;
+                }
+            }
+        }
+
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden));
+        for (int token_idx = 0; token_idx < num_combined_tokens; ++token_idx) {
+            for (int h = 0; h < hidden; ++h) {
+                host_combined_x[static_cast<size_t>(token_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] =
+                    static_cast<nv_bfloat16>(host_combined_accum[static_cast<size_t>(token_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
+            }
+        }
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+
+        if (combine_wait_recv_cost_stats != nullptr) {
+            const int64_t zero = 0;
+            xpu_blocking_memcpy(stream, combine_wait_recv_cost_stats, &zero, sizeof(int64_t));
+        }
+
+        if (clean_meta != nullptr and num_clean_int > 0)
+            xpu_blocking_memset(stream, clean_meta, 0, static_cast<size_t>(num_clean_int) * sizeof(int));
+        return;
+    }
+
+    const uint64_t group_key =
+        xpu_low_latency_group_key(num_ranks, hidden, num_max_dispatch_tokens_per_rank, num_topk, num_experts);
+    auto state =
+        get_xpu_low_latency_state(xpu_low_latency_combine_states, xpu_low_latency_combine_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuLowLatencyCombineArrival{stream,
+                                                                              rank,
+                                                                              num_ranks,
+                                                                              num_combined_tokens,
+                                                                              hidden,
+                                                                              num_max_dispatch_tokens_per_rank,
+                                                                              num_topk,
+                                                                              num_experts,
+                                                                              num_local_experts,
+                                                                              combined_x,
+                                                                              combine_wait_recv_cost_stats,
+                                                                              clean_meta,
+                                                                              num_clean_int,
+                                                                              std::move(host_x),
+                                                                              std::move(host_topk_weights),
+                                                                              std::move(host_src_info),
+                                                                              std::move(host_layout_range)};
+    state->arrived++;
+
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuLowLatencyCombineArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+        auto& dst = arrivals[static_cast<size_t>(dst_rank)];
+        std::vector<float> host_combined_accum(static_cast<size_t>(dst.num_combined_tokens) * static_cast<size_t>(dst.hidden), 0.f);
+
+        for (int owner_rank = 0; owner_rank < num_ranks; ++owner_rank) {
+            const auto& owner = arrivals[static_cast<size_t>(owner_rank)];
+            const auto* owner_x_bf16 = reinterpret_cast<const nv_bfloat16*>(owner.x.data());
+            const int tokens_per_expert_total = owner.num_ranks * owner.num_max_dispatch_tokens_per_rank;
+            for (int local_expert = 0; local_expert < owner.num_local_experts; ++local_expert) {
+                int begin = 0;
+                for (int src_rank = 0; src_rank < owner.num_ranks; ++src_rank) {
+                    const int end = static_cast<int>(owner.layout_range[static_cast<size_t>(local_expert) * static_cast<size_t>(owner.num_ranks) +
+                                                                      static_cast<size_t>(src_rank)]);
+                    if (src_rank == dst_rank) {
+                        for (int slot = begin; slot < end; ++slot) {
+                            const int encoded = owner.src_info[static_cast<size_t>(local_expert) * static_cast<size_t>(tokens_per_expert_total) +
+                                                               static_cast<size_t>(slot)];
+                            if (encoded < 0)
+                                continue;
+
+                            int token_idx = -1;
+                            int topk_pos = -1;
+                            xpu_decode_src_info(encoded, owner.num_topk, token_idx, topk_pos);
+                            if (token_idx < 0 || token_idx >= dst.num_combined_tokens || topk_pos < 0 || topk_pos >= dst.num_topk)
+                                continue;
+
+                            const float weight =
+                                dst.topk_weights[static_cast<size_t>(token_idx) * static_cast<size_t>(dst.num_topk) + static_cast<size_t>(topk_pos)];
+                            const size_t packed_row = static_cast<size_t>(local_expert) * static_cast<size_t>(tokens_per_expert_total) +
+                                                      static_cast<size_t>(slot);
+                            for (int h = 0; h < dst.hidden; ++h) {
+                                host_combined_accum[static_cast<size_t>(token_idx) * static_cast<size_t>(dst.hidden) + static_cast<size_t>(h)] +=
+                                    static_cast<float>(owner_x_bf16[packed_row * static_cast<size_t>(dst.hidden) + static_cast<size_t>(h)]) * weight;
+                            }
+                        }
+                        break;
+                    }
+                    begin = end;
+                }
+            }
+        }
+
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(dst.num_combined_tokens) * static_cast<size_t>(dst.hidden));
+        for (int token_idx = 0; token_idx < dst.num_combined_tokens; ++token_idx) {
+            for (int h = 0; h < dst.hidden; ++h) {
+                host_combined_x[static_cast<size_t>(token_idx) * static_cast<size_t>(dst.hidden) + static_cast<size_t>(h)] =
+                    static_cast<nv_bfloat16>(host_combined_accum[static_cast<size_t>(token_idx) * static_cast<size_t>(dst.hidden) +
+                                                                 static_cast<size_t>(h)]);
+            }
+        }
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(dst.stream, dst.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+
+        if (dst.combine_wait_recv_cost_stats != nullptr) {
+            const int64_t zero = 0;
+            xpu_blocking_memcpy(dst.stream, dst.combine_wait_recv_cost_stats, &zero, sizeof(int64_t));
+        }
+
+        if (dst.clean_meta != nullptr and dst.num_clean_int > 0)
+            xpu_blocking_memset(dst.stream, dst.clean_meta, 0, static_cast<size_t>(dst.num_clean_int) * sizeof(int));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
+    return;
 }
 
-void query_mask_buffer(int*, int, int*, runtime_stream_t) {
-    EP_UNSUPPORTED_XPU("internode_ll query_mask_buffer");
+void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_ptr, runtime_stream_t stream) {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and output_ptr != nullptr);
+    EP_HOST_ASSERT(num_ranks >= 0);
+    xpu_blocking_memcpy(stream, output_ptr, mask_buffer_ptr, static_cast<size_t>(num_ranks) * sizeof(int));
 }
 
-void update_mask_buffer(int*, int, bool, runtime_stream_t) {
-    EP_UNSUPPORTED_XPU("internode_ll update_mask_buffer");
+void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, runtime_stream_t stream) {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr);
+    const int host_value = mask ? 1 : 0;
+    xpu_blocking_memcpy(stream, mask_buffer_ptr + rank_to_mask, &host_value, sizeof(int));
 }
 
-void clean_mask_buffer(int*, int, runtime_stream_t) {
-    EP_UNSUPPORTED_XPU("internode_ll clean_mask_buffer");
+void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, runtime_stream_t stream) {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr);
+    xpu_blocking_memset(stream, mask_buffer_ptr, 0, static_cast<size_t>(num_ranks) * sizeof(int));
 }
 
 #else

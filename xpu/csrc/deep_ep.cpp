@@ -325,11 +325,25 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 #if defined(DEEPEP_USE_XPU)
     if (ptr == nullptr)
         return;
-    std::lock_guard<std::mutex> guard(imported_allocations_mu);
-    const auto it = imported_allocations.find(ptr);
-    EP_HOST_ASSERT(it != imported_allocations.end() and "XPU IPC handle close got unknown pointer");
-    validate_xpu_live_allocation(ptr, it->second.first, it->second.second);
-    imported_allocations.erase(it);
+    std::pair<size_t, uint64_t> imported_meta{};
+    {
+        std::lock_guard<std::mutex> guard(imported_allocations_mu);
+        const auto it = imported_allocations.find(ptr);
+        EP_HOST_ASSERT(it != imported_allocations.end() and "XPU IPC handle close got unknown pointer");
+        imported_meta = it->second;
+        imported_allocations.erase(it);
+    }
+
+    // Teardown can legitimately happen after the exporting buffer has already
+    // released its allocation. Keep close order-independent across local ranks.
+    std::lock_guard<std::mutex> live_guard(xpu_live_allocations_mu);
+    const auto live_it = xpu_live_allocations.find(ptr);
+    if (live_it == xpu_live_allocations.end())
+        return;
+    EP_HOST_ASSERT(live_it->second.size == imported_meta.first and
+                   "XPU IPC handle close size mismatch with live allocation");
+    EP_HOST_ASSERT(live_it->second.generation == imported_meta.second and
+                   "XPU IPC handle close generation mismatch with live allocation");
 #else
     if (use_fabric) {
         cu_mem_free(ptr);
@@ -528,12 +542,18 @@ Buffer::Buffer(int rank,
 #if defined(DEEPEP_USE_XPU)
     if (num_rdma_bytes > 0) {
         static std::once_flag warned_once;
-        std::call_once(warned_once, []() {
-            printf("WARNING: XPU internode (RDMA/NVSHMEM) path is not implemented yet; num_rdma_bytes will be ignored.\n");
+        std::call_once(warned_once, [this, low_latency_mode]() {
+            if (low_latency_mode) {
+                printf("WARNING: XPU low-latency mode uses staged local-only buffers; RDMA/NVSHMEM transport is not implemented yet.\n");
+            } else {
+                printf("WARNING: XPU internode (RDMA/NVSHMEM) path is not implemented yet; num_rdma_bytes will be ignored.\n");
+            }
             fflush(stdout);
         });
-        this->num_rdma_bytes = 0;
-        num_rdma_bytes = 0;
+        if (not low_latency_mode) {
+            this->num_rdma_bytes = 0;
+            num_rdma_bytes = 0;
+        }
     }
 #endif
 
@@ -621,7 +641,11 @@ bool Buffer::is_available() const {
 }
 
 bool Buffer::is_internode_available() const {
+#if defined(DEEPEP_USE_XPU)
+    return false;
+#else
     return is_available() and num_rdma_bytes > 0;
+#endif
 }
 
 int Buffer::get_num_rdma_ranks() const {
@@ -693,7 +717,14 @@ void Buffer::destroy() {
     }
 
     // Free NVSHMEM
-#if !defined(DISABLE_NVSHMEM) && !defined(DEEPEP_USE_XPU)
+#if defined(DEEPEP_USE_XPU)
+    if (rdma_buffer_ptr != nullptr)
+        runtime_free(rdma_buffer_ptr);
+    if (mask_buffer_ptr != nullptr)
+        runtime_free(mask_buffer_ptr);
+    if (sync_buffer_ptr != nullptr)
+        runtime_free(sync_buffer_ptr);
+#elif !defined(DISABLE_NVSHMEM)
     if (is_available() and num_rdma_bytes > 0) {
         runtime_device_synchronize();
         internode::barrier();
@@ -748,7 +779,21 @@ void Buffer::sync(const std::vector<int>& device_ids,
     }
 
     // Sync NVSHMEM handles and allocate memory
-#if !defined(DISABLE_NVSHMEM) && !defined(DEEPEP_USE_XPU)
+#if defined(DEEPEP_USE_XPU)
+    if (num_rdma_bytes > 0) {
+        runtime_malloc(&rdma_buffer_ptr, num_rdma_bytes);
+        runtime_memset(rdma_buffer_ptr, 0, num_rdma_bytes);
+
+        if (enable_shrink) {
+            int num_mask_buffer_bytes = num_ranks * sizeof(int);
+            int num_sync_buffer_bytes = num_ranks * sizeof(int);
+            runtime_malloc(reinterpret_cast<void**>(&mask_buffer_ptr), num_mask_buffer_bytes);
+            runtime_malloc(reinterpret_cast<void**>(&sync_buffer_ptr), num_sync_buffer_bytes);
+            runtime_memset(mask_buffer_ptr, 0, num_mask_buffer_bytes);
+            runtime_memset(sync_buffer_ptr, 0, num_sync_buffer_bytes);
+        }
+    }
+#elif !defined(DISABLE_NVSHMEM)
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
         EP_HOST_ASSERT(root_unique_id_opt.has_value());
@@ -801,12 +846,19 @@ Buffer::get_dispatch_layout(
         backend::set_current_stream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+    // Wait previous tasks to be finished.
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
+#if defined(DEEPEP_USE_XPU)
     }
+#endif
 
     auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
     auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(backend::kDeviceType));
@@ -962,12 +1014,19 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         backend::set_current_stream(comm_stream);
     }
 
-    // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+    // Wait previous tasks to be finished.
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
+#if defined(DEEPEP_USE_XPU)
     }
+#endif
 
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1;
@@ -978,6 +1037,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
     int num_memset_int = num_channels * num_ranks * 4;
+    void** intranode_buffer_ptrs = buffer_ptrs_gpu;
+    int** intranode_barrier_signal_ptrs = barrier_signal_ptrs_gpu;
+#if defined(DEEPEP_USE_XPU)
+    // Staged XPU intranode kernels run host-side rendezvous logic and need
+    // host-visible peer pointer tables instead of device pointer tables.
+    intranode_buffer_ptrs = buffer_ptrs;
+    intranode_barrier_signal_ptrs = barrier_signal_ptrs;
+#endif
 #if defined(DEEPEP_USE_XPU)
     {
         pybind11::gil_scoped_release no_gil;
@@ -989,7 +1056,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
         // Copy rank prefix matrix and clean flags
         intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, intranode_buffer_ptrs, intranode_barrier_signal_ptrs, rank, num_ranks, comm_stream);
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(backend::kDeviceType));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(backend::kDeviceType));
@@ -1015,8 +1082,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    rank_prefix_matrix.data_ptr<int>(),
                                    num_memset_int,
                                    expert_alignment,
-                                   buffer_ptrs_gpu,
-                                   barrier_signal_ptrs_gpu,
+                                   intranode_buffer_ptrs,
+                                   intranode_barrier_signal_ptrs,
                                    rank,
                                    comm_stream,
                                    num_channels);
@@ -1116,7 +1183,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         num_scales,
                         scale_token_stride,
                         scale_hidden_stride,
-                        buffer_ptrs_gpu,
+                        intranode_buffer_ptrs,
                         rank,
                         num_ranks,
                         comm_stream,
@@ -1221,11 +1288,18 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     }
 
     // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
+#if defined(DEEPEP_USE_XPU)
     }
+#endif
 
     int num_topk = 0;
     auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -1243,6 +1317,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
     intranode::cached_notify_combine(buffer_ptrs_gpu,
                                      send_head.data_ptr<int>(),
                                      num_channels,
@@ -1252,6 +1330,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      rank,
                                      num_ranks,
                                      comm_stream);
+#if defined(DEEPEP_USE_XPU)
+    }
+#endif
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1272,6 +1353,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
+ #if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
     intranode::combine(get_runtime_dtype(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -1294,6 +1379,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        config.num_sms,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens);
+#if defined(DEEPEP_USE_XPU)
+    }
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1459,11 +1547,18 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     }
 
     // Wait previous tasks to be finished
-    if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else {
+            stream_wait(comm_stream, compute_stream);
+        }
+#if defined(DEEPEP_USE_XPU)
     }
+#endif
 
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1, num_rdma_recv_tokens = -1;
@@ -1803,30 +1898,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     EP_HOST_ASSERT(config.num_max_nvl_chunked_recv_tokens % num_rdma_ranks == 0);
     EP_HOST_ASSERT(config.num_max_nvl_chunked_send_tokens <= config.num_max_nvl_chunked_recv_tokens / num_rdma_ranks);
 
-    // Launch barrier and reset queue head and tail
-    internode::cached_notify(hidden_int4,
-                             0,
-                             0,
-                             num_topk,
-                             num_ranks,
-                             num_channels,
-                             num_combined_tokens,
-                             combined_rdma_head.data_ptr<int>(),
-                             rdma_channel_prefix_matrix.data_ptr<int>(),
-                             rdma_rank_prefix_sum.data_ptr<int>(),
-                             combined_nvl_head.data_ptr<int>(),
-                             rdma_buffer_ptr,
-                             config.num_max_rdma_chunked_recv_tokens,
-                             buffer_ptrs_gpu,
-                             config.num_max_nvl_chunked_recv_tokens,
-                             barrier_signal_ptrs_gpu,
-                             rank,
-                             comm_stream,
-                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                             num_nvl_bytes,
-                             false,
-                             low_latency_mode);
-
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
@@ -1839,37 +1910,68 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             bias_ptrs[i] = bias.data_ptr();
         }
 
-    // Launch data combine
     auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
-    internode::combine(get_runtime_dtype(x.scalar_type()),
-                       combined_x.data_ptr(),
-                       combined_topk_weights_ptr,
-                       is_combined_token_in_rank.data_ptr<bool>(),
-                       x.data_ptr(),
-                       topk_weights_ptr,
-                       bias_ptrs[0],
-                       bias_ptrs[1],
-                       combined_rdma_head.data_ptr<int>(),
-                       combined_nvl_head.data_ptr<int>(),
-                       src_meta.data_ptr(),
-                       rdma_channel_prefix_matrix.data_ptr<int>(),
-                       rdma_rank_prefix_sum.data_ptr<int>(),
-                       gbl_channel_prefix_matrix.data_ptr<int>(),
-                       num_tokens,
-                       num_combined_tokens,
-                       hidden,
-                       num_topk,
-                       rdma_buffer_ptr,
-                       config.num_max_rdma_chunked_send_tokens,
-                       config.num_max_rdma_chunked_recv_tokens,
-                       buffer_ptrs_gpu,
-                       config.num_max_nvl_chunked_send_tokens,
-                       config.num_max_nvl_chunked_recv_tokens,
-                       rank,
-                       num_ranks,
-                       comm_stream,
-                       num_channels,
-                       low_latency_mode);
+
+    // Launch barrier and reset queue head and tail, then combine.
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+#endif
+        internode::cached_notify(hidden_int4,
+                                 0,
+                                 0,
+                                 num_topk,
+                                 num_ranks,
+                                 num_channels,
+                                 num_combined_tokens,
+                                 combined_rdma_head.data_ptr<int>(),
+                                 rdma_channel_prefix_matrix.data_ptr<int>(),
+                                 rdma_rank_prefix_sum.data_ptr<int>(),
+                                 combined_nvl_head.data_ptr<int>(),
+                                 rdma_buffer_ptr,
+                                 config.num_max_rdma_chunked_recv_tokens,
+                                 buffer_ptrs_gpu,
+                                 config.num_max_nvl_chunked_recv_tokens,
+                                 barrier_signal_ptrs_gpu,
+                                 rank,
+                                 comm_stream,
+                                 config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                                 num_nvl_bytes,
+                                 false,
+                                 low_latency_mode);
+
+        internode::combine(get_runtime_dtype(x.scalar_type()),
+                           combined_x.data_ptr(),
+                           combined_topk_weights_ptr,
+                           is_combined_token_in_rank.data_ptr<bool>(),
+                           x.data_ptr(),
+                           topk_weights_ptr,
+                           bias_ptrs[0],
+                           bias_ptrs[1],
+                           combined_rdma_head.data_ptr<int>(),
+                           combined_nvl_head.data_ptr<int>(),
+                           src_meta.data_ptr(),
+                           rdma_channel_prefix_matrix.data_ptr<int>(),
+                           rdma_rank_prefix_sum.data_ptr<int>(),
+                           gbl_channel_prefix_matrix.data_ptr<int>(),
+                           num_tokens,
+                           num_combined_tokens,
+                           hidden,
+                           num_topk,
+                           rdma_buffer_ptr,
+                           config.num_max_rdma_chunked_send_tokens,
+                           config.num_max_rdma_chunked_recv_tokens,
+                           buffer_ptrs_gpu,
+                           config.num_max_nvl_chunked_send_tokens,
+                           config.num_max_nvl_chunked_recv_tokens,
+                           rank,
+                           num_ranks,
+                           comm_stream,
+                           num_channels,
+                           low_latency_mode);
+#if defined(DEEPEP_USE_XPU)
+    }
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1997,12 +2099,17 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto compute_stream = backend::get_current_stream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
+    // Staged XPU low-latency path keeps BF16 payload even when use_fp8=True,
+    // mirroring the Python fallback contract while still returning scale tensors.
+#if defined(DEEPEP_USE_XPU)
+    auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+                                      x.options().dtype(torch::kBFloat16));
+#else
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+#endif
     auto packed_recv_src_info =
         torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(backend::kDeviceType));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(backend::kDeviceType));
@@ -2062,7 +2169,17 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             launch_stream,
             phases);
     };
+
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+        if (not return_recv_hook)
+            stream_wait(launch_stream, compute_stream);
+        launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    }
+#else
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -2071,13 +2188,21 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         // so in Python API, we must wrap all tensors into the event handle.
         event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
+#if defined(DEEPEP_USE_XPU)
+        pybind11::gil_scoped_release no_gil;
+#endif
         stream_wait(compute_stream, launch_stream);
     }
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+        recv_hook = [=]() {
+#if defined(DEEPEP_USE_XPU)
+            pybind11::gil_scoped_release no_gil;
+#endif
+            launcher(LOW_LATENCY_RECV_PHASE);
+        };
 
     // Return values
     return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
@@ -2144,8 +2269,6 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto compute_stream = backend::get_current_stream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -2188,7 +2311,17 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               phases,
                               zero_copy);
     };
+
+#if defined(DEEPEP_USE_XPU)
+    {
+        pybind11::gil_scoped_release no_gil;
+        if (not return_recv_hook)
+            stream_wait(launch_stream, compute_stream);
+        launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    }
+#else
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -2197,13 +2330,21 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
         // so in Python API, we must wrap all tensors into the event handle.
         event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
+#if defined(DEEPEP_USE_XPU)
+        pybind11::gil_scoped_release no_gil;
+#endif
         stream_wait(compute_stream, launch_stream);
     }
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+        recv_hook = [=]() {
+#if defined(DEEPEP_USE_XPU)
+            pybind11::gil_scoped_release no_gil;
+#endif
+            launcher(LOW_LATENCY_RECV_PHASE);
+        };
 
     // Return values
     return {combined_x, event, recv_hook};
