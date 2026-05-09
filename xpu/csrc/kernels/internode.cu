@@ -4,6 +4,7 @@
 #if defined(DEEPEP_USE_XPU)
 #include "configs.cuh"
 #include "exception.cuh"
+#include <c10/util/Half.h>
 #else
 #include "buffer.cuh"
 #include "configs.cuh"
@@ -95,8 +96,8 @@ struct XpuInternodeCombineArrival {
     std::vector<XpuInternodeSourceMeta> src_meta;
     std::vector<uint8_t> is_combined_token_in_rank;
     std::vector<float> topk_weights;
-    std::vector<nv_bfloat16> bias_0;
-    std::vector<nv_bfloat16> bias_1;
+    std::vector<uint8_t> bias_0;
+    std::vector<uint8_t> bias_1;
 };
 
 template <typename Arrival>
@@ -161,12 +162,16 @@ inline void get_channel_task_range_host(int num_tokens, int num_channels, int ch
     token_end_idx = std::min(token_start_idx + num_tokens_per_channel, num_tokens);
 }
 
-inline std::vector<nv_bfloat16> xpu_copy_optional_bias(runtime_stream_t stream, const void* bias_ptr, int num_rows, int hidden) {
-    std::vector<nv_bfloat16> host_bias;
-    if (bias_ptr == nullptr || num_rows <= 0 || hidden <= 0)
+inline std::vector<uint8_t> xpu_copy_optional_bias(runtime_stream_t stream,
+                                                   const void* bias_ptr,
+                                                   int num_rows,
+                                                   int hidden,
+                                                   size_t elem_size) {
+    std::vector<uint8_t> host_bias;
+    if (bias_ptr == nullptr || num_rows <= 0 || hidden <= 0 || elem_size == 0)
         return host_bias;
-    host_bias.assign(static_cast<size_t>(num_rows) * static_cast<size_t>(hidden), nv_bfloat16(0));
-    xpu_blocking_memcpy(stream, host_bias.data(), bias_ptr, host_bias.size() * sizeof(nv_bfloat16));
+    host_bias.assign(static_cast<size_t>(num_rows) * static_cast<size_t>(hidden) * elem_size, 0);
+    xpu_blocking_memcpy(stream, host_bias.data(), bias_ptr, host_bias.size());
     return host_bias;
 }
 
@@ -726,10 +731,14 @@ void combine(runtime_data_type_t type,
              runtime_stream_t stream,
              int,
              bool) {
-    EP_HOST_ASSERT(type == RUNTIME_R_16BF && "staged XPU internode combine currently supports BF16 only");
+    const bool is_bf16 = (type == RUNTIME_R_16BF);
+    const bool is_f32 = (type == static_cast<runtime_data_type_t>(c10::ScalarType::Float));
+    const bool is_f16 = (type == static_cast<runtime_data_type_t>(c10::ScalarType::Half));
+    EP_HOST_ASSERT((is_bf16 or is_f32 or is_f16) && "staged XPU internode combine currently supports BF16/FP16/FP32 only");
     EP_HOST_ASSERT(combined_x != nullptr && x != nullptr && src_meta != nullptr);
 
-    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
+    const size_t elem_size = is_bf16 ? sizeof(nv_bfloat16) : (is_f16 ? sizeof(c10::Half) : sizeof(float));
+    const size_t row_bytes = static_cast<size_t>(hidden) * elem_size;
     const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
     std::vector<uint8_t> host_x(x_bytes, 0);
     if (x_bytes > 0)
@@ -752,10 +761,14 @@ void combine(runtime_data_type_t type,
     }
 
     if (num_ranks == 1) {
-        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_x_accum(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), 0.f);
         std::vector<float> host_combined_weights;
         if (combined_topk_weights != nullptr && num_topk > 0)
             host_combined_weights.assign(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_topk), 0.f);
+
+        const auto* host_x_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(host_x.data()) : nullptr;
+        const auto* host_x_f32 = is_f32 ? reinterpret_cast<const float*>(host_x.data()) : nullptr;
+        const auto* host_x_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(host_x.data()) : nullptr;
 
         for (int i = 0; i < num_tokens; ++i) {
             const auto meta = host_src_meta[static_cast<size_t>(i)];
@@ -765,10 +778,12 @@ void combine(runtime_data_type_t type,
             if (!host_mask.empty() && host_mask[static_cast<size_t>(dst_idx)] == 0)
                 continue;
 
-            auto* dst_row = host_combined_x.data() + static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden);
-            auto* src_row = reinterpret_cast<const nv_bfloat16*>(host_x.data() + static_cast<size_t>(i) * row_bytes);
-            for (int h = 0; h < hidden; ++h)
-                dst_row[h] = dst_row[h] + src_row[h];
+            for (int h = 0; h < hidden; ++h) {
+                const size_t idx = static_cast<size_t>(i) * static_cast<size_t>(hidden) + static_cast<size_t>(h);
+                const float x_value = is_bf16 ? static_cast<float>(host_x_bf16[idx]) :
+                                     (is_f16 ? static_cast<float>(host_x_f16[idx]) : host_x_f32[idx]);
+                host_combined_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] += x_value;
+            }
 
             if (!host_combined_weights.empty()) {
                 for (int k = 0; k < num_topk; ++k) {
@@ -778,31 +793,49 @@ void combine(runtime_data_type_t type,
             }
         }
 
-        const auto host_bias_0 = xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden);
-        const auto host_bias_1 = xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden);
-        auto apply_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+        const auto host_bias_0 = xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden, elem_size);
+        const auto host_bias_1 = xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden, elem_size);
+        auto apply_bias = [&](const std::vector<uint8_t>& host_bias) {
             if (host_bias.empty())
                 return;
+            const auto* bias_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(host_bias.data()) : nullptr;
+            const auto* bias_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(host_bias.data()) : nullptr;
+            const auto* bias_f32 = is_f32 ? reinterpret_cast<const float*>(host_bias.data()) : nullptr;
             for (int token = 0; token < num_combined_tokens; ++token) {
                 if (!host_mask.empty() && host_mask[static_cast<size_t>(token)] == 0)
                     continue;
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
-                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
-                for (int h = 0; h < hidden; ++h)
-                    dst_row[h] = dst_row[h] + bias_row[h];
+                for (int h = 0; h < hidden; ++h) {
+                    const size_t idx = static_cast<size_t>(token) * static_cast<size_t>(hidden) + static_cast<size_t>(h);
+                    host_combined_x_accum[idx] += is_bf16 ? static_cast<float>(bias_bf16[idx]) :
+                                             (is_f16 ? static_cast<float>(bias_f16[idx]) : bias_f32[idx]);
+                }
             }
         };
         apply_bias(host_bias_0);
         apply_bias(host_bias_1);
 
-        if (!host_combined_x.empty())
-            xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_x_accum.empty()) {
+            if (is_bf16) {
+                std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden));
+                for (size_t i = 0; i < host_combined_x_accum.size(); ++i)
+                    host_combined_x[i] = static_cast<nv_bfloat16>(host_combined_x_accum[i]);
+                xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+            } else if (is_f16) {
+                std::vector<c10::Half> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden));
+                for (size_t i = 0; i < host_combined_x_accum.size(); ++i)
+                    host_combined_x[i] = static_cast<c10::Half>(host_combined_x_accum[i]);
+                xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(c10::Half));
+            } else {
+                xpu_blocking_memcpy(stream, combined_x, host_combined_x_accum.data(), host_combined_x_accum.size() * sizeof(float));
+            }
+        }
         if (!host_combined_weights.empty())
             xpu_blocking_memcpy(stream, combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
         return;
     }
 
-    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden, num_topk, 1);
+    const uint64_t dtype_key = is_f32 ? 2 : (is_f16 ? 3 : 1);
+    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden, num_topk, dtype_key);
     auto state = get_xpu_internode_state(xpu_internode_combine_states, xpu_internode_combine_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
@@ -819,8 +852,8 @@ void combine(runtime_data_type_t type,
                                                                             std::move(host_src_meta),
                                                                             std::move(host_mask),
                                                                             std::move(host_topk_weights),
-                                                                            xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden),
-                                                                            xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden)};
+                                                                            xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden, elem_size),
+                                                                            xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden, elem_size)};
     state->arrived++;
     if (state->arrived < num_ranks) {
         state->cv.wait(lock, [&] { return state->generation != generation; });
@@ -838,7 +871,7 @@ void combine(runtime_data_type_t type,
 
     for (int owner_rank = 0; owner_rank < num_ranks; ++owner_rank) {
         auto& owner = arrivals[static_cast<size_t>(owner_rank)];
-        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_x_accum(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden), 0.f);
         std::vector<float> host_combined_weights;
         if (owner.combined_topk_weights != nullptr && owner.num_topk > 0)
             host_combined_weights.assign(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.num_topk), 0.f);
@@ -853,10 +886,14 @@ void combine(runtime_data_type_t type,
                     owner.is_combined_token_in_rank[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] == 0)
                     continue;
 
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.hidden);
-                auto* src_row = reinterpret_cast<const nv_bfloat16*>(src.x.data() + static_cast<size_t>(token) * row_bytes);
-                for (int h = 0; h < owner.hidden; ++h)
-                    dst_row[h] = dst_row[h] + src_row[h];
+                const auto* src_row_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(src.x.data() + static_cast<size_t>(token) * row_bytes) : nullptr;
+                const auto* src_row_f32 = is_f32 ? reinterpret_cast<const float*>(src.x.data() + static_cast<size_t>(token) * row_bytes) : nullptr;
+                const auto* src_row_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(src.x.data() + static_cast<size_t>(token) * row_bytes) : nullptr;
+                for (int h = 0; h < owner.hidden; ++h) {
+                    const float x_value = is_bf16 ? static_cast<float>(src_row_bf16[h]) :
+                                         (is_f16 ? static_cast<float>(src_row_f16[h]) : src_row_f32[h]);
+                    host_combined_x_accum[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.hidden) + static_cast<size_t>(h)] += x_value;
+                }
 
                 if (!host_combined_weights.empty()) {
                     for (int k = 0; k < owner.num_topk; ++k) {
@@ -867,26 +904,43 @@ void combine(runtime_data_type_t type,
             }
         }
 
-        auto apply_owner_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+        auto apply_owner_bias = [&](const std::vector<uint8_t>& host_bias) {
             if (host_bias.empty())
                 return;
+            const auto* bias_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(host_bias.data()) : nullptr;
+            const auto* bias_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(host_bias.data()) : nullptr;
+            const auto* bias_f32 = is_f32 ? reinterpret_cast<const float*>(host_bias.data()) : nullptr;
             for (int token = 0; token < owner.num_combined_tokens; ++token) {
                 bool active = false;
                 for (int src_rank = 0; src_rank < num_ranks; ++src_rank)
                     active = active || (owner.is_combined_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] != 0);
                 if (!active)
                     continue;
-                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
-                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
-                for (int h = 0; h < owner.hidden; ++h)
-                    dst_row[h] = dst_row[h] + bias_row[h];
+                for (int h = 0; h < owner.hidden; ++h) {
+                    const size_t idx = static_cast<size_t>(token) * static_cast<size_t>(owner.hidden) + static_cast<size_t>(h);
+                    host_combined_x_accum[idx] += is_bf16 ? static_cast<float>(bias_bf16[idx]) :
+                                             (is_f16 ? static_cast<float>(bias_f16[idx]) : bias_f32[idx]);
+                }
             }
         };
         apply_owner_bias(owner.bias_0);
         apply_owner_bias(owner.bias_1);
 
-        if (!host_combined_x.empty())
-            xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_x_accum.empty()) {
+            if (is_bf16) {
+                std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden));
+                for (size_t i = 0; i < host_combined_x_accum.size(); ++i)
+                    host_combined_x[i] = static_cast<nv_bfloat16>(host_combined_x_accum[i]);
+                xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+            } else if (is_f16) {
+                std::vector<c10::Half> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden));
+                for (size_t i = 0; i < host_combined_x_accum.size(); ++i)
+                    host_combined_x[i] = static_cast<c10::Half>(host_combined_x_accum[i]);
+                xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(c10::Half));
+            } else {
+                xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x_accum.data(), host_combined_x_accum.size() * sizeof(float));
+            }
+        }
         if (!host_combined_weights.empty())
             xpu_blocking_memcpy(owner.stream, owner.combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
     }
