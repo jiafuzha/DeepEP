@@ -145,6 +145,8 @@ This directory is the staged XPU migration workspace.
 - Added two-process two-rank `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 - Added two-process two-rank cached `float16` intranode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 - Added two-process two-rank cached `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process two-rank low-latency dispatch/combine return-recv-hook regression in `xpu/tests/test_xpu_import.py` to validate deferred receive-phase execution on the staged XPU path.
+- Switched staged XPU intranode multi-rank rendezvous grouping to hash host-visible IPC peer tables (instead of world-size-only grouping), and wired `Buffer::intranode_combine` notify/combine calls to pass host IPC pointer tables under `DEEPEP_USE_XPU` in `xpu/csrc/deep_ep.cpp`.
 
 ## Layer Migration Status Summary
 
@@ -155,7 +157,7 @@ This directory is the staged XPU migration workspace.
 - [x] IPC transport with generation/checksum validation
 - [x] Buffer lifecycle management (idempotent destroy)
 - [x] Error handling and live allocation tracking
-- All 55 XPU tests pass, including expanded native intranode regressions (uncached/cached two-rank two-process dispatch+combine plus float32/float16 two-rank two-process combine and cached float16), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch/combine coverage (including FP8/logfmt two-process variants), staged internode dispatch/combine coverage (single-rank and two-rank two-process, including float32/float16 plus cached float32/float16), cached multi-round two-process stress coverage, low-latency FP8/logfmt multi-round two-process stress coverage, fallback tests, and import/runtime coverage
+- All 56 XPU tests pass, including expanded native intranode regressions (uncached/cached two-rank two-process dispatch+combine plus float32/float16 two-rank two-process combine and cached float16), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine and return-recv-hook receive phase), staged two-rank low-latency dispatch/combine coverage (including FP8/logfmt two-process variants), staged internode dispatch/combine coverage (single-rank and two-rank two-process, including float32/float16 plus cached float32/float16), cached multi-round two-process stress coverage, low-latency FP8/logfmt multi-round two-process stress coverage, fallback tests, and import/runtime coverage
 
 **Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
 - [x] Dynamic extension loading with XPU-first fallback
@@ -166,7 +168,7 @@ This directory is the staged XPU migration workspace.
 - Test coverage: 8 dedicated fallback tests + runtime integration tests
 
 **Kernel Layer (xpu/csrc/kernels/*.cu|*.cuh):** 🚧 PARTIALLY PORTED (PHASE 2 STARTED)
-- Current approach: `layout::get_dispatch_layout`, staged single-rank intranode dispatch/combine, staged two-rank same-process intranode dispatch/combine, staged single-rank internode dispatch/combine, and staged low-latency maintenance plus dispatch/combine helpers have concrete XPU implementations; remaining kernels still return `EP_UNSUPPORTED_XPU` and trigger Python fallbacks
+- Current approach: `layout::get_dispatch_layout`, staged single-rank intranode dispatch/combine, staged two-rank same-process intranode dispatch/combine, staged single-rank internode dispatch/combine, and staged low-latency maintenance plus dispatch/combine helpers (including two-rank two-process FP8/logfmt and return-recv-hook flows) have concrete XPU implementations; remaining kernels still return `EP_UNSUPPORTED_XPU` and trigger Python fallbacks
 - [ ] Full SYCL kernel implementation (in progress)
 - [x] Python fallback coverage for all major operations:
   - intranode dispatch/combine → Python bincount + tensor scatter
@@ -185,9 +187,9 @@ This directory is the staged XPU migration workspace.
 **Phase 2: Multi-Rank XPU Support (In Progress)**
 - Implement SYCL kernels for compute-critical operations:
   1. layout::get_dispatch_layout (token counting) ✅ concrete XPU path implemented
-  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 staged two-rank same-process dispatch (uncached/cached) and combine implemented; full SYCL parallelization and broader multi-rank hardening pending
+  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 staged two-rank same-process dispatch (uncached/cached) and combine implemented; staged PCIe-IPC peer-table keyed rendezvous path enabled on XPU; full SYCL parallelization and broader multi-rank hardening pending
   3. internode::dispatch/combine (RDMA MoE operations)
-  4. low-latency dispatch/combine (low-latency paths) 🚧 staged single-rank BF16/FP8 dispatch, logfmt combine, and maintenance helpers implemented; broader multi-rank support still pending
+  4. low-latency dispatch/combine (low-latency paths) ✅ staged single-rank and two-rank coverage implemented for BF16/FP8 dispatch, logfmt combine, maintenance helpers, and return-recv-hook receive-phase execution (two-process validation)
 - Use SYCLomatic tool for CUDA→SYCL automated porting as starting point
 - Requires SYCL queue management and work-group coordination
 
@@ -200,5 +202,5 @@ This directory is the staged XPU migration workspace.
 
 1. `xpu/csrc/kernels/intranode.cu`: extend current single-rank native path to multi-rank/SYCL parallel kernels
 2. `xpu/csrc/kernels/internode.cu` + `ibgda_device.cuh`: iSHMEM porting and Level Zero IPC
-3. `xpu/csrc/kernels/low_latency*` paths: concrete XPU implementation for low-latency dispatch/combine
+3. `xpu/csrc/kernels/low_latency*` paths: SYCL parallelization/performance tuning over current staged functional implementation
 4. `xpu/csrc/kernels/launch.cuh`: Full SYCL kernel launch macro implementation

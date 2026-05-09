@@ -1309,18 +1309,27 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
 
+    void** intranode_buffer_ptrs = buffer_ptrs_gpu;
+    int** intranode_barrier_signal_ptrs = barrier_signal_ptrs_gpu;
+#if defined(DEEPEP_USE_XPU)
+    // Staged XPU intranode kernels run host-side rendezvous logic and need
+    // host-visible peer pointer tables instead of device pointer tables.
+    intranode_buffer_ptrs = buffer_ptrs;
+    intranode_barrier_signal_ptrs = barrier_signal_ptrs;
+#endif
+
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
 #if defined(DEEPEP_USE_XPU)
     {
         pybind11::gil_scoped_release no_gil;
 #endif
-    intranode::cached_notify_combine(buffer_ptrs_gpu,
+    intranode::cached_notify_combine(intranode_buffer_ptrs,
                                      send_head.data_ptr<int>(),
                                      num_channels,
                                      num_recv_tokens,
                                      num_channels * num_ranks * 2,
-                                     barrier_signal_ptrs_gpu,
+                                     intranode_barrier_signal_ptrs,
                                      rank,
                                      num_ranks,
                                      comm_stream);
@@ -1366,7 +1375,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_recv_tokens,
                        hidden,
                        num_topk,
-                       buffer_ptrs_gpu,
+                       intranode_buffer_ptrs,
                        rank,
                        num_ranks,
                        comm_stream,

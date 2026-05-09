@@ -142,6 +142,22 @@ inline int get_source_rank_from_rank_prefix(const std::vector<int>& rank_prefix_
     return -1;
 }
 
+inline uintptr_t get_xpu_ipc_group_key(void** buffer_ptrs, int num_ranks) {
+    if (buffer_ptrs == nullptr || num_ranks <= 0)
+        return static_cast<uintptr_t>(num_ranks);
+
+    // Hash imported peer pointer table so staged rendezvous follows IPC topology
+    // instead of globally aliasing by world-size only.
+    uintptr_t hash = static_cast<uintptr_t>(1469598103934665603ull);
+    constexpr uintptr_t kFnvPrime = static_cast<uintptr_t>(1099511628211ull);
+    for (int i = 0; i < num_ranks; ++i) {
+        const uintptr_t value = reinterpret_cast<uintptr_t>(buffer_ptrs[i]);
+        hash ^= value + static_cast<uintptr_t>(0x9e3779b97f4a7c15ull) + (hash << 6) + (hash >> 2);
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
 }  // namespace
 
 void notify_dispatch(const int* num_tokens_per_rank,
@@ -211,10 +227,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
     if (num_tokens > 0)
         xpu_blocking_memcpy(stream, host_is_token_in_rank.data(), is_token_in_rank, host_is_token_in_rank.size() * sizeof(uint8_t));
 
-    // Staged XPU rendezvous is currently validated in single-process runs.
-    // Use a deterministic world-size key to avoid per-instance pointer alias
-    // differences from splitting participants into disjoint groups.
-    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
+    const uintptr_t group_key = get_xpu_ipc_group_key(buffer_ptrs, num_ranks);
     auto state = get_xpu_intranode_state(xpu_intranode_notify_states, xpu_intranode_notify_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
@@ -504,10 +517,7 @@ void dispatch(void* recv_x,
     EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
     EP_HOST_ASSERT(recv_topk_idx == nullptr || num_topk > 0);
 
-    // Staged XPU rendezvous is currently validated in single-process runs.
-    // Use a deterministic world-size key to avoid per-instance pointer alias
-    // differences from splitting participants into disjoint groups.
-    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
+    const uintptr_t group_key = get_xpu_ipc_group_key(buffer_ptrs, num_ranks);
     auto state = get_xpu_intranode_state(xpu_intranode_dispatch_states, xpu_intranode_dispatch_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
@@ -678,7 +688,7 @@ void combine(runtime_data_type_t type,
              int num_recv_tokens,
              int hidden,
              int num_topk,
-             void**,
+             void** buffer_ptrs,
              int rank,
              int num_ranks,
              runtime_stream_t stream,
@@ -869,9 +879,7 @@ void combine(runtime_data_type_t type,
         xpu_blocking_memcpy(stream, host_bias_1.data(), bias_1, host_bias_1.size());
     }
 
-    // Staged XPU rendezvous is currently validated in single-process runs.
-    // Key by world-size to avoid dereferencing device pointer tables in host code.
-    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
+    const uintptr_t group_key = get_xpu_ipc_group_key(buffer_ptrs, num_ranks);
     auto state = get_xpu_intranode_state(xpu_intranode_combine_states, xpu_intranode_combine_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
