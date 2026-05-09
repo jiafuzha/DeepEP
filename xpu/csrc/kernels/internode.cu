@@ -17,85 +17,652 @@ namespace deep_ep {
 
 namespace internode {
 
-#if defined(DEEPEP_USE_XPU)
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
-int get_source_meta_bytes() {
-    EP_UNSUPPORTED_XPU("internode kernels");
-    return 0;
+namespace {
+
+struct XpuInternodeSourceMeta {
+    int src_rank;
+    int src_token_idx;
+};
+
+struct XpuInternodeNotifyArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_channels;
+    int num_experts;
+    int expert_alignment;
+    int num_tokens;
+    std::vector<int> num_tokens_per_rank;
+    std::vector<int> num_tokens_per_expert;
+    std::vector<uint8_t> is_token_in_rank;
+    int* moe_recv_counter_mapped;
+    int* moe_recv_rdma_counter_mapped;
+    int* moe_recv_expert_counter_mapped;
+    int* rdma_channel_prefix_matrix;
+    int* recv_rdma_rank_prefix_sum;
+    int* gbl_channel_prefix_matrix;
+    int* recv_gbl_rank_prefix_sum;
+};
+
+struct XpuInternodeDispatchArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_channels;
+    int num_tokens;
+    int hidden_int4;
+    int num_scales;
+    int num_topk;
+    int scale_token_stride;
+    int scale_hidden_stride;
+    void* recv_x;
+    float* recv_x_scales;
+    topk_idx_t* recv_topk_idx;
+    float* recv_topk_weights;
+    void* recv_src_meta;
+    int* send_rdma_head;
+    int* send_nvl_head;
+    int* recv_rdma_channel_prefix_matrix;
+    int* recv_gbl_channel_prefix_matrix;
+    std::vector<uint8_t> x;
+    std::vector<uint8_t> is_token_in_rank;
+    std::vector<float> x_scales;
+    std::vector<topk_idx_t> topk_idx;
+    std::vector<float> topk_weights;
+};
+
+struct XpuInternodeCombineArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_tokens;
+    int num_combined_tokens;
+    int hidden;
+    int num_topk;
+    void* combined_x;
+    float* combined_topk_weights;
+    std::vector<uint8_t> x;
+    std::vector<XpuInternodeSourceMeta> src_meta;
+    std::vector<uint8_t> is_combined_token_in_rank;
+    std::vector<float> topk_weights;
+    std::vector<nv_bfloat16> bias_0;
+    std::vector<nv_bfloat16> bias_1;
+};
+
+template <typename Arrival>
+struct XpuInternodeRendezvousState {
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t generation = 0;
+    int arrived = 0;
+    std::vector<std::optional<Arrival>> arrivals;
+};
+
+template <typename Arrival>
+std::shared_ptr<XpuInternodeRendezvousState<Arrival>> get_xpu_internode_state(
+    std::unordered_map<uint64_t, std::shared_ptr<XpuInternodeRendezvousState<Arrival>>>& states,
+    std::mutex& states_mu,
+    uint64_t key,
+    int num_ranks) {
+    std::lock_guard<std::mutex> guard(states_mu);
+    auto& state = states[key];
+    if (state == nullptr)
+        state = std::make_shared<XpuInternodeRendezvousState<Arrival>>();
+    if (state->arrivals.empty())
+        state->arrivals.resize(static_cast<size_t>(num_ranks));
+    return state;
 }
 
-void notify_dispatch(const int*,
-                     int*,
+inline uint64_t xpu_internode_group_key(int num_ranks, int value0, int value1, int value2) {
+    uint64_t key = static_cast<uint64_t>(static_cast<uint32_t>(num_ranks));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(value0));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(value1));
+    key = (key << 16) ^ static_cast<uint64_t>(static_cast<uint16_t>(value2));
+    return key;
+}
+
+std::mutex xpu_internode_notify_states_mu;
+std::unordered_map<uint64_t, std::shared_ptr<XpuInternodeRendezvousState<XpuInternodeNotifyArrival>>> xpu_internode_notify_states;
+std::mutex xpu_internode_dispatch_states_mu;
+std::unordered_map<uint64_t, std::shared_ptr<XpuInternodeRendezvousState<XpuInternodeDispatchArrival>>> xpu_internode_dispatch_states;
+std::mutex xpu_internode_combine_states_mu;
+std::unordered_map<uint64_t, std::shared_ptr<XpuInternodeRendezvousState<XpuInternodeCombineArrival>>> xpu_internode_combine_states;
+std::mutex xpu_internode_memcpy_mu;
+
+inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* src, size_t bytes) {
+    if (bytes == 0)
+        return;
+    std::lock_guard<std::mutex> guard(xpu_internode_memcpy_mu);
+    auto event = stream.queue().memcpy(dst, src, bytes);
+    event.wait_and_throw();
+}
+
+inline void xpu_blocking_memset(runtime_stream_t stream, void* ptr, int value, size_t bytes) {
+    if (bytes == 0)
+        return;
+    std::lock_guard<std::mutex> guard(xpu_internode_memcpy_mu);
+    auto event = stream.queue().memset(ptr, value, bytes);
+    event.wait_and_throw();
+}
+
+inline void get_channel_task_range_host(int num_tokens, int num_channels, int channel_id, int& token_start_idx, int& token_end_idx) {
+    const int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+    token_start_idx = std::min(num_tokens_per_channel * channel_id, num_tokens);
+    token_end_idx = std::min(token_start_idx + num_tokens_per_channel, num_tokens);
+}
+
+inline std::vector<nv_bfloat16> xpu_copy_optional_bias(runtime_stream_t stream, const void* bias_ptr, int num_rows, int hidden) {
+    std::vector<nv_bfloat16> host_bias;
+    if (bias_ptr == nullptr || num_rows <= 0 || hidden <= 0)
+        return host_bias;
+    host_bias.assign(static_cast<size_t>(num_rows) * static_cast<size_t>(hidden), nv_bfloat16(0));
+    xpu_blocking_memcpy(stream, host_bias.data(), bias_ptr, host_bias.size() * sizeof(nv_bfloat16));
+    return host_bias;
+}
+
+}  // namespace
+
+int get_source_meta_bytes() {
+    return static_cast<int>(sizeof(XpuInternodeSourceMeta));
+}
+
+void notify_dispatch(const int* num_tokens_per_rank,
+                     int* moe_recv_counter_mapped,
+                     int num_ranks,
+                     const int* num_tokens_per_rdma_rank,
+                     int* moe_recv_rdma_counter_mapped,
+                     const int* num_tokens_per_expert,
+                     int* moe_recv_expert_counter_mapped,
+                     int num_experts,
+                     const bool* is_token_in_rank,
+                     int num_tokens,
+                     int num_worst_tokens,
+                     int num_channels,
                      int,
-                     const int*,
-                     int*,
-                     const int*,
-                     int*,
-                     int,
-                     const bool*,
                      int,
                      int,
-                     int,
-                     int,
-                     int,
-                     int,
-                     int,
-                     int*,
-                     int*,
-                     int*,
-                     int*,
+                     int expert_alignment,
+                     int* rdma_channel_prefix_matrix,
+                     int* recv_rdma_rank_prefix_sum,
+                     int* gbl_channel_prefix_matrix,
+                     int* recv_gbl_rank_prefix_sum,
                      void*,
                      int,
                      void**,
                      int,
                      int**,
-                     int,
-                     runtime_stream_t,
+                     int rank,
+                     runtime_stream_t stream,
                      int64_t,
                      int64_t,
                      bool) {
-    EP_UNSUPPORTED_XPU("internode notify_dispatch");
+    EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(num_channels > 0);
+
+    std::vector<int> host_num_tokens_per_rank(static_cast<size_t>(num_ranks), 0);
+    xpu_blocking_memcpy(stream, host_num_tokens_per_rank.data(), num_tokens_per_rank, static_cast<size_t>(num_ranks) * sizeof(int));
+
+    std::vector<int> host_num_tokens_per_expert(static_cast<size_t>(num_experts), 0);
+    xpu_blocking_memcpy(stream, host_num_tokens_per_expert.data(), num_tokens_per_expert, static_cast<size_t>(num_experts) * sizeof(int));
+
+    const size_t is_token_in_rank_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_ranks);
+    std::vector<uint8_t> host_is_token_in_rank(is_token_in_rank_elems, 0);
+    if (is_token_in_rank_elems > 0)
+        xpu_blocking_memcpy(stream, host_is_token_in_rank.data(), is_token_in_rank, is_token_in_rank_elems * sizeof(uint8_t));
+
+    if (num_ranks == 1) {
+        int host_recv_tokens = host_num_tokens_per_rank[0];
+        if (num_worst_tokens > 0)
+            host_recv_tokens = std::min(host_recv_tokens, num_worst_tokens);
+        *moe_recv_counter_mapped = host_recv_tokens;
+        *moe_recv_rdma_counter_mapped = host_recv_tokens;
+
+        for (int i = 0; i < num_experts; ++i) {
+            const int aligned = ((host_num_tokens_per_expert[static_cast<size_t>(i)] + expert_alignment - 1) / expert_alignment) * expert_alignment;
+            moe_recv_expert_counter_mapped[i] = aligned;
+        }
+
+        std::vector<int> host_channel_prefix(static_cast<size_t>(num_channels), 0);
+        for (int channel = 0; channel < num_channels; ++channel) {
+            int token_start = 0, token_end = 0;
+            get_channel_task_range_host(num_tokens, num_channels, channel, token_start, token_end);
+            int count = 0;
+            for (int token = token_start; token < token_end; ++token)
+                count += static_cast<int>(host_is_token_in_rank[static_cast<size_t>(token)] != 0);
+            host_channel_prefix[static_cast<size_t>(channel)] = count;
+        }
+        for (int channel = 1; channel < num_channels; ++channel)
+            host_channel_prefix[static_cast<size_t>(channel)] += host_channel_prefix[static_cast<size_t>(channel - 1)];
+
+        xpu_blocking_memcpy(stream, rdma_channel_prefix_matrix, host_channel_prefix.data(), static_cast<size_t>(num_channels) * sizeof(int));
+        xpu_blocking_memcpy(stream, gbl_channel_prefix_matrix, host_channel_prefix.data(), static_cast<size_t>(num_channels) * sizeof(int));
+        xpu_blocking_memcpy(stream, recv_rdma_rank_prefix_sum, &host_recv_tokens, sizeof(int));
+        xpu_blocking_memcpy(stream, recv_gbl_rank_prefix_sum, &host_recv_tokens, sizeof(int));
+        return;
+    }
+
+    const uint64_t group_key = xpu_internode_group_key(num_ranks, num_channels, num_experts, 0);
+    auto state = get_xpu_internode_state(xpu_internode_notify_states, xpu_internode_notify_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuInternodeNotifyArrival{stream,
+                                                                           rank,
+                                                                           num_ranks,
+                                                                           num_channels,
+                                                                           num_experts,
+                                                                           expert_alignment,
+                                                                           num_tokens,
+                                                                           std::move(host_num_tokens_per_rank),
+                                                                           std::move(host_num_tokens_per_expert),
+                                                                           std::move(host_is_token_in_rank),
+                                                                           moe_recv_counter_mapped,
+                                                                           moe_recv_rdma_counter_mapped,
+                                                                           moe_recv_expert_counter_mapped,
+                                                                           rdma_channel_prefix_matrix,
+                                                                           recv_rdma_rank_prefix_sum,
+                                                                           gbl_channel_prefix_matrix,
+                                                                           recv_gbl_rank_prefix_sum};
+    state->arrived++;
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    const int num_local_experts = num_experts / num_ranks;
+
+    std::vector<XpuInternodeNotifyArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+        auto& dst = arrivals[static_cast<size_t>(dst_rank)];
+        std::vector<int> host_gbl_prefix(static_cast<size_t>(num_ranks), 0);
+        int total = 0;
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            total += arrivals[static_cast<size_t>(src_rank)].num_tokens_per_rank[static_cast<size_t>(dst_rank)];
+            host_gbl_prefix[static_cast<size_t>(src_rank)] = total;
+        }
+        if (num_worst_tokens > 0)
+            total = std::min(total, num_worst_tokens);
+        dst.moe_recv_counter_mapped[0] = total;
+        dst.moe_recv_rdma_counter_mapped[0] = total;
+
+        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+            const int global_expert = dst_rank * num_local_experts + local_expert;
+            int expert_total = 0;
+            for (int src_rank = 0; src_rank < num_ranks; ++src_rank)
+                expert_total += arrivals[static_cast<size_t>(src_rank)].num_tokens_per_expert[static_cast<size_t>(global_expert)];
+            dst.moe_recv_expert_counter_mapped[local_expert] = ((expert_total + dst.expert_alignment - 1) / dst.expert_alignment) * dst.expert_alignment;
+        }
+
+        std::vector<int> host_gbl_channel_prefix(static_cast<size_t>(num_ranks) * static_cast<size_t>(num_channels), 0);
+        std::vector<int> host_rdma_channel_prefix(static_cast<size_t>(num_channels), 0);
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int channel = 0; channel < num_channels; ++channel) {
+                int token_start = 0, token_end = 0;
+                get_channel_task_range_host(src.num_tokens, num_channels, channel, token_start, token_end);
+                int count = 0;
+                for (int token = token_start; token < token_end; ++token) {
+                    count += static_cast<int>(src.is_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)] != 0);
+                }
+                host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(num_channels) + static_cast<size_t>(channel)] = count;
+                host_rdma_channel_prefix[static_cast<size_t>(channel)] += count;
+            }
+            for (int channel = 1; channel < num_channels; ++channel) {
+                host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(num_channels) + static_cast<size_t>(channel)] +=
+                    host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(num_channels) + static_cast<size_t>(channel - 1)];
+            }
+        }
+        for (int channel = 1; channel < num_channels; ++channel)
+            host_rdma_channel_prefix[static_cast<size_t>(channel)] += host_rdma_channel_prefix[static_cast<size_t>(channel - 1)];
+
+        xpu_blocking_memcpy(dst.stream, dst.rdma_channel_prefix_matrix, host_rdma_channel_prefix.data(), static_cast<size_t>(num_channels) * sizeof(int));
+        xpu_blocking_memcpy(dst.stream, dst.recv_rdma_rank_prefix_sum, &total, sizeof(int));
+        xpu_blocking_memcpy(dst.stream, dst.gbl_channel_prefix_matrix, host_gbl_channel_prefix.data(), host_gbl_channel_prefix.size() * sizeof(int));
+        xpu_blocking_memcpy(dst.stream, dst.recv_gbl_rank_prefix_sum, host_gbl_prefix.data(), host_gbl_prefix.size() * sizeof(int));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
 }
 
-void dispatch(void*,
-              float*,
-              topk_idx_t*,
-              float*,
-              void*,
-              const void*,
-              const float*,
-              const topk_idx_t*,
-              const float*,
-              int*,
-              int*,
-              int*,
-              int*,
+void dispatch(void* recv_x,
+              float* recv_x_scales,
+              topk_idx_t* recv_topk_idx,
+              float* recv_topk_weights,
+              void* recv_src_meta,
+              const void* x,
+              const float* x_scales,
+              const topk_idx_t* topk_idx,
+              const float* topk_weights,
+              int* send_rdma_head,
+              int* send_nvl_head,
+              int* recv_rdma_channel_prefix_matrix,
+              int* recv_gbl_channel_prefix_matrix,
               const int*,
               const int*,
               const int*,
               const int*,
-              const bool*,
+              const bool* is_token_in_rank,
+              int num_tokens,
+              int num_worst_tokens,
+              int hidden_int4,
+              int num_scales,
+              int num_topk,
               int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
-              int,
+              int scale_token_stride,
+              int scale_hidden_stride,
               void*,
               int,
               int,
               void**,
               int,
               int,
-              int,
-              int,
+              int rank,
+              int num_ranks,
               bool,
-              runtime_stream_t,
-              int,
+              runtime_stream_t stream,
+              int num_channels,
               bool) {
-    EP_UNSUPPORTED_XPU("internode dispatch");
+    EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(recv_x != nullptr and recv_src_meta != nullptr and x != nullptr and is_token_in_rank != nullptr);
+    EP_HOST_ASSERT(hidden_int4 >= 0 and num_channels > 0);
+
+    const size_t row_bytes = static_cast<size_t>(hidden_int4) * sizeof(int4);
+    const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
+    std::vector<uint8_t> host_x(x_bytes, 0);
+    if (x_bytes > 0)
+        xpu_blocking_memcpy(stream, host_x.data(), x, x_bytes);
+
+    const size_t is_token_in_rank_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_ranks);
+    std::vector<uint8_t> host_is_token_in_rank(is_token_in_rank_elems, 0);
+    if (is_token_in_rank_elems > 0)
+        xpu_blocking_memcpy(stream, host_is_token_in_rank.data(), is_token_in_rank, is_token_in_rank_elems * sizeof(uint8_t));
+
+    std::vector<float> host_x_scales;
+    if (x_scales != nullptr and recv_x_scales != nullptr and num_scales > 0) {
+        const size_t scale_src_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(std::max(1, scale_token_stride));
+        host_x_scales.resize(scale_src_elems);
+        xpu_blocking_memcpy(stream, host_x_scales.data(), x_scales, scale_src_elems * sizeof(float));
+    }
+
+    std::vector<topk_idx_t> host_topk_idx;
+    if (topk_idx != nullptr and recv_topk_idx != nullptr and num_topk > 0) {
+        const size_t topk_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk);
+        host_topk_idx.resize(topk_elems);
+        xpu_blocking_memcpy(stream, host_topk_idx.data(), topk_idx, topk_elems * sizeof(topk_idx_t));
+    }
+
+    std::vector<float> host_topk_weights;
+    if (topk_weights != nullptr and recv_topk_weights != nullptr and num_topk > 0) {
+        const size_t topk_weight_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk);
+        host_topk_weights.resize(topk_weight_elems);
+        xpu_blocking_memcpy(stream, host_topk_weights.data(), topk_weights, topk_weight_elems * sizeof(float));
+    }
+
+    if (num_ranks == 1) {
+        std::vector<int> selected_src_indices;
+        selected_src_indices.reserve(static_cast<size_t>(num_tokens));
+        for (int t = 0; t < num_tokens; ++t) {
+            if (host_is_token_in_rank[static_cast<size_t>(t)] != 0)
+                selected_src_indices.push_back(t);
+        }
+        const int num_recv_tokens = num_worst_tokens > 0 ? std::min(num_worst_tokens, static_cast<int>(selected_src_indices.size()))
+                                                          : static_cast<int>(selected_src_indices.size());
+        selected_src_indices.resize(static_cast<size_t>(num_recv_tokens));
+
+        std::vector<uint8_t> host_recv_x(static_cast<size_t>(num_recv_tokens) * row_bytes, 0);
+        std::vector<XpuInternodeSourceMeta> host_recv_src_meta(static_cast<size_t>(num_recv_tokens), XpuInternodeSourceMeta{0, -1});
+        std::vector<float> host_recv_x_scales;
+        if (recv_x_scales != nullptr and num_scales > 0)
+            host_recv_x_scales.assign(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(num_scales), 0.f);
+        std::vector<topk_idx_t> host_recv_topk_idx;
+        if (recv_topk_idx != nullptr and num_topk > 0)
+            host_recv_topk_idx.assign(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(num_topk), static_cast<topk_idx_t>(-1));
+        std::vector<float> host_recv_topk_weights;
+        if (recv_topk_weights != nullptr and num_topk > 0)
+            host_recv_topk_weights.assign(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(num_topk), 0.f);
+
+        for (int out_idx = 0; out_idx < num_recv_tokens; ++out_idx) {
+            const int src_idx = selected_src_indices[static_cast<size_t>(out_idx)];
+            host_recv_src_meta[static_cast<size_t>(out_idx)] = XpuInternodeSourceMeta{0, src_idx};
+            std::memcpy(host_recv_x.data() + static_cast<size_t>(out_idx) * row_bytes,
+                        host_x.data() + static_cast<size_t>(src_idx) * row_bytes,
+                        row_bytes);
+            if (!host_x_scales.empty()) {
+                for (int s = 0; s < num_scales; ++s) {
+                    host_recv_x_scales[static_cast<size_t>(out_idx) * static_cast<size_t>(num_scales) + static_cast<size_t>(s)] =
+                        host_x_scales[static_cast<size_t>(src_idx) * static_cast<size_t>(scale_token_stride) +
+                                      static_cast<size_t>(s) * static_cast<size_t>(scale_hidden_stride)];
+                }
+            }
+            if (!host_topk_idx.empty()) {
+                std::memcpy(host_recv_topk_idx.data() + static_cast<size_t>(out_idx) * static_cast<size_t>(num_topk),
+                            host_topk_idx.data() + static_cast<size_t>(src_idx) * static_cast<size_t>(num_topk),
+                            static_cast<size_t>(num_topk) * sizeof(topk_idx_t));
+            }
+            if (!host_topk_weights.empty()) {
+                std::memcpy(host_recv_topk_weights.data() + static_cast<size_t>(out_idx) * static_cast<size_t>(num_topk),
+                            host_topk_weights.data() + static_cast<size_t>(src_idx) * static_cast<size_t>(num_topk),
+                            static_cast<size_t>(num_topk) * sizeof(float));
+            }
+        }
+
+        std::vector<int> host_channel_prefix(static_cast<size_t>(num_channels), 0);
+        for (int channel = 0; channel < num_channels; ++channel) {
+            int token_start = 0, token_end = 0;
+            get_channel_task_range_host(num_tokens, num_channels, channel, token_start, token_end);
+            int count = 0;
+            for (const int src_idx : selected_src_indices)
+                count += (src_idx >= token_start and src_idx < token_end) ? 1 : 0;
+            host_channel_prefix[static_cast<size_t>(channel)] = count;
+        }
+        for (int channel = 1; channel < num_channels; ++channel)
+            host_channel_prefix[static_cast<size_t>(channel)] += host_channel_prefix[static_cast<size_t>(channel - 1)];
+
+        std::vector<int> host_send_rdma_head(static_cast<size_t>(num_tokens), 0);
+        int sent = 0;
+        for (int token = 0; token < num_tokens; ++token) {
+            if (host_is_token_in_rank[static_cast<size_t>(token)] != 0)
+                ++sent;
+            host_send_rdma_head[static_cast<size_t>(token)] = sent;
+        }
+        std::vector<int> host_send_nvl_head(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(NUM_MAX_NVL_PEERS), 0);
+        for (int i = 0; i < num_recv_tokens; ++i)
+            host_send_nvl_head[static_cast<size_t>(i) * static_cast<size_t>(NUM_MAX_NVL_PEERS)] = i + 1;
+
+        if (!host_recv_x.empty())
+            xpu_blocking_memcpy(stream, recv_x, host_recv_x.data(), host_recv_x.size());
+        if (!host_recv_src_meta.empty())
+            xpu_blocking_memcpy(stream, recv_src_meta, host_recv_src_meta.data(), host_recv_src_meta.size() * sizeof(XpuInternodeSourceMeta));
+        if (!host_recv_x_scales.empty())
+            xpu_blocking_memcpy(stream, recv_x_scales, host_recv_x_scales.data(), host_recv_x_scales.size() * sizeof(float));
+        if (!host_recv_topk_idx.empty())
+            xpu_blocking_memcpy(stream, recv_topk_idx, host_recv_topk_idx.data(), host_recv_topk_idx.size() * sizeof(topk_idx_t));
+        if (!host_recv_topk_weights.empty())
+            xpu_blocking_memcpy(stream, recv_topk_weights, host_recv_topk_weights.data(), host_recv_topk_weights.size() * sizeof(float));
+        if (recv_rdma_channel_prefix_matrix != nullptr)
+            xpu_blocking_memcpy(stream, recv_rdma_channel_prefix_matrix, host_channel_prefix.data(), static_cast<size_t>(num_channels) * sizeof(int));
+        if (recv_gbl_channel_prefix_matrix != nullptr)
+            xpu_blocking_memcpy(stream, recv_gbl_channel_prefix_matrix, host_channel_prefix.data(), static_cast<size_t>(num_channels) * sizeof(int));
+        if (send_rdma_head != nullptr)
+            xpu_blocking_memcpy(stream, send_rdma_head, host_send_rdma_head.data(), host_send_rdma_head.size() * sizeof(int));
+        if (send_nvl_head != nullptr && !host_send_nvl_head.empty())
+            xpu_blocking_memcpy(stream, send_nvl_head, host_send_nvl_head.data(), host_send_nvl_head.size() * sizeof(int));
+        return;
+    }
+
+    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden_int4, num_topk, num_scales);
+    auto state = get_xpu_internode_state(xpu_internode_dispatch_states, xpu_internode_dispatch_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuInternodeDispatchArrival{stream,
+                                                                             rank,
+                                                                             num_ranks,
+                                                                             num_channels,
+                                                                             num_tokens,
+                                                                             hidden_int4,
+                                                                             num_scales,
+                                                                             num_topk,
+                                                                             scale_token_stride,
+                                                                             scale_hidden_stride,
+                                                                             recv_x,
+                                                                             recv_x_scales,
+                                                                             recv_topk_idx,
+                                                                             recv_topk_weights,
+                                                                             recv_src_meta,
+                                                                             send_rdma_head,
+                                                                             send_nvl_head,
+                                                                             recv_rdma_channel_prefix_matrix,
+                                                                             recv_gbl_channel_prefix_matrix,
+                                                                             std::move(host_x),
+                                                                             std::move(host_is_token_in_rank),
+                                                                             std::move(host_x_scales),
+                                                                             std::move(host_topk_idx),
+                                                                             std::move(host_topk_weights)};
+    state->arrived++;
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuInternodeDispatchArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+        auto& src = arrivals[static_cast<size_t>(src_rank)];
+        if (src.send_rdma_head == nullptr)
+            continue;
+        std::vector<int> host_send_rdma_head(static_cast<size_t>(src.num_tokens), 0);
+        int sent = 0;
+        for (int token = 0; token < src.num_tokens; ++token) {
+            bool dispatched = false;
+            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank)
+                dispatched = dispatched || (src.is_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)] != 0);
+            if (dispatched)
+                ++sent;
+            host_send_rdma_head[static_cast<size_t>(token)] = sent;
+        }
+        xpu_blocking_memcpy(src.stream, src.send_rdma_head, host_send_rdma_head.data(), host_send_rdma_head.size() * sizeof(int));
+    }
+
+    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+        auto& dst = arrivals[static_cast<size_t>(dst_rank)];
+        std::vector<std::pair<int, int>> selected_tokens;
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int token = 0; token < src.num_tokens; ++token) {
+                if (src.is_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)] != 0)
+                    selected_tokens.emplace_back(src_rank, token);
+            }
+        }
+        if (num_worst_tokens > 0 && static_cast<int>(selected_tokens.size()) > num_worst_tokens)
+            selected_tokens.resize(static_cast<size_t>(num_worst_tokens));
+
+        std::vector<uint8_t> host_recv_x(static_cast<size_t>(selected_tokens.size()) * row_bytes, 0);
+        std::vector<XpuInternodeSourceMeta> host_recv_src_meta(static_cast<size_t>(selected_tokens.size()), XpuInternodeSourceMeta{-1, -1});
+        std::vector<float> host_recv_x_scales;
+        if (dst.recv_x_scales != nullptr && dst.num_scales > 0)
+            host_recv_x_scales.assign(static_cast<size_t>(selected_tokens.size()) * static_cast<size_t>(dst.num_scales), 0.f);
+        std::vector<topk_idx_t> host_recv_topk_idx;
+        if (dst.recv_topk_idx != nullptr && dst.num_topk > 0)
+            host_recv_topk_idx.assign(static_cast<size_t>(selected_tokens.size()) * static_cast<size_t>(dst.num_topk), static_cast<topk_idx_t>(-1));
+        std::vector<float> host_recv_topk_weights;
+        if (dst.recv_topk_weights != nullptr && dst.num_topk > 0)
+            host_recv_topk_weights.assign(static_cast<size_t>(selected_tokens.size()) * static_cast<size_t>(dst.num_topk), 0.f);
+
+        for (size_t out_idx = 0; out_idx < selected_tokens.size(); ++out_idx) {
+            const auto [src_rank, token] = selected_tokens[out_idx];
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            host_recv_src_meta[out_idx] = XpuInternodeSourceMeta{src_rank, token};
+            std::memcpy(host_recv_x.data() + out_idx * row_bytes, src.x.data() + static_cast<size_t>(token) * row_bytes, row_bytes);
+            if (!src.x_scales.empty()) {
+                for (int s = 0; s < dst.num_scales; ++s) {
+                    host_recv_x_scales[out_idx * static_cast<size_t>(dst.num_scales) + static_cast<size_t>(s)] =
+                        src.x_scales[static_cast<size_t>(token) * static_cast<size_t>(src.scale_token_stride) + static_cast<size_t>(s) * static_cast<size_t>(src.scale_hidden_stride)];
+                }
+            }
+            if (!src.topk_idx.empty()) {
+                std::memcpy(host_recv_topk_idx.data() + out_idx * static_cast<size_t>(dst.num_topk),
+                            src.topk_idx.data() + static_cast<size_t>(token) * static_cast<size_t>(src.num_topk),
+                            static_cast<size_t>(dst.num_topk) * sizeof(topk_idx_t));
+            }
+            if (!src.topk_weights.empty()) {
+                std::memcpy(host_recv_topk_weights.data() + out_idx * static_cast<size_t>(dst.num_topk),
+                            src.topk_weights.data() + static_cast<size_t>(token) * static_cast<size_t>(src.num_topk),
+                            static_cast<size_t>(dst.num_topk) * sizeof(float));
+            }
+        }
+
+        std::vector<int> host_rdma_channel_prefix(static_cast<size_t>(dst.num_channels), 0);
+        std::vector<int> host_gbl_channel_prefix(static_cast<size_t>(num_ranks) * static_cast<size_t>(dst.num_channels), 0);
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int channel = 0; channel < dst.num_channels; ++channel) {
+                int token_start = 0, token_end = 0;
+                get_channel_task_range_host(src.num_tokens, dst.num_channels, channel, token_start, token_end);
+                int count = 0;
+                for (int token = token_start; token < token_end; ++token) {
+                    count += static_cast<int>(src.is_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)] != 0);
+                }
+                host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(dst.num_channels) + static_cast<size_t>(channel)] = count;
+                host_rdma_channel_prefix[static_cast<size_t>(channel)] += count;
+            }
+            for (int channel = 1; channel < dst.num_channels; ++channel) {
+                host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(dst.num_channels) + static_cast<size_t>(channel)] +=
+                    host_gbl_channel_prefix[static_cast<size_t>(src_rank) * static_cast<size_t>(dst.num_channels) + static_cast<size_t>(channel - 1)];
+            }
+        }
+        for (int channel = 1; channel < dst.num_channels; ++channel)
+            host_rdma_channel_prefix[static_cast<size_t>(channel)] += host_rdma_channel_prefix[static_cast<size_t>(channel - 1)];
+
+        std::vector<int> host_send_nvl_head(static_cast<size_t>(selected_tokens.size()) * static_cast<size_t>(NUM_MAX_NVL_PEERS), 0);
+        for (size_t i = 0; i < selected_tokens.size(); ++i)
+            host_send_nvl_head[i * static_cast<size_t>(NUM_MAX_NVL_PEERS) + static_cast<size_t>(selected_tokens[i].first)] = static_cast<int>(i + 1);
+
+        if (!host_recv_x.empty())
+            xpu_blocking_memcpy(dst.stream, dst.recv_x, host_recv_x.data(), host_recv_x.size());
+        if (!host_recv_src_meta.empty())
+            xpu_blocking_memcpy(dst.stream, dst.recv_src_meta, host_recv_src_meta.data(), host_recv_src_meta.size() * sizeof(XpuInternodeSourceMeta));
+        if (!host_recv_x_scales.empty())
+            xpu_blocking_memcpy(dst.stream, dst.recv_x_scales, host_recv_x_scales.data(), host_recv_x_scales.size() * sizeof(float));
+        if (!host_recv_topk_idx.empty())
+            xpu_blocking_memcpy(dst.stream, dst.recv_topk_idx, host_recv_topk_idx.data(), host_recv_topk_idx.size() * sizeof(topk_idx_t));
+        if (!host_recv_topk_weights.empty())
+            xpu_blocking_memcpy(dst.stream, dst.recv_topk_weights, host_recv_topk_weights.data(), host_recv_topk_weights.size() * sizeof(float));
+        if (dst.recv_rdma_channel_prefix_matrix != nullptr)
+            xpu_blocking_memcpy(dst.stream, dst.recv_rdma_channel_prefix_matrix, host_rdma_channel_prefix.data(), host_rdma_channel_prefix.size() * sizeof(int));
+        if (dst.recv_gbl_channel_prefix_matrix != nullptr)
+            xpu_blocking_memcpy(dst.stream, dst.recv_gbl_channel_prefix_matrix, host_gbl_channel_prefix.data(), host_gbl_channel_prefix.size() * sizeof(int));
+        if (dst.send_nvl_head != nullptr && !host_send_nvl_head.empty())
+            xpu_blocking_memcpy(dst.stream, dst.send_nvl_head, host_send_nvl_head.data(), host_send_nvl_head.size() * sizeof(int));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
 }
 
 void cached_notify(int,
@@ -104,55 +671,456 @@ void cached_notify(int,
                    int,
                    int,
                    int,
-                   int,
-                   int*,
+                   int num_combined_tokens,
+                   int* combined_rdma_head,
                    const int*,
                    const int*,
-                   int*,
+                   int* combined_nvl_head,
                    void*,
                    int,
                    void**,
                    int,
                    int**,
                    int,
-                   runtime_stream_t,
+                   runtime_stream_t stream,
                    int64_t,
                    int64_t,
                    bool,
                    bool) {
-    EP_UNSUPPORTED_XPU("internode cached_notify");
+    if (combined_rdma_head != nullptr && num_combined_tokens > 0)
+        xpu_blocking_memset(stream, combined_rdma_head, 0, static_cast<size_t>(num_combined_tokens) * sizeof(int));
+    if (combined_nvl_head != nullptr && num_combined_tokens > 0) {
+        xpu_blocking_memset(
+            stream, combined_nvl_head, 0, static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(NUM_MAX_NVL_PEERS) * sizeof(int));
+    }
 }
 
-void combine(runtime_data_type_t,
-             void*,
-             float*,
-             const bool*,
-             const void*,
-             const float*,
-             const void*,
-             const void*,
+void combine(runtime_data_type_t type,
+             void* combined_x,
+             float* combined_topk_weights,
+             const bool* is_combined_token_in_rank,
+             const void* x,
+             const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
              const int*,
              const int*,
-             const void*,
+             const void* src_meta,
              const int*,
              const int*,
              const int*,
-             int,
-             int,
-             int,
-             int,
+             int num_tokens,
+             int num_combined_tokens,
+             int hidden,
+             int num_topk,
              void*,
              int,
              int,
              void**,
              int,
              int,
-             int,
-             int,
-             runtime_stream_t,
+             int rank,
+             int num_ranks,
+             runtime_stream_t stream,
              int,
              bool) {
-    EP_UNSUPPORTED_XPU("internode combine");
+    EP_HOST_ASSERT(type == RUNTIME_R_16BF && "staged XPU internode combine currently supports BF16 only");
+    EP_HOST_ASSERT(combined_x != nullptr && x != nullptr && src_meta != nullptr);
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
+    const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
+    std::vector<uint8_t> host_x(x_bytes, 0);
+    if (x_bytes > 0)
+        xpu_blocking_memcpy(stream, host_x.data(), x, x_bytes);
+
+    std::vector<XpuInternodeSourceMeta> host_src_meta(static_cast<size_t>(num_tokens), XpuInternodeSourceMeta{-1, -1});
+    if (num_tokens > 0)
+        xpu_blocking_memcpy(stream, host_src_meta.data(), src_meta, static_cast<size_t>(num_tokens) * sizeof(XpuInternodeSourceMeta));
+
+    const size_t mask_elems = static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_ranks);
+    std::vector<uint8_t> host_mask(mask_elems, 1);
+    if (is_combined_token_in_rank != nullptr && mask_elems > 0)
+        xpu_blocking_memcpy(stream, host_mask.data(), is_combined_token_in_rank, mask_elems * sizeof(uint8_t));
+
+    std::vector<float> host_topk_weights;
+    if (topk_weights != nullptr && combined_topk_weights != nullptr && num_topk > 0) {
+        const size_t topk_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk);
+        host_topk_weights.resize(topk_elems);
+        xpu_blocking_memcpy(stream, host_topk_weights.data(), topk_weights, topk_elems * sizeof(float));
+    }
+
+    if (num_ranks == 1) {
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_weights;
+        if (combined_topk_weights != nullptr && num_topk > 0)
+            host_combined_weights.assign(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_topk), 0.f);
+
+        for (int i = 0; i < num_tokens; ++i) {
+            const auto meta = host_src_meta[static_cast<size_t>(i)];
+            const int dst_idx = meta.src_token_idx;
+            if (dst_idx < 0 || dst_idx >= num_combined_tokens)
+                continue;
+            if (!host_mask.empty() && host_mask[static_cast<size_t>(dst_idx)] == 0)
+                continue;
+
+            auto* dst_row = host_combined_x.data() + static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden);
+            auto* src_row = reinterpret_cast<const nv_bfloat16*>(host_x.data() + static_cast<size_t>(i) * row_bytes);
+            for (int h = 0; h < hidden; ++h)
+                dst_row[h] = dst_row[h] + src_row[h];
+
+            if (!host_combined_weights.empty()) {
+                for (int k = 0; k < num_topk; ++k) {
+                    host_combined_weights[static_cast<size_t>(dst_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)] +=
+                        host_topk_weights[static_cast<size_t>(i) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)];
+                }
+            }
+        }
+
+        const auto host_bias_0 = xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden);
+        const auto host_bias_1 = xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden);
+        auto apply_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+            if (host_bias.empty())
+                return;
+            for (int token = 0; token < num_combined_tokens; ++token) {
+                if (!host_mask.empty() && host_mask[static_cast<size_t>(token)] == 0)
+                    continue;
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
+                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
+                for (int h = 0; h < hidden; ++h)
+                    dst_row[h] = dst_row[h] + bias_row[h];
+            }
+        };
+        apply_bias(host_bias_0);
+        apply_bias(host_bias_1);
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_weights.empty())
+            xpu_blocking_memcpy(stream, combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
+        return;
+    }
+
+    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden, num_topk, 1);
+    auto state = get_xpu_internode_state(xpu_internode_combine_states, xpu_internode_combine_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuInternodeCombineArrival{stream,
+                                                                            rank,
+                                                                            num_ranks,
+                                                                            num_tokens,
+                                                                            num_combined_tokens,
+                                                                            hidden,
+                                                                            num_topk,
+                                                                            combined_x,
+                                                                            combined_topk_weights,
+                                                                            std::move(host_x),
+                                                                            std::move(host_src_meta),
+                                                                            std::move(host_mask),
+                                                                            std::move(host_topk_weights),
+                                                                            xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden),
+                                                                            xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden)};
+    state->arrived++;
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuInternodeCombineArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int owner_rank = 0; owner_rank < num_ranks; ++owner_rank) {
+        auto& owner = arrivals[static_cast<size_t>(owner_rank)];
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_weights;
+        if (owner.combined_topk_weights != nullptr && owner.num_topk > 0)
+            host_combined_weights.assign(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.num_topk), 0.f);
+
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int token = 0; token < src.num_tokens; ++token) {
+                const auto meta = src.src_meta[static_cast<size_t>(token)];
+                if (meta.src_rank != owner_rank || meta.src_token_idx < 0 || meta.src_token_idx >= owner.num_combined_tokens)
+                    continue;
+                if (!owner.is_combined_token_in_rank.empty() &&
+                    owner.is_combined_token_in_rank[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] == 0)
+                    continue;
+
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.hidden);
+                auto* src_row = reinterpret_cast<const nv_bfloat16*>(src.x.data() + static_cast<size_t>(token) * row_bytes);
+                for (int h = 0; h < owner.hidden; ++h)
+                    dst_row[h] = dst_row[h] + src_row[h];
+
+                if (!host_combined_weights.empty()) {
+                    for (int k = 0; k < owner.num_topk; ++k) {
+                        host_combined_weights[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)] +=
+                            src.topk_weights[static_cast<size_t>(token) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)];
+                    }
+                }
+            }
+        }
+
+        auto apply_owner_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+            if (host_bias.empty())
+                return;
+            for (int token = 0; token < owner.num_combined_tokens; ++token) {
+                bool active = false;
+                for (int src_rank = 0; src_rank < num_ranks; ++src_rank)
+                    active = active || (owner.is_combined_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] != 0);
+                if (!active)
+                    continue;
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
+                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
+                for (int h = 0; h < owner.hidden; ++h)
+                    dst_row[h] = dst_row[h] + bias_row[h];
+            }
+        };
+        apply_owner_bias(owner.bias_0);
+        apply_owner_bias(owner.bias_1);
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_weights.empty())
+            xpu_blocking_memcpy(owner.stream, owner.combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
+}
+
+void cached_notify(int,
+                   int,
+                   int,
+                   int,
+                   int,
+                   int,
+                   int num_combined_tokens,
+                   int* combined_rdma_head,
+                   const int*,
+                   const int*,
+                   int* combined_nvl_head,
+                   void*,
+                   int,
+                   void**,
+                   int,
+                   int**,
+                   int,
+                   runtime_stream_t stream,
+                   int64_t,
+                   int64_t,
+                   bool,
+                   bool) {
+    if (combined_rdma_head != nullptr && num_combined_tokens > 0)
+        xpu_blocking_memset(stream, combined_rdma_head, 0, static_cast<size_t>(num_combined_tokens) * sizeof(int));
+    if (combined_nvl_head != nullptr && num_combined_tokens > 0) {
+        xpu_blocking_memset(
+            stream, combined_nvl_head, 0, static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(NUM_MAX_NVL_PEERS) * sizeof(int));
+    }
+}
+
+void combine(runtime_data_type_t type,
+             void* combined_x,
+             float* combined_topk_weights,
+             const bool* is_combined_token_in_rank,
+             const void* x,
+             const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
+             const int*,
+             const int*,
+             const void* src_meta,
+             const int*,
+             const int*,
+             const int*,
+             int num_tokens,
+             int num_combined_tokens,
+             int hidden,
+             int num_topk,
+             void*,
+             int,
+             int,
+             void**,
+             int,
+             int,
+             int rank,
+             int num_ranks,
+             runtime_stream_t stream,
+             int,
+             bool) {
+    EP_HOST_ASSERT(type == RUNTIME_R_16BF && "staged XPU internode combine currently supports BF16 only");
+    EP_HOST_ASSERT(combined_x != nullptr && x != nullptr && src_meta != nullptr);
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
+    const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
+    std::vector<uint8_t> host_x(x_bytes, 0);
+    if (x_bytes > 0)
+        xpu_blocking_memcpy(stream, host_x.data(), x, x_bytes);
+
+    std::vector<XpuInternodeSourceMeta> host_src_meta(static_cast<size_t>(num_tokens), XpuInternodeSourceMeta{-1, -1});
+    if (num_tokens > 0)
+        xpu_blocking_memcpy(stream, host_src_meta.data(), src_meta, static_cast<size_t>(num_tokens) * sizeof(XpuInternodeSourceMeta));
+
+    const size_t mask_elems = static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_ranks);
+    std::vector<uint8_t> host_mask(mask_elems, 1);
+    if (is_combined_token_in_rank != nullptr && mask_elems > 0)
+        xpu_blocking_memcpy(stream, host_mask.data(), is_combined_token_in_rank, mask_elems * sizeof(uint8_t));
+
+    std::vector<float> host_topk_weights;
+    if (topk_weights != nullptr && combined_topk_weights != nullptr && num_topk > 0) {
+        const size_t topk_elems = static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk);
+        host_topk_weights.resize(topk_elems);
+        xpu_blocking_memcpy(stream, host_topk_weights.data(), topk_weights, topk_elems * sizeof(float));
+    }
+
+    if (num_ranks == 1) {
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_weights;
+        if (combined_topk_weights != nullptr && num_topk > 0)
+            host_combined_weights.assign(static_cast<size_t>(num_combined_tokens) * static_cast<size_t>(num_topk), 0.f);
+
+        for (int i = 0; i < num_tokens; ++i) {
+            const auto meta = host_src_meta[static_cast<size_t>(i)];
+            const int dst_idx = meta.src_token_idx;
+            if (dst_idx < 0 || dst_idx >= num_combined_tokens)
+                continue;
+            if (!host_mask.empty() && host_mask[static_cast<size_t>(dst_idx)] == 0)
+                continue;
+
+            auto* dst_row = host_combined_x.data() + static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden);
+            auto* src_row = reinterpret_cast<const nv_bfloat16*>(host_x.data() + static_cast<size_t>(i) * row_bytes);
+            for (int h = 0; h < hidden; ++h)
+                dst_row[h] = dst_row[h] + src_row[h];
+
+            if (!host_combined_weights.empty()) {
+                for (int k = 0; k < num_topk; ++k) {
+                    host_combined_weights[static_cast<size_t>(dst_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)] +=
+                        host_topk_weights[static_cast<size_t>(i) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)];
+                }
+            }
+        }
+
+        const auto host_bias_0 = xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden);
+        const auto host_bias_1 = xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden);
+        auto apply_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+            if (host_bias.empty())
+                return;
+            for (int token = 0; token < num_combined_tokens; ++token) {
+                if (!host_mask.empty() && host_mask[static_cast<size_t>(token)] == 0)
+                    continue;
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
+                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(hidden);
+                for (int h = 0; h < hidden; ++h)
+                    dst_row[h] = dst_row[h] + bias_row[h];
+            }
+        };
+        apply_bias(host_bias_0);
+        apply_bias(host_bias_1);
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(stream, combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_weights.empty())
+            xpu_blocking_memcpy(stream, combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
+        return;
+    }
+
+    const uint64_t group_key = xpu_internode_group_key(num_ranks, hidden, num_topk, 1);
+    auto state = get_xpu_internode_state(xpu_internode_combine_states, xpu_internode_combine_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuInternodeCombineArrival{stream,
+                                                                            rank,
+                                                                            num_ranks,
+                                                                            num_tokens,
+                                                                            num_combined_tokens,
+                                                                            hidden,
+                                                                            num_topk,
+                                                                            combined_x,
+                                                                            combined_topk_weights,
+                                                                            std::move(host_x),
+                                                                            std::move(host_src_meta),
+                                                                            std::move(host_mask),
+                                                                            std::move(host_topk_weights),
+                                                                            xpu_copy_optional_bias(stream, bias_0, num_combined_tokens, hidden),
+                                                                            xpu_copy_optional_bias(stream, bias_1, num_combined_tokens, hidden)};
+    state->arrived++;
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuInternodeCombineArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    for (int owner_rank = 0; owner_rank < num_ranks; ++owner_rank) {
+        auto& owner = arrivals[static_cast<size_t>(owner_rank)];
+        std::vector<nv_bfloat16> host_combined_x(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.hidden), nv_bfloat16(0));
+        std::vector<float> host_combined_weights;
+        if (owner.combined_topk_weights != nullptr && owner.num_topk > 0)
+            host_combined_weights.assign(static_cast<size_t>(owner.num_combined_tokens) * static_cast<size_t>(owner.num_topk), 0.f);
+
+        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+            const auto& src = arrivals[static_cast<size_t>(src_rank)];
+            for (int token = 0; token < src.num_tokens; ++token) {
+                const auto meta = src.src_meta[static_cast<size_t>(token)];
+                if (meta.src_rank != owner_rank || meta.src_token_idx < 0 || meta.src_token_idx >= owner.num_combined_tokens)
+                    continue;
+                if (!owner.is_combined_token_in_rank.empty() &&
+                    owner.is_combined_token_in_rank[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] == 0)
+                    continue;
+
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.hidden);
+                auto* src_row = reinterpret_cast<const nv_bfloat16*>(src.x.data() + static_cast<size_t>(token) * row_bytes);
+                for (int h = 0; h < owner.hidden; ++h)
+                    dst_row[h] = dst_row[h] + src_row[h];
+
+                if (!host_combined_weights.empty()) {
+                    for (int k = 0; k < owner.num_topk; ++k) {
+                        host_combined_weights[static_cast<size_t>(meta.src_token_idx) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)] +=
+                            src.topk_weights[static_cast<size_t>(token) * static_cast<size_t>(owner.num_topk) + static_cast<size_t>(k)];
+                    }
+                }
+            }
+        }
+
+        auto apply_owner_bias = [&](const std::vector<nv_bfloat16>& host_bias) {
+            if (host_bias.empty())
+                return;
+            for (int token = 0; token < owner.num_combined_tokens; ++token) {
+                bool active = false;
+                for (int src_rank = 0; src_rank < num_ranks; ++src_rank)
+                    active = active || (owner.is_combined_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(src_rank)] != 0);
+                if (!active)
+                    continue;
+                auto* dst_row = host_combined_x.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
+                auto* bias_row = host_bias.data() + static_cast<size_t>(token) * static_cast<size_t>(owner.hidden);
+                for (int h = 0; h < owner.hidden; ++h)
+                    dst_row[h] = dst_row[h] + bias_row[h];
+            }
+        };
+        apply_owner_bias(owner.bias_0);
+        apply_owner_bias(owner.bias_1);
+
+        if (!host_combined_x.empty())
+            xpu_blocking_memcpy(owner.stream, owner.combined_x, host_combined_x.data(), host_combined_x.size() * sizeof(nv_bfloat16));
+        if (!host_combined_weights.empty())
+            xpu_blocking_memcpy(owner.stream, owner.combined_topk_weights, host_combined_weights.data(), host_combined_weights.size() * sizeof(float));
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
 }
 
 #else

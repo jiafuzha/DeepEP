@@ -108,6 +108,26 @@ This directory is the staged XPU migration workspace.
 - Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify single-rank intranode native combine reduces duplicate source indices and applies bias correctly on XPU.
 - Fixed the single-rank native XPU `intranode::dispatch` contract in `xpu/csrc/kernels/intranode.cu` to use `num_channels = num_sms / 2`, matching the CUDA kernel interface and native tensor shapes.
 - Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` to verify single-rank intranode cached-handle dispatch reuse succeeds on the native XPU path.
+- Enabled staged native XPU multi-rank `intranode::cached_notify_dispatch` in `xpu/csrc/kernels/intranode.cu` (stream-ordered no-op metadata sync instead of unsupported guard), so cached multi-rank dispatch no longer fails at notify stage.
+- Enabled staged native XPU multi-rank `intranode::cached_notify_combine` in `xpu/csrc/kernels/intranode.cu` (stream-ordered no-op queue sync instead of unsupported guard), so cached multi-rank combine no longer fails at notify stage.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for two-rank cached intranode dispatch on the staged XPU path and validated it under the requested oneAPI + `icx`/`icpx` environment without NUMA pinning.
+- Added staged native XPU multi-rank `intranode::combine` host rendezvous path in `xpu/csrc/kernels/intranode.cu`, including source-rank reconstruction from dispatch rank-prefix metadata and optional top-k weight accumulation.
+- Added scoped XPU `gil_scoped_release` in `Buffer::intranode_combine` (`xpu/csrc/deep_ep.cpp`) to avoid same-process two-thread combine rendezvous deadlock.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for two-rank same-process intranode combine on the staged XPU path.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for two-rank same-process cached intranode combine on the staged XPU path.
+- Added staged local-only XPU low-latency buffer allocation in `xpu/csrc/deep_ep.cpp` so low-latency maintenance APIs can operate without NVSHMEM transport.
+- Replaced XPU stubs for `internode_ll::clean_low_latency_buffer`, `query_mask_buffer`, `update_mask_buffer`, and `clean_mask_buffer` in `xpu/csrc/kernels/internode_ll.cu` with concrete stream-ordered staged implementations.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank low-latency maintenance on the staged XPU path (mask update/query/clean and low-latency buffer clean).
+- Replaced XPU stubs for single-rank BF16 `internode_ll::dispatch` and `internode_ll::combine` in `xpu/csrc/kernels/internode_ll.cu` with staged host implementations covering the low-latency dispatch/combine round trip on XPU.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank low-latency dispatch plus combine on the staged XPU path.
+- Extended staged single-rank XPU low-latency dispatch in `xpu/csrc/deep_ep.cpp` and `xpu/csrc/kernels/internode_ll.cu` to support `use_fp8=True` in native mode by keeping BF16 payloads and emitting unit scale tensors per packed token block.
+- Enabled staged single-rank XPU low-latency combine with `use_logfmt=True` in `xpu/csrc/kernels/internode_ll.cu`.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank low-latency FP8 dispatch mode and logfmt combine mode on the staged XPU path.
+- Replaced XPU stubs for multi-rank low-latency `internode_ll::dispatch` and `internode_ll::combine` in `xpu/csrc/kernels/internode_ll.cu` with staged same-process host rendezvous implementations.
+- Added scoped XPU `gil_scoped_release` around low-latency dispatch/combine stream waits and launch paths in `xpu/csrc/deep_ep.cpp` to avoid threaded same-process rendezvous deadlock.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for two-rank same-process low-latency dispatch plus combine on the staged XPU path.
+- Replaced XPU stubs for single-rank `internode::notify_dispatch`, `internode::dispatch`, `internode::cached_notify`, and `internode::combine` in `xpu/csrc/kernels/internode.cu` with staged host implementations.
+- Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank staged internode dispatch plus combine on the XPU path.
 
 ## Layer Migration Status Summary
 
@@ -118,7 +138,7 @@ This directory is the staged XPU migration workspace.
 - [x] IPC transport with generation/checksum validation
 - [x] Buffer lifecycle management (idempotent destroy)
 - [x] Error handling and live allocation tracking
-- All 26 XPU tests pass, including expanded native intranode regressions, fallback tests, and import/runtime coverage
+- All 36 XPU tests pass, including expanded native intranode regressions (uncached and cached two-rank same-process dispatch and combine), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch+combine coverage, staged single-rank internode dispatch+combine coverage, fallback tests, and import/runtime coverage
 
 **Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
 - [x] Dynamic extension loading with XPU-first fallback
@@ -129,7 +149,7 @@ This directory is the staged XPU migration workspace.
 - Test coverage: 8 dedicated fallback tests + runtime integration tests
 
 **Kernel Layer (xpu/csrc/kernels/*.cu|*.cuh):** 🚧 PARTIALLY PORTED (PHASE 2 STARTED)
-- Current approach: `layout::get_dispatch_layout` and single-rank intranode dispatch/combine paths have concrete XPU implementations; remaining kernels still return `EP_UNSUPPORTED_XPU` and trigger Python fallbacks
+- Current approach: `layout::get_dispatch_layout`, staged single-rank intranode dispatch/combine, staged two-rank same-process intranode dispatch/combine, staged single-rank internode dispatch/combine, and staged low-latency maintenance plus dispatch/combine helpers have concrete XPU implementations; remaining kernels still return `EP_UNSUPPORTED_XPU` and trigger Python fallbacks
 - [ ] Full SYCL kernel implementation (in progress)
 - [x] Python fallback coverage for all major operations:
   - intranode dispatch/combine → Python bincount + tensor scatter
@@ -148,9 +168,9 @@ This directory is the staged XPU migration workspace.
 **Phase 2: Multi-Rank XPU Support (In Progress)**
 - Implement SYCL kernels for compute-critical operations:
   1. layout::get_dispatch_layout (token counting) ✅ concrete XPU path implemented
-  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 single-rank native path implemented with reduction, bias, and cached-handle reuse semantics; multi-rank pending
+  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 staged two-rank same-process dispatch (uncached/cached) and combine implemented; full SYCL parallelization and broader multi-rank hardening pending
   3. internode::dispatch/combine (RDMA MoE operations)
-  4. low-latency dispatch/combine (low-latency paths)
+  4. low-latency dispatch/combine (low-latency paths) 🚧 staged single-rank BF16/FP8 dispatch, logfmt combine, and maintenance helpers implemented; broader multi-rank support still pending
 - Use SYCLomatic tool for CUDA→SYCL automated porting as starting point
 - Requires SYCL queue management and work-group coordination
 

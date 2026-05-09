@@ -66,6 +66,24 @@ struct XpuIntranodeDispatchArrival {
     std::vector<float> topk_weights;
 };
 
+struct XpuIntranodeCombineArrival {
+    runtime_stream_t stream;
+    int rank;
+    int num_ranks;
+    int num_tokens;
+    int num_recv_tokens;
+    int hidden;
+    int num_topk;
+    void* recv_x;
+    float* recv_topk_weights;
+    std::vector<uint8_t> x;
+    std::vector<int> src_idx;
+    std::vector<int> rank_prefix_matrix;
+    std::vector<float> topk_weights;
+    std::vector<uint8_t> bias_0;
+    std::vector<uint8_t> bias_1;
+};
+
 template <typename Arrival>
 struct XpuIntranodeRendezvousState {
     std::mutex mu;
@@ -94,6 +112,8 @@ std::mutex xpu_intranode_notify_states_mu;
 std::unordered_map<uintptr_t, std::shared_ptr<XpuIntranodeRendezvousState<XpuIntranodeNotifyArrival>>> xpu_intranode_notify_states;
 std::mutex xpu_intranode_dispatch_states_mu;
 std::unordered_map<uintptr_t, std::shared_ptr<XpuIntranodeRendezvousState<XpuIntranodeDispatchArrival>>> xpu_intranode_dispatch_states;
+std::mutex xpu_intranode_combine_states_mu;
+std::unordered_map<uintptr_t, std::shared_ptr<XpuIntranodeRendezvousState<XpuIntranodeCombineArrival>>> xpu_intranode_combine_states;
 std::mutex xpu_intranode_memcpy_mu;
 
 inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* src, size_t bytes) {
@@ -108,6 +128,15 @@ inline void get_channel_task_range_host(int num_tokens, int num_channels, int ch
     const int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
     token_start_idx = std::min(num_tokens_per_channel * channel_id, num_tokens);
     token_end_idx = std::min(token_start_idx + num_tokens_per_channel, num_tokens);
+}
+
+inline int get_source_rank_from_rank_prefix(const std::vector<int>& rank_prefix_matrix, int num_ranks, int dst_rank, int row_idx) {
+    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+        const int prefix = rank_prefix_matrix[static_cast<size_t>(src_rank) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)];
+        if (row_idx < prefix)
+            return src_rank;
+    }
+    return -1;
 }
 
 }  // namespace
@@ -130,7 +159,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      runtime_stream_t stream,
                      int num_channels) {
     EP_HOST_ASSERT(num_experts > 0 and expert_alignment > 0 and num_channels > 0);
-    EP_HOST_ASSERT(buffer_ptrs != nullptr and buffer_ptrs[0] != nullptr);
+    EP_HOST_ASSERT(buffer_ptrs != nullptr);
 
     if (num_ranks == 1 and rank == 0) {
         int host_recv_tokens = 0;
@@ -179,7 +208,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
     if (num_tokens > 0)
         xpu_blocking_memcpy(stream, host_is_token_in_rank.data(), is_token_in_rank, host_is_token_in_rank.size() * sizeof(uint8_t));
 
-    const uintptr_t group_key = reinterpret_cast<uintptr_t>(buffer_ptrs[0]);
+    // Staged XPU rendezvous is currently validated in single-process runs.
+    // Use a deterministic world-size key to avoid per-instance pointer alias
+    // differences from splitting participants into disjoint groups.
+    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
     auto state = get_xpu_intranode_state(xpu_intranode_notify_states, xpu_intranode_notify_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
@@ -275,9 +307,14 @@ void notify_dispatch(const int* num_tokens_per_rank,
     state->cv.notify_all();
 }
 
-void cached_notify_dispatch(const int*, int, void**, int**, int rank, int num_ranks, runtime_stream_t) {
-    if (num_ranks != 1 or rank != 0)
-        EP_UNSUPPORTED_XPU("intranode cached_notify_dispatch (multi-rank)");
+void cached_notify_dispatch(const int* rank_prefix_matrix, int, void**, int**, int rank, int num_ranks, runtime_stream_t stream) {
+    EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
+    EP_HOST_ASSERT(rank_prefix_matrix != nullptr);
+
+    // Host-staged XPU dispatch uses cached prefix matrices directly and does not
+    // consume in-buffer queue metadata. Keep stream ordering consistent.
+    auto noop = stream.queue().memcpy(const_cast<int*>(rank_prefix_matrix), rank_prefix_matrix, sizeof(int));
+    noop.wait_and_throw();
 }
 
 void dispatch(void* recv_x,
@@ -310,7 +347,7 @@ void dispatch(void* recv_x,
               int) {
     EP_HOST_ASSERT(recv_x != nullptr and recv_src_idx != nullptr and recv_channel_offset != nullptr and send_head != nullptr);
     EP_HOST_ASSERT(x != nullptr and is_token_in_rank != nullptr);
-    EP_HOST_ASSERT(buffer_ptrs != nullptr and buffer_ptrs[0] != nullptr);
+    EP_HOST_ASSERT(buffer_ptrs != nullptr);
     EP_HOST_ASSERT(num_tokens >= 0 and hidden_int4 >= 0 and num_sms > 0);
     EP_HOST_ASSERT(num_sms % 2 == 0 and "num_sms must be even for intranode dispatch");
 
@@ -464,7 +501,10 @@ void dispatch(void* recv_x,
     EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
     EP_HOST_ASSERT(recv_topk_idx == nullptr || num_topk > 0);
 
-    const uintptr_t group_key = reinterpret_cast<uintptr_t>(buffer_ptrs[0]);
+    // Staged XPU rendezvous is currently validated in single-process runs.
+    // Use a deterministic world-size key to avoid per-instance pointer alias
+    // differences from splitting participants into disjoint groups.
+    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
     auto state = get_xpu_intranode_state(xpu_intranode_dispatch_states, xpu_intranode_dispatch_states_mu, group_key, num_ranks);
     std::unique_lock<std::mutex> lock(state->mu);
     const size_t generation = state->generation;
@@ -611,8 +651,7 @@ void dispatch(void* recv_x,
 }
 
 void cached_notify_combine(void**, int* send_head, int, int, int, int**, int rank, int num_ranks, runtime_stream_t stream) {
-    if (num_ranks != 1 or rank != 0)
-        EP_UNSUPPORTED_XPU("intranode cached_notify_combine (multi-rank)");
+    EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
     // Single-rank XPU path does not use queue heads in buffer memory. Keep API side effects minimal.
     if (send_head != nullptr) {
         // Ensure memory dependency on communication stream.
@@ -629,7 +668,7 @@ void combine(runtime_data_type_t type,
              const void* bias_0,
              const void* bias_1,
              const int* src_idx,
-             const int*,
+             const int* rank_prefix_matrix,
              const int*,
              int*,
              int num_tokens,
@@ -643,95 +682,248 @@ void combine(runtime_data_type_t type,
              int,
              int,
              int) {
-    if (num_ranks != 1 or rank != 0)
-        EP_UNSUPPORTED_XPU("intranode combine (multi-rank)");
     if (type != RUNTIME_R_16BF)
         EP_UNSUPPORTED_XPU("intranode combine unsupported dtype on XPU");
 
     EP_HOST_ASSERT(recv_x != nullptr and x != nullptr and src_idx != nullptr);
     EP_HOST_ASSERT(num_tokens >= 0 and num_recv_tokens >= 0 and hidden >= 0 and num_topk >= 0);
 
+    EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
+
     const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(nv_bfloat16);
     const size_t src_bytes = static_cast<size_t>(num_tokens) * row_bytes;
-    std::vector<uint8_t> host_x(src_bytes);
-    if (src_bytes > 0) {
-        auto x_event = stream.queue().memcpy(host_x.data(), x, src_bytes);
-        x_event.wait_and_throw();
-    }
 
-    std::vector<int> host_src_idx(static_cast<size_t>(num_tokens), -1);
-    if (num_tokens > 0) {
-        auto src_idx_event = stream.queue().memcpy(host_src_idx.data(), src_idx, static_cast<size_t>(num_tokens) * sizeof(int));
-        src_idx_event.wait_and_throw();
-    }
-
-    std::vector<float> host_recv_x_accum(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden), 0.f);
-    const auto* host_x_bf16 = reinterpret_cast<const nv_bfloat16*>(host_x.data());
-    for (int i = 0; i < num_tokens; ++i) {
-        const int dst_idx = host_src_idx[static_cast<size_t>(i)];
-        if (dst_idx < 0 or dst_idx >= num_recv_tokens)
-            continue;
-        for (int h = 0; h < hidden; ++h) {
-            host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] +=
-                static_cast<float>(host_x_bf16[static_cast<size_t>(i) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
+    if (num_ranks == 1 and rank == 0) {
+        std::vector<uint8_t> host_x(src_bytes);
+        if (src_bytes > 0) {
+            auto x_event = stream.queue().memcpy(host_x.data(), x, src_bytes);
+            x_event.wait_and_throw();
         }
-    }
 
-    const nv_bfloat16* host_bias_0_bf16 = nullptr;
-    const nv_bfloat16* host_bias_1_bf16 = nullptr;
-    std::vector<uint8_t> host_bias_0;
-    std::vector<uint8_t> host_bias_1;
-    if (bias_0 != nullptr) {
-        host_bias_0.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
-        auto bias0_event = stream.queue().memcpy(host_bias_0.data(), bias_0, host_bias_0.size());
-        bias0_event.wait_and_throw();
-        host_bias_0_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_0.data());
-    }
-    if (bias_1 != nullptr) {
-        host_bias_1.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
-        auto bias1_event = stream.queue().memcpy(host_bias_1.data(), bias_1, host_bias_1.size());
-        bias1_event.wait_and_throw();
-        host_bias_1_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_1.data());
-    }
-
-    std::vector<nv_bfloat16> host_recv_x(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden));
-    for (int dst_idx = 0; dst_idx < num_recv_tokens; ++dst_idx) {
-        for (int h = 0; h < hidden; ++h) {
-            float value = host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)];
-            if (host_bias_0_bf16 != nullptr)
-                value += static_cast<float>(host_bias_0_bf16[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
-            if (host_bias_1_bf16 != nullptr)
-                value += static_cast<float>(host_bias_1_bf16[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
-            host_recv_x[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] = static_cast<nv_bfloat16>(value);
+        std::vector<int> host_src_idx(static_cast<size_t>(num_tokens), -1);
+        if (num_tokens > 0) {
+            auto src_idx_event = stream.queue().memcpy(host_src_idx.data(), src_idx, static_cast<size_t>(num_tokens) * sizeof(int));
+            src_idx_event.wait_and_throw();
         }
-    }
 
-    if (!host_recv_x.empty()) {
-        auto recv_x_event = stream.queue().memcpy(recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(nv_bfloat16));
-        recv_x_event.wait_and_throw();
-    }
-
-    if (recv_topk_weights != nullptr and topk_weights != nullptr and num_topk > 0) {
-        std::vector<float> host_topk_weights(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk), 0.f);
-        auto topk_event = stream.queue().memcpy(
-            host_topk_weights.data(), topk_weights, host_topk_weights.size() * sizeof(float));
-        topk_event.wait_and_throw();
-
-        std::vector<float> host_recv_topk_weights(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(num_topk), 0.f);
+        std::vector<float> host_recv_x_accum(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden), 0.f);
+        const auto* host_x_bf16 = reinterpret_cast<const nv_bfloat16*>(host_x.data());
         for (int i = 0; i < num_tokens; ++i) {
             const int dst_idx = host_src_idx[static_cast<size_t>(i)];
             if (dst_idx < 0 or dst_idx >= num_recv_tokens)
                 continue;
-            for (int k = 0; k < num_topk; ++k) {
-                host_recv_topk_weights[static_cast<size_t>(dst_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)] +=
-                    host_topk_weights[static_cast<size_t>(i) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)];
+            for (int h = 0; h < hidden; ++h) {
+                host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] +=
+                    static_cast<float>(host_x_bf16[static_cast<size_t>(i) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
             }
         }
 
-        auto recv_topk_event = stream.queue().memcpy(
-            recv_topk_weights, host_recv_topk_weights.data(), host_recv_topk_weights.size() * sizeof(float));
-        recv_topk_event.wait_and_throw();
+        const nv_bfloat16* host_bias_0_bf16 = nullptr;
+        const nv_bfloat16* host_bias_1_bf16 = nullptr;
+        std::vector<uint8_t> host_bias_0;
+        std::vector<uint8_t> host_bias_1;
+        if (bias_0 != nullptr) {
+            host_bias_0.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
+            auto bias0_event = stream.queue().memcpy(host_bias_0.data(), bias_0, host_bias_0.size());
+            bias0_event.wait_and_throw();
+            host_bias_0_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_0.data());
+        }
+        if (bias_1 != nullptr) {
+            host_bias_1.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
+            auto bias1_event = stream.queue().memcpy(host_bias_1.data(), bias_1, host_bias_1.size());
+            bias1_event.wait_and_throw();
+            host_bias_1_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_1.data());
+        }
+
+        std::vector<nv_bfloat16> host_recv_x(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden));
+        for (int dst_idx = 0; dst_idx < num_recv_tokens; ++dst_idx) {
+            for (int h = 0; h < hidden; ++h) {
+                float value = host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)];
+                if (host_bias_0_bf16 != nullptr)
+                    value += static_cast<float>(host_bias_0_bf16[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
+                if (host_bias_1_bf16 != nullptr)
+                    value += static_cast<float>(host_bias_1_bf16[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
+                host_recv_x[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] = static_cast<nv_bfloat16>(value);
+            }
+        }
+
+        if (!host_recv_x.empty()) {
+            auto recv_x_event = stream.queue().memcpy(recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(nv_bfloat16));
+            recv_x_event.wait_and_throw();
+        }
+
+        if (recv_topk_weights != nullptr and topk_weights != nullptr and num_topk > 0) {
+            std::vector<float> host_topk_weights(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk), 0.f);
+            auto topk_event = stream.queue().memcpy(
+                host_topk_weights.data(), topk_weights, host_topk_weights.size() * sizeof(float));
+            topk_event.wait_and_throw();
+
+            std::vector<float> host_recv_topk_weights(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(num_topk), 0.f);
+            for (int i = 0; i < num_tokens; ++i) {
+                const int dst_idx = host_src_idx[static_cast<size_t>(i)];
+                if (dst_idx < 0 or dst_idx >= num_recv_tokens)
+                    continue;
+                for (int k = 0; k < num_topk; ++k) {
+                    host_recv_topk_weights[static_cast<size_t>(dst_idx) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)] +=
+                        host_topk_weights[static_cast<size_t>(i) * static_cast<size_t>(num_topk) + static_cast<size_t>(k)];
+                }
+            }
+
+            auto recv_topk_event = stream.queue().memcpy(
+                recv_topk_weights, host_recv_topk_weights.data(), host_recv_topk_weights.size() * sizeof(float));
+            recv_topk_event.wait_and_throw();
+        }
+        return;
     }
+
+    std::vector<uint8_t> host_x(src_bytes);
+    if (src_bytes > 0)
+        xpu_blocking_memcpy(stream, host_x.data(), x, src_bytes);
+
+    std::vector<int> host_src_idx(static_cast<size_t>(num_tokens), -1);
+    if (num_tokens > 0)
+        xpu_blocking_memcpy(stream, host_src_idx.data(), src_idx, static_cast<size_t>(num_tokens) * sizeof(int));
+
+    std::vector<int> host_rank_prefix_matrix(static_cast<size_t>(num_ranks) * static_cast<size_t>(num_ranks), 0);
+    if (num_ranks > 0)
+        xpu_blocking_memcpy(stream,
+                           host_rank_prefix_matrix.data(),
+                           rank_prefix_matrix,
+                           host_rank_prefix_matrix.size() * sizeof(int));
+
+    std::vector<float> host_topk_weights;
+    if (recv_topk_weights != nullptr and topk_weights != nullptr and num_topk > 0) {
+        host_topk_weights.resize(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_topk), 0.f);
+        xpu_blocking_memcpy(stream,
+                           host_topk_weights.data(),
+                           topk_weights,
+                           host_topk_weights.size() * sizeof(float));
+    }
+
+    std::vector<uint8_t> host_bias_0;
+    std::vector<uint8_t> host_bias_1;
+    if (bias_0 != nullptr) {
+        host_bias_0.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
+        xpu_blocking_memcpy(stream, host_bias_0.data(), bias_0, host_bias_0.size());
+    }
+    if (bias_1 != nullptr) {
+        host_bias_1.resize(static_cast<size_t>(num_recv_tokens) * row_bytes);
+        xpu_blocking_memcpy(stream, host_bias_1.data(), bias_1, host_bias_1.size());
+    }
+
+    // Staged XPU rendezvous is currently validated in single-process runs.
+    // Key by world-size to avoid dereferencing device pointer tables in host code.
+    const uintptr_t group_key = static_cast<uintptr_t>(num_ranks);
+    auto state = get_xpu_intranode_state(xpu_intranode_combine_states, xpu_intranode_combine_states_mu, group_key, num_ranks);
+    std::unique_lock<std::mutex> lock(state->mu);
+    const size_t generation = state->generation;
+    state->arrivals[static_cast<size_t>(rank)] = XpuIntranodeCombineArrival{stream,
+                                                                            rank,
+                                                                            num_ranks,
+                                                                            num_tokens,
+                                                                            num_recv_tokens,
+                                                                            hidden,
+                                                                            num_topk,
+                                                                            recv_x,
+                                                                            recv_topk_weights,
+                                                                            std::move(host_x),
+                                                                            std::move(host_src_idx),
+                                                                            std::move(host_rank_prefix_matrix),
+                                                                            std::move(host_topk_weights),
+                                                                            std::move(host_bias_0),
+                                                                            std::move(host_bias_1)};
+    state->arrived++;
+
+    if (state->arrived < num_ranks) {
+        state->cv.wait(lock, [&] { return state->generation != generation; });
+        return;
+    }
+
+    std::vector<XpuIntranodeCombineArrival> arrivals;
+    arrivals.reserve(static_cast<size_t>(num_ranks));
+    for (auto& arrival_opt : state->arrivals) {
+        EP_HOST_ASSERT(arrival_opt.has_value());
+        arrivals.push_back(std::move(arrival_opt.value()));
+        arrival_opt.reset();
+    }
+    state->arrived = 0;
+
+    std::vector<std::vector<float>> recv_x_accum_per_rank(static_cast<size_t>(num_ranks));
+    std::vector<std::vector<float>> recv_topk_accum_per_rank(static_cast<size_t>(num_ranks));
+    for (int target_rank = 0; target_rank < num_ranks; ++target_rank) {
+        const auto& target = arrivals[static_cast<size_t>(target_rank)];
+        recv_x_accum_per_rank[static_cast<size_t>(target_rank)].assign(
+            static_cast<size_t>(target.num_recv_tokens) * static_cast<size_t>(target.hidden), 0.f);
+        if (target.recv_topk_weights != nullptr && target.num_topk > 0) {
+            recv_topk_accum_per_rank[static_cast<size_t>(target_rank)].assign(
+                static_cast<size_t>(target.num_recv_tokens) * static_cast<size_t>(target.num_topk), 0.f);
+        }
+    }
+
+    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+        const auto& arrival = arrivals[static_cast<size_t>(dst_rank)];
+        const auto* host_x_bf16 = reinterpret_cast<const nv_bfloat16*>(arrival.x.data());
+        for (int row = 0; row < arrival.num_tokens; ++row) {
+            const int src_token_idx = arrival.src_idx[static_cast<size_t>(row)];
+            const int src_rank = get_source_rank_from_rank_prefix(arrival.rank_prefix_matrix, num_ranks, dst_rank, row);
+            if (src_rank < 0 || src_rank >= num_ranks)
+                continue;
+            auto& target_accum = recv_x_accum_per_rank[static_cast<size_t>(src_rank)];
+            const auto& target = arrivals[static_cast<size_t>(src_rank)];
+            if (src_token_idx < 0 || src_token_idx >= target.num_recv_tokens)
+                continue;
+
+            for (int h = 0; h < arrival.hidden; ++h) {
+                target_accum[static_cast<size_t>(src_token_idx) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)] +=
+                    static_cast<float>(host_x_bf16[static_cast<size_t>(row) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)]);
+            }
+
+            if (!arrival.topk_weights.empty() &&
+                arrivals[static_cast<size_t>(src_rank)].recv_topk_weights != nullptr &&
+                arrivals[static_cast<size_t>(src_rank)].num_topk > 0) {
+                auto& target_topk_accum = recv_topk_accum_per_rank[static_cast<size_t>(src_rank)];
+                for (int k = 0; k < arrival.num_topk; ++k) {
+                    target_topk_accum[static_cast<size_t>(src_token_idx) * static_cast<size_t>(arrival.num_topk) + static_cast<size_t>(k)] +=
+                        arrival.topk_weights[static_cast<size_t>(row) * static_cast<size_t>(arrival.num_topk) + static_cast<size_t>(k)];
+                }
+            }
+        }
+    }
+
+    for (int target_rank = 0; target_rank < num_ranks; ++target_rank) {
+        const auto& arrival = arrivals[static_cast<size_t>(target_rank)];
+        const auto* bias0_bf16 = arrival.bias_0.empty() ? nullptr : reinterpret_cast<const nv_bfloat16*>(arrival.bias_0.data());
+        const auto* bias1_bf16 = arrival.bias_1.empty() ? nullptr : reinterpret_cast<const nv_bfloat16*>(arrival.bias_1.data());
+        std::vector<nv_bfloat16> host_recv_x(static_cast<size_t>(arrival.num_recv_tokens) * static_cast<size_t>(arrival.hidden));
+
+        const auto& accum = recv_x_accum_per_rank[static_cast<size_t>(target_rank)];
+        for (int i = 0; i < arrival.num_recv_tokens; ++i) {
+            for (int h = 0; h < arrival.hidden; ++h) {
+                float value = accum[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)];
+                if (bias0_bf16 != nullptr)
+                    value += static_cast<float>(bias0_bf16[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)]);
+                if (bias1_bf16 != nullptr)
+                    value += static_cast<float>(bias1_bf16[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)]);
+                host_recv_x[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)] = static_cast<nv_bfloat16>(value);
+            }
+        }
+        if (!host_recv_x.empty())
+            xpu_blocking_memcpy(arrival.stream, arrival.recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(nv_bfloat16));
+
+        if (arrival.recv_topk_weights != nullptr && arrival.num_topk > 0) {
+            const auto& topk_accum = recv_topk_accum_per_rank[static_cast<size_t>(target_rank)];
+            if (!topk_accum.empty()) {
+                xpu_blocking_memcpy(arrival.stream,
+                                   arrival.recv_topk_weights,
+                                   topk_accum.data(),
+                                   topk_accum.size() * sizeof(float));
+            }
+        }
+    }
+
+    state->generation++;
+    lock.unlock();
+    state->cv.notify_all();
 }
 
 #else

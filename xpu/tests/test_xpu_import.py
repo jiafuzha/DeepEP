@@ -1,4 +1,5 @@
 import importlib
+import os
 import subprocess
 import sys
 import textwrap
@@ -19,8 +20,51 @@ def test_xpu_extension_loads_and_exposes_topk_dtype():
     assert hasattr(buffer_mod._EXT, 'topk_idx_t')
 
 
-def _run_inline_python(script: str) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, '-c', script], capture_output=True, text=True)
+def _run_inline_python(script: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    merged_env = os.environ.copy()
+    if env is not None:
+        merged_env.update(env)
+    return subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, env=merged_env)
+
+
+def _run_two_process_xpu_scripts(script_template: str) -> None:
+    shared_env = os.environ.copy()
+    shared_env['ZE_AFFINITY_MASK'] = '0,1'
+
+    probe = _run_inline_python(
+        "import sys, torch; sys.exit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.xpu.device_count() >= 2 else 2)",
+        env={'ZE_AFFINITY_MASK': '0,1'},
+    )
+    if probe.returncode == 2:
+        pytest.skip('at least two xpu devices are required under ZE_AFFINITY_MASK=0,1')
+    assert probe.returncode == 0, probe.stderr
+
+    processes: list[tuple[int, subprocess.Popen[str]]] = []
+    for local_device in (0, 1):
+        script = script_template.replace('__LOCAL_DEVICE__', str(local_device))
+        proc = subprocess.Popen(
+            [sys.executable, '-c', script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=shared_env,
+        )
+        processes.append((local_device, proc))
+
+    for local_device, proc in processes:
+        try:
+            stdout, stderr = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            pytest.fail(
+                f'process for xpu device {local_device} timed out\nstdout:\n{stdout}\nstderr:\n{stderr}'
+            )
+
+        assert proc.returncode == 0, (
+            f'process for xpu device {local_device} failed with return code {proc.returncode}\n'
+            f'stdout:\n{stdout}\nstderr:\n{stderr}'
+        )
 
 
 def test_native_xpu_stale_ipc_handle_rejected_after_exporter_destroy():
@@ -699,20 +743,504 @@ def test_native_xpu_intranode_dispatch_two_rank_same_process_succeeds():
     script = textwrap.dedent(
         """
         import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        buf = ext.Buffer(0, 1, 32 * 1024 * 1024, 0, False, True, False, False)
+        cfg = ext.Config()
+        device_id = buf.get_local_device_id()
+        local_handle = buf.get_local_ipc_handle()
+        buf.sync([device_id], [local_handle], None)
+
+        base = 100 * local_device
+        x = torch.tensor(
+            [
+                [1 + base, 2 + base, 3 + base, 4 + base, 5 + base, 6 + base, 7 + base, 8 + base],
+                [9 + base, 10 + base, 11 + base, 12 + base, 13 + base, 14 + base, 15 + base, 16 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [0]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+
+        layout = buf.get_dispatch_layout(topk, 1, None, False, False)
+        recv_x, _, recv_topk, recv_w, _, _, _, recv_channel, recv_src, _, _ = buf.intranode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        assert recv_src.cpu().tolist() == [0, 1]
+        assert recv_topk.cpu().tolist() == [[0], [0]]
+        assert recv_w.cpu().tolist() == [[1.0], [1.0]]
+        assert recv_channel.shape[0] == 1
+        assert recv_channel.shape[1] > 0
+        assert recv_x.cpu().to(torch.float32).tolist() == [
+            [1.0 + base, 2.0 + base, 3.0 + base, 4.0 + base, 5.0 + base, 6.0 + base, 7.0 + base, 8.0 + base],
+            [9.0 + base, 10.0 + base, 11.0 + base, 12.0 + base, 13.0 + base, 14.0 + base, 15.0 + base, 16.0 + base],
+        ]
+
+        buf.destroy()
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+
+
+def test_native_xpu_intranode_dispatch_two_rank_cached_same_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        buf = ext.Buffer(0, 1, 32 * 1024 * 1024, 0, False, True, False, False)
+        cfg = ext.Config()
+
+        device_id = buf.get_local_device_id()
+        local_handle = buf.get_local_ipc_handle()
+        buf.sync([device_id], [local_handle], None)
+
+        base = 100 * local_device
+        x_uncached = torch.tensor(
+            [
+                [1 + base, 2 + base, 3 + base, 4 + base, 5 + base, 6 + base, 7 + base, 8 + base],
+                [9 + base, 10 + base, 11 + base, 12 + base, 13 + base, 14 + base, 15 + base, 16 + base],
+                [17 + base, 18 + base, 19 + base, 20 + base, 21 + base, 22 + base, 23 + base, 24 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        x_cached = torch.tensor(
+            [
+                [201 + base, 202 + base, 203 + base, 204 + base, 205 + base, 206 + base, 207 + base, 208 + base],
+                [209 + base, 210 + base, 211 + base, 212 + base, 213 + base, 214 + base, 215 + base, 216 + base],
+                [217 + base, 218 + base, 219 + base, 220 + base, 221 + base, 222 + base, 223 + base, 224 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [0], [-1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((3, 1), dtype=torch.float32, device='xpu')
+
+        layout = buf.get_dispatch_layout(topk, 1, None, False, False)
+        first = buf.intranode_dispatch(
+            x_uncached,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        rank_prefix = first[5]
+        channel_prefix = first[6]
+        recv_channel_prefix = first[7]
+        recv_src_idx = first[8]
+
+        second = buf.intranode_dispatch(
+            x_cached,
+            None,
+            None,
+            None,
+            None,
+            layout[3],
+            None,
+            int(recv_src_idx.size(0)),
+            rank_prefix,
+            channel_prefix,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk_idx, recv_topk_weights, _, _, _, recv_channel_prefix_cached, recv_src_idx_cached, _, _ = second
+        assert recv_topk_idx is None
+        assert recv_topk_weights is None
+        assert recv_src_idx_cached.cpu().tolist() == [0, 1]
+        assert recv_channel_prefix_cached.shape == recv_channel_prefix.shape
+        assert recv_x.cpu().to(torch.float32).tolist() == x_cached[:2].cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+
+
+def test_native_xpu_intranode_combine_two_rank_same_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        buf = ext.Buffer(0, 1, 32 * 1024 * 1024, 0, False, True, False, False)
+        cfg = ext.Config()
+        device_id = buf.get_local_device_id()
+        local_handle = buf.get_local_ipc_handle()
+        buf.sync([device_id], [local_handle], None)
+
+        base = 100 * local_device
+        x = torch.tensor(
+            [
+                [1 + base, 2 + base, 3 + base, 4 + base, 5 + base, 6 + base, 7 + base, 8 + base],
+                [9 + base, 10 + base, 11 + base, 12 + base, 13 + base, 14 + base, 15 + base, 16 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [0]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+
+        layout = buf.get_dispatch_layout(topk, 1, None, False, False)
+        dispatch_out = buf.intranode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, _, recv_w, _, rank_prefix, channel_prefix, _, recv_src, send_head, _ = dispatch_out
+        combined_x, combined_w, _ = buf.intranode_combine(
+            recv_x,
+            recv_w,
+            None,
+            None,
+            recv_src,
+            rank_prefix,
+            channel_prefix,
+            send_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        assert combined_x.cpu().to(torch.float32).tolist() == [
+            [1.0 + base, 2.0 + base, 3.0 + base, 4.0 + base, 5.0 + base, 6.0 + base, 7.0 + base, 8.0 + base],
+            [9.0 + base, 10.0 + base, 11.0 + base, 12.0 + base, 13.0 + base, 14.0 + base, 15.0 + base, 16.0 + base],
+        ]
+        assert combined_w.cpu().tolist() == [[1.0], [1.0]]
+
+        buf.destroy()
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+
+
+def test_native_xpu_intranode_combine_two_rank_cached_same_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        buf = ext.Buffer(0, 1, 32 * 1024 * 1024, 0, False, True, False, False)
+        cfg = ext.Config()
+
+        device_id = buf.get_local_device_id()
+        local_handle = buf.get_local_ipc_handle()
+        buf.sync([device_id], [local_handle], None)
+
+        base = 100 * local_device
+        x_uncached = torch.tensor(
+            [
+                [1 + base, 2 + base, 3 + base, 4 + base, 5 + base, 6 + base, 7 + base, 8 + base],
+                [9 + base, 10 + base, 11 + base, 12 + base, 13 + base, 14 + base, 15 + base, 16 + base],
+                [17 + base, 18 + base, 19 + base, 20 + base, 21 + base, 22 + base, 23 + base, 24 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        x_cached = torch.tensor(
+            [
+                [201 + base, 202 + base, 203 + base, 204 + base, 205 + base, 206 + base, 207 + base, 208 + base],
+                [209 + base, 210 + base, 211 + base, 212 + base, 213 + base, 214 + base, 215 + base, 216 + base],
+                [217 + base, 218 + base, 219 + base, 220 + base, 221 + base, 222 + base, 223 + base, 224 + base],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [0], [-1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((3, 1), dtype=torch.float32, device='xpu')
+
+        layout = buf.get_dispatch_layout(topk, 1, None, False, False)
+        first = buf.intranode_dispatch(
+            x_uncached,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        second = buf.intranode_dispatch(
+            x_cached,
+            None,
+            None,
+            None,
+            None,
+            layout[3],
+            None,
+            int(first[8].size(0)),
+            first[5],
+            first[6],
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, _, recv_topk_weights, _, rank_prefix, channel_prefix, _, recv_src_idx, send_head, _ = second
+        combined_x, combined_w, _ = buf.intranode_combine(
+            recv_x,
+            recv_topk_weights,
+            None,
+            None,
+            recv_src_idx,
+            rank_prefix,
+            channel_prefix,
+            send_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        assert combined_w is None
+        expected = torch.zeros((3, 8), dtype=torch.float32)
+        expected[:2] = x_cached[:2].cpu().to(torch.float32)
+        assert combined_x.cpu().to(torch.float32).tolist() == expected.tolist()
+
+        buf.destroy()
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+
+
+def test_native_xpu_internode_dispatch_combine_single_rank_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        # Keep staged local RDMA buffer enabled via low_latency_mode=True.
+        buf = ext.Buffer(0, 1, 0, 32 * 1024 * 1024, True, True, False, False)
+        cfg = ext.Config()
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        x = torch.tensor(
+            [
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [9, 10, 11, 12, 13, 14, 15, 16],
+                [17, 18, 19, 20, 21, 22, 23, 24],
+            ],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk_idx = torch.tensor([[0], [0], [-1]], dtype=torch.int64, device='xpu')
+        topk_weights = torch.ones((3, 1), dtype=torch.float32, device='xpu')
+
+        per_rank, _, per_expert, in_rank, _ = buf.get_dispatch_layout(topk_idx, 1, None, False, False)
+        per_rdma = torch.tensor([2], dtype=torch.int32, device='xpu')
+
+        dispatch_out = buf.internode_dispatch(
+            x,
+            None,
+            topk_idx,
+            topk_weights,
+            per_rank,
+            per_rdma,
+            in_rank,
+            per_expert,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk_idx, recv_topk_weights = dispatch_out[:4]
+        rdma_channel_prefix = dispatch_out[5]
+        gbl_channel_prefix = dispatch_out[6]
+        recv_rdma_rank_prefix = dispatch_out[8]
+        recv_src_meta = dispatch_out[11]
+        send_rdma_head = dispatch_out[12]
+        send_nvl_head = dispatch_out[13]
+
+        assert recv_x.size(0) == 2
+        assert recv_topk_idx.cpu().tolist() == [[0], [0]]
+        assert recv_topk_weights.cpu().tolist() == [[1.0], [1.0]]
+
+        combined_x, combined_w, _ = buf.internode_combine(
+            recv_x,
+            recv_topk_weights,
+            None,
+            None,
+            recv_src_meta,
+            in_rank,
+            rdma_channel_prefix,
+            recv_rdma_rank_prefix,
+            gbl_channel_prefix,
+            send_rdma_head,
+            send_nvl_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        assert combined_x.cpu().to(torch.float32).tolist() == [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+        assert combined_w.cpu().tolist() == [[1.0], [1.0], [0.0]]
+
+        buf.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_internode_dispatch_combine_two_rank_same_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
         import threading
         import torch
 
         ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
         _ = torch.empty((1,), device='xpu')
 
-        buf0 = ext.Buffer(0, 2, 32 * 1024 * 1024, 0, False, True, False, False)
-        buf1 = ext.Buffer(1, 2, 32 * 1024 * 1024, 0, False, True, False, False)
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(4, 128, 2, num_experts)
+
+        buf0 = ext.Buffer(0, 2, 0, rdma_bytes, True, True, False, False)
+        buf1 = ext.Buffer(1, 2, 0, rdma_bytes, True, True, False, False)
         cfg = ext.Config()
 
-        handles = [buf0.get_local_ipc_handle(), buf1.get_local_ipc_handle()]
         device_id = buf0.get_local_device_id()
-        buf0.sync([device_id, device_id], handles, None)
-        buf1.sync([device_id, device_id], handles, None)
+        buf0.sync([device_id, device_id], [], None)
+        buf1.sync([device_id, device_id], [], None)
 
         x0 = torch.tensor(
             [
@@ -732,26 +1260,30 @@ def test_native_xpu_intranode_dispatch_two_rank_same_process_succeeds():
         )
         topk0 = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
         topk1 = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
-        weights0 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
-        weights1 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        w0 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        w1 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
 
-        layout0 = buf0.get_dispatch_layout(topk0, 2, None, False, False)
-        layout1 = buf1.get_dispatch_layout(topk1, 2, None, False, False)
+        layout0 = buf0.get_dispatch_layout(topk0, num_experts, None, False, False)
+        layout1 = buf1.get_dispatch_layout(topk1, num_experts, None, False, False)
 
-        results = [None, None]
+        combined = [None, None]
         errors = []
 
-        def run_dispatch(index, buf, x, topk, weights, layout):
+        def run_rank(index, buf, x, topk, weights, layout):
             try:
-                results[index] = buf.intranode_dispatch(
+                dispatched = buf.internode_dispatch(
                     x,
                     None,
                     topk,
                     weights,
                     layout[0],
+                    layout[1],
                     layout[3],
                     layout[2],
                     0,
+                    0,
+                    None,
+                    None,
                     None,
                     None,
                     1,
@@ -761,37 +1293,43 @@ def test_native_xpu_intranode_dispatch_two_rank_same_process_succeeds():
                     False,
                     False,
                 )
+
+                combined[index] = buf.internode_combine(
+                    dispatched[0],
+                    dispatched[3],
+                    None,
+                    None,
+                    dispatched[11],
+                    layout[3],
+                    dispatched[5],
+                    dispatched[8],
+                    dispatched[6],
+                    dispatched[12],
+                    dispatched[13],
+                    cfg,
+                    None,
+                    False,
+                    False,
+                )
             except Exception as exc:
                 errors.append(repr(exc))
 
-        t0 = threading.Thread(target=run_dispatch, args=(0, buf0, x0, topk0, weights0, layout0))
-        t1 = threading.Thread(target=run_dispatch, args=(1, buf1, x1, topk1, weights1, layout1))
+        t0 = threading.Thread(target=run_rank, args=(0, buf0, x0, topk0, w0, layout0))
+        t1 = threading.Thread(target=run_rank, args=(1, buf1, x1, topk1, w1, layout1))
         t0.start()
         t1.start()
-        t0.join()
-        t1.join()
+        t0.join(60)
+        t1.join(60)
 
+        assert not t0.is_alive() and not t1.is_alive(), 'internode two-rank dispatch/combine timed out'
         assert not errors, errors
 
-        recv_x0, _, recv_topk0, recv_w0, _, _, _, recv_channel0, recv_src0, _, _ = results[0]
-        recv_x1, _, recv_topk1, recv_w1, _, _, _, recv_channel1, recv_src1, _, _ = results[1]
-
-        assert recv_src0.cpu().tolist() == [0, 0]
-        assert recv_src1.cpu().tolist() == [1, 1]
-        assert recv_topk0.cpu().tolist() == [[0], [0]]
-        assert recv_topk1.cpu().tolist() == [[1], [1]]
-        assert recv_w0.cpu().tolist() == [[1.0], [1.0]]
-        assert recv_w1.cpu().tolist() == [[1.0], [1.0]]
-        assert recv_channel0.shape == (2, cfg.num_sms // 2)
-        assert recv_channel1.shape == (2, cfg.num_sms // 2)
-        assert recv_x0.cpu().to(torch.float32).tolist() == [
-            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            [101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0],
-        ]
-        assert recv_x1.cpu().to(torch.float32).tolist() == [
-            [9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
-            [109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0, 116.0],
-        ]
+        combined_x0, combined_w0, _ = combined[0]
+        combined_x1, combined_w1, _ = combined[1]
+        assert combined_x0.cpu().to(torch.float32).tolist() == x0.cpu().to(torch.float32).tolist()
+        assert combined_x1.cpu().to(torch.float32).tolist() == x1.cpu().to(torch.float32).tolist()
+        assert combined_w0.cpu().tolist() == [[1.0], [1.0]]
+        assert combined_w1.cpu().tolist() == [[1.0], [1.0]]
 
         buf0.destroy()
         buf1.destroy()
@@ -800,3 +1338,396 @@ def test_native_xpu_intranode_dispatch_two_rank_same_process_succeeds():
 
     completed = _run_inline_python(script)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_low_latency_maintenance_single_rank_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 512
+        num_experts = 1
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            1,
+            num_experts,
+        )
+
+        buf = ext.Buffer(0, 1, 0, rdma_bytes, True, True, True, False)
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        status = torch.empty((1,), dtype=torch.int32, device='xpu')
+        buf.low_latency_query_mask_buffer(status)
+        assert status.cpu().tolist() == [0]
+
+        buf.low_latency_update_mask_buffer(0, True)
+        buf.low_latency_query_mask_buffer(status)
+        assert status.cpu().tolist() == [1]
+
+        buf.low_latency_clean_mask_buffer()
+        buf.low_latency_query_mask_buffer(status)
+        assert status.cpu().tolist() == [0]
+
+        raw_buffer = buf.get_local_buffer_tensor(torch.int32, 0, True)
+        raw_buffer.fill_(1)
+        before_nonzero = torch.count_nonzero(raw_buffer).item()
+        buf.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        after_nonzero = torch.count_nonzero(raw_buffer).item()
+        assert after_nonzero < before_nonzero
+        assert raw_buffer[0].item() == 0
+
+        buf.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_low_latency_dispatch_combine_single_rank_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 128
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            1,
+            num_experts,
+        )
+
+        buf = ext.Buffer(0, 1, 0, rdma_bytes, True, True, False, False)
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        x = torch.arange(4 * hidden, dtype=torch.float32, device='xpu').reshape(4, hidden).to(torch.bfloat16)
+        topk_idx = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64, device='xpu')
+        topk_weights = torch.ones((4, 1), dtype=torch.float32, device='xpu')
+
+        packed_x, packed_scales, recv_count, src_info, layout_range, _, _ = buf.low_latency_dispatch(
+            x,
+            topk_idx,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        assert packed_scales is None
+        assert tuple(packed_x.shape) == (num_experts, num_max_dispatch_tokens_per_rank, hidden)
+        assert recv_count.cpu().tolist() == [2, 2]
+        assert tuple(src_info.shape) == (num_experts, num_max_dispatch_tokens_per_rank)
+        assert tuple(layout_range.shape) == (num_experts, 1)
+
+        combined_x, _, _ = buf.low_latency_combine(
+            packed_x,
+            topk_idx,
+            topk_weights,
+            src_info,
+            layout_range,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            None,
+        )
+
+        assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_low_latency_dispatch_combine_two_rank_same_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import threading
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 128
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            2,
+            num_experts,
+        )
+
+        buf0 = ext.Buffer(0, 2, 0, rdma_bytes, True, True, False, False)
+        buf1 = ext.Buffer(1, 2, 0, rdma_bytes, True, True, False, False)
+        d0 = buf0.get_local_device_id()
+        buf0.sync([d0, d0], [], None)
+        buf1.sync([d0, d0], [], None)
+
+        x0 = torch.arange(2 * hidden, dtype=torch.float32, device='xpu').reshape(2, hidden).to(torch.bfloat16)
+        x1 = (torch.arange(2 * hidden, dtype=torch.float32, device='xpu').reshape(2, hidden) + 1000).to(torch.bfloat16)
+        topk0 = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        topk1 = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        w0 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        w1 = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+
+        results = [None, None]
+        errors = []
+
+        def run_rank(idx, buf, x, topk, w):
+            try:
+                packed_x, _, _, src_info, layout_range, _, _ = buf.low_latency_dispatch(
+                    x,
+                    topk,
+                    None,
+                    None,
+                    num_max_dispatch_tokens_per_rank,
+                    num_experts,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                )
+                combined_x, _, _ = buf.low_latency_combine(
+                    packed_x,
+                    topk,
+                    w,
+                    src_info,
+                    layout_range,
+                    None,
+                    num_max_dispatch_tokens_per_rank,
+                    num_experts,
+                    False,
+                    False,
+                    False,
+                    False,
+                    None,
+                )
+                results[idx] = combined_x
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        t0 = threading.Thread(target=run_rank, args=(0, buf0, x0, topk0, w0))
+        t1 = threading.Thread(target=run_rank, args=(1, buf1, x1, topk1, w1))
+        t0.start()
+        t1.start()
+        t0.join(60)
+        t1.join(60)
+
+        assert not t0.is_alive() and not t1.is_alive(), 'low-latency two-rank dispatch/combine timed out'
+        assert not errors, errors
+        assert torch.allclose(results[0].cpu().to(torch.float32), x0.cpu().to(torch.float32))
+        assert torch.allclose(results[1].cpu().to(torch.float32), x1.cpu().to(torch.float32))
+
+        buf0.destroy()
+        buf1.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_low_latency_dispatch_fp8_mode_single_rank_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 512
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            1,
+            num_experts,
+        )
+
+        buf = ext.Buffer(0, 1, 0, rdma_bytes, True, True, False, False)
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        x = torch.arange(4 * hidden, dtype=torch.float32, device='xpu').reshape(4, hidden).to(torch.bfloat16)
+        topk_idx = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64, device='xpu')
+        topk_weights = torch.ones((4, 1), dtype=torch.float32, device='xpu')
+
+        packed_x, packed_scales, recv_count, src_info, layout_range, _, _ = buf.low_latency_dispatch(
+            x,
+            topk_idx,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            True,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        assert packed_x.dtype == torch.bfloat16
+        assert packed_scales is not None
+        assert packed_scales.dtype == torch.float32
+        assert tuple(packed_scales.shape) == (num_experts, num_max_dispatch_tokens_per_rank, hidden // 128)
+        assert torch.all(packed_scales == 1).item()
+        assert recv_count.cpu().tolist() == [2, 2]
+
+        combined_x, _, _ = buf.low_latency_combine(
+            packed_x,
+            topk_idx,
+            topk_weights,
+            src_info,
+            layout_range,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            None,
+        )
+
+        assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_native_xpu_low_latency_combine_logfmt_single_rank_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 128
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            1,
+            num_experts,
+        )
+
+        buf = ext.Buffer(0, 1, 0, rdma_bytes, True, True, False, False)
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        x = torch.arange(4 * hidden, dtype=torch.float32, device='xpu').reshape(4, hidden).to(torch.bfloat16)
+        topk_idx = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64, device='xpu')
+        topk_weights = torch.ones((4, 1), dtype=torch.float32, device='xpu')
+
+        packed_x, _, _, src_info, layout_range, _, _ = buf.low_latency_dispatch(
+            x,
+            topk_idx,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        combined_x, _, _ = buf.low_latency_combine(
+            packed_x,
+            topk_idx,
+            topk_weights,
+            src_info,
+            layout_range,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            True,
+            False,
+            False,
+            False,
+            None,
+        )
+
+        assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    completed = _run_inline_python(script)
+    assert completed.returncode == 0, completed.stderr
+
+
