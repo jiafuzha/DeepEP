@@ -129,6 +129,7 @@ This directory is the staged XPU migration workspace.
 - Replaced XPU stubs for single-rank `internode::notify_dispatch`, `internode::dispatch`, `internode::cached_notify`, and `internode::combine` in `xpu/csrc/kernels/internode.cu` with staged host implementations.
 - Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank staged internode dispatch plus combine on the XPU path.
 - Reconstructed two-rank XPU dispatch/combine regressions (intranode uncached/cached, internode uncached/cached, and low-latency) to run in two separate subprocesses with `ZE_AFFINITY_MASK=0,1`, one process per local XPU device.
+- Added two-process two-rank low-latency regressions for FP8 dispatch mode and logfmt combine mode in `xpu/tests/test_xpu_import.py`, both executed via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 
 ## Layer Migration Status Summary
 
@@ -139,7 +140,7 @@ This directory is the staged XPU migration workspace.
 - [x] IPC transport with generation/checksum validation
 - [x] Buffer lifecycle management (idempotent destroy)
 - [x] Error handling and live allocation tracking
-- All 39 XPU tests pass, including expanded native intranode regressions (uncached and cached two-rank two-process dispatch and combine), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch+combine coverage, staged internode dispatch+combine coverage (single-rank and two-rank two-process), fallback tests, and import/runtime coverage
+- All 41 XPU tests pass, including expanded native intranode regressions (uncached and cached two-rank two-process dispatch and combine), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch+combine coverage (including FP8/logfmt two-process variants), staged internode dispatch+combine coverage (single-rank and two-rank two-process), fallback tests, and import/runtime coverage
 
 **Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
 - [x] Dynamic extension loading with XPU-first fallback
