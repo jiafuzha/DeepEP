@@ -5,18 +5,25 @@
 
 #if defined(DEEPEP_USE_XPU)
 
+struct xpu_launch_config_t {
+    int num_sms;
+    int num_threads;
+    deep_ep::runtime_stream_t stream;
+};
+
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(sms, threads, stream) \
-    int __num_sms = (sms);                         \
-    int __num_threads = (threads);                 \
-    auto __stream = (stream)
+    xpu_launch_config_t cfg{(sms), (threads), (stream)}; \
+    int __num_sms = cfg.num_sms;                            \
+    int __num_threads = cfg.num_threads;                    \
+    auto __stream = cfg.stream
 #endif
 
 #ifndef LAUNCH_KERNEL
-#define LAUNCH_KERNEL(config, kernel, ...)        \
-    do {                                          \
-        (void)(config);                           \
-        EP_UNSUPPORTED_XPU("CUDA kernel launch"); \
+#define LAUNCH_KERNEL(config, kernel, ...) \
+    do {                                    \
+        (void)(config);                     \
+        kernel(__VA_ARGS__);                \
     } while (0)
 #endif
 
