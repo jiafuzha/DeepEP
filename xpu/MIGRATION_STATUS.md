@@ -130,6 +130,21 @@ This directory is the staged XPU migration workspace.
 - Added native subprocess regression coverage in `xpu/tests/test_xpu_import.py` for single-rank staged internode dispatch plus combine on the XPU path.
 - Reconstructed two-rank XPU dispatch/combine regressions (intranode uncached/cached, internode uncached/cached, and low-latency) to run in two separate subprocesses with `ZE_AFFINITY_MASK=0,1`, one process per local XPU device.
 - Added two-process two-rank low-latency regressions for FP8 dispatch mode and logfmt combine mode in `xpu/tests/test_xpu_import.py`, both executed via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Extended staged XPU `intranode::combine` in `xpu/csrc/kernels/intranode.cu` to support `float32` tensors natively across both single-rank and staged multi-rank host-rendezvous paths (BF16 path unchanged).
+- Added two-process two-rank `float32` intranode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Extended staged XPU `internode::combine` in `xpu/csrc/kernels/internode.cu` to support `float32` tensors natively across both single-rank and staged multi-rank host-rendezvous paths (BF16 path unchanged).
+- Added two-process two-rank `float32` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process two-rank cached `float32` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for cached two-rank intranode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for cached two-rank `float32` internode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for two-rank low-latency FP8 dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for two-rank low-latency logfmt combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Extended staged XPU intranode combine to support `float16` in both single-rank and multi-rank host paths in `xpu/csrc/kernels/intranode.cu`.
+- Extended staged XPU internode combine to support `float16` in both single-rank and multi-rank host paths in `xpu/csrc/kernels/internode.cu`.
+- Added two-process two-rank `float16` intranode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process two-rank `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process two-rank cached `float16` intranode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process two-rank cached `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 
 ## Layer Migration Status Summary
 
@@ -140,7 +155,7 @@ This directory is the staged XPU migration workspace.
 - [x] IPC transport with generation/checksum validation
 - [x] Buffer lifecycle management (idempotent destroy)
 - [x] Error handling and live allocation tracking
-- All 41 XPU tests pass, including expanded native intranode regressions (uncached and cached two-rank two-process dispatch and combine), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch+combine coverage (including FP8/logfmt two-process variants), staged internode dispatch+combine coverage (single-rank and two-rank two-process), fallback tests, and import/runtime coverage
+- All 55 XPU tests pass, including expanded native intranode regressions (uncached/cached two-rank two-process dispatch+combine plus float32/float16 two-rank two-process combine and cached float16), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine), staged two-rank low-latency dispatch/combine coverage (including FP8/logfmt two-process variants), staged internode dispatch/combine coverage (single-rank and two-rank two-process, including float32/float16 plus cached float32/float16), cached multi-round two-process stress coverage, low-latency FP8/logfmt multi-round two-process stress coverage, fallback tests, and import/runtime coverage
 
 **Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
 - [x] Dynamic extension loading with XPU-first fallback
