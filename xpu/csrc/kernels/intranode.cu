@@ -700,15 +700,16 @@ void combine(runtime_data_type_t type,
     const bool is_bf16 = (type == RUNTIME_R_16BF);
     const bool is_f32 = (type == static_cast<runtime_data_type_t>(c10::ScalarType::Float));
     const bool is_f16 = (type == static_cast<runtime_data_type_t>(c10::ScalarType::Half));
-    if (!is_bf16 and !is_f32 and !is_f16)
-        EP_UNSUPPORTED_XPU("intranode combine unsupported dtype on XPU");
+    const bool is_f64 = (type == static_cast<runtime_data_type_t>(c10::ScalarType::Double));
+    EP_HOST_ASSERT(is_bf16 or is_f32 or is_f16 or is_f64);
 
     EP_HOST_ASSERT(recv_x != nullptr and x != nullptr and src_idx != nullptr);
     EP_HOST_ASSERT(num_tokens >= 0 and num_recv_tokens >= 0 and hidden >= 0 and num_topk >= 0);
 
     EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
 
-    const size_t elem_size = is_bf16 ? sizeof(nv_bfloat16) : (is_f16 ? sizeof(c10::Half) : sizeof(float));
+    const size_t elem_size = is_bf16 ? sizeof(nv_bfloat16) :
+        (is_f16 ? sizeof(c10::Half) : (is_f64 ? sizeof(double) : sizeof(float)));
     const size_t row_bytes = static_cast<size_t>(hidden) * elem_size;
     const size_t src_bytes = static_cast<size_t>(num_tokens) * row_bytes;
 
@@ -729,6 +730,7 @@ void combine(runtime_data_type_t type,
         const auto* host_x_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(host_x.data()) : nullptr;
         const auto* host_x_f32 = is_f32 ? reinterpret_cast<const float*>(host_x.data()) : nullptr;
         const auto* host_x_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(host_x.data()) : nullptr;
+        const auto* host_x_f64 = is_f64 ? reinterpret_cast<const double*>(host_x.data()) : nullptr;
         for (int i = 0; i < num_tokens; ++i) {
             const int dst_idx = host_src_idx[static_cast<size_t>(i)];
             if (dst_idx < 0 or dst_idx >= num_recv_tokens)
@@ -736,7 +738,8 @@ void combine(runtime_data_type_t type,
             for (int h = 0; h < hidden; ++h) {
                 const size_t idx = static_cast<size_t>(i) * static_cast<size_t>(hidden) + static_cast<size_t>(h);
                 const float x_value = is_bf16 ? static_cast<float>(host_x_bf16[idx]) :
-                                     (is_f16 ? static_cast<float>(host_x_f16[idx]) : host_x_f32[idx]);
+                                     (is_f16 ? static_cast<float>(host_x_f16[idx]) :
+                                     (is_f64 ? static_cast<float>(host_x_f64[idx]) : host_x_f32[idx]));
                 host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] += x_value;
             }
         }
@@ -747,6 +750,8 @@ void combine(runtime_data_type_t type,
         const c10::Half* host_bias_1_f16 = nullptr;
         const float* host_bias_0_f32 = nullptr;
         const float* host_bias_1_f32 = nullptr;
+        const double* host_bias_0_f64 = nullptr;
+        const double* host_bias_1_f64 = nullptr;
         std::vector<uint8_t> host_bias_0;
         std::vector<uint8_t> host_bias_1;
         if (bias_0 != nullptr) {
@@ -757,6 +762,8 @@ void combine(runtime_data_type_t type,
                 host_bias_0_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_0.data());
             else if (is_f16)
                 host_bias_0_f16 = reinterpret_cast<const c10::Half*>(host_bias_0.data());
+            else if (is_f64)
+                host_bias_0_f64 = reinterpret_cast<const double*>(host_bias_0.data());
             else
                 host_bias_0_f32 = reinterpret_cast<const float*>(host_bias_0.data());
         }
@@ -768,6 +775,8 @@ void combine(runtime_data_type_t type,
                 host_bias_1_bf16 = reinterpret_cast<const nv_bfloat16*>(host_bias_1.data());
             else if (is_f16)
                 host_bias_1_f16 = reinterpret_cast<const c10::Half*>(host_bias_1.data());
+            else if (is_f64)
+                host_bias_1_f64 = reinterpret_cast<const double*>(host_bias_1.data());
             else
                 host_bias_1_f32 = reinterpret_cast<const float*>(host_bias_1.data());
         }
@@ -804,7 +813,7 @@ void combine(runtime_data_type_t type,
                 auto recv_x_event = stream.queue().memcpy(recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(c10::Half));
                 recv_x_event.wait_and_throw();
             }
-        } else {
+        } else if (is_f32) {
             std::vector<float> host_recv_x(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden), 0.f);
             for (int dst_idx = 0; dst_idx < num_recv_tokens; ++dst_idx) {
                 for (int h = 0; h < hidden; ++h) {
@@ -818,6 +827,23 @@ void combine(runtime_data_type_t type,
             }
             if (!host_recv_x.empty()) {
                 auto recv_x_event = stream.queue().memcpy(recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(float));
+                recv_x_event.wait_and_throw();
+            }
+        } else {
+            std::vector<double> host_recv_x(static_cast<size_t>(num_recv_tokens) * static_cast<size_t>(hidden), 0.0);
+            for (int dst_idx = 0; dst_idx < num_recv_tokens; ++dst_idx) {
+                for (int h = 0; h < hidden; ++h) {
+                    double value = static_cast<double>(
+                        host_recv_x_accum[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)]);
+                    if (host_bias_0_f64 != nullptr)
+                        value += host_bias_0_f64[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)];
+                    if (host_bias_1_f64 != nullptr)
+                        value += host_bias_1_f64[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)];
+                    host_recv_x[static_cast<size_t>(dst_idx) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] = value;
+                }
+            }
+            if (!host_recv_x.empty()) {
+                auto recv_x_event = stream.queue().memcpy(recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(double));
                 recv_x_event.wait_and_throw();
             }
         }
@@ -933,6 +959,7 @@ void combine(runtime_data_type_t type,
         const auto* host_x_bf16 = is_bf16 ? reinterpret_cast<const nv_bfloat16*>(arrival.x.data()) : nullptr;
         const auto* host_x_f32 = is_f32 ? reinterpret_cast<const float*>(arrival.x.data()) : nullptr;
         const auto* host_x_f16 = is_f16 ? reinterpret_cast<const c10::Half*>(arrival.x.data()) : nullptr;
+        const auto* host_x_f64 = is_f64 ? reinterpret_cast<const double*>(arrival.x.data()) : nullptr;
         for (int row = 0; row < arrival.num_tokens; ++row) {
             const int src_token_idx = arrival.src_idx[static_cast<size_t>(row)];
             const int src_rank = get_source_rank_from_rank_prefix(arrival.rank_prefix_matrix, num_ranks, dst_rank, row);
@@ -946,7 +973,8 @@ void combine(runtime_data_type_t type,
             for (int h = 0; h < arrival.hidden; ++h) {
                 const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h);
                 const float x_value = is_bf16 ? static_cast<float>(host_x_bf16[idx]) :
-                                     (is_f16 ? static_cast<float>(host_x_f16[idx]) : host_x_f32[idx]);
+                                     (is_f16 ? static_cast<float>(host_x_f16[idx]) :
+                                     (is_f64 ? static_cast<float>(host_x_f64[idx]) : host_x_f32[idx]));
                 target_accum[static_cast<size_t>(src_token_idx) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)] += x_value;
             }
 
@@ -970,6 +998,8 @@ void combine(runtime_data_type_t type,
         const auto* bias1_f16 = (is_f16 && !arrival.bias_1.empty()) ? reinterpret_cast<const c10::Half*>(arrival.bias_1.data()) : nullptr;
         const auto* bias0_f32 = (is_f32 && !arrival.bias_0.empty()) ? reinterpret_cast<const float*>(arrival.bias_0.data()) : nullptr;
         const auto* bias1_f32 = (is_f32 && !arrival.bias_1.empty()) ? reinterpret_cast<const float*>(arrival.bias_1.data()) : nullptr;
+        const auto* bias0_f64 = (is_f64 && !arrival.bias_0.empty()) ? reinterpret_cast<const double*>(arrival.bias_0.data()) : nullptr;
+        const auto* bias1_f64 = (is_f64 && !arrival.bias_1.empty()) ? reinterpret_cast<const double*>(arrival.bias_1.data()) : nullptr;
 
         const auto& accum = recv_x_accum_per_rank[static_cast<size_t>(target_rank)];
         if (is_bf16) {
@@ -1000,7 +1030,7 @@ void combine(runtime_data_type_t type,
             }
             if (!host_recv_x.empty())
                 xpu_blocking_memcpy(arrival.stream, arrival.recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(c10::Half));
-        } else {
+        } else if (is_f32) {
             std::vector<float> host_recv_x(static_cast<size_t>(arrival.num_recv_tokens) * static_cast<size_t>(arrival.hidden), 0.f);
             for (int i = 0; i < arrival.num_recv_tokens; ++i) {
                 for (int h = 0; h < arrival.hidden; ++h) {
@@ -1014,6 +1044,21 @@ void combine(runtime_data_type_t type,
             }
             if (!host_recv_x.empty())
                 xpu_blocking_memcpy(arrival.stream, arrival.recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(float));
+        } else {
+            std::vector<double> host_recv_x(static_cast<size_t>(arrival.num_recv_tokens) * static_cast<size_t>(arrival.hidden), 0.0);
+            for (int i = 0; i < arrival.num_recv_tokens; ++i) {
+                for (int h = 0; h < arrival.hidden; ++h) {
+                    double value = static_cast<double>(
+                        accum[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)]);
+                    if (bias0_f64 != nullptr)
+                        value += bias0_f64[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)];
+                    if (bias1_f64 != nullptr)
+                        value += bias1_f64[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)];
+                    host_recv_x[static_cast<size_t>(i) * static_cast<size_t>(arrival.hidden) + static_cast<size_t>(h)] = value;
+                }
+            }
+            if (!host_recv_x.empty())
+                xpu_blocking_memcpy(arrival.stream, arrival.recv_x, host_recv_x.data(), host_recv_x.size() * sizeof(double));
         }
 
         if (arrival.recv_topk_weights != nullptr && arrival.num_topk > 0) {

@@ -373,6 +373,17 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
     }
 #endif
 }
+
+#if defined(DEEPEP_USE_XPU)
+bool SharedMemoryAllocator::requires_live_validation(void* ptr) const {
+    if (ptr == nullptr)
+        return false;
+    std::lock_guard<std::mutex> guard(imported_allocations_mu);
+    const auto it = imported_allocations.find(ptr);
+    EP_HOST_ASSERT(it != imported_allocations.end() and "XPU IPC handle query got unknown pointer");
+    return it->second.require_live_validation;
+}
+#endif
 }  // namespace shared_memory
 
 namespace deep_ep {
@@ -801,6 +812,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
+    has_foreign_ipc_peers = false;
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
@@ -813,9 +825,20 @@ void Buffer::sync(const std::vector<int>& device_ids,
             if (offset + i != rank) {
                 std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
+#if defined(DEEPEP_USE_XPU)
+                has_foreign_ipc_peers = has_foreign_ipc_peers or
+                                        (not shared_memory_allocator.requires_live_validation(buffer_ptrs[i]));
+#endif
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
+#if defined(DEEPEP_USE_XPU)
+                // In staged XPU mode, allow a foreign self-rank payload during cross-process handle exchange.
+                // Keep local buffer ownership for this rank and treat the mismatch as foreign-peer presence.
+                if (std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) != 0)
+                    has_foreign_ipc_peers = true;
+#else
                 EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
+#endif
             }
         }
 
@@ -979,6 +1002,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("intranode dispatch multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1315,6 +1343,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
                    channel_prefix_matrix.scalar_type() == torch::kInt32);
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("intranode combine multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1499,6 +1532,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            bool allocate_on_comm_stream) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_bytes > 0 and "internode_dispatch requires RDMA buffer bytes > 0");
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("internode dispatch multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1880,6 +1918,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     bool allocate_on_comm_stream) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_bytes > 0 and "internode_combine requires RDMA buffer bytes > 0");
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("internode combine multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -2108,6 +2151,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_bytes > 0 and "low_latency_dispatch requires RDMA buffer bytes > 0");
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("low-latency dispatch multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     EP_HOST_ASSERT(low_latency_mode);
 
@@ -2276,6 +2324,11 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_bytes > 0 and "low_latency_combine requires RDMA buffer bytes > 0");
+#if defined(DEEPEP_USE_XPU)
+    if (num_ranks > 1 and has_foreign_ipc_peers) {
+        EP_UNSUPPORTED_XPU("low-latency combine multi-rank across processes via PCIe IPC transport is pending");
+    }
+#endif
 
     EP_HOST_ASSERT(low_latency_mode);
 

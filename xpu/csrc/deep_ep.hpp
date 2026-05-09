@@ -60,6 +60,9 @@ public:
     void get_mem_handle(MemHandle* mem_handle, void* ptr);
     void open_mem_handle(void** ptr, MemHandle* mem_handle);
     void close_mem_handle(void* ptr);
+#if defined(DEEPEP_USE_XPU)
+    bool requires_live_validation(void* ptr) const;
+#endif
 
 private:
     bool use_fabric;
@@ -70,9 +73,9 @@ private:
         bool require_live_validation;
     };
 
-    std::mutex allocation_sizes_mu;
+    mutable std::mutex allocation_sizes_mu;
     std::unordered_map<void*, std::pair<size_t, uint64_t>> allocation_sizes;
-    std::mutex imported_allocations_mu;
+    mutable std::mutex imported_allocations_mu;
     std::unordered_map<void*, ImportedAllocationMeta> imported_allocations;
 #endif
 };
@@ -107,6 +110,7 @@ private:
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
+    bool has_foreign_ipc_peers = false;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
