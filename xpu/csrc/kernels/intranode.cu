@@ -368,8 +368,6 @@ void dispatch(void* recv_x,
     EP_HOST_ASSERT(num_sms % 2 == 0 and "num_sms must be even for intranode dispatch");
 
     const int num_channels = num_sms / 2;
-    if (num_ranks > 1)
-        EP_HOST_ASSERT(num_worst_tokens == 0 and "multi-rank XPU dispatch does not support num_worst_tokens yet");
 
     const size_t row_bytes = static_cast<size_t>(hidden_int4) * sizeof(int4);
     const size_t x_bytes = static_cast<size_t>(num_tokens) * row_bytes;
@@ -584,6 +582,8 @@ void dispatch(void* recv_x,
                     selected_tokens.emplace_back(src_rank, token);
             }
         }
+        if (num_worst_tokens > 0 && static_cast<int>(selected_tokens.size()) > num_worst_tokens)
+            selected_tokens.resize(static_cast<size_t>(num_worst_tokens));
 
         std::vector<uint8_t> host_recv_x(static_cast<size_t>(selected_tokens.size()) * row_bytes, 0);
         std::vector<int> host_recv_src_idx(static_cast<size_t>(selected_tokens.size()), -1);
@@ -632,9 +632,11 @@ void dispatch(void* recv_x,
                 int token_start = 0, token_end = 0;
                 get_channel_task_range_host(src.num_tokens, dst.num_channels, channel, token_start, token_end);
                 int count = 0;
-                for (int token = token_start; token < token_end; ++token) {
-                    count += static_cast<int>(
-                        src.is_token_in_rank[static_cast<size_t>(token) * static_cast<size_t>(num_ranks) + static_cast<size_t>(dst_rank)] != 0);
+                for (const auto& selected : selected_tokens) {
+                    if (selected.first != src_rank)
+                        continue;
+                    const int token = selected.second;
+                    count += static_cast<int>(token >= token_start and token < token_end);
                 }
                 host_recv_channel_offset[static_cast<size_t>(src_rank) * static_cast<size_t>(dst.num_channels) + static_cast<size_t>(channel)] = count;
             }

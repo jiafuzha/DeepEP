@@ -144,11 +144,23 @@ inline XpuLocalMemHandle decode_xpu_local_handle(const XpuIpcMemHandle& handle) 
     EP_HOST_ASSERT(local.generation > 0 and "XPU local IPC handle has invalid generation payload");
     EP_HOST_ASSERT(local.ptr_value != 0 and "XPU local IPC handle has null pointer payload");
     EP_HOST_ASSERT(local.size > 0 and "XPU local IPC handle has invalid size payload");
-    EP_HOST_ASSERT(local.pid == static_cast<uint64_t>(getpid()) and
-                   "XPU local IPC handles are only valid within the exporting process");
     EP_HOST_ASSERT(local.checksum == compute_xpu_local_handle_checksum(local) and
                    "Invalid XPU local IPC handle checksum");
     return local;
+}
+
+inline void* build_xpu_foreign_handle_token(const XpuLocalMemHandle& local) {
+    uint64_t hash = 0;
+    hash = fnv1a64_mix(hash, local.magic);
+    hash = fnv1a64_mix(hash, local.version);
+    hash = fnv1a64_mix(hash, local.kind);
+    hash = fnv1a64_mix(hash, local.generation);
+    hash = fnv1a64_mix(hash, local.ptr_value);
+    hash = fnv1a64_mix(hash, local.size);
+    hash = fnv1a64_mix(hash, local.pid);
+    hash = fnv1a64_mix(hash, local.checksum);
+    const uintptr_t token = static_cast<uintptr_t>((hash << 1) | 1ull);
+    return reinterpret_cast<void*>(token == 0 ? 1ull : token);
 }
 
 }  // namespace
@@ -293,16 +305,22 @@ void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
     EP_HOST_ASSERT(local.size > 0 and "XPU IPC handle import got invalid allocation size");
     EP_HOST_ASSERT(mem_handle->size == static_cast<size_t>(local.size) and
                    "XPU IPC handle import size mismatch");
-    validate_xpu_live_allocation(reinterpret_cast<void*>(local.ptr_value), static_cast<size_t>(local.size), local.generation);
-    void* opened_ptr = reinterpret_cast<void*>(local.ptr_value);
+    const bool same_process = (local.pid == static_cast<uint64_t>(getpid()));
+    if (same_process)
+        validate_xpu_live_allocation(reinterpret_cast<void*>(local.ptr_value), static_cast<size_t>(local.size), local.generation);
+
+    void* opened_ptr = same_process ? reinterpret_cast<void*>(local.ptr_value) : build_xpu_foreign_handle_token(local);
     EP_HOST_ASSERT(opened_ptr != nullptr and "XPU IPC handle import decoded null pointer");
     {
         std::lock_guard<std::mutex> guard(imported_allocations_mu);
-        const auto [it, inserted] =
-            imported_allocations.emplace(opened_ptr, std::make_pair(static_cast<size_t>(local.size), local.generation));
+        const auto [it, inserted] = imported_allocations.emplace(
+            opened_ptr,
+            SharedMemoryAllocator::ImportedAllocationMeta{static_cast<size_t>(local.size), local.generation, same_process});
         EP_HOST_ASSERT(inserted and "XPU IPC handle import got duplicate pointer without close");
-        EP_HOST_ASSERT(it->second.first == static_cast<size_t>(local.size) and "XPU IPC handle import got inconsistent size");
-        EP_HOST_ASSERT(it->second.second == local.generation and "XPU IPC handle import got inconsistent generation");
+        EP_HOST_ASSERT(it->second.size == static_cast<size_t>(local.size) and "XPU IPC handle import got inconsistent size");
+        EP_HOST_ASSERT(it->second.generation == local.generation and "XPU IPC handle import got inconsistent generation");
+        EP_HOST_ASSERT(it->second.require_live_validation == same_process and
+                       "XPU IPC handle import got inconsistent process-local validation requirement");
     }
     *ptr = opened_ptr;
 #else
@@ -325,7 +343,7 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 #if defined(DEEPEP_USE_XPU)
     if (ptr == nullptr)
         return;
-    std::pair<size_t, uint64_t> imported_meta{};
+    SharedMemoryAllocator::ImportedAllocationMeta imported_meta{};
     {
         std::lock_guard<std::mutex> guard(imported_allocations_mu);
         const auto it = imported_allocations.find(ptr);
@@ -334,15 +352,18 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
         imported_allocations.erase(it);
     }
 
+    if (not imported_meta.require_live_validation)
+        return;
+
     // Teardown can legitimately happen after the exporting buffer has already
     // released its allocation. Keep close order-independent across local ranks.
     std::lock_guard<std::mutex> live_guard(xpu_live_allocations_mu);
     const auto live_it = xpu_live_allocations.find(ptr);
     if (live_it == xpu_live_allocations.end())
         return;
-    EP_HOST_ASSERT(live_it->second.size == imported_meta.first and
+    EP_HOST_ASSERT(live_it->second.size == imported_meta.size and
                    "XPU IPC handle close size mismatch with live allocation");
-    EP_HOST_ASSERT(live_it->second.generation == imported_meta.second and
+    EP_HOST_ASSERT(live_it->second.generation == imported_meta.generation and
                    "XPU IPC handle close generation mismatch with live allocation");
 #else
     if (use_fabric) {
@@ -516,6 +537,32 @@ inline int runtime_get_num_sms(int device_id) {
     return device_prop.multiProcessorCount;
 #endif
 }
+
+#if defined(DEEPEP_USE_XPU)
+inline uint64_t xpu_hash_bytes_fnv1a(const uint8_t* data, size_t size) {
+    constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+    constexpr uint64_t kFnvPrime = 1099511628211ull;
+    uint64_t hash = kFnvOffset;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(data[i]);
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+inline void build_xpu_ipc_peer_tokens(const shared_memory::MemHandle* handles, int num_ranks, void** out_tokens) {
+    EP_HOST_ASSERT(handles != nullptr and out_tokens != nullptr and num_ranks > 0);
+    for (int i = 0; i < num_ranks; ++i) {
+        auto hash = xpu_hash_bytes_fnv1a(handles[i].inner.xpu_ipc_mem_handle.opaque,
+                                         sizeof(handles[i].inner.xpu_ipc_mem_handle.opaque));
+        hash ^= static_cast<uint64_t>(handles[i].size) + static_cast<uint64_t>(0x9e3779b97f4a7c15ull) +
+                (hash << 6) + (hash >> 2);
+        hash ^= static_cast<uint64_t>(i + 1) * static_cast<uint64_t>(0x9e3779b97f4a7c15ull);
+        const uintptr_t token = static_cast<uintptr_t>((hash << 1) | 1ull);
+        out_tokens[i] = reinterpret_cast<void*>(token);
+    }
+}
+#endif
 
 Buffer::Buffer(int rank,
                int num_ranks,
@@ -1040,9 +1087,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     void** intranode_buffer_ptrs = buffer_ptrs_gpu;
     int** intranode_barrier_signal_ptrs = barrier_signal_ptrs_gpu;
 #if defined(DEEPEP_USE_XPU)
-    // Staged XPU intranode kernels run host-side rendezvous logic and need
-    // host-visible peer pointer tables instead of device pointer tables.
-    intranode_buffer_ptrs = buffer_ptrs;
+    // Use IPC-handle-derived peer tokens for staged XPU rendezvous grouping.
+    // This avoids dependence on process-local pointer identity.
+    void* intranode_ipc_peer_tokens[NUM_MAX_NVL_PEERS] = {nullptr};
+    build_xpu_ipc_peer_tokens(ipc_handles, num_ranks, intranode_ipc_peer_tokens);
+    intranode_buffer_ptrs = intranode_ipc_peer_tokens;
     intranode_barrier_signal_ptrs = barrier_signal_ptrs;
 #endif
 #if defined(DEEPEP_USE_XPU)
@@ -1312,9 +1361,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     void** intranode_buffer_ptrs = buffer_ptrs_gpu;
     int** intranode_barrier_signal_ptrs = barrier_signal_ptrs_gpu;
 #if defined(DEEPEP_USE_XPU)
-    // Staged XPU intranode kernels run host-side rendezvous logic and need
-    // host-visible peer pointer tables instead of device pointer tables.
-    intranode_buffer_ptrs = buffer_ptrs;
+    // Use IPC-handle-derived peer tokens for staged XPU rendezvous grouping.
+    // This avoids dependence on process-local pointer identity.
+    void* intranode_ipc_peer_tokens[NUM_MAX_NVL_PEERS] = {nullptr};
+    build_xpu_ipc_peer_tokens(ipc_handles, num_ranks, intranode_ipc_peer_tokens);
+    intranode_buffer_ptrs = intranode_ipc_peer_tokens;
     intranode_barrier_signal_ptrs = barrier_signal_ptrs;
 #endif
 

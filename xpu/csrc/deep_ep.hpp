@@ -64,10 +64,16 @@ public:
 private:
     bool use_fabric;
 #if defined(DEEPEP_USE_XPU)
+    struct ImportedAllocationMeta {
+        size_t size;
+        uint64_t generation;
+        bool require_live_validation;
+    };
+
     std::mutex allocation_sizes_mu;
     std::unordered_map<void*, std::pair<size_t, uint64_t>> allocation_sizes;
     std::mutex imported_allocations_mu;
-    std::unordered_map<void*, std::pair<size_t, uint64_t>> imported_allocations;
+    std::unordered_map<void*, ImportedAllocationMeta> imported_allocations;
 #endif
 };
 }  // namespace shared_memory

@@ -145,8 +145,12 @@ This directory is the staged XPU migration workspace.
 - Added two-process two-rank `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 - Added two-process two-rank cached `float16` intranode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 - Added two-process two-rank cached `float16` internode dispatch/combine regression in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for cached two-rank `float16` intranode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round randomized stress regression for cached two-rank `float16` internode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for uncached two-rank `float32` intranode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
+- Added two-process multi-round stress regression for uncached two-rank `float16` intranode dispatch/combine in `xpu/tests/test_xpu_import.py` via `ZE_AFFINITY_MASK=0,1` subprocess isolation.
 - Added two-process two-rank low-latency dispatch/combine return-recv-hook regression in `xpu/tests/test_xpu_import.py` to validate deferred receive-phase execution on the staged XPU path.
-- Switched staged XPU intranode multi-rank rendezvous grouping to hash host-visible IPC peer tables (instead of world-size-only grouping), and wired `Buffer::intranode_combine` notify/combine calls to pass host IPC pointer tables under `DEEPEP_USE_XPU` in `xpu/csrc/deep_ep.cpp`.
+- Switched staged XPU intranode multi-rank rendezvous grouping to IPC-handle-derived peer tokens (instead of world-size-only or process-local pointer identity grouping), and wired `Buffer::intranode_combine` notify/combine calls to pass host IPC pointer tables under `DEEPEP_USE_XPU` in `xpu/csrc/deep_ep.cpp`.
 
 ## Layer Migration Status Summary
 
@@ -157,7 +161,7 @@ This directory is the staged XPU migration workspace.
 - [x] IPC transport with generation/checksum validation
 - [x] Buffer lifecycle management (idempotent destroy)
 - [x] Error handling and live allocation tracking
-- All 56 XPU tests pass, including expanded native intranode regressions (uncached/cached two-rank two-process dispatch+combine plus float32/float16 two-rank two-process combine and cached float16), staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine and return-recv-hook receive phase), staged two-rank low-latency dispatch/combine coverage (including FP8/logfmt two-process variants), staged internode dispatch/combine coverage (single-rank and two-rank two-process, including float32/float16 plus cached float32/float16), cached multi-round two-process stress coverage, low-latency FP8/logfmt multi-round two-process stress coverage, fallback tests, and import/runtime coverage
+- All 60 XPU tests pass, including expanded native intranode regressions (uncached/cached two-rank two-process dispatch+combine plus float32/float16 two-rank two-process combine and cached float16), uncached intranode float32/float16 multi-round two-process stress coverage, staged low-latency maintenance coverage, staged low-latency BF16/FP8 dispatch+combine coverage (including logfmt combine and return-recv-hook receive phase), staged two-rank low-latency dispatch/combine coverage (including FP8/logfmt two-process variants), staged internode dispatch/combine coverage (single-rank and two-rank two-process, including float32/float16 plus cached float32/float16), cached multi-round two-process stress coverage (including cached float16 intranode/internode stress), low-latency FP8/logfmt multi-round two-process stress coverage, fallback tests, and import/runtime coverage
 
 **Python Wrapper Layer (xpu/deep_ep/*.py):** ✅ COMPREHENSIVE FALLBACK SYSTEM
 - [x] Dynamic extension loading with XPU-first fallback
@@ -187,7 +191,7 @@ This directory is the staged XPU migration workspace.
 **Phase 2: Multi-Rank XPU Support (In Progress)**
 - Implement SYCL kernels for compute-critical operations:
   1. layout::get_dispatch_layout (token counting) ✅ concrete XPU path implemented
-  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 staged two-rank same-process dispatch (uncached/cached) and combine implemented; staged PCIe-IPC peer-table keyed rendezvous path enabled on XPU; full SYCL parallelization and broader multi-rank hardening pending
+  2. intranode::dispatch/combine (NVLink MoE gather/scatter) 🚧 staged two-rank same-process dispatch (uncached/cached) and combine implemented; staged PCIe-IPC handle-token keyed rendezvous path enabled on XPU; full SYCL parallelization and broader multi-rank hardening pending
   3. internode::dispatch/combine (RDMA MoE operations)
   4. low-latency dispatch/combine (low-latency paths) ✅ staged single-rank and two-rank coverage implemented for BF16/FP8 dispatch, logfmt combine, maintenance helpers, and return-recv-hook receive-phase execution (two-process validation)
 - Use SYCLomatic tool for CUDA→SYCL automated porting as starting point
