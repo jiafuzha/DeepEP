@@ -2797,6 +2797,86 @@ def test_native_xpu_low_latency_combine_logfmt_two_rank_same_process_succeeds():
     _run_two_process_xpu_scripts(script)
 
 
+def test_native_xpu_low_latency_dispatch_combine_two_rank_return_recv_hook_two_process_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        num_max_dispatch_tokens_per_rank = 4
+        hidden = 128
+        num_experts = 2
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            1,
+            num_experts,
+        )
+
+        buf = ext.Buffer(0, 1, 0, rdma_bytes, True, True, False, False)
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id], [], None)
+
+        base = 1000 * local_device
+        x = (torch.arange(2 * hidden, dtype=torch.float32, device='xpu').reshape(2, hidden) + base).to(torch.bfloat16)
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        w = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+
+        packed_x, _, _, src_info, layout_range, _, dispatch_recv_hook = buf.low_latency_dispatch(
+            x,
+            topk,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            True,
+        )
+        assert dispatch_recv_hook is not None
+        dispatch_recv_hook()
+
+        combined_x, _, combine_recv_hook = buf.low_latency_combine(
+            packed_x,
+            topk,
+            w,
+            src_info,
+            layout_range,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            True,
+            None,
+        )
+        assert combine_recv_hook is not None
+        combine_recv_hook()
+
+        assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+
+
 def test_native_xpu_intranode_dispatch_combine_two_rank_two_process_stress_succeeds():
     ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
     ext_path = getattr(ext, '__file__', '')
