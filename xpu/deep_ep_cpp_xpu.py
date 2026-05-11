@@ -107,7 +107,7 @@ class Buffer:
         return bytes(payload)
 
     def get_local_nvshmem_unique_id(self) -> bytes:
-        return b'DEEPEP_XPU_STAGED_UID_000000000000'
+        return bytes(b'DEEPEP_XPU_STAGED_UID_000000000000')
 
     def get_local_buffer_tensor(self, dtype: torch.dtype, offset: int, use_rdma_buffer: bool) -> torch.Tensor:
         source = self._rdma_buffer if use_rdma_buffer else self._nvl_buffer
@@ -120,10 +120,10 @@ class Buffer:
         if byte_offset > source.numel():
             raise ValueError('offset exceeds buffer size')
         usable_bytes = source.numel() - byte_offset
-        usable_elems = usable_bytes // elem_size
-        if usable_elems == 0:
+        usable_bytes -= usable_bytes % elem_size
+        if usable_bytes == 0:
             return torch.empty((0,), dtype=dtype, device=self._device)
-        sliced = source.narrow(0, byte_offset, usable_elems * elem_size)
+        sliced = source.narrow(0, byte_offset, usable_bytes)
         return sliced.view(dtype)
 
     def get_comm_stream(self) -> Any:

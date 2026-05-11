@@ -723,13 +723,13 @@ pybind11::bytearray Buffer::get_local_ipc_handle() const {
     return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
 }
 
-pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
+pybind11::bytes Buffer::get_local_nvshmem_unique_id() const {
 #if defined(DEEPEP_USE_XPU)
-    return {};
+    return pybind11::bytes("DEEPEP_XPU_STAGED_UID_000000000000");
 #elif !defined(DISABLE_NVSHMEM)
     EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
     auto unique_id = internode::get_unique_id();
-    return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
+    return pybind11::bytes(reinterpret_cast<const char*>(unique_id.data()), unique_id.size());
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
@@ -738,9 +738,15 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
-    auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
-    auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
-    return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(backend::kDeviceType));
+    const bool use_rdma_storage = use_rdma_buffer and rdma_buffer_ptr != nullptr and num_rdma_bytes > 0;
+    auto num_bytes = use_rdma_storage ? num_rdma_bytes : num_nvl_bytes;
+    EP_HOST_ASSERT(offset >= 0 and offset <= static_cast<int64_t>(num_bytes) and "Buffer offset out of range");
+    auto remaining_bytes = static_cast<int64_t>(num_bytes) - offset;
+    remaining_bytes -= remaining_bytes % element_bytes;
+    auto base_ptr = static_cast<uint8_t*>(use_rdma_storage ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
+    return torch::from_blob(base_ptr,
+                            remaining_bytes / element_bytes,
+                            torch::TensorOptions().dtype(casted_dtype).device(backend::kDeviceType));
 }
 
 torch::Stream Buffer::get_comm_stream() const {
@@ -806,7 +812,7 @@ void Buffer::destroy() {
 
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
-                  const std::optional<pybind11::bytearray>& root_unique_id_opt) {
+                  const pybind11::object& root_unique_id) {
     EP_HOST_ASSERT(not is_available());
     has_foreign_ipc_peers = false;
 
@@ -863,13 +869,13 @@ void Buffer::sync(const std::vector<int>& device_ids,
 #elif !defined(DISABLE_NVSHMEM)
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
-        EP_HOST_ASSERT(root_unique_id_opt.has_value());
-        std::vector<uint8_t> root_unique_id(root_unique_id_opt->size());
-        auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
-        std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
+        EP_HOST_ASSERT(not root_unique_id.is_none());
+        auto root_unique_id_str = root_unique_id.cast<std::string>();
+        std::vector<uint8_t> root_unique_id_bytes(root_unique_id_str.size());
+        std::memcpy(root_unique_id_bytes.data(), root_unique_id_str.data(), root_unique_id_str.size());
         auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
-        EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
+        EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id_bytes, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
         // Allocate
