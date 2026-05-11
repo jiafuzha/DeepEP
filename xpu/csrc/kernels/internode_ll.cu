@@ -16,6 +16,7 @@ namespace internode_ll {
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -111,10 +112,28 @@ std::mutex xpu_low_latency_dispatch_states_mu;
 std::unordered_map<uint64_t, std::shared_ptr<XpuLowLatencyRendezvousState<XpuLowLatencyDispatchArrival>>> xpu_low_latency_dispatch_states;
 std::mutex xpu_low_latency_combine_states_mu;
 std::unordered_map<uint64_t, std::shared_ptr<XpuLowLatencyRendezvousState<XpuLowLatencyCombineArrival>>> xpu_low_latency_combine_states;
+std::mutex xpu_low_latency_memops_mu;
+
+inline bool xpu_should_serialize_memops() {
+    static const bool should_serialize = []() {
+        const char* raw = std::getenv("DEEPEP_XPU_SERIALIZE_MEMOPS");
+        if (raw == nullptr)
+            return false;
+        return std::strcmp(raw, "0") != 0 and
+               std::strcmp(raw, "false") != 0 and
+               std::strcmp(raw, "False") != 0 and
+               std::strcmp(raw, "no") != 0 and
+               std::strcmp(raw, "off") != 0;
+    }();
+    return should_serialize;
+}
 
 inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* src, size_t bytes) {
     if (bytes == 0)
         return;
+    std::optional<std::lock_guard<std::mutex>> guard;
+    if (xpu_should_serialize_memops())
+        guard.emplace(xpu_low_latency_memops_mu);
     auto event = stream.queue().memcpy(dst, src, bytes);
     event.wait_and_throw();
 }
@@ -122,6 +141,9 @@ inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* 
 inline void xpu_blocking_memset(runtime_stream_t stream, void* ptr, int value, size_t bytes) {
     if (bytes == 0)
         return;
+    std::optional<std::lock_guard<std::mutex>> guard;
+    if (xpu_should_serialize_memops())
+        guard.emplace(xpu_low_latency_memops_mu);
     auto event = stream.queue().memset(ptr, value, bytes);
     event.wait_and_throw();
 }

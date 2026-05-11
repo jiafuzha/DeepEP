@@ -1,27 +1,10 @@
 import torch
 import pytest
 
-import xpu.deep_ep_cpp_xpu as backend
 
-
-def _warm_up_xpu_allocator() -> None:
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        torch.xpu.set_device(0)
-        _ = torch.empty((1,), device='xpu')
-
-
-def test_stub_buffer_metadata_and_handles():
-    _warm_up_xpu_allocator()
-    buf = backend.Buffer(
-        9,      # rank
-        16,     # num_ranks
-        128,    # num_nvl_bytes
-        256,    # num_rdma_bytes
-        False,  # low_latency_mode
-        False,  # explicitly_destroy
-        False,  # enable_shrink
-        False,  # use_fabric
-    )
+def test_stub_buffer_metadata_and_handles(xpu_stub_backend_module):
+    backend = xpu_stub_backend_module
+    buf = backend.Buffer(9, 16, 128, 256, False, False, False, False)
 
     assert buf.get_num_rdma_ranks() == 2
     assert buf.get_rdma_rank() == 1
@@ -37,18 +20,9 @@ def test_stub_buffer_metadata_and_handles():
     assert len(uid) > 0
 
 
-def test_stub_buffer_tensor_views_and_sync_destroy():
-    _warm_up_xpu_allocator()
-    buf = backend.Buffer(
-        0,      # rank
-        1,      # num_ranks
-        128,    # num_nvl_bytes
-        128,    # num_rdma_bytes
-        False,  # low_latency_mode
-        False,  # explicitly_destroy
-        False,  # enable_shrink
-        False,  # use_fabric
-    )
+def test_stub_buffer_tensor_views_and_sync_destroy(xpu_stub_backend_module):
+    backend = xpu_stub_backend_module
+    buf = backend.Buffer(0, 1, 128, 128, False, False, False, False)
 
     assert not buf.is_available()
     device_id = buf.get_local_device_id()
@@ -69,18 +43,9 @@ def test_stub_buffer_tensor_views_and_sync_destroy():
     assert not buf.is_available()
 
 
-def test_stub_stream_and_size_hint_api():
-    _warm_up_xpu_allocator()
-    buf = backend.Buffer(
-        0,      # rank
-        1,      # num_ranks
-        0,      # num_nvl_bytes
-        0,      # num_rdma_bytes
-        False,  # low_latency_mode
-        False,  # explicitly_destroy
-        False,  # enable_shrink
-        False,  # use_fabric
-    )
+def test_stub_stream_and_size_hint_api(xpu_stub_backend_module):
+    backend = xpu_stub_backend_module
+    buf = backend.Buffer(0, 1, 0, 0, False, False, False, False)
 
     stream = buf.get_comm_stream()
     # Stream may be None on CPU-only environments; API should still be callable.
@@ -92,13 +57,12 @@ def test_stub_stream_and_size_hint_api():
     assert hint_large >= hint_small
 
 
-def test_stub_internode_requires_rdma_bytes():
+def test_stub_internode_requires_rdma_bytes(xpu_stub_backend_module):
+    backend = xpu_stub_backend_module
     is_native_backend = getattr(backend, '__file__', '').endswith(('.so', '.pyd'))
     if is_native_backend:
         pytest.skip('pure-Python stub backend is not active')
 
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        _ = torch.empty((1,), device='xpu')
     buf = backend.Buffer(9, 16, 128, 0, False, False, False, False)
 
     buf.sync([], [], None)

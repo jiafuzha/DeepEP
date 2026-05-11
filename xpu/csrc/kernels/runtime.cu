@@ -5,6 +5,8 @@
 #if defined(DEEPEP_USE_XPU)
 #include "configs.cuh"
 #include "exception.cuh"
+
+#include <c10/xpu/XPUCachingAllocator.h>
 #else
 #include "configs.cuh"
 #include "exception.cuh"
@@ -69,19 +71,13 @@ int init(const std::vector<uint8_t>&, int rank, int, bool) {
 void* alloc(size_t size, size_t alignment) {
     if (size == 0)
         return nullptr;
-    if (alignment == 0)
-        alignment = alignof(void*);
-    if ((alignment & (alignment - 1)) != 0)
-        alignment = alignof(void*);
-
-    void* ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, size) != 0)
-        return nullptr;
-    return ptr;
+    (void)alignment;
+    return c10::xpu::XPUCachingAllocator::raw_alloc(size);
 }
 
 void free(void* ptr) {
-    std::free(ptr);
+    if (ptr != nullptr)
+        c10::xpu::XPUCachingAllocator::raw_delete(ptr);
 }
 
 void barrier() {
