@@ -1,6 +1,14 @@
 import torch
+import pytest
 
 from xpu.deep_ep.buffer import Buffer, Config
+
+
+TEST_CONFIG = Config(num_sms=20,
+                     num_max_nvl_chunked_send_tokens=6,
+                     num_max_nvl_chunked_recv_tokens=256,
+                     num_max_rdma_chunked_send_tokens=6,
+                     num_max_rdma_chunked_recv_tokens=256)
 
 
 class _RaisingInternodeRuntime:
@@ -50,11 +58,7 @@ def _make_buffer_for_low_latency_fallback_tests() -> Buffer:
 
 
 def _config() -> Config:
-    return Config(num_sms=20, 
-                  num_max_nvl_chunked_send_tokens=6,
-                  num_max_nvl_chunked_recv_tokens=256,
-                  num_max_rdma_chunked_send_tokens=6,
-                  num_max_rdma_chunked_recv_tokens=256)
+    return TEST_CONFIG
 
 
 def _config_fingerprint(config: Config) -> tuple[int, int, int, int]:
@@ -66,6 +70,26 @@ def _config_fingerprint(config: Config) -> tuple[int, int, int, int]:
     )
 
 
+@pytest.fixture
+def xpu_buffer_module(monkeypatch):
+    from xpu.deep_ep import buffer as buffer_mod
+
+    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
+    return buffer_mod
+
+
+@pytest.fixture
+def fallback_buffer(xpu_buffer_module) -> Buffer:
+    del xpu_buffer_module
+    return _make_buffer_for_fallback_tests()
+
+
+@pytest.fixture
+def low_latency_fallback_buffer(xpu_buffer_module) -> Buffer:
+    del xpu_buffer_module
+    return _make_buffer_for_low_latency_fallback_tests()
+
+
 def test_rank_config_lookup_falls_back_to_profiled_neighbors():
     assert _config_fingerprint(Buffer.get_dispatch_config(1)) == _config_fingerprint(Buffer.get_dispatch_config(2))
     assert _config_fingerprint(Buffer.get_dispatch_config(3)) == _config_fingerprint(Buffer.get_dispatch_config(4))
@@ -73,11 +97,8 @@ def test_rank_config_lookup_falls_back_to_profiled_neighbors():
     assert _config_fingerprint(Buffer.get_combine_config(3)) == _config_fingerprint(Buffer.get_combine_config(4))
 
 
-def test_internode_dispatch_fallback_single_rank(monkeypatch):
-    from xpu.deep_ep import buffer as buffer_mod
-
-    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
-    buf = _make_buffer_for_fallback_tests()
+def test_internode_dispatch_fallback_single_rank(fallback_buffer):
+    buf = fallback_buffer
 
     x = torch.randn(4, 8, dtype=torch.bfloat16)
     topk_idx = torch.zeros((4, 1), dtype=torch.int64)
@@ -108,11 +129,8 @@ def test_internode_dispatch_fallback_single_rank(monkeypatch):
     assert event is not None
 
 
-def test_internode_combine_fallback_single_rank(monkeypatch):
-    from xpu.deep_ep import buffer as buffer_mod
-
-    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
-    buf = _make_buffer_for_fallback_tests()
+def test_internode_combine_fallback_single_rank(fallback_buffer):
+    buf = fallback_buffer
 
     x = torch.randn(4, 8, dtype=torch.bfloat16)
     topk_weights = torch.ones((4, 1), dtype=torch.float32)
@@ -132,11 +150,8 @@ def test_internode_combine_fallback_single_rank(monkeypatch):
     assert event is not None
 
 
-def test_low_latency_dispatch_fallback_single_rank(monkeypatch):
-    from xpu.deep_ep import buffer as buffer_mod
-
-    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
-    buf = _make_buffer_for_low_latency_fallback_tests()
+def test_low_latency_dispatch_fallback_single_rank(low_latency_fallback_buffer):
+    buf = low_latency_fallback_buffer
 
     x = torch.randn(4, 8, dtype=torch.bfloat16)
     topk_idx = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
@@ -158,11 +173,8 @@ def test_low_latency_dispatch_fallback_single_rank(monkeypatch):
     assert callable(hook)
 
 
-def test_low_latency_combine_fallback_single_rank(monkeypatch):
-    from xpu.deep_ep import buffer as buffer_mod
-
-    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
-    buf = _make_buffer_for_low_latency_fallback_tests()
+def test_low_latency_combine_fallback_single_rank(low_latency_fallback_buffer):
+    buf = low_latency_fallback_buffer
 
     x = torch.arange(64, dtype=torch.bfloat16).view(4, 16)
     topk_idx = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
@@ -188,11 +200,8 @@ def test_low_latency_combine_fallback_single_rank(monkeypatch):
     assert callable(hook)
 
 
-def test_low_latency_mask_buffer_fallback_single_rank(monkeypatch):
-    from xpu.deep_ep import buffer as buffer_mod
-
-    monkeypatch.setattr(buffer_mod, '_has_xpu_runtime', lambda: True)
-    buf = _make_buffer_for_low_latency_fallback_tests()
+def test_low_latency_mask_buffer_fallback_single_rank(low_latency_fallback_buffer):
+    buf = low_latency_fallback_buffer
 
     status = torch.zeros((1,), dtype=torch.int)
     buf.low_latency_update_mask_buffer(0, True)

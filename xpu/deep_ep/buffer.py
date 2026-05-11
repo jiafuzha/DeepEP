@@ -30,17 +30,89 @@ def _has_xpu_runtime() -> bool:
     return hasattr(torch, 'xpu') and torch.xpu.is_available()
 
 
-def _get_profiled_config(num_ranks: int, config_map: dict[int, 'Config']) -> 'Config':
+def _normalize_num_sms(num_sms: int) -> int:
+    num_sms = max(1, int(num_sms))
+    if num_sms > 1 and (num_sms % 2) != 0:
+        num_sms -= 1
+    return max(1, num_sms)
+
+
+def _detect_backend_num_sms() -> Optional[int]:
+    if _has_xpu_runtime():
+        try:
+            props = torch.xpu.get_device_properties(torch.xpu.current_device())
+            for attr in ('max_compute_units', 'multi_processor_count'):
+                value = getattr(props, attr, None)
+                if isinstance(value, int) and value > 0:
+                    return _normalize_num_sms(value)
+        except Exception:
+            return None
+
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            value = getattr(props, 'multi_processor_count', None)
+            if isinstance(value, int) and value > 0:
+                return _normalize_num_sms(value)
+        except Exception:
+            return None
+
+    return None
+
+
+def _get_profiled_config(num_ranks: int,
+                         config_map: dict[int, Tuple[int, int, int, int, int]]) -> Tuple[int, int, int, int, int]:
     if num_ranks <= 0:
         raise ValueError(f'num_ranks must be positive, got {num_ranks}')
     if num_ranks in config_map:
         return config_map[num_ranks]
 
+    strategy = os.getenv('DEEPEP_XPU_CONFIG_STRATEGY', 'nearest').strip().lower()
+    if strategy in ('nearest', 'profiled'):
+        profiled_ranks = sorted(config_map)
+        for profiled_rank in profiled_ranks:
+            if num_ranks <= profiled_rank:
+                return config_map[profiled_rank]
+        return config_map[profiled_ranks[-1]]
+
+    def _clamp_int(v: float, minimum: int = 1) -> int:
+        return max(minimum, int(round(v)))
+
+    def _align_int(v: float, alignment: int, minimum: int = 1) -> int:
+        aligned = int(round(v / alignment)) * alignment
+        return max(minimum, aligned)
+
+    def _blend(a: Tuple[int, int, int, int, int],
+               b: Tuple[int, int, int, int, int],
+               alpha: float) -> Tuple[int, int, int, int, int]:
+        # Keep `bytes_per_element` from profiled configs; this value is currently fixed at 128.
+        return (
+            Buffer.num_sms,
+            _clamp_int(a[1] + (b[1] - a[1]) * alpha),
+            _align_int(a[2] + (b[2] - a[2]) * alpha, 16, 16),
+            _clamp_int(a[3] + (b[3] - a[3]) * alpha),
+            int(a[4]),
+        )
+
     profiled_ranks = sorted(config_map)
-    for profiled_rank in profiled_ranks:
-        if num_ranks <= profiled_rank:
-            return config_map[profiled_rank]
-    return config_map[profiled_ranks[-1]]
+    if num_ranks < profiled_ranks[0]:
+        return config_map[profiled_ranks[0]]
+
+    for idx in range(1, len(profiled_ranks)):
+        lo = profiled_ranks[idx - 1]
+        hi = profiled_ranks[idx]
+        if lo < num_ranks < hi:
+            alpha = float(num_ranks - lo) / float(hi - lo)
+            return _blend(config_map[lo], config_map[hi], alpha)
+
+    # Extrapolate beyond the profiled range using the last two points.
+    hi = profiled_ranks[-1]
+    lo = profiled_ranks[-2] if len(profiled_ranks) >= 2 else profiled_ranks[-1]
+    if hi == lo:
+        return config_map[hi]
+
+    alpha = float(num_ranks - lo) / float(hi - lo)
+    return _blend(config_map[lo], config_map[hi], alpha)
 
 
 class Buffer:
@@ -61,6 +133,7 @@ class Buffer:
     """
 
     num_sms: int = 20
+    _num_sms_initialized: bool = False
 
     def __init__(self,
                  group: Optional[dist.ProcessGroup],
@@ -96,6 +169,16 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
+        if not Buffer._num_sms_initialized:
+            env_num_sms = os.getenv('DEEPEP_NUM_SMS')
+            if env_num_sms:
+                Buffer.set_num_sms(int(env_num_sms))
+            elif os.getenv('DEEPEP_XPU_AUTO_NUM_SMS', '1').strip().lower() not in ('0', 'false', 'no', 'off'):
+                detected_num_sms = _detect_backend_num_sms()
+                if detected_num_sms is not None:
+                    Buffer.set_num_sms(detected_num_sms)
+            Buffer._num_sms_initialized = True
+
         check_nvlink_connections(group)
 
         # Initialize the CPP runtime
@@ -204,7 +287,8 @@ class Buffer:
             new_num_sms: the new number to be set.
         """
 
-        assert new_num_sms % 2 == 0, 'The SM count must be even'
+        assert new_num_sms > 0, 'The SM count must be positive'
+        assert new_num_sms == 1 or new_num_sms % 2 == 0, 'The SM count must be 1 or even'
         Buffer.num_sms = new_num_sms
 
     @staticmethod
@@ -538,20 +622,20 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
-            8: Config(Buffer.num_sms, 6, 256, 6, 128),
-            16: Config(Buffer.num_sms, 36, 288, 20, 128),
-            24: Config(Buffer.num_sms, 32, 288, 8, 128),
-            32: Config(Buffer.num_sms, 32, 288, 8, 128),
-            48: Config(Buffer.num_sms, 32, 288, 8, 128),
-            64: Config(Buffer.num_sms, 32, 288, 8, 128),
-            96: Config(Buffer.num_sms, 20, 480, 12, 128),
-            128: Config(Buffer.num_sms, 20, 560, 12, 128),
-            144: Config(Buffer.num_sms, 32, 720, 12, 128),
-            160: Config(Buffer.num_sms, 28, 720, 12, 128),
+            2: (Buffer.num_sms, 24, 256, 6, 128),
+            4: (Buffer.num_sms, 6, 256, 6, 128),
+            8: (Buffer.num_sms, 6, 256, 6, 128),
+            16: (Buffer.num_sms, 36, 288, 20, 128),
+            24: (Buffer.num_sms, 32, 288, 8, 128),
+            32: (Buffer.num_sms, 32, 288, 8, 128),
+            48: (Buffer.num_sms, 32, 288, 8, 128),
+            64: (Buffer.num_sms, 32, 288, 8, 128),
+            96: (Buffer.num_sms, 20, 480, 12, 128),
+            128: (Buffer.num_sms, 20, 560, 12, 128),
+            144: (Buffer.num_sms, 32, 720, 12, 128),
+            160: (Buffer.num_sms, 28, 720, 12, 128),
         }
-        return _get_profiled_config(num_ranks, config_map)
+        return Config(*_get_profiled_config(num_ranks, config_map))
 
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
@@ -567,20 +651,20 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
-            8: Config(Buffer.num_sms, 4, 256, 6, 128),
-            16: Config(Buffer.num_sms, 4, 288, 12, 128),
-            24: Config(Buffer.num_sms, 1, 288, 8, 128),
-            32: Config(Buffer.num_sms, 1, 288, 8, 128),
-            48: Config(Buffer.num_sms, 1, 288, 8, 128),
-            64: Config(Buffer.num_sms, 1, 288, 8, 128),
-            96: Config(Buffer.num_sms, 1, 480, 8, 128),
-            128: Config(Buffer.num_sms, 1, 560, 8, 128),
-            144: Config(Buffer.num_sms, 2, 720, 8, 128),
-            160: Config(Buffer.num_sms, 2, 720, 8, 128),
+            2: (Buffer.num_sms, 10, 256, 6, 128),
+            4: (Buffer.num_sms, 9, 256, 6, 128),
+            8: (Buffer.num_sms, 4, 256, 6, 128),
+            16: (Buffer.num_sms, 4, 288, 12, 128),
+            24: (Buffer.num_sms, 1, 288, 8, 128),
+            32: (Buffer.num_sms, 1, 288, 8, 128),
+            48: (Buffer.num_sms, 1, 288, 8, 128),
+            64: (Buffer.num_sms, 1, 288, 8, 128),
+            96: (Buffer.num_sms, 1, 480, 8, 128),
+            128: (Buffer.num_sms, 1, 560, 8, 128),
+            144: (Buffer.num_sms, 2, 720, 8, 128),
+            160: (Buffer.num_sms, 2, 720, 8, 128),
         }
-        return _get_profiled_config(num_ranks, config_map)
+        return Config(*_get_profiled_config(num_ranks, config_map))
 
     # noinspection PyTypeChecker
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,

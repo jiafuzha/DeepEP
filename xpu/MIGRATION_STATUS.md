@@ -4,6 +4,16 @@ This directory is the staged XPU migration workspace.
 
 ## Completed in this commit
 
+- Reduced staged XPU degraded-dispatch host overhead in `xpu/csrc/deep_ep.cpp`: replaced host copies of `num_tokens_per_rank`, `num_tokens_per_rdma_rank`, and `num_tokens_per_expert` with direct device-side slicing in non-cached local-only fallback paths for `intranode_dispatch` and `internode_dispatch`.
+- Reduced staged XPU combine fallback overhead in `xpu/csrc/deep_ep.cpp`: removed redundant host prefix-matrix CPU scans in `intranode_combine` and `internode_combine` cross-process foreign-peer handling. These paths now directly enter constrained local single-rank degradation.
+- Reduced staged XPU low-latency foreign-peer overhead in `xpu/csrc/deep_ep.cpp`: replaced host `topk_idx.to(torch::kCPU)` token filtering loops in `low_latency_dispatch` and `low_latency_combine` with device-side boolean mask + `nonzero` index selection. This preserves local-subset degraded semantics while removing per-call host roundtrips.
+- Reduced staged XPU cross-process dispatch overhead in `xpu/csrc/deep_ep.cpp`: removed redundant host-side `is_token_in_rank.to(torch::kCPU)` scans in `intranode_dispatch` and `internode_dispatch` local-only degraded paths. Behavior remains constrained to local-rank execution, but avoids large per-call CPU transfer/loop costs.
+- Updated staged XPU cross-process combine behavior in `xpu/csrc/deep_ep.cpp`: `intranode_combine` and `internode_combine` now degrade remote-routing multi-rank cases to constrained local single-rank execution instead of hard-failing with `EP_UNSUPPORTED_XPU`, preserving forward progress while full PCIe IPC transport support is pending.
+- Extended the Phase-2 staged XPU rendezvous throughput improvement to `xpu/csrc/kernels/internode_ll.cu`: low-latency host-side SYCL `memcpy`/`memset` helpers now avoid forced global serialization by default, with opt-in conservative mode via `DEEPEP_XPU_SERIALIZE_MEMOPS=1`.
+- Added a Phase-2 staged XPU rendezvous throughput improvement in `xpu/csrc/kernels/intranode.cu` and `xpu/csrc/kernels/internode.cu`: host-side SYCL `memcpy`/`memset` helpers no longer force global serialization by default, with opt-in fallback via `DEEPEP_XPU_SERIALIZE_MEMOPS=1` for conservative debugging.
+- Migrated XPU staged internode runtime allocation in `xpu/csrc/kernels/runtime.cu` from host `posix_memalign/free` to `c10::xpu::XPUCachingAllocator::raw_alloc/raw_delete`, aligning staged internode buffer ownership with backend-managed XPU memory.
+- Added Phase-2 backend-aware SM-count tuning in `xpu/deep_ep/buffer.py`: `Buffer.num_sms` now auto-detects from active XPU/CUDA device properties (with `DEEPEP_NUM_SMS` override and `DEEPEP_XPU_AUTO_NUM_SMS` toggle), reducing dependence on the previous static default during staged performance bring-up.
+- Added Phase-2 runtime config tuning path in `xpu/deep_ep/buffer.py`: opt-in interpolation/extrapolation for non-profiled rank counts via `DEEPEP_XPU_CONFIG_STRATEGY=interpolate`, while preserving default nearest-profile behavior for compatibility.
 - Created mirrored Python package at `xpu/deep_ep`.
 - Added dynamic extension loading with XPU-first fallback.
 - Added temporary Python stub backend `xpu/deep_ep_cpp_xpu.py`.

@@ -1,12 +1,22 @@
 import importlib
+import atexit
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+from functools import lru_cache
 
 import pytest
 import torch
+
+
+@lru_cache(maxsize=1)
+def _shared_ipc_dir() -> str:
+    path = tempfile.mkdtemp(prefix='deepep_xpu_ipc_')
+    atexit.register(lambda: shutil.rmtree(path, ignore_errors=True))
+    return path
 
 
 def test_xpu_python_package_importable():
@@ -28,22 +38,38 @@ def _run_inline_python(script: str, env: dict[str, str] | None = None) -> subpro
     return subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, env=merged_env)
 
 
+@lru_cache(maxsize=1)
+def _has_two_xpu_devices_under_affinity_mask() -> bool:
+    probe = _run_inline_python(
+        "import sys, torch; sys.exit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.xpu.device_count() >= 2 else 2)",
+        env={'ZE_AFFINITY_MASK': '0,1'},
+    )
+    if probe.returncode == 2:
+        return False
+    assert probe.returncode == 0, probe.stderr
+    return True
+
+
 def _run_two_process_xpu_scripts(script_template: str, rounds: int = 1, extra_env: dict[str, str] | None = None) -> None:
     assert rounds >= 1
     shared_env = os.environ.copy()
     shared_env['ZE_AFFINITY_MASK'] = '0,1'
     if extra_env is not None:
         shared_env.update(extra_env)
+    else:
+        shared_env['DEEPEP_TEST_IPC_DIR'] = _shared_ipc_dir()
 
-    probe = _run_inline_python(
-        "import sys, torch; sys.exit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.xpu.device_count() >= 2 else 2)",
-        env={'ZE_AFFINITY_MASK': '0,1'},
-    )
-    if probe.returncode == 2:
+    if not _has_two_xpu_devices_under_affinity_mask():
         pytest.skip('at least two xpu devices are required under ZE_AFFINITY_MASK=0,1')
-    assert probe.returncode == 0, probe.stderr
 
     for round_idx in range(rounds):
+        ipc_dir = shared_env.get('DEEPEP_TEST_IPC_DIR')
+        if ipc_dir:
+            for rank in (0, 1):
+                handle_path = os.path.join(ipc_dir, f'handle_{rank}.bin')
+                if os.path.exists(handle_path):
+                    os.remove(handle_path)
+
         processes: list[tuple[int, subprocess.Popen[str]]] = []
         for local_device in (0, 1):
             script = script_template.replace('__LOCAL_DEVICE__', str(local_device)).replace('__ROUND__', str(round_idx))
@@ -72,13 +98,8 @@ def _run_two_process_xpu_scripts(script_template: str, rounds: int = 1, extra_en
             )
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_stale_ipc_handle_rejected_after_exporter_destroy():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -104,13 +125,8 @@ def test_native_xpu_stale_ipc_handle_rejected_after_exporter_destroy():
     assert completed.returncode != 0
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_malformed_ipc_handle_metadata_rejected():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -136,13 +152,8 @@ def test_native_xpu_malformed_ipc_handle_metadata_rejected():
     assert completed.returncode != 0
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_corrupted_ipc_checksum_rejected():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -168,13 +179,8 @@ def test_native_xpu_corrupted_ipc_checksum_rejected():
     assert completed.returncode != 0
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_duplicate_remote_ipc_handle_rejected():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -202,13 +208,8 @@ def test_native_xpu_duplicate_remote_ipc_handle_rejected():
     assert completed.returncode != 0
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_cross_process_ipc_sync_succeeds_with_exchanged_handles():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -249,17 +250,11 @@ def test_native_xpu_cross_process_ipc_sync_succeeds_with_exchanged_handles():
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script, rounds=3)
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_cross_process_intranode_single_rank_dispatch_combine_succeeds_with_exchanged_handles():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -359,17 +354,11 @@ def test_native_xpu_cross_process_intranode_single_rank_dispatch_combine_succeed
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script, rounds=3)
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_cross_process_internode_single_rank_dispatch_combine_succeeds_with_exchanged_handles():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -483,17 +472,11 @@ def test_native_xpu_cross_process_internode_single_rank_dispatch_combine_succeed
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script, rounds=3)
 
 
+@pytest.mark.usefixtures('require_native_xpu_runtime')
 def test_native_xpu_cross_process_low_latency_single_rank_dispatch_combine_succeeds_with_exchanged_handles():
-    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
-    ext_path = getattr(ext, '__file__', '')
-    if not ext_path.endswith(('.so', '.pyd')):
-        pytest.skip('native staged extension is not active')
-    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
-        pytest.skip('xpu runtime is not available')
 
     script = textwrap.dedent(
         """
@@ -580,8 +563,7 @@ def test_native_xpu_cross_process_low_latency_single_rank_dispatch_combine_succe
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_single_rank_cached_dispatch_combine_succeeds_with_exchanged_handles():
@@ -717,8 +699,7 @@ def test_native_xpu_cross_process_intranode_single_rank_cached_dispatch_combine_
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script, rounds=3)
 
 
 def test_native_xpu_cross_process_internode_single_rank_cached_dispatch_combine_succeeds_with_exchanged_handles():
@@ -866,8 +847,7 @@ def test_native_xpu_cross_process_internode_single_rank_cached_dispatch_combine_
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script, rounds=3)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_dispatch_partial_local_routing_succeeds():
@@ -952,8 +932,7 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_partial_local_rout
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_partial_local_routing_succeeds():
@@ -1059,8 +1038,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_partial_loc
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_partial_local_routing_succeeds():
@@ -1166,8 +1144,7 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_partial_lo
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_partial_local_routing_succeeds():
@@ -1294,8 +1271,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_par
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_partial_local_multi_round_stress_succeeds():
@@ -1405,8 +1381,7 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_partial_lo
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_partial_local_multi_round_stress_succeeds():
@@ -1537,8 +1512,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_par
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_dispatch_local_only_routing_succeeds():
@@ -1620,8 +1594,7 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_local_only_routing
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_local_only_routing_succeeds():
@@ -1719,8 +1692,7 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_local_only
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_local_only_routing_succeeds():
@@ -1844,8 +1816,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_loc
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_dispatch_partial_local_routing_succeeds():
@@ -1938,8 +1909,7 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_partial_local_rout
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_partial_local_routing_succeeds():
@@ -2062,8 +2032,7 @@ def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_partial_loc
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_local_only_routing_succeeds():
@@ -2180,8 +2149,7 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_local_only
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_partial_local_routing_succeeds():
@@ -2303,8 +2271,7 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_partial_lo
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_local_only_routing_succeeds():
@@ -2451,8 +2418,7 @@ def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_loc
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_partial_local_routing_succeeds():
@@ -2604,8 +2570,7 @@ def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_par
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_partial_local_multi_round_stress_succeeds():
@@ -2731,8 +2696,7 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_partial_lo
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_partial_local_multi_round_stress_succeeds():
@@ -2889,8 +2853,7 @@ def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_par
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_low_latency_two_rank_dispatch_partial_local_routing_succeeds():
@@ -2970,8 +2933,7 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_partial_local_ro
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_low_latency_two_rank_dispatch_local_only_routing_succeeds():
@@ -3052,8 +3014,7 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_local_only_routi
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_local_only_routing_succeeds():
@@ -3157,8 +3118,7 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_local_on
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_partial_local_routing_succeeds():
@@ -3263,8 +3223,7 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_partial_
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_partial_local_multi_round_stress_succeeds():
@@ -3372,8 +3331,7 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_partial_
         """
     )
 
-    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
-        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+    _run_two_process_xpu_scripts(script)
 
 
 def test_native_xpu_ipc_handle_kind_mismatch_rejected():

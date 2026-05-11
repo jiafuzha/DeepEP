@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -119,10 +120,40 @@ std::mutex xpu_intranode_combine_states_mu;
 std::unordered_map<uintptr_t, std::shared_ptr<XpuIntranodeRendezvousState<XpuIntranodeCombineArrival>>> xpu_intranode_combine_states;
 std::mutex xpu_intranode_memcpy_mu;
 
+inline bool xpu_should_serialize_memops() {
+    static const bool should_serialize = []() {
+        const char* raw = std::getenv("DEEPEP_XPU_SERIALIZE_MEMOPS");
+        if (raw == nullptr)
+            return false;
+        return std::strcmp(raw, "0") != 0 and
+               std::strcmp(raw, "false") != 0 and
+               std::strcmp(raw, "False") != 0 and
+               std::strcmp(raw, "no") != 0 and
+               std::strcmp(raw, "off") != 0;
+    }();
+    return should_serialize;
+}
+
+inline bool xpu_cached_notify_requires_sync() {
+    static const bool requires_sync = []() {
+        const char* raw = std::getenv("DEEPEP_XPU_CACHED_NOTIFY_SYNC");
+        if (raw == nullptr)
+            return false;
+        return std::strcmp(raw, "0") != 0 and
+               std::strcmp(raw, "false") != 0 and
+               std::strcmp(raw, "False") != 0 and
+               std::strcmp(raw, "no") != 0 and
+               std::strcmp(raw, "off") != 0;
+    }();
+    return requires_sync;
+}
+
 inline void xpu_blocking_memcpy(runtime_stream_t stream, void* dst, const void* src, size_t bytes) {
     if (bytes == 0)
         return;
-    std::lock_guard<std::mutex> guard(xpu_intranode_memcpy_mu);
+    std::optional<std::lock_guard<std::mutex>> guard;
+    if (xpu_should_serialize_memops())
+        guard.emplace(xpu_intranode_memcpy_mu);
     auto event = stream.queue().memcpy(dst, src, bytes);
     event.wait_and_throw();
 }
@@ -328,9 +359,14 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int, void**, int**, i
     EP_HOST_ASSERT(rank_prefix_matrix != nullptr);
 
     // Host-staged XPU dispatch uses cached prefix matrices directly and does not
-    // consume in-buffer queue metadata. Keep stream ordering consistent.
-    auto noop = stream.queue().memcpy(const_cast<int*>(rank_prefix_matrix), rank_prefix_matrix, sizeof(int));
-    noop.wait_and_throw();
+    // consume in-buffer queue metadata. Keep old forced-stream ordering as an
+    // opt-in debug path only.
+    if (!xpu_cached_notify_requires_sync()) {
+        (void)stream;
+        return;
+    }
+    auto sync_event = stream.queue().memcpy(const_cast<int*>(rank_prefix_matrix), rank_prefix_matrix, sizeof(int));
+    sync_event.wait_and_throw();
 }
 
 void dispatch(void* recv_x,
@@ -667,11 +703,15 @@ void dispatch(void* recv_x,
 
 void cached_notify_combine(void**, int* send_head, int, int, int, int**, int rank, int num_ranks, runtime_stream_t stream) {
     EP_HOST_ASSERT(rank >= 0 and rank < num_ranks);
-    // Single-rank XPU path does not use queue heads in buffer memory. Keep API side effects minimal.
+    // Single-rank XPU path does not use queue heads in buffer memory.
+    // Keep old forced-stream ordering as an opt-in debug path only.
+    if (!xpu_cached_notify_requires_sync()) {
+        (void)stream;
+        return;
+    }
     if (send_head != nullptr) {
-        // Ensure memory dependency on communication stream.
-        auto noop = stream.queue().memcpy(send_head, send_head, sizeof(int));
-        noop.wait_and_throw();
+        auto sync_event = stream.queue().memcpy(send_head, send_head, sizeof(int));
+        sync_event.wait_and_throw();
     }
 }
 
