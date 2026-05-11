@@ -4,7 +4,7 @@ import setuptools
 import importlib
 
 from pathlib import Path
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
@@ -16,6 +16,15 @@ def get_nvshmem_host_lib_name(base_dir):
 
 
 if __name__ == '__main__':
+    skip_cuda_build = int(os.getenv('DEEPEP_SKIP_CUDA_BUILD', '0')) == 1
+    if skip_cuda_build:
+        print('Warning: `DEEPEP_SKIP_CUDA_BUILD=1` set; skipping CUDA extension build for this install')
+    elif CUDA_HOME is None:
+        raise RuntimeError(
+            'CUDA toolkit not found (`CUDA_HOME` is not set). '\
+            'Install CUDA and set `CUDA_HOME`, or use `DEEPEP_SKIP_CUDA_BUILD=1` for metadata-only install.'
+        )
+
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -113,15 +122,21 @@ if __name__ == '__main__':
     except Exception as _:
         revision = ''
 
+    ext_modules = []
+    cmdclass = {}
+    if not skip_cuda_build:
+        ext_modules = [
+            CUDAExtension(name='deep_ep_cpp',
+                          include_dirs=include_dirs,
+                          library_dirs=library_dirs,
+                          sources=sources,
+                          extra_compile_args=extra_compile_args,
+                          extra_link_args=extra_link_args)
+        ]
+        cmdclass = {'build_ext': BuildExtension}
+
     setuptools.setup(name='deep_ep',
                      version='1.2.1' + revision,
                      packages=setuptools.find_packages(include=['deep_ep']),
-                     ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
-                                       include_dirs=include_dirs,
-                                       library_dirs=library_dirs,
-                                       sources=sources,
-                                       extra_compile_args=extra_compile_args,
-                                       extra_link_args=extra_link_args)
-                     ],
-                     cmdclass={'build_ext': BuildExtension})
+                     ext_modules=ext_modules,
+                     cmdclass=cmdclass)

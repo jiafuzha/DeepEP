@@ -77,12 +77,19 @@ python tests/test_low_latency.py
 NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
 ```
 
+If CUDA toolkit is not installed on the current machine (for example, XPU-only development), use metadata-only installation:
+
+```bash
+DEEPEP_SKIP_CUDA_BUILD=1 python -m pip install -e . --no-build-isolation
+```
+
 #### Installation environment variables
 
 - `NVSHMEM_DIR`: the path to the NVSHMEM directory, disable all internode and low-latency features if not specified
 - `DISABLE_SM90_FEATURES`: 0 or 1, whether to disable SM90 features, it is required for SM90 devices or CUDA 11
 - `TORCH_CUDA_ARCH_LIST`: the list of target architectures, e.g. `TORCH_CUDA_ARCH_LIST="9.0"`
 - `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, whether to disable aggressive load/store instructions, see [Undefined-behavior PTX usage](#undefined-behavior-ptx-usage) for more details
+- `DEEPEP_SKIP_CUDA_BUILD`: 0 or 1, when set to 1 skips CUDA extension build (useful for metadata-only installs in non-CUDA environments)
 
 Then, import `deep_ep` in your Python project, and enjoy!
 
