@@ -57,6 +57,22 @@ def _config() -> Config:
                   num_max_rdma_chunked_recv_tokens=256)
 
 
+def _config_fingerprint(config: Config) -> tuple[int, int, int, int]:
+    return (
+        config.get_nvl_buffer_size_hint(8, 128),
+        config.get_nvl_buffer_size_hint(16, 256),
+        config.get_rdma_buffer_size_hint(8, 128),
+        config.get_rdma_buffer_size_hint(16, 256),
+    )
+
+
+def test_rank_config_lookup_falls_back_to_profiled_neighbors():
+    assert _config_fingerprint(Buffer.get_dispatch_config(1)) == _config_fingerprint(Buffer.get_dispatch_config(2))
+    assert _config_fingerprint(Buffer.get_dispatch_config(3)) == _config_fingerprint(Buffer.get_dispatch_config(4))
+    assert _config_fingerprint(Buffer.get_combine_config(1)) == _config_fingerprint(Buffer.get_combine_config(2))
+    assert _config_fingerprint(Buffer.get_combine_config(3)) == _config_fingerprint(Buffer.get_combine_config(4))
+
+
 def test_internode_dispatch_fallback_single_rank(monkeypatch):
     from xpu.deep_ep import buffer as buffer_mod
 

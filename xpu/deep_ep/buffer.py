@@ -30,6 +30,19 @@ def _has_xpu_runtime() -> bool:
     return hasattr(torch, 'xpu') and torch.xpu.is_available()
 
 
+def _get_profiled_config(num_ranks: int, config_map: dict[int, 'Config']) -> 'Config':
+    if num_ranks <= 0:
+        raise ValueError(f'num_ranks must be positive, got {num_ranks}')
+    if num_ranks in config_map:
+        return config_map[num_ranks]
+
+    profiled_ranks = sorted(config_map)
+    for profiled_rank in profiled_ranks:
+        if num_ranks <= profiled_rank:
+            return config_map[profiled_rank]
+    return config_map[profiled_ranks[-1]]
+
+
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
@@ -538,8 +551,7 @@ class Buffer:
             144: Config(Buffer.num_sms, 32, 720, 12, 128),
             160: Config(Buffer.num_sms, 28, 720, 12, 128),
         }
-        assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
-        return config_map[num_ranks]
+        return _get_profiled_config(num_ranks, config_map)
 
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
@@ -568,8 +580,7 @@ class Buffer:
             144: Config(Buffer.num_sms, 2, 720, 8, 128),
             160: Config(Buffer.num_sms, 2, 720, 8, 128),
         }
-        assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
-        return config_map[num_ranks]
+        return _get_profiled_config(num_ranks, config_map)
 
     # noinspection PyTypeChecker
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
