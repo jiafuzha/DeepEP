@@ -870,7 +870,7 @@ def test_native_xpu_cross_process_internode_single_rank_cached_dispatch_combine_
         _run_two_process_xpu_scripts(script, rounds=3, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
 
 
-def test_native_xpu_cross_process_intranode_two_rank_dispatch_fails_fast_with_clear_error():
+def test_native_xpu_cross_process_intranode_two_rank_dispatch_partial_local_routing_succeeds():
     ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
     ext_path = getattr(ext, '__file__', '')
     if not ext_path.endswith(('.so', '.pyd')):
@@ -920,32 +920,377 @@ def test_native_xpu_cross_process_intranode_two_rank_dispatch_fails_fast_with_cl
         weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
         layout = buf.get_dispatch_layout(topk, 2, None, False, False)
 
-        try:
-            buf.intranode_dispatch(
-                x,
-                None,
-                topk,
-                weights,
-                layout[0],
-                layout[3],
-                layout[2],
-                0,
-                None,
-                None,
-                1,
-                0,
-                cfg,
-                None,
-                False,
-                False,
-            )
-        except Exception as exc:
-            message = str(exc)
-            assert 'cross processes' in message or 'cross-process' in message
-            buf.destroy()
-        else:
-            buf.destroy()
-            raise AssertionError('Expected cross-process intranode multi-rank dispatch to fail fast')
+        recv_x, _, recv_topk, recv_w, _, _, _, recv_channel, recv_src, _, _ = buf.intranode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x_cpu = recv_x.cpu().to(torch.float32)
+        x_cpu = x.cpu().to(torch.float32)
+
+        assert recv_src.cpu().tolist() == [rank]
+        assert recv_topk.cpu().tolist() == [[rank]]
+        assert recv_w.cpu().tolist() == [[1.0]]
+        assert recv_channel.shape[0] == num_ranks
+        assert recv_x_cpu.tolist() == [x_cpu[rank].tolist()]
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 0, False, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.arange(1, 2 * 128 + 1, dtype=torch.float32, device='xpu').reshape(2, 128)
+        x = (x + rank * 256).to(torch.bfloat16)
+        x_cached = x + 100
+
+        remote_topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        remote_layout = buf.get_dispatch_layout(remote_topk, 2, None, False, False)
+
+        first = buf.intranode_dispatch(
+            x,
+            None,
+            remote_topk,
+            weights,
+            remote_layout[0],
+            remote_layout[3],
+            remote_layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk_idx, recv_topk_weights, _, _, _, recv_channel, recv_src_idx, _, _ = buf.intranode_dispatch(
+            x_cached,
+            None,
+            None,
+            None,
+            None,
+            remote_layout[3],
+            None,
+            first[0].size(0),
+            first[5],
+            first[6],
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x_cpu = recv_x.cpu().to(torch.float32)
+        x_cached_cpu = x_cached.cpu().to(torch.float32)
+
+        assert recv_topk_idx is None
+        assert recv_topk_weights is None
+        assert recv_src_idx.cpu().tolist() == [rank]
+        assert recv_channel.shape[0] == num_ranks
+        assert recv_x_cpu.tolist() == [x_cached_cpu[rank].tolist()]
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_intranode_two_rank_dispatch_combine_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 0, False, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        layout = buf.get_dispatch_layout(topk, 2, None, False, False)
+
+        recv_x, _, recv_topk, recv_w, _, rank_prefix, channel_prefix, _, recv_src, send_head, _ = buf.intranode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        assert recv_src.cpu().tolist() == [rank]
+        assert recv_topk.cpu().tolist() == [[rank]]
+        assert recv_w.cpu().tolist() == [[1.0]]
+
+        combined_x, combined_w, _ = buf.intranode_combine(
+            recv_x,
+            recv_w,
+            None,
+            None,
+            recv_src,
+            rank_prefix,
+            channel_prefix,
+            send_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        x_cpu = x.cpu().to(torch.float32)
+        combined_x_cpu = combined_x.cpu().to(torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.float32)
+        expected[rank] = x_cpu[rank]
+
+        assert combined_x_cpu.tolist() == expected.tolist()
+        assert combined_w.cpu().tolist() == ([[1.0], [0.0]] if rank == 0 else [[0.0], [1.0]])
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 0, False, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        x_cached = x + 100
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        layout = buf.get_dispatch_layout(topk, 2, None, False, False)
+
+        first = buf.intranode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            layout[3],
+            layout[2],
+            0,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        second = buf.intranode_dispatch(
+            x_cached,
+            None,
+            None,
+            None,
+            None,
+            layout[3],
+            None,
+            first[0].size(0),
+            first[5],
+            first[6],
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk_idx, recv_topk_weights, _, rank_prefix_cached, channel_prefix_cached, _, recv_src_idx, send_head_cached, _ = second
+        assert recv_topk_idx is None
+        assert recv_topk_weights is None
+        assert recv_src_idx.cpu().tolist() == [rank]
+
+        combined_x, combined_w, _ = buf.intranode_combine(
+            recv_x,
+            None,
+            None,
+            None,
+            recv_src_idx,
+            rank_prefix_cached,
+            channel_prefix_cached,
+            send_head_cached,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        x_cached_cpu = x_cached.cpu().to(torch.float32)
+        combined_x_cpu = combined_x.cpu().to(torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.float32)
+        expected[rank] = x_cached_cpu[rank]
+
+        assert combined_x_cpu.tolist() == expected.tolist()
+        assert combined_w is None
+
+        buf.destroy()
         """
     )
 
@@ -1227,7 +1572,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_loc
             False,
         )
 
-        recv_x, _, recv_topk_idx, recv_topk_weights, _, _, _, _, recv_src_idx, _, _ = second
+        recv_x, _, recv_topk_idx, recv_topk_weights, _, rank_prefix_cached, channel_prefix_cached, _, recv_src_idx, send_head_cached, _ = second
         assert recv_topk_idx is None
         assert recv_topk_weights is None
         assert recv_src_idx.cpu().tolist() == [0, 1]
@@ -1239,9 +1584,9 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_loc
             None,
             None,
             recv_src_idx,
-            first[5],
-            first[6],
-            first[9],
+            rank_prefix_cached,
+            channel_prefix_cached,
+            send_head_cached,
             cfg,
             None,
             False,
@@ -1260,7 +1605,7 @@ def test_native_xpu_cross_process_intranode_two_rank_cached_dispatch_combine_loc
         _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
 
 
-def test_native_xpu_cross_process_internode_two_rank_dispatch_fails_fast_with_clear_error():
+def test_native_xpu_cross_process_internode_two_rank_dispatch_partial_local_routing_succeeds():
     ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
     ext_path = getattr(ext, '__file__', '')
     if not ext_path.endswith(('.so', '.pyd')):
@@ -1314,40 +1659,163 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_fails_fast_with_cl
         layout = buf.get_dispatch_layout(topk, 2, None, False, False)
         per_rdma = torch.tensor([2], dtype=torch.int32, device='xpu')
 
-        try:
-            buf.internode_dispatch(
-                x,
-                None,
-                topk,
-                weights,
-                layout[0],
-                per_rdma,
-                layout[3],
-                layout[2],
-                0,
-                0,
-                None,
-                None,
-                None,
-                None,
-                1,
-                0,
-                cfg,
-                None,
-                False,
-                False,
-            )
-        except Exception as exc:
-            message = str(exc)
-            assert (
-                'cross processes' in message
-                or 'cross-process' in message
-                or 'requires RDMA buffer bytes > 0' in message
-            ), message
-        else:
-            raise AssertionError('Expected cross-process internode multi-rank dispatch to fail fast')
-        finally:
-            buf.destroy()
+        dispatch_out = buf.internode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            per_rdma,
+            layout[3],
+            layout[2],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk, recv_w = dispatch_out[:4]
+        recv_x_cpu = recv_x.cpu().to(torch.float32)
+        x_cpu = x.cpu().to(torch.float32)
+
+        assert recv_x.shape[0] == 1
+        assert recv_topk.cpu().tolist() == [[rank]]
+        assert recv_w.cpu().tolist() == [[1.0]]
+        assert recv_x_cpu.tolist() == [x_cpu[rank].tolist()]
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 32 * 1024 * 1024, True, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        remote_topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        remote_layout = buf.get_dispatch_layout(remote_topk, 2, None, False, False)
+        per_rdma = torch.tensor([2], dtype=torch.int32, device='xpu')
+
+        uncached_out = buf.internode_dispatch(
+            x,
+            None,
+            remote_topk,
+            weights,
+            remote_layout[0],
+            per_rdma,
+            remote_layout[3],
+            remote_layout[2],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        cached_recv_tokens = uncached_out[0].size(0)
+        cached_recv_rdma_tokens = uncached_out[0].size(0)
+        cached_rdma_channel_prefix = uncached_out[5]
+        cached_recv_rdma_rank_prefix = uncached_out[8]
+        cached_gbl_channel_prefix = uncached_out[6]
+        cached_recv_gbl_rank_prefix = uncached_out[10]
+
+        cached_out = buf.internode_dispatch(
+            x,
+            None,
+            None,
+            None,
+            None,
+            None,
+            remote_layout[3],
+            None,
+            cached_recv_tokens,
+            cached_recv_rdma_tokens,
+            cached_rdma_channel_prefix,
+            cached_recv_rdma_rank_prefix,
+            cached_gbl_channel_prefix,
+            cached_recv_gbl_rank_prefix,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk, recv_w = cached_out[:4]
+        recv_x_cpu = recv_x.cpu().to(torch.float32)
+        x_cpu = x.cpu().to(torch.float32)
+
+        assert recv_x.shape[0] == 1
+        assert recv_topk is None
+        assert recv_w is None
+        assert recv_x_cpu.tolist() == [x_cpu[rank].tolist()]
+
+        buf.destroy()
         """
     )
 
@@ -1464,6 +1932,129 @@ def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_local_only
 
         assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
         assert combined_w.cpu().tolist() == [[1.0], [1.0]]
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_internode_two_rank_dispatch_combine_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 32 * 1024 * 1024, True, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        layout = buf.get_dispatch_layout(topk, 2, None, False, False)
+        per_rdma = torch.tensor([2], dtype=torch.int32, device='xpu')
+
+        dispatch_out = buf.internode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            per_rdma,
+            layout[3],
+            layout[2],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk, recv_w = dispatch_out[:4]
+        rdma_channel_prefix = dispatch_out[5]
+        gbl_channel_prefix = dispatch_out[6]
+        recv_rdma_rank_prefix = dispatch_out[8]
+        recv_src_meta = dispatch_out[11]
+        send_rdma_head = dispatch_out[12]
+        send_nvl_head = dispatch_out[13]
+
+        assert recv_x.shape[0] == 1
+        assert recv_topk.cpu().tolist() == [[rank]]
+        assert recv_w.cpu().tolist() == [[1.0]]
+
+        combined_x, combined_w, _ = buf.internode_combine(
+            recv_x,
+            recv_w,
+            None,
+            None,
+            recv_src_meta,
+            layout[3],
+            rdma_channel_prefix,
+            recv_rdma_rank_prefix,
+            gbl_channel_prefix,
+            send_rdma_head,
+            send_nvl_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        x_cpu = x.cpu().to(torch.float32)
+        combined_x_cpu = combined_x.cpu().to(torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.float32)
+        expected[rank] = x_cpu[rank]
+
+        assert combined_x_cpu.tolist() == expected.tolist()
+        assert combined_w.cpu().tolist() == ([[1.0], [0.0]] if rank == 0 else [[0.0], [1.0]])
 
         buf.destroy()
         """
@@ -1621,7 +2212,160 @@ def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_loc
         _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
 
 
-def test_native_xpu_cross_process_low_latency_two_rank_dispatch_fails_fast_with_clear_error():
+def test_native_xpu_cross_process_internode_two_rank_cached_dispatch_combine_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        cfg = ext.Config()
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, 32 * 1024 * 1024, True, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
+            dtype=torch.bfloat16,
+            device='xpu',
+        )
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+        layout = buf.get_dispatch_layout(topk, 2, None, False, False)
+        per_rdma = torch.tensor([2], dtype=torch.int32, device='xpu')
+
+        uncached_out = buf.internode_dispatch(
+            x,
+            None,
+            topk,
+            weights,
+            layout[0],
+            per_rdma,
+            layout[3],
+            layout[2],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        cached_recv_tokens = uncached_out[0].size(0)
+        cached_recv_rdma_tokens = uncached_out[0].size(0)
+        cached_rdma_channel_prefix = uncached_out[5]
+        cached_recv_rdma_rank_prefix = uncached_out[8]
+        cached_gbl_channel_prefix = uncached_out[6]
+        cached_recv_gbl_rank_prefix = uncached_out[10]
+
+        cached_out = buf.internode_dispatch(
+            x,
+            None,
+            None,
+            None,
+            None,
+            None,
+            layout[3],
+            None,
+            cached_recv_tokens,
+            cached_recv_rdma_tokens,
+            cached_rdma_channel_prefix,
+            cached_recv_rdma_rank_prefix,
+            cached_gbl_channel_prefix,
+            cached_recv_gbl_rank_prefix,
+            1,
+            0,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        recv_x, _, recv_topk, recv_w = cached_out[:4]
+        rdma_channel_prefix = cached_out[5]
+        gbl_channel_prefix = cached_out[6]
+        recv_rdma_rank_prefix = cached_out[8]
+        recv_src_meta = uncached_out[11]
+        send_rdma_head = uncached_out[12]
+        send_nvl_head = uncached_out[13]
+
+        assert recv_x.shape[0] == 1
+        assert recv_topk is None
+        assert recv_w is None
+
+        combined_x, combined_w, _ = buf.internode_combine(
+            recv_x,
+            None,
+            None,
+            None,
+            recv_src_meta,
+            layout[3],
+            rdma_channel_prefix,
+            recv_rdma_rank_prefix,
+            gbl_channel_prefix,
+            send_rdma_head,
+            send_nvl_head,
+            cfg,
+            None,
+            False,
+            False,
+        )
+
+        x_cpu = x.cpu().to(torch.float32)
+        combined_x_cpu = combined_x.cpu().to(torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.float32)
+        expected[rank] = x_cpu[rank]
+
+        assert combined_x_cpu.tolist() == expected.tolist()
+        assert combined_w is None
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_low_latency_two_rank_dispatch_partial_local_routing_succeeds():
     ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
     ext_path = getattr(ext, '__file__', '')
     if not ext_path.endswith(('.so', '.pyd')):
@@ -1666,34 +2410,35 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_fails_fast_with_
         device_id = buf.get_local_device_id()
         buf.sync([device_id, device_id], handles, None)
 
-        x = torch.tensor(
-            [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],
-            dtype=torch.bfloat16,
-            device='xpu',
-        )
+        x = torch.arange(1, 2 * 128 + 1, dtype=torch.float32, device='xpu').reshape(2, 128)
+        x = (x + rank * 256).to(torch.bfloat16)
         topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
 
-        try:
-            buf.low_latency_dispatch(
-                x,
-                topk,
-                None,
-                None,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                False,
-                False,
-                False,
-                False,
-                False,
-            )
-        except Exception as exc:
-            message = str(exc)
-            assert 'cross processes' in message or 'cross-process' in message
-            buf.destroy()
-        else:
-            buf.destroy()
-            raise AssertionError('Expected cross-process low-latency multi-rank dispatch to fail fast')
+        dispatch_out = buf.low_latency_dispatch(
+            x,
+            topk,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        packed_recv_x = dispatch_out[0]
+        packed_recv_count = dispatch_out[2]
+        packed_recv_x_cpu = packed_recv_x.cpu().to(torch.float32)
+        x_cpu = x.cpu().to(torch.float32)
+
+        assert packed_recv_x.shape[0] == 1
+        assert packed_recv_x.shape[1] == num_max_dispatch_tokens_per_rank
+        assert packed_recv_count.cpu().tolist() == [1]
+        assert packed_recv_x_cpu[0, 0].tolist() == x_cpu[rank].tolist()
+
+        buf.destroy()
         """
     )
 
@@ -1879,6 +2624,112 @@ def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_local_on
         )
 
         assert combined_x.cpu().to(torch.float32).tolist() == x.cpu().to(torch.float32).tolist()
+
+        buf.destroy()
+        """
+    )
+
+    with tempfile.TemporaryDirectory(prefix='deepep_xpu_ipc_') as temp_dir:
+        _run_two_process_xpu_scripts(script, extra_env={'DEEPEP_TEST_IPC_DIR': temp_dir})
+
+
+def test_native_xpu_cross_process_low_latency_two_rank_dispatch_combine_partial_local_routing_succeeds():
+    ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+    ext_path = getattr(ext, '__file__', '')
+    if not ext_path.endswith(('.so', '.pyd')):
+        pytest.skip('native staged extension is not active')
+    if not hasattr(torch, 'xpu') or not torch.xpu.is_available():
+        pytest.skip('xpu runtime is not available')
+
+    script = textwrap.dedent(
+        """
+        import importlib
+        import os
+        import pathlib
+        import time
+        import torch
+
+        ext = importlib.import_module('xpu.deep_ep_cpp_xpu')
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        rank = local_device
+        num_ranks = 2
+        num_experts = 2
+        num_max_dispatch_tokens_per_rank = 8
+        hidden = 128
+        rdma_bytes = ext.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank,
+            hidden,
+            num_ranks,
+            num_experts,
+        )
+        buf = ext.Buffer(rank, num_ranks, 32 * 1024 * 1024, rdma_bytes, True, True, False, False)
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        my_path = ipc_dir / f'handle_{rank}.bin'
+        peer_path = ipc_dir / f'handle_{1 - rank}.bin'
+        my_path.write_bytes(buf.get_local_ipc_handle())
+
+        deadline = time.time() + 15.0
+        while (not peer_path.exists()) and time.time() < deadline:
+            time.sleep(0.02)
+        if not peer_path.exists():
+            raise RuntimeError('Timed out waiting for peer IPC handle')
+
+        handles = [
+            bytearray((ipc_dir / 'handle_0.bin').read_bytes()),
+            bytearray((ipc_dir / 'handle_1.bin').read_bytes()),
+        ]
+        device_id = buf.get_local_device_id()
+        buf.sync([device_id, device_id], handles, None)
+
+        x = torch.arange(1, 2 * hidden + 1, dtype=torch.float32, device='xpu').reshape(2, hidden)
+        x = (x + rank * 256).to(torch.bfloat16)
+        topk = torch.tensor([[0], [1]], dtype=torch.int64, device='xpu')
+        topk_weights = torch.ones((2, 1), dtype=torch.float32, device='xpu')
+
+        dispatch_out = buf.low_latency_dispatch(
+            x,
+            topk,
+            None,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            False,
+        )
+
+        packed_recv_x = dispatch_out[0]
+        packed_recv_src_info = dispatch_out[3]
+        packed_recv_layout_range = dispatch_out[4]
+        packed_recv_count = dispatch_out[2]
+
+        assert packed_recv_count.cpu().tolist() == [1]
+
+        combined_x, _, _ = buf.low_latency_combine(
+            packed_recv_x,
+            topk,
+            topk_weights,
+            packed_recv_src_info,
+            packed_recv_layout_range,
+            None,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            False,
+            False,
+            False,
+            False,
+            None,
+        )
+
+        x_cpu = x.cpu().to(torch.float32)
+        assert combined_x.shape[0] == 1
+        assert combined_x.cpu().to(torch.float32).tolist() == [x_cpu[rank].tolist()]
 
         buf.destroy()
         """

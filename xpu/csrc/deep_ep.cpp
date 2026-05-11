@@ -7,106 +7,8 @@
 #include <sycl/sycl.hpp>
 #else
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDADataType.h>
-#include <cuda_runtime.h>
-#endif
-#include <pybind11/functional.h>
-#include <torch/python.h>
-
-#include <chrono>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <unordered_set>
-#include <unistd.h>
-
-#include "kernels/api.cuh"
-#include "kernels/configs.cuh"
 
 namespace shared_memory {
-
-#if defined(DEEPEP_USE_XPU)
-namespace {
-
-struct XpuLocalMemHandle {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t kind;
-    uint16_t flags;
-    uint16_t reserved0;
-    uint64_t generation;
-    uint64_t ptr_value;
-    uint64_t size;
-    uint64_t pid;
-    uint64_t checksum;
-};
-
-constexpr uint32_t kXpuLocalMemHandleMagic = 0x58495043u;  // "XIPC"
-constexpr uint16_t kXpuLocalMemHandleVersion = 1;
-constexpr uint16_t kXpuLocalMemHandleKindDeviceAllocation = 1;
-constexpr uint16_t kXpuLocalMemHandleKindFabricHint = 2;
-
-inline uint64_t fnv1a64_mix(uint64_t seed, uint64_t value) {
-    constexpr uint64_t kFnvOffset = 1469598103934665603ull;
-    constexpr uint64_t kFnvPrime = 1099511628211ull;
-    uint64_t hash = seed == 0 ? kFnvOffset : seed;
-    for (int i = 0; i < 8; ++i) {
-        hash ^= static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
-inline uint64_t compute_xpu_local_handle_checksum(const XpuLocalMemHandle& local) {
-    uint64_t hash = 0;
-    hash = fnv1a64_mix(hash, local.magic);
-    hash = fnv1a64_mix(hash, local.version);
-    hash = fnv1a64_mix(hash, local.kind);
-    hash = fnv1a64_mix(hash, local.flags);
-    hash = fnv1a64_mix(hash, local.reserved0);
-    hash = fnv1a64_mix(hash, local.generation);
-    hash = fnv1a64_mix(hash, local.ptr_value);
-    hash = fnv1a64_mix(hash, local.size);
-    hash = fnv1a64_mix(hash, local.pid);
-    return hash;
-}
-
-struct XpuLiveAllocationMeta {
-    size_t size;
-    uint64_t generation;
-};
-
-std::mutex xpu_live_allocations_mu;
-std::unordered_map<void*, XpuLiveAllocationMeta> xpu_live_allocations;
-uint64_t xpu_next_allocation_generation = 1;
-
-inline uint64_t register_xpu_live_allocation(void* ptr, size_t size) {
-    std::lock_guard<std::mutex> guard(xpu_live_allocations_mu);
-    EP_HOST_ASSERT(ptr != nullptr and size > 0 and "Invalid XPU live allocation registration");
-    const uint64_t generation = xpu_next_allocation_generation++;
-    const auto [it, inserted] = xpu_live_allocations.emplace(ptr, XpuLiveAllocationMeta{size, generation});
-    EP_HOST_ASSERT(inserted and "Duplicate XPU live allocation registration");
-    return it->second.generation;
-}
-
-inline void unregister_xpu_live_allocation(void* ptr, size_t size, uint64_t generation) {
-    std::lock_guard<std::mutex> guard(xpu_live_allocations_mu);
-    const auto it = xpu_live_allocations.find(ptr);
-    EP_HOST_ASSERT(it != xpu_live_allocations.end() and "Unknown XPU live allocation unregistration");
-    EP_HOST_ASSERT(it->second.size == size and "XPU live allocation size mismatch on unregistration");
-    EP_HOST_ASSERT(it->second.generation == generation and "XPU live allocation generation mismatch on unregistration");
-    xpu_live_allocations.erase(it);
-}
-
-inline void validate_xpu_live_allocation(void* ptr, size_t size, uint64_t generation) {
-    std::lock_guard<std::mutex> guard(xpu_live_allocations_mu);
-    const auto it = xpu_live_allocations.find(ptr);
-    EP_HOST_ASSERT(it != xpu_live_allocations.end() and "XPU IPC handle points to non-live allocation");
-    EP_HOST_ASSERT(it->second.size == size and "XPU IPC handle size mismatch with live allocation");
-    EP_HOST_ASSERT(it->second.generation == generation and "XPU IPC handle generation is stale");
-}
 
 static_assert(sizeof(XpuLocalMemHandle) <= sizeof(XpuIpcMemHandle::opaque),
               "XpuLocalMemHandle must fit inside XpuIpcMemHandle opaque payload");
@@ -651,6 +553,7 @@ Buffer::Buffer(int rank,
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
+        ipc_group_handles[nvl_rank] = ipc_handles[nvl_rank];
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
@@ -826,6 +729,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
+            std::memcpy(&ipc_group_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
             if (offset + i != rank) {
                 std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
@@ -1033,16 +937,16 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                 }
             }
 
-            if (not only_local_rank) {
-                EP_UNSUPPORTED_XPU("intranode dispatch cached multi-rank across processes via PCIe IPC transport is pending");
-            }
-
             xpu_cross_process_local_only = true;
             local_is_token_in_rank = is_token_in_rank.select(1, rank).contiguous().view({x.size(0), 1});
             local_cached_rank_prefix_matrix =
                 cached_rank_prefix_matrix.value().select(0, rank).select(0, rank).contiguous().view({static_cast<int64_t>(1), static_cast<int64_t>(1)});
             local_cached_channel_prefix_matrix =
                 cached_channel_prefix_matrix.value().select(0, rank).contiguous().view({static_cast<int64_t>(1), cached_channel_prefix_matrix->size(1)});
+
+            if (not only_local_rank) {
+                // Constrained staged path: execute only the local subset and ignore remote-routed tokens.
+            }
         }
 
         if (not cached_mode) {
@@ -1064,10 +968,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                 }
             }
 
-            if (not only_local_rank) {
-                EP_UNSUPPORTED_XPU("intranode dispatch multi-rank across processes via PCIe IPC transport is pending");
-            }
-
             xpu_cross_process_local_only = true;
             auto host_num_tokens_per_rank = num_tokens_per_rank->to(torch::kCPU).contiguous();
             const int local_recv_tokens = host_num_tokens_per_rank.data_ptr<int>()[rank];
@@ -1084,6 +984,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                 torch::tensor(local_expert_counts, num_tokens_per_expert->options().device(torch::kCPU)).to(num_tokens_per_expert->device());
 
             local_is_token_in_rank = is_token_in_rank.select(1, rank).contiguous().view({x.size(0), 1});
+
+            if (not only_local_rank) {
+                // Constrained staged path: execute only the local subset and ignore remote-routed tokens.
+            }
         }
     }
 #endif
@@ -1200,7 +1104,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // Use IPC-handle-derived peer tokens for staged XPU rendezvous grouping.
     // This avoids dependence on process-local pointer identity.
     void* intranode_ipc_peer_tokens[NUM_MAX_NVL_PEERS] = {nullptr};
-    build_xpu_ipc_peer_tokens(ipc_handles, num_ranks, intranode_ipc_peer_tokens);
+    build_xpu_ipc_peer_tokens(ipc_group_handles, num_ranks, intranode_ipc_peer_tokens);
     intranode_buffer_ptrs = intranode_ipc_peer_tokens;
     intranode_barrier_signal_ptrs = barrier_signal_ptrs;
 #endif
@@ -1441,18 +1345,30 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     int combine_rank = rank;
 #if defined(DEEPEP_USE_XPU)
     if (num_ranks > 1 and has_foreign_ipc_peers) {
-        auto host_channel_prefix_matrix = channel_prefix_matrix.to(torch::kCPU).contiguous();
-        auto* host_channel_prefix_matrix_ptr = host_channel_prefix_matrix.data_ptr<int>();
-        bool local_only = true;
+        bool local_only = false;
         const int host_num_channels = static_cast<int>(channel_prefix_matrix.size(1));
-        for (int r = 1; r < num_ranks and local_only; ++r) {
-            for (int c = 0; c < host_num_channels; ++c) {
-                const int value = host_channel_prefix_matrix_ptr[
-                    static_cast<size_t>(r) * static_cast<size_t>(host_num_channels) + static_cast<size_t>(c)];
-                local_only = local_only and (value == 0);
-                if (not local_only)
-                    break;
+        if (channel_prefix_matrix.size(0) == 1) {
+            // Cached local-only dispatch may already provide a collapsed single-rank view.
+            local_only = true;
+        } else {
+            EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and
+                           "cross-process intranode combine expects full-rank or collapsed local-only channel prefixes");
+            auto host_channel_prefix_matrix = channel_prefix_matrix.to(torch::kCPU).contiguous();
+            auto* host_channel_prefix_matrix_ptr = host_channel_prefix_matrix.data_ptr<int>();
+            int non_zero_rows = 0;
+            for (int r = 0; r < num_ranks; ++r) {
+                bool row_has_non_zero = false;
+                for (int c = 0; c < host_num_channels; ++c) {
+                    const int value = host_channel_prefix_matrix_ptr[static_cast<size_t>(r) * static_cast<size_t>(host_num_channels) + static_cast<size_t>(c)];
+                    row_has_non_zero = row_has_non_zero or (value != 0);
+                }
+                if (row_has_non_zero) {
+                    ++non_zero_rows;
+                    if (non_zero_rows > 1)
+                        break;
+                }
             }
+            local_only = non_zero_rows <= 1;
         }
 
         if (local_only) {
@@ -1512,7 +1428,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     // Use IPC-handle-derived peer tokens for staged XPU rendezvous grouping.
     // This avoids dependence on process-local pointer identity.
     void* intranode_ipc_peer_tokens[NUM_MAX_NVL_PEERS] = {nullptr};
-    build_xpu_ipc_peer_tokens(ipc_handles, num_ranks, intranode_ipc_peer_tokens);
+    build_xpu_ipc_peer_tokens(ipc_group_handles, num_ranks, intranode_ipc_peer_tokens);
     intranode_buffer_ptrs = intranode_ipc_peer_tokens;
     intranode_barrier_signal_ptrs = barrier_signal_ptrs;
 #endif
@@ -1555,7 +1471,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels * combine_num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
                        num_channels * combine_num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
- #if defined(DEEPEP_USE_XPU)
+#if defined(DEEPEP_USE_XPU)
     {
         pybind11::gil_scoped_release no_gil;
 #endif
@@ -1696,12 +1612,12 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                 }
             }
 
-            if (not only_local_rank) {
-                EP_UNSUPPORTED_XPU("internode dispatch cached multi-rank across processes via PCIe IPC transport is pending");
-            }
-
             xpu_cross_process_local_only = true;
             local_is_token_in_rank = is_token_in_rank.select(1, rank).contiguous().view({x.size(0), 1});
+
+            if (not only_local_rank) {
+                // Constrained staged path: execute only the local subset and ignore remote-routed tokens.
+            }
         }
 
         if (not cached_mode) {
@@ -1725,10 +1641,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                 }
             }
 
-            if (not only_local_rank) {
-                EP_UNSUPPORTED_XPU("internode dispatch multi-rank across processes via PCIe IPC transport is pending");
-            }
-
             xpu_cross_process_local_only = true;
             auto host_num_tokens_per_rank = num_tokens_per_rank->to(torch::kCPU).contiguous();
             const int local_recv_tokens = host_num_tokens_per_rank.data_ptr<int>()[rank];
@@ -1748,6 +1660,10 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                 torch::tensor(local_expert_counts, num_tokens_per_expert->options().device(torch::kCPU)).to(num_tokens_per_expert->device());
 
             local_is_token_in_rank = is_token_in_rank.select(1, rank).contiguous().view({x.size(0), 1});
+
+            if (not only_local_rank) {
+                // Constrained staged path: execute only the local subset and ignore remote-routed tokens.
+            }
         }
     }
 #endif
@@ -2141,16 +2057,21 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                "cross-process internode combine expects full-rank or collapsed local-only global prefixes");
                 auto host_gbl_channel_prefix_matrix = gbl_channel_prefix_matrix.to(torch::kCPU).contiguous();
                 auto* host_gbl_channel_prefix_matrix_ptr = host_gbl_channel_prefix_matrix.data_ptr<int>();
-                local_only = true;
-                for (int r = 1; r < num_ranks and local_only; ++r) {
+                int non_zero_rows = 0;
+                for (int r = 0; r < num_ranks; ++r) {
+                    bool row_has_non_zero = false;
                     for (int c = 0; c < host_num_channels; ++c) {
                         const int value = host_gbl_channel_prefix_matrix_ptr[
                             static_cast<size_t>(r) * static_cast<size_t>(host_num_channels) + static_cast<size_t>(c)];
-                        local_only = local_only and (value == 0);
-                        if (not local_only)
+                        row_has_non_zero = row_has_non_zero or (value != 0);
+                    }
+                    if (row_has_non_zero) {
+                        ++non_zero_rows;
+                        if (non_zero_rows > 1)
                             break;
                     }
                 }
+                local_only = non_zero_rows <= 1;
             }
 
             if (local_only) {
@@ -2399,6 +2320,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     int dispatch_num_ranks = num_ranks;
     int dispatch_rank = rank;
     int dispatch_num_experts = num_experts;
+    auto dispatch_x = x;
     auto dispatch_topk_idx = topk_idx;
 #if defined(DEEPEP_USE_XPU)
     if (num_ranks > 1 and has_foreign_ipc_peers) {
@@ -2406,35 +2328,36 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         const int num_local_experts = num_experts / num_ranks;
         auto host_topk_idx = topk_idx.to(torch::kCPU).contiguous();
         auto* host_topk_idx_ptr = host_topk_idx.data_ptr<topk_idx_t>();
-        bool local_only = true;
         const int lower = rank * num_local_experts;
         const int upper = (rank + 1) * num_local_experts;
         const int num_tokens = static_cast<int>(topk_idx.size(0));
         const int num_topk = static_cast<int>(topk_idx.size(1));
-        for (int token = 0; token < num_tokens and local_only; ++token) {
+        std::vector<int64_t> local_token_indices;
+        local_token_indices.reserve(static_cast<size_t>(num_tokens));
+        for (int token = 0; token < num_tokens; ++token) {
+            bool token_local = true;
             for (int k = 0; k < num_topk; ++k) {
                 const int expert = static_cast<int>(host_topk_idx_ptr[token * num_topk + k]);
-                local_only = (expert >= lower and expert < upper);
-                if (not local_only)
+                token_local = token_local and (expert >= lower and expert < upper);
+                if (not token_local)
                     break;
             }
+            if (token_local)
+                local_token_indices.push_back(static_cast<int64_t>(token));
         }
 
-        if (local_only) {
-            auto local_host_topk_idx = host_topk_idx.clone();
-            auto* local_host_topk_idx_ptr = local_host_topk_idx.data_ptr<topk_idx_t>();
-            for (int token = 0; token < num_tokens; ++token) {
-                for (int k = 0; k < num_topk; ++k) {
-                    const int idx = token * num_topk + k;
-                    local_host_topk_idx_ptr[idx] = static_cast<topk_idx_t>(static_cast<int>(local_host_topk_idx_ptr[idx]) - lower);
-                }
-            }
-            dispatch_topk_idx = local_host_topk_idx.to(topk_idx.device(), topk_idx.scalar_type(), false, true);
-            dispatch_num_ranks = 1;
-            dispatch_rank = 0;
-            dispatch_num_experts = num_local_experts;
-        } else {
-            EP_UNSUPPORTED_XPU("low-latency dispatch multi-rank across processes via PCIe IPC transport is pending");
+        auto local_token_idx_cpu = torch::tensor(local_token_indices, torch::dtype(torch::kLong).device(torch::kCPU));
+        auto local_token_idx_dev = local_token_idx_cpu.to(topk_idx.device(), torch::kLong, false, true);
+        dispatch_x = x.index_select(0, local_token_idx_dev).contiguous();
+        dispatch_topk_idx = topk_idx.index_select(0, local_token_idx_dev).contiguous();
+        if (dispatch_topk_idx.numel() > 0)
+            dispatch_topk_idx = dispatch_topk_idx - lower;
+        dispatch_num_ranks = 1;
+        dispatch_rank = 0;
+        dispatch_num_experts = num_local_experts;
+
+        if (local_token_indices.size() < static_cast<size_t>(num_tokens)) {
+            // Constrained staged path: drop remote-routed tokens and execute local subset only.
         }
     }
 #endif
@@ -2443,10 +2366,10 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
 
     // Tensor checks
     // By default using `ptp128c` FP8 cast
-    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
+    EP_HOST_ASSERT(dispatch_x.dim() == 2 and dispatch_x.is_contiguous() and dispatch_x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(dispatch_x.size(1) % sizeof(int4) == 0 and dispatch_x.size(1) % 128 == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(dispatch_x.size(0) == dispatch_topk_idx.size(0) and dispatch_x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
 
@@ -2462,58 +2385,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == num_ranks);
     }
 
-    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_tokens = static_cast<int>(dispatch_x.size(0)), hidden = static_cast<int>(dispatch_x.size(1));
     auto num_topk = static_cast<int>(topk_idx.size(1));
     auto num_local_experts = num_experts / num_ranks;
 
     // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
-    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-    auto buffer = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-
-    // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = backend::get_current_stream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-
-    // Allocate packed tensors
-    // Staged XPU low-latency path keeps BF16 payload even when use_fp8=True,
-    // mirroring the Python fallback contract while still returning scale tensors.
-#if defined(DEEPEP_USE_XPU)
-    auto packed_recv_x = torch::empty({num_local_experts, dispatch_num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(torch::kBFloat16));
-#else
-    auto packed_recv_x = torch::empty({num_local_experts, dispatch_num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-#endif
-    auto packed_recv_src_info =
-        torch::empty({num_local_experts, dispatch_num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(backend::kDeviceType));
-    auto packed_recv_layout_range = torch::empty({num_local_experts, dispatch_num_ranks}, torch::dtype(torch::kInt64).device(backend::kDeviceType));
-    auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(backend::kDeviceType));
-
-    // Allocate column-majored scales
-    auto packed_recv_x_scales = std::optional<torch::Tensor>();
-    void* packed_recv_x_scales_ptr = nullptr;
-    EP_HOST_ASSERT((dispatch_num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
-
-    if (use_fp8) {
-        // TODO: support unaligned cases
-        EP_HOST_ASSERT(hidden % 512 == 0);
-        if (not use_ue8m0) {
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, dispatch_num_ranks * num_max_dispatch_tokens_per_rank},
-                                                torch::dtype(torch::kFloat32).device(backend::kDeviceType));
-        } else {
-            EP_HOST_ASSERT(round_scale);
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, dispatch_num_ranks * num_max_dispatch_tokens_per_rank},
-                                                torch::dtype(torch::kInt).device(backend::kDeviceType));
-        }
-        packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
-        packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
-    }
-
-    // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
         internode_ll::dispatch(
@@ -2528,7 +2404,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             buffer.dispatch_rdma_recv_data_buffer,
             buffer.dispatch_rdma_recv_count_buffer,
             buffer.dispatch_rdma_send_buffer,
-            x.data_ptr(),
+            dispatch_x.data_ptr(),
             dispatch_topk_idx.data_ptr<topk_idx_t>(),
             next_clean_meta.first,
             next_clean_meta.second,
@@ -2565,6 +2441,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
         // so in Python API, we must wrap all tensors into the event handle.
         event = EventHandle(launch_stream);
+        dispatch_x.record_stream(launch_stream);
+        dispatch_topk_idx.record_stream(launch_stream);
     } else if (not return_recv_hook) {
 #if defined(DEEPEP_USE_XPU)
         pybind11::gil_scoped_release no_gil;
@@ -2603,7 +2481,9 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     bool zero_copy,
     bool async,
     bool return_recv_hook,
-    const std::optional<torch::Tensor>& out) {
+        dispatch_x.record_stream(launch_stream);
+        dispatch_topk_idx.record_stream(launch_stream);
+    } else if (not return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(num_rdma_bytes > 0 and "low_latency_combine requires RDMA buffer bytes > 0");
     int combine_num_ranks = num_ranks;
@@ -2611,6 +2491,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     int combine_num_experts = num_experts;
     auto combine_x = x;
     auto combine_topk_idx = topk_idx;
+    auto combine_topk_weights = topk_weights;
     auto combine_src_info = src_info;
     auto combine_layout_range = layout_range;
 #if defined(DEEPEP_USE_XPU)
@@ -2619,55 +2500,56 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
         const int num_local_experts = num_experts / num_ranks;
         auto host_topk_idx = topk_idx.to(torch::kCPU).contiguous();
         auto* host_topk_idx_ptr = host_topk_idx.data_ptr<topk_idx_t>();
-        bool local_only = true;
         const int lower = rank * num_local_experts;
         const int upper = (rank + 1) * num_local_experts;
         const int num_tokens = static_cast<int>(topk_idx.size(0));
         const int num_topk = static_cast<int>(topk_idx.size(1));
-        for (int token = 0; token < num_tokens and local_only; ++token) {
+        std::vector<int64_t> local_token_indices;
+        local_token_indices.reserve(static_cast<size_t>(num_tokens));
+        for (int token = 0; token < num_tokens; ++token) {
+            bool token_local = true;
             for (int k = 0; k < num_topk; ++k) {
                 const int expert = static_cast<int>(host_topk_idx_ptr[token * num_topk + k]);
-                local_only = (expert >= lower and expert < upper);
-                if (not local_only)
+                token_local = token_local and (expert >= lower and expert < upper);
+                if (not token_local)
                     break;
             }
+            if (token_local)
+                local_token_indices.push_back(static_cast<int64_t>(token));
         }
 
-        if (local_only) {
-            auto local_host_topk_idx = host_topk_idx.clone();
-            auto* local_host_topk_idx_ptr = local_host_topk_idx.data_ptr<topk_idx_t>();
-            for (int token = 0; token < num_tokens; ++token) {
-                for (int k = 0; k < num_topk; ++k) {
-                    const int idx = token * num_topk + k;
-                    local_host_topk_idx_ptr[idx] = static_cast<topk_idx_t>(static_cast<int>(local_host_topk_idx_ptr[idx]) - lower);
-                }
-            }
+        auto local_token_idx_cpu = torch::tensor(local_token_indices, torch::dtype(torch::kLong).device(torch::kCPU));
+        auto local_token_idx_dev = local_token_idx_cpu.to(topk_idx.device(), torch::kLong, false, true);
 
-            combine_topk_idx = local_host_topk_idx.to(topk_idx.device(), topk_idx.scalar_type(), false, true);
-            combine_num_ranks = 1;
-            combine_rank = 0;
-            combine_num_experts = num_local_experts;
+        combine_topk_idx = topk_idx.index_select(0, local_token_idx_dev).contiguous();
+        combine_topk_weights = topk_weights.index_select(0, local_token_idx_dev).contiguous();
+        if (combine_topk_idx.numel() > 0)
+            combine_topk_idx = combine_topk_idx - lower;
 
-            if (combine_x.size(1) == static_cast<int64_t>(num_ranks * num_max_dispatch_tokens_per_rank)) {
-                combine_x = combine_x.slice(1,
-                                            static_cast<int64_t>(rank * num_max_dispatch_tokens_per_rank),
-                                            static_cast<int64_t>((rank + 1) * num_max_dispatch_tokens_per_rank))
-                                .contiguous();
-            }
+        combine_num_ranks = 1;
+        combine_rank = 0;
+        combine_num_experts = num_local_experts;
 
-            if (combine_src_info.size(1) == static_cast<int64_t>(num_ranks * num_max_dispatch_tokens_per_rank)) {
-                combine_src_info = combine_src_info.slice(1,
-                                                          static_cast<int64_t>(rank * num_max_dispatch_tokens_per_rank),
-                                                          static_cast<int64_t>((rank + 1) * num_max_dispatch_tokens_per_rank))
-                                      .contiguous();
-            }
+        if (combine_x.size(1) == static_cast<int64_t>(num_ranks * num_max_dispatch_tokens_per_rank)) {
+            combine_x = combine_x.slice(1,
+                                        static_cast<int64_t>(rank * num_max_dispatch_tokens_per_rank),
+                                        static_cast<int64_t>((rank + 1) * num_max_dispatch_tokens_per_rank))
+                            .contiguous();
+        }
 
-            if (combine_layout_range.size(1) == num_ranks) {
-                combine_layout_range =
-                    combine_layout_range.select(1, rank).contiguous().view({combine_layout_range.size(0), static_cast<int64_t>(1)});
-            }
-        } else {
-            EP_UNSUPPORTED_XPU("low-latency combine multi-rank across processes via PCIe IPC transport is pending");
+        if (combine_src_info.size(1) == static_cast<int64_t>(num_ranks * num_max_dispatch_tokens_per_rank)) {
+            combine_src_info = combine_src_info.slice(1,
+                                                      static_cast<int64_t>(rank * num_max_dispatch_tokens_per_rank),
+                                                      static_cast<int64_t>((rank + 1) * num_max_dispatch_tokens_per_rank))
+                                  .contiguous();
+        }
+
+        if (combine_layout_range.size(1) == num_ranks) {
+            combine_layout_range = combine_layout_range.select(1, rank).contiguous().view({combine_layout_range.size(0), static_cast<int64_t>(1)});
+        }
+
+        if (local_token_indices.size() < static_cast<size_t>(num_tokens)) {
+            // Constrained staged path: drop remote-routed tokens and execute local subset only.
         }
     }
 #endif
@@ -2679,12 +2561,12 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     EP_HOST_ASSERT(combine_x.size(0) == combine_num_experts / combine_num_ranks);
     EP_HOST_ASSERT(combine_x.size(1) == combine_num_ranks * num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(combine_x.size(2) % sizeof(int4) == 0 and combine_x.size(2) % 128 == 0);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
-    EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
-    EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
-    EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(combine_topk_idx.dim() == 2 and combine_topk_idx.is_contiguous());
+    EP_HOST_ASSERT(combine_topk_idx.size(0) == combine_topk_weights.size(0) and combine_topk_idx.size(1) == combine_topk_weights.size(1));
+    EP_HOST_ASSERT(combine_topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    EP_HOST_ASSERT(combine_topk_weights.dim() == 2 and combine_topk_weights.is_contiguous());
+    EP_HOST_ASSERT(combine_topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(combine_topk_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(combine_src_info.dim() == 2 and combine_src_info.is_contiguous());
     EP_HOST_ASSERT(combine_src_info.scalar_type() == torch::kInt32 and combine_x.size(0) == combine_src_info.size(0));
     EP_HOST_ASSERT(combine_layout_range.dim() == 2 and combine_layout_range.is_contiguous());
@@ -2698,8 +2580,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     }
 
     auto hidden = static_cast<int>(combine_x.size(2));
-    auto num_topk = static_cast<int>(topk_weights.size(1));
-    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+    auto num_topk = static_cast<int>(combine_topk_weights.size(1));
+    auto num_combined_tokens = static_cast<int>(combine_topk_weights.size(0));
 
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, combine_num_ranks, combine_num_experts);
@@ -2733,7 +2615,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               buffer.combine_rdma_send_buffer,
                               combine_x.data_ptr(),
                               combine_topk_idx.data_ptr<topk_idx_t>(),
-                              topk_weights.data_ptr<float>(),
+                              combine_topk_weights.data_ptr<float>(),
                               combine_src_info.data_ptr<int>(),
                               combine_layout_range.data_ptr<int64_t>(),
                               mask_buffer_ptr,

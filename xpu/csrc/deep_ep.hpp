@@ -112,6 +112,7 @@ private:
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     bool has_foreign_ipc_peers = false;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+    shared_memory::MemHandle ipc_group_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
     backend::Stream comm_stream;
