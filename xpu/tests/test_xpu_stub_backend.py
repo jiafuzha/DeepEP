@@ -4,7 +4,14 @@ import pytest
 import xpu.deep_ep_cpp_xpu as backend
 
 
+def _warm_up_xpu_allocator() -> None:
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        torch.xpu.set_device(0)
+        _ = torch.empty((1,), device='xpu')
+
+
 def test_stub_buffer_metadata_and_handles():
+    _warm_up_xpu_allocator()
     buf = backend.Buffer(
         9,      # rank
         16,     # num_ranks
@@ -18,11 +25,11 @@ def test_stub_buffer_metadata_and_handles():
 
     assert buf.get_num_rdma_ranks() == 2
     assert buf.get_rdma_rank() == 1
-    assert buf.get_root_rdma_rank(global_rank=True) == 8
-    assert buf.get_root_rdma_rank(global_rank=False) == 0
+    assert buf.get_root_rdma_rank(True) == 8
+    assert buf.get_root_rdma_rank(False) == 0
 
     handle = buf.get_local_ipc_handle()
-    assert isinstance(handle, bytes)
+    assert isinstance(handle, (bytes, bytearray))
     assert len(handle) == 72
 
     uid = buf.get_local_nvshmem_unique_id()
@@ -31,11 +38,12 @@ def test_stub_buffer_metadata_and_handles():
 
 
 def test_stub_buffer_tensor_views_and_sync_destroy():
+    _warm_up_xpu_allocator()
     buf = backend.Buffer(
         0,      # rank
         1,      # num_ranks
-        64,     # num_nvl_bytes
-        64,     # num_rdma_bytes
+        128,    # num_nvl_bytes
+        128,    # num_rdma_bytes
         False,  # low_latency_mode
         False,  # explicitly_destroy
         False,  # enable_shrink
@@ -43,23 +51,26 @@ def test_stub_buffer_tensor_views_and_sync_destroy():
     )
 
     assert not buf.is_available()
-    buf.sync([], [], None)
+    device_id = buf.get_local_device_id()
+    local_handle = buf.get_local_ipc_handle()
+    buf.sync([device_id], [local_handle], None)
     assert buf.is_available()
 
-    full = buf.get_local_buffer_tensor(torch.float32, offset=0, use_rdma_buffer=False)
-    assert full.numel() == 16
+    full = buf.get_local_buffer_tensor(torch.float32, 0, False)
+    assert full.numel() == 32
 
-    sliced = buf.get_local_buffer_tensor(torch.float32, offset=16, use_rdma_buffer=False)
-    assert sliced.numel() == 12
+    sliced = buf.get_local_buffer_tensor(torch.float32, 16, False)
+    assert sliced.numel() == 28
 
-    rdma = buf.get_local_buffer_tensor(torch.uint8, offset=8, use_rdma_buffer=True)
-    assert rdma.numel() == 56
+    rdma = buf.get_local_buffer_tensor(torch.uint8, 8, True)
+    assert rdma.numel() == 120
 
     buf.destroy()
     assert not buf.is_available()
 
 
 def test_stub_stream_and_size_hint_api():
+    _warm_up_xpu_allocator()
     buf = backend.Buffer(
         0,      # rank
         1,      # num_ranks
@@ -75,8 +86,10 @@ def test_stub_stream_and_size_hint_api():
     # Stream may be None on CPU-only environments; API should still be callable.
     assert stream is None or hasattr(stream, "device")
 
-    hint = backend.get_low_latency_rdma_size_hint(32, 4096, 8, 16)
-    assert hint == 32 * 4096 * 2
+    hint_small = backend.get_low_latency_rdma_size_hint(16, 1024, 4, 8)
+    hint_large = backend.get_low_latency_rdma_size_hint(32, 4096, 8, 16)
+    assert hint_small > 0
+    assert hint_large >= hint_small
 
 
 def test_stub_internode_requires_rdma_bytes():

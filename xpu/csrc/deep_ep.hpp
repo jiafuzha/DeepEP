@@ -172,7 +172,7 @@ public:
 
     pybind11::bytearray get_local_ipc_handle() const;
 
-    pybind11::bytearray get_local_nvshmem_unique_id() const;
+    pybind11::bytes get_local_nvshmem_unique_id() const;
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
@@ -180,7 +180,7 @@ public:
 
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
-              const std::optional<pybind11::bytearray>& root_unique_id_opt);
+              const pybind11::object& root_unique_id);
 
     void destroy();
 
