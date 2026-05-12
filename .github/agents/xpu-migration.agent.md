@@ -117,6 +117,24 @@ Use these as migration references when reasoning and implementation details are 
 4. Validate build/runtime assumptions and list remaining gaps.
 5. Provide a concise checklist of follow-up verification steps.
 
+## build and validation/test environment setup
+Don't try to create a new virtual environment for testing by yourself. Always run below scripts when you build and validate/test your code.
+```
+conda activate jiafuzha_deepep
+source /opt/intel/oneapi/setvars.sh --force
+export CC=icx
+export CXX=icpx
+ISHMEM_IBGDA_BAR_BACKEND=igub
+ISHMEM_IB_ENABLE_IBGDA=1
+ISHMEM_IBGDA_DIRECT_DOORBELL=1
+
+```
+
+## Test cases
+There are two devices available, 0 and 1. You should have two separate processes when construct test cases for multiple ranks, like dispatch and combine. 'export ZE_AFFINITY_MASK=0' uses the device 0 in one process and 'export ZE_AFFINITY_MASK=1' uses device 1 in the other process.
+
+The test cases should reuse same environment and setup as much as possible with proper cleanup to avoid side effects.
+
 ## Output Format
 - Migration summary by subsystem.
 - File-by-file changes.

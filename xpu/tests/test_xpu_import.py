@@ -1,6 +1,7 @@
 import importlib
 import atexit
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -40,27 +41,27 @@ def _run_inline_python(script: str, env: dict[str, str] | None = None) -> subpro
 
 @lru_cache(maxsize=1)
 def _has_two_xpu_devices_under_affinity_mask() -> bool:
-    probe = _run_inline_python(
-        "import sys, torch; sys.exit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.xpu.device_count() >= 2 else 2)",
-        env={'ZE_AFFINITY_MASK': '0,1'},
-    )
-    if probe.returncode == 2:
-        return False
-    assert probe.returncode == 0, probe.stderr
+    for mask in ('0', '1'):
+        probe = _run_inline_python(
+            "import sys, torch; sys.exit(0 if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.xpu.device_count() >= 1 else 2)",
+            env={'ZE_AFFINITY_MASK': mask},
+        )
+        if probe.returncode == 2:
+            return False
+        assert probe.returncode == 0, probe.stderr
     return True
 
 
 def _run_two_process_xpu_scripts(script_template: str, rounds: int = 1, extra_env: dict[str, str] | None = None) -> None:
     assert rounds >= 1
     shared_env = os.environ.copy()
-    shared_env['ZE_AFFINITY_MASK'] = '0,1'
     if extra_env is not None:
         shared_env.update(extra_env)
     else:
         shared_env['DEEPEP_TEST_IPC_DIR'] = _shared_ipc_dir()
 
     if not _has_two_xpu_devices_under_affinity_mask():
-        pytest.skip('at least two xpu devices are required under ZE_AFFINITY_MASK=0,1')
+        pytest.skip('two isolated xpu devices are required under ZE_AFFINITY_MASK=0 and ZE_AFFINITY_MASK=1')
 
     for round_idx in range(rounds):
         ipc_dir = shared_env.get('DEEPEP_TEST_IPC_DIR')
@@ -72,13 +73,16 @@ def _run_two_process_xpu_scripts(script_template: str, rounds: int = 1, extra_en
 
         processes: list[tuple[int, subprocess.Popen[str]]] = []
         for local_device in (0, 1):
+            proc_env = shared_env.copy()
+            proc_env['ZE_AFFINITY_MASK'] = str(local_device)
             script = script_template.replace('__LOCAL_DEVICE__', str(local_device)).replace('__ROUND__', str(round_idx))
+            script = script.replace('torch.xpu.set_device(local_device)', 'torch.xpu.set_device(0)')
             proc = subprocess.Popen(
                 [sys.executable, '-c', script],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=shared_env,
+                env=proc_env,
             )
             processes.append((local_device, proc))
 
@@ -96,6 +100,34 @@ def _run_two_process_xpu_scripts(script_template: str, rounds: int = 1, extra_en
                 f'round {round_idx} process for xpu device {local_device} failed with return code {proc.returncode}\n'
                 f'stdout:\n{stdout}\nstderr:\n{stderr}'
             )
+
+
+@pytest.mark.usefixtures('require_native_xpu_runtime')
+def test_two_process_xpu_helper_uses_single_device_affinity_masks():
+
+    script = textwrap.dedent(
+        """
+        import os
+        import pathlib
+        import torch
+
+        local_device = __LOCAL_DEVICE__
+        torch.xpu.set_device(local_device)
+        _ = torch.empty((1,), device='xpu')
+
+        assert os.environ['ZE_AFFINITY_MASK'] == str(local_device)
+        assert torch.xpu.device_count() == 1
+        assert torch.xpu.current_device() == 0
+
+        ipc_dir = pathlib.Path(os.environ['DEEPEP_TEST_IPC_DIR'])
+        (ipc_dir / f'affinity_{local_device}.txt').write_text(os.environ['ZE_AFFINITY_MASK'])
+        """
+    )
+
+    _run_two_process_xpu_scripts(script)
+    ipc_dir = _shared_ipc_dir()
+    assert (pathlib.Path(ipc_dir) / 'affinity_0.txt').read_text() == '0'
+    assert (pathlib.Path(ipc_dir) / 'affinity_1.txt').read_text() == '1'
 
 
 @pytest.mark.usefixtures('require_native_xpu_runtime')
@@ -7184,5 +7216,3 @@ def test_native_xpu_low_latency_combine_logfmt_two_rank_two_process_stress_succe
     )
 
     _run_two_process_xpu_scripts(script, rounds=3)
-
-
