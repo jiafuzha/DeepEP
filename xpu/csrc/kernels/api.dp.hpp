@@ -51,10 +51,9 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 namespace intranode {
 
 void notify_dispatch(const int* num_tokens_per_rank,
-                     int* moe_recv_counter_mapped,
                      int num_ranks,
                      const int* num_tokens_per_expert,
-                     int* moe_recv_expert_counter_mapped,
+                     int* recv_tokens_per_expert,
                      int num_experts,
                      int num_tokens,
                      const bool* is_token_in_rank,

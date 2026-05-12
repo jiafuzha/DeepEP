@@ -1,11 +1,18 @@
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
+# Ensure `python tests/...` exercises the mirrored XPU tree instead of an installed wheel.
+XPU_ROOT = Path(__file__).resolve().parents[1]
+if str(XPU_ROOT) not in sys.path:
+    sys.path.insert(0, str(XPU_ROOT))
+
 import deep_ep
 import deep_ep_xpu_cpp
-from utils import init_dist, require_xpu_devices
+from utils import ensure_master_port, init_dist, require_xpu_devices
 
 
 def _expect_not_supported(label, fn):
@@ -95,5 +102,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Verify mirrored XPU low-latency APIs fail explicitly as unsupported')
     parser.add_argument('--num-processes', type=int, default=2, help='Number of processes to spawn (default: 2)')
     args = parser.parse_args()
+    ensure_master_port()
     require_xpu_devices(args.num_processes, 'tests/test_low_latency.py')
     torch.multiprocessing.spawn(test_loop, args=(args.num_processes, args), nprocs=args.num_processes)

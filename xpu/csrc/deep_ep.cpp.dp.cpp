@@ -12,20 +12,15 @@
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <thread>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "kernels/api.dp.hpp"
 #include "kernels/configs.dp.hpp"
 #include <cmath>
-
-#ifndef _SYS_pidfd_open
-#define _SYS_pidfd_open 434
-#endif
-
-#ifndef _SYS_pidfd_getfd
-#define _SYS_pidfd_getfd 438
-#endif
 
 namespace {
 
@@ -47,6 +42,10 @@ void ze_check(ze_result_t status, const char* expr) {
 
 torch::TensorOptions xpu_tensor_options(torch::ScalarType dtype, c10::DeviceIndex device_index) {
     return torch::TensorOptions().dtype(dtype).device(c10::Device(c10::kXPU, device_index));
+}
+
+int64_t align_up_bytes(int64_t value, int64_t alignment = 64) {
+    return ((value + alignment - 1) / alignment) * alignment;
 }
 
 dpct::library_data_t scalar_type_to_library_data(torch::ScalarType scalar_type) {
@@ -84,8 +83,92 @@ T* malloc_shared_or_throw(size_t count, const XPUStream& stream) {
     return ptr;
 }
 
+template <typename T>
+T* malloc_host_or_throw(size_t count, const XPUStream& stream) {
+    auto* ptr = sycl::malloc_host<T>(count, stream.queue());
+    EP_HOST_ASSERT(ptr != nullptr);
+    return ptr;
+}
+
 [[noreturn]] void throw_xpu_low_latency_unsupported(const char* api) {
     throw EPException("XPU", __FILE__, __LINE__, std::string(api) + ": " + kXpuLowLatencyUnsupportedMessage);
+}
+
+int create_ipc_socket(char* socket_path, size_t socket_path_size, int rank) {
+    const char* master_port = std::getenv("MASTER_PORT");
+    int written = std::snprintf(socket_path,
+                                socket_path_size,
+                                "/tmp/deepep-xpu-ipc-%d-%s-%d.sock",
+                                static_cast<int>(geteuid()),
+                                master_port == nullptr ? "0" : master_port,
+                                rank);
+    EP_HOST_ASSERT(written > 0 and static_cast<size_t>(written) < socket_path_size);
+
+    int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    EP_HOST_ASSERT(sockfd >= 0);
+
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    unlink(socket_path);
+    EP_HOST_ASSERT(bind(sockfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    return sockfd;
+}
+
+void close_ipc_socket(int sockfd, const char* socket_path) {
+    if (sockfd >= 0)
+        close(sockfd);
+    if (socket_path[0] != '\0')
+        unlink(socket_path);
+}
+
+void send_fd_no_connection(int sockfd, const char* remote_socket_path, int fd_to_send, int rank) {
+    sockaddr_un remote_addr {};
+    remote_addr.sun_family = AF_UNIX;
+    std::strncpy(remote_addr.sun_path, remote_socket_path, sizeof(remote_addr.sun_path) - 1);
+
+    int payload = rank;
+    iovec iov {.iov_base = &payload, .iov_len = sizeof(payload)};
+
+    char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg {};
+    msg.msg_name = &remote_addr;
+    msg.msg_namelen = sizeof(remote_addr);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+
+    EP_HOST_ASSERT(sendmsg(sockfd, &msg, 0) == static_cast<ssize_t>(sizeof(payload)));
+}
+
+std::pair<int, int> recv_fd_no_connection(int sockfd) {
+    int payload = -1;
+    iovec iov {.iov_base = &payload, .iov_len = sizeof(payload)};
+
+    char control[CMSG_SPACE(sizeof(int))] = {};
+    msghdr msg {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    EP_HOST_ASSERT(recvmsg(sockfd, &msg, 0) == static_cast<ssize_t>(sizeof(payload)));
+
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    EP_HOST_ASSERT(cmsg != nullptr);
+    EP_HOST_ASSERT(cmsg->cmsg_level == SOL_SOCKET and cmsg->cmsg_type == SCM_RIGHTS);
+
+    int received_fd = -1;
+    std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
+    EP_HOST_ASSERT(received_fd >= 0);
+    return {received_fd, payload};
 }
 
 size_t get_xpu_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
@@ -119,23 +202,18 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
     auto alloc_it = allocation_sizes.find(ptr);
     EP_HOST_ASSERT(alloc_it != allocation_sizes.end());
     mem_handle->size = alloc_it->second;
-    mem_handle->inner.pid = getpid();
+    std::memset(mem_handle->inner.socket_path, 0, sizeof(mem_handle->inner.socket_path));
     ZE_CHECK(zeMemGetIpcHandle(get_ze_context(), ptr, &mem_handle->inner.ze_ipc_mem_handle));
 }
 
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
-    auto pidfd = static_cast<int>(syscall(_SYS_pidfd_open, mem_handle->inner.pid, 0));
-    EP_HOST_ASSERT(pidfd >= 0);
-    auto remote_fd = static_cast<int>(syscall(
-        _SYS_pidfd_getfd, pidfd, *reinterpret_cast<const int*>(mem_handle->inner.ze_ipc_mem_handle.data), 0));
-    close(pidfd);
-    EP_HOST_ASSERT(remote_fd >= 0);
-
-    auto ze_handle = mem_handle->inner.ze_ipc_mem_handle;
-    std::memcpy(ze_handle.data, &remote_fd, sizeof(remote_fd));
-    auto status = zeMemOpenIpcHandle(get_ze_context(), get_ze_device(), ze_handle, 0u, ptr);
-    close(remote_fd);
-    ZE_CHECK(status);
+    ZE_CHECK(zeMemOpenIpcHandle(
+        get_ze_context(), get_ze_device(), mem_handle->inner.ze_ipc_mem_handle, ZE_IPC_MEMORY_FLAG_BIAS_CACHED, ptr));
+    void* base_ptr = nullptr;
+    size_t base_size = 0;
+    ZE_CHECK(zeMemGetAddressRange(get_ze_context(), *ptr, &base_ptr, &base_size));
+    EP_HOST_ASSERT(base_ptr == *ptr);
+    EP_HOST_ASSERT(base_size >= mem_handle->size);
 }
 
 void SharedMemoryAllocator::close_mem_handle(void* ptr) {
@@ -204,6 +282,10 @@ Buffer::Buffer(int rank,
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
+        ipc_socket_fd = create_ipc_socket(ipc_socket_path, sizeof(ipc_socket_path), rank);
+        std::strncpy(ipc_handles[nvl_rank].inner.socket_path,
+                     ipc_socket_path,
+                     sizeof(ipc_handles[nvl_rank].inner.socket_path) - 1);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
@@ -221,19 +303,19 @@ Buffer::Buffer(int rank,
     comm_stream.queue().memset(workspace, 0, NUM_WORKSPACE_BYTES);
 
     // MoE counter
-    moe_recv_counter = malloc_shared_or_throw<int>(1, comm_stream);
+    moe_recv_counter = malloc_host_or_throw<int>(1, comm_stream);
     moe_recv_counter_mapped = const_cast<int*>(moe_recv_counter);
     *moe_recv_counter = -1;
 
     // MoE expert-level counter
-    moe_recv_expert_counter = malloc_shared_or_throw<int>(NUM_MAX_LOCAL_EXPERTS, comm_stream);
+    moe_recv_expert_counter = malloc_host_or_throw<int>(NUM_MAX_LOCAL_EXPERTS, comm_stream);
     moe_recv_expert_counter_mapped = const_cast<int*>(moe_recv_expert_counter);
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
-        moe_recv_rdma_counter = malloc_shared_or_throw<int>(1, comm_stream);
+        moe_recv_rdma_counter = malloc_host_or_throw<int>(1, comm_stream);
         moe_recv_rdma_counter_mapped = const_cast<int*>(moe_recv_rdma_counter);
         *moe_recv_rdma_counter = -1;
     }
@@ -243,6 +325,9 @@ Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy) {
         destroy();
     } else if (not destroyed) {
+        const char* use_collective_fallback = std::getenv("DEEP_EP_XPU_USE_COLLECTIVE_FALLBACK");
+        if (use_collective_fallback != nullptr and std::strcmp(use_collective_fallback, "1") == 0)
+            return;
         printf("WARNING: destroy() was not called before DeepEP buffer destruction, which can leak resources.\n");
         fflush(stdout);
     }
@@ -306,10 +391,6 @@ void Buffer::destroy() {
     device_synchronize(device_id);
 
     if (num_nvl_bytes > 0) {
-        // Barrier
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
-        device_synchronize(device_id);
-
         // Close remote IPC
         if (is_available()) {
             for (int i = 0; i < num_nvl_ranks; ++i)
@@ -319,6 +400,9 @@ void Buffer::destroy() {
 
         // Free local buffer and error flag
         shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
+        close_ipc_socket(ipc_socket_fd, ipc_socket_path);
+        ipc_socket_fd = -1;
+        ipc_socket_path[0] = '\0';
     }
 
     // Free NVSHMEM
@@ -357,17 +441,37 @@ void Buffer::sync(const std::vector<int>& device_ids,
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
         EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
-        for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+        int offset = rdma_rank * num_nvl_ranks;
+        for (int i = 0; i < num_nvl_ranks; ++i) {
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
-            if (offset + i != rank) {
-                std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
-                shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
-                barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
-            } else {
+            std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
+            if (offset + i == rank)
                 EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
-            }
+        }
+
+        int local_fd = -1;
+        std::memcpy(&local_fd, ipc_handles[nvl_rank].inner.ze_ipc_mem_handle.data, sizeof(local_fd));
+        EP_HOST_ASSERT(local_fd >= 0);
+
+        for (int step = 1; step < num_nvl_ranks; ++step) {
+            int send_idx = (nvl_rank + step) % num_nvl_ranks;
+            int recv_idx = (nvl_rank - step + num_nvl_ranks) % num_nvl_ranks;
+            send_fd_no_connection(ipc_socket_fd, ipc_handles[send_idx].inner.socket_path, local_fd, rank);
+
+            auto [remote_fd, remote_rank] = recv_fd_no_connection(ipc_socket_fd);
+            EP_HOST_ASSERT(remote_rank == offset + recv_idx);
+
+            auto remote_handle = ipc_handles[recv_idx];
+            std::memcpy(remote_handle.inner.ze_ipc_mem_handle.data, &remote_fd, sizeof(remote_fd));
+            shared_memory_allocator.open_mem_handle(&buffer_ptrs[recv_idx], &remote_handle);
+            close(remote_fd);
+            barrier_signal_ptrs[recv_idx] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[recv_idx]) + num_nvl_bytes);
+        }
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            EP_HOST_ASSERT(buffer_ptrs[i] != nullptr);
+            EP_HOST_ASSERT(barrier_signal_ptrs[i] != nullptr);
         }
 
         // Copy all buffer and barrier signal pointers to GPU
@@ -508,14 +612,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream) {
-    bool cached_mode = cached_rank_prefix_matrix.has_value();
+    bool precomputed_layout_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
-    if (cached_mode) {
+    if (precomputed_layout_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix.has_value());
         EP_HOST_ASSERT(cached_channel_prefix_matrix.has_value());
+        EP_HOST_ASSERT(cached_num_recv_tokens >= 0);
     } else {
         EP_HOST_ASSERT(num_tokens_per_rank.has_value());
         EP_HOST_ASSERT(num_tokens_per_expert.has_value());
@@ -523,7 +628,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Type checks
     EP_HOST_ASSERT(is_token_in_rank.scalar_type() == torch::kBool);
-    if (cached_mode) {
+    if (precomputed_layout_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix->scalar_type() == torch::kInt32);
         EP_HOST_ASSERT(cached_channel_prefix_matrix->scalar_type() == torch::kInt32);
     } else {
@@ -536,21 +641,25 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
     EP_HOST_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous());
     EP_HOST_ASSERT(is_token_in_rank.size(0) == x.size(0) and is_token_in_rank.size(1) == num_ranks);
-    if (cached_mode) {
+    if (precomputed_layout_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix->dim() == 2 and cached_rank_prefix_matrix->is_contiguous());
         EP_HOST_ASSERT(cached_rank_prefix_matrix->size(0) == num_ranks and cached_rank_prefix_matrix->size(1) == num_ranks);
         EP_HOST_ASSERT(cached_channel_prefix_matrix->dim() == 2 and cached_channel_prefix_matrix->is_contiguous());
         EP_HOST_ASSERT(cached_channel_prefix_matrix->size(0) == num_ranks and cached_channel_prefix_matrix->size(1) == num_channels);
-    } else {
+    }
+    if (num_tokens_per_expert.has_value()) {
         EP_HOST_ASSERT(num_tokens_per_expert->dim() == 1 and num_tokens_per_expert->is_contiguous());
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
+    }
+    if (not precomputed_layout_mode) {
         EP_HOST_ASSERT(num_tokens_per_rank->dim() == 1 and num_tokens_per_rank->is_contiguous());
         EP_HOST_ASSERT(num_tokens_per_rank->size(0) == num_ranks);
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
-    auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
+    auto num_experts = num_tokens_per_expert.has_value() ? static_cast<int>(num_tokens_per_expert->size(0)) : 0;
+    auto num_local_experts = num_experts / num_ranks;
 
     // Top-k checks
     int num_topk = 0;
@@ -600,39 +709,41 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Create handles (only return for non-cached mode)
     int num_recv_tokens = -1;
+    int actual_num_recv_tokens = -1;
     auto rank_prefix_matrix = torch::Tensor();
     auto channel_prefix_matrix = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
+    auto recv_tokens_per_expert = torch::Tensor();
 
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
     int num_memset_int = num_channels * num_ranks * 4;
-    if (cached_mode) {
+    if (precomputed_layout_mode) {
         num_recv_tokens = cached_num_recv_tokens;
+        actual_num_recv_tokens = cached_num_recv_tokens;
         rank_prefix_matrix = cached_rank_prefix_matrix.value();
         channel_prefix_matrix = cached_channel_prefix_matrix.value();
-
-        // Copy rank prefix matrix and clean flags
-        intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+        auto local_buffer_ptr = static_cast<int*>(buffer_ptrs[rank]);
+        comm_stream.queue().memcpy(local_buffer_ptr, rank_prefix_matrix.data_ptr<int>(), num_ranks * num_ranks * sizeof(int));
+        comm_stream.queue().memset(local_buffer_ptr + num_ranks * num_ranks, 0, num_memset_int * sizeof(int));
+        comm_stream.queue().wait();
+        if (num_worst_tokens > 0 and topk_idx.has_value())
+            num_recv_tokens = num_worst_tokens;
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, xpu_tensor_options(torch::kInt32, device_id));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, xpu_tensor_options(torch::kInt32, device_id));
+        recv_tokens_per_expert = torch::empty({num_local_experts}, xpu_tensor_options(torch::kInt32, device_id));
 
         // Send sizes
         // Meta information:
         //  - Size prefix by ranks, shaped as `[num_ranks, num_ranks]`
         //  - Size prefix by experts (not used later), shaped as `[num_ranks, num_local_experts]`
         // NOTES: no more token dropping in this version
-        *moe_recv_counter = -1;
-        for (int i = 0; i < num_local_experts; ++i)
-            moe_recv_expert_counter[i] = -1;
         EP_HOST_ASSERT(num_ranks * (num_ranks + num_local_experts) * sizeof(int) <= num_nvl_bytes);
         intranode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(),
-                                   moe_recv_counter_mapped,
                                    num_ranks,
                                    num_tokens_per_expert->data_ptr<int>(),
-                                   moe_recv_expert_counter_mapped,
+                                   recv_tokens_per_expert.data_ptr<int>(),
                                    num_experts,
                                    num_tokens,
                                    is_token_in_rank.data_ptr<bool>(),
@@ -654,26 +765,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             EP_HOST_ASSERT(topk_idx.has_value());
             EP_HOST_ASSERT(topk_weights.has_value());
         } else {
-            // Synchronize total received tokens and tokens per expert
-            auto start_time = std::chrono::high_resolution_clock::now();
-            while (true) {
-                // Read total count
-                num_recv_tokens = static_cast<int>(*moe_recv_counter);
-
-                // Read per-expert count
-                bool ready = (num_recv_tokens >= 0);
-                for (int i = 0; i < num_local_experts and ready; ++i)
-                    ready &= moe_recv_expert_counter[i] >= 0;
-
-                if (ready)
-                    break;
-
-                // Timeout check
-                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
-                    NUM_CPU_TIMEOUT_SECS)
-                    throw std::runtime_error("DeepEP error: CPU recv timeout");
-            }
-            num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
+            device_synchronize(device_id);
+            auto rank_prefix_matrix_cpu = rank_prefix_matrix.to(torch::kCPU);
+            auto recv_tokens_per_expert_cpu = recv_tokens_per_expert.to(torch::kCPU);
+            num_recv_tokens = rank_prefix_matrix_cpu.data_ptr<int>()[(num_ranks - 1) * num_ranks + rank];
+            actual_num_recv_tokens = num_recv_tokens;
+            num_recv_tokens_per_expert_list =
+                std::vector<int>(recv_tokens_per_expert_cpu.data_ptr<int>(),
+                                 recv_tokens_per_expert_cpu.data_ptr<int>() + num_local_experts);
         }
     }
 
@@ -699,6 +798,206 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
                                              : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
+    }
+
+    if (precomputed_layout_mode) {
+        EP_HOST_ASSERT(not x_scales.has_value() and "The simple XPU intranode path currently supports tensor inputs only");
+        auto rank_prefix_matrix_cpu = rank_prefix_matrix.to(torch::kCPU);
+        auto is_token_in_rank_cpu = is_token_in_rank.to(torch::kCPU);
+        auto* rank_prefix_ptr = rank_prefix_matrix_cpu.data_ptr<int>();
+        auto* is_token_in_rank_ptr = is_token_in_rank_cpu.data_ptr<bool>();
+        auto topk_idx_cpu = topk_idx.has_value() ? topk_idx->to(torch::kCPU) : torch::Tensor();
+        auto* topk_idx_cpu_ptr = topk_idx.has_value() ? topk_idx_cpu.data_ptr<topk_idx_t>() : nullptr;
+        std::vector<int> recv_tokens_per_rank(num_ranks);
+        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank)
+            recv_tokens_per_rank[dst_rank] = rank_prefix_ptr[(num_ranks - 1) * num_ranks + dst_rank];
+        int max_recv_tokens = *std::max_element(recv_tokens_per_rank.begin(), recv_tokens_per_rank.end());
+
+        int row_bytes = hidden * static_cast<int>(recv_x.element_size());
+        int64_t x_stage_offset = 0;
+        int64_t x_stage_bytes = static_cast<int64_t>(max_recv_tokens) * row_bytes;
+        int64_t src_idx_stage_offset = align_up_bytes(x_stage_offset + x_stage_bytes);
+        int64_t src_idx_stage_bytes = static_cast<int64_t>(max_recv_tokens) * sizeof(int);
+        int64_t topk_idx_stage_offset = align_up_bytes(src_idx_stage_offset + src_idx_stage_bytes);
+        int64_t topk_idx_stage_bytes = static_cast<int64_t>(max_recv_tokens) * num_topk * sizeof(topk_idx_t);
+        int64_t topk_weight_stage_offset = align_up_bytes(topk_idx_stage_offset + topk_idx_stage_bytes);
+        int64_t topk_weight_stage_bytes = static_cast<int64_t>(max_recv_tokens) * num_topk * sizeof(float);
+        int64_t signal_offset = align_up_bytes(topk_weight_stage_offset + topk_weight_stage_bytes);
+        EP_HOST_ASSERT(signal_offset + static_cast<int64_t>(num_ranks) * sizeof(int) <= num_nvl_bytes);
+
+        auto* local_base_ptr = static_cast<uint8_t*>(buffer_ptrs[rank]);
+        auto* local_signal_ptr = reinterpret_cast<int*>(local_base_ptr + signal_offset);
+        comm_stream.queue().memset(local_base_ptr + x_stage_offset, 0, signal_offset - x_stage_offset);
+        comm_stream.queue().memset(local_signal_ptr, 0, num_ranks * sizeof(int)).wait();
+        int phase_base = static_cast<int>(++intranode_simple_phase);
+        int ready_phase = phase_base * 2;
+        int done_phase = ready_phase + 1;
+        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+            if (dst_rank == rank)
+                continue;
+            auto* remote_signal_ptr =
+                reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
+            comm_stream.queue().memcpy(remote_signal_ptr, &ready_phase, sizeof(ready_phase));
+        }
+        comm_stream.queue().memcpy(local_signal_ptr + rank, &ready_phase, sizeof(ready_phase)).wait();
+        std::vector<int> signal_values(num_ranks, 0);
+        while (true) {
+            comm_stream.queue().memcpy(signal_values.data(), local_signal_ptr, num_ranks * sizeof(int)).wait();
+            bool ready = true;
+            for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                if (src_rank == rank)
+                    continue;
+                if (signal_values[src_rank] < ready_phase) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        std::vector<int> next_offsets(num_ranks);
+        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+            next_offsets[dst_rank] = (rank == 0) ? 0 : rank_prefix_ptr[(rank - 1) * num_ranks + dst_rank];
+        }
+
+        std::vector<uint8_t> host_x_row(row_bytes);
+        std::vector<topk_idx_t> local_topk_idx_row(num_topk);
+        std::vector<float> local_topk_weight_row(num_topk);
+        std::vector<float> host_topk_weight_row(num_topk);
+        for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+            auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(token_idx) * row_bytes;
+            comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
+            if (topk_idx.has_value())
+                comm_stream.queue().memcpy(host_topk_weight_row.data(),
+                                           topk_weights_ptr + static_cast<int64_t>(token_idx) * num_topk,
+                                           num_topk * sizeof(float))
+                    .wait();
+            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                if (not is_token_in_rank_ptr[token_idx * num_ranks + dst_rank])
+                    continue;
+                int dst_offset = next_offsets[dst_rank]++;
+                auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[dst_rank]);
+                comm_stream.queue().memcpy(remote_base_ptr + x_stage_offset + static_cast<int64_t>(dst_offset) * row_bytes,
+                                           host_x_row.data(),
+                                           row_bytes)
+                    .wait();
+                comm_stream.queue().memcpy(remote_base_ptr + src_idx_stage_offset + static_cast<int64_t>(dst_offset) * sizeof(int),
+                                           &token_idx,
+                                           sizeof(int))
+                    .wait();
+                if (topk_idx.has_value()) {
+                    int local_expert_begin = dst_rank * num_local_experts;
+                    int local_expert_end = local_expert_begin + num_local_experts;
+                    std::fill(local_topk_idx_row.begin(), local_topk_idx_row.end(), static_cast<topk_idx_t>(-1));
+                    std::fill(local_topk_weight_row.begin(), local_topk_weight_row.end(), 0.0f);
+                    for (int k = 0; k < num_topk; ++k) {
+                        auto expert_idx = static_cast<int>(topk_idx_cpu_ptr[token_idx * num_topk + k]);
+                        if (expert_idx >= local_expert_begin and expert_idx < local_expert_end) {
+                            local_topk_idx_row[k] = static_cast<topk_idx_t>(expert_idx - local_expert_begin);
+                            local_topk_weight_row[k] = host_topk_weight_row[k];
+                        }
+                    }
+                    comm_stream.queue().memcpy(remote_base_ptr + topk_idx_stage_offset +
+                                                   static_cast<int64_t>(dst_offset) * num_topk * sizeof(topk_idx_t),
+                                               local_topk_idx_row.data(),
+                                               num_topk * sizeof(topk_idx_t))
+                        .wait();
+                    comm_stream.queue().memcpy(remote_base_ptr + topk_weight_stage_offset +
+                                                   static_cast<int64_t>(dst_offset) * num_topk * sizeof(float),
+                                               local_topk_weight_row.data(),
+                                               num_topk * sizeof(float))
+                        .wait();
+                }
+            }
+        }
+        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+            if (dst_rank == rank)
+                continue;
+            auto* remote_signal_ptr =
+                reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
+            comm_stream.queue().memcpy(remote_signal_ptr, &done_phase, sizeof(done_phase));
+        }
+        comm_stream.queue().memcpy(local_signal_ptr + rank, &done_phase, sizeof(done_phase));
+        comm_stream.queue().wait();
+        while (true) {
+            comm_stream.queue().memcpy(signal_values.data(), local_signal_ptr, num_ranks * sizeof(int)).wait();
+            bool ready = true;
+            for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                if (src_rank == rank)
+                    continue;
+                if (signal_values[src_rank] < done_phase) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        comm_stream.queue().memcpy(recv_x.data_ptr(),
+                                   local_base_ptr + x_stage_offset,
+                                   static_cast<int64_t>(actual_num_recv_tokens) * row_bytes);
+        comm_stream.queue().memcpy(recv_src_idx.data_ptr<int>(),
+                                   local_base_ptr + src_idx_stage_offset,
+                                   static_cast<int64_t>(actual_num_recv_tokens) * sizeof(int));
+        if (topk_idx.has_value()) {
+            comm_stream.queue().memcpy(recv_topk_idx_ptr,
+                                       local_base_ptr + topk_idx_stage_offset,
+                                       static_cast<int64_t>(actual_num_recv_tokens) * num_topk * sizeof(topk_idx_t));
+            comm_stream.queue().memcpy(recv_topk_weights_ptr,
+                                       local_base_ptr + topk_weight_stage_offset,
+                                       static_cast<int64_t>(actual_num_recv_tokens) * num_topk * sizeof(float));
+        }
+        comm_stream.queue().wait();
+
+        if (actual_num_recv_tokens < num_recv_tokens) {
+            recv_x.slice(0, actual_num_recv_tokens, num_recv_tokens).zero_();
+            recv_src_idx.slice(0, actual_num_recv_tokens, num_recv_tokens).zero_();
+            if (recv_topk_idx.has_value())
+                recv_topk_idx->slice(0, actual_num_recv_tokens, num_recv_tokens).fill_(-1);
+            if (recv_topk_weights.has_value())
+                recv_topk_weights->slice(0, actual_num_recv_tokens, num_recv_tokens).zero_();
+        }
+        recv_channel_prefix_matrix.copy_(channel_prefix_matrix);
+        send_head.zero_();
+
+        std::optional<EventHandle> event;
+        if (async) {
+            event = EventHandle(comm_stream);
+            for (auto& t :
+                 {x, is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix, recv_x, recv_src_idx, recv_channel_prefix_matrix, send_head}) {
+                t.record_stream(comm_stream);
+                if (allocate_on_comm_stream)
+                    t.record_stream(compute_stream);
+            }
+            for (auto& to :
+                 {x_scales, topk_idx, topk_weights, num_tokens_per_rank, num_tokens_per_expert, cached_channel_prefix_matrix,
+                  cached_rank_prefix_matrix, recv_topk_idx, recv_topk_weights, recv_x_scales}) {
+                to.has_value() ? to->record_stream(comm_stream) : void();
+                if (allocate_on_comm_stream)
+                    to.has_value() ? to->record_stream(compute_stream) : void();
+            }
+        } else {
+            stream_wait(compute_stream, comm_stream);
+        }
+
+        if (allocate_on_comm_stream)
+            c10::xpu::setCurrentXPUStream(compute_stream);
+
+        return {recv_x,
+                recv_x_scales,
+                recv_topk_idx,
+                recv_topk_weights,
+                num_recv_tokens_per_expert_list,
+                rank_prefix_matrix,
+                channel_prefix_matrix,
+                recv_channel_prefix_matrix,
+                recv_src_idx,
+                send_head,
+                event};
     }
 
     // Dispatch
@@ -855,6 +1154,150 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
+
+    auto rank_prefix_matrix_cpu = rank_prefix_matrix.to(torch::kCPU);
+    auto src_idx_cpu = src_idx.to(torch::kCPU);
+    auto* rank_prefix_ptr = rank_prefix_matrix_cpu.data_ptr<int>();
+    auto* src_idx_ptr = src_idx_cpu.data_ptr<int>();
+    auto simple_bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+
+    int row_bytes = hidden * static_cast<int>(x.element_size());
+    int64_t x_stage_offset = 0;
+    int64_t x_stage_bytes = static_cast<int64_t>(num_ranks) * num_recv_tokens * row_bytes;
+    int64_t topk_stage_offset = align_up_bytes(x_stage_offset + x_stage_bytes);
+    int64_t topk_stage_bytes = static_cast<int64_t>(num_ranks) * num_recv_tokens * num_topk * sizeof(float);
+    int64_t signal_offset = align_up_bytes(topk_stage_offset + topk_stage_bytes);
+    EP_HOST_ASSERT(signal_offset + static_cast<int64_t>(num_ranks) * sizeof(int) <= num_nvl_bytes);
+
+    auto* local_base_ptr = static_cast<uint8_t*>(buffer_ptrs[rank]);
+    auto* local_signal_ptr = reinterpret_cast<int*>(local_base_ptr + signal_offset);
+    comm_stream.queue().memset(local_base_ptr + x_stage_offset, 0, signal_offset - x_stage_offset);
+    comm_stream.queue().memset(local_signal_ptr, 0, num_ranks * sizeof(int)).wait();
+    int phase_base = static_cast<int>(++intranode_simple_phase);
+    int ready_phase = phase_base * 2;
+    int done_phase = ready_phase + 1;
+    for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+        if (src_rank_id == rank)
+            continue;
+        auto* remote_signal_ptr =
+            reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
+        comm_stream.queue().memcpy(remote_signal_ptr, &ready_phase, sizeof(ready_phase));
+    }
+    comm_stream.queue().memcpy(local_signal_ptr + rank, &ready_phase, sizeof(ready_phase)).wait();
+    std::vector<int> signal_values(num_ranks, 0);
+    while (true) {
+        comm_stream.queue().memcpy(signal_values.data(), local_signal_ptr, num_ranks * sizeof(int)).wait();
+        bool ready = true;
+        for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+            if (src_rank_id == rank)
+                continue;
+            if (signal_values[src_rank_id] < ready_phase) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::vector<uint8_t> host_x_row(row_bytes);
+    std::vector<float> host_topk_row(num_topk);
+    int start = 0;
+    for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+        int end = rank_prefix_ptr[src_rank_id * num_ranks + rank];
+        auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[src_rank_id]);
+        for (int row = start; row < end; ++row) {
+            int dst_token = src_idx_ptr[row];
+            EP_HOST_ASSERT(dst_token >= 0 and dst_token < num_recv_tokens);
+            auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(row) * row_bytes;
+            auto row_slot = static_cast<int64_t>(rank) * num_recv_tokens + dst_token;
+            comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
+            comm_stream.queue().memcpy(remote_base_ptr + x_stage_offset + row_slot * row_bytes, host_x_row.data(), row_bytes).wait();
+            if (topk_weights.has_value()) {
+                comm_stream.queue().memcpy(host_topk_row.data(),
+                                           topk_weights_ptr + static_cast<int64_t>(row) * num_topk,
+                                           num_topk * sizeof(float))
+                    .wait();
+                comm_stream.queue().memcpy(remote_base_ptr + topk_stage_offset + row_slot * num_topk * sizeof(float),
+                                           host_topk_row.data(),
+                                           num_topk * sizeof(float))
+                    .wait();
+            }
+        }
+        start = end;
+    }
+
+    for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+        if (src_rank_id == rank)
+            continue;
+        auto* remote_signal_ptr =
+            reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
+        comm_stream.queue().memcpy(remote_signal_ptr, &done_phase, sizeof(done_phase));
+    }
+    comm_stream.queue().memcpy(local_signal_ptr + rank, &done_phase, sizeof(done_phase));
+    comm_stream.queue().wait();
+
+    while (true) {
+        comm_stream.queue().memcpy(signal_values.data(), local_signal_ptr, num_ranks * sizeof(int)).wait();
+        bool ready = true;
+        for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+            if (src_rank_id == rank)
+                continue;
+            if (signal_values[src_rank_id] < done_phase) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::vector<uint8_t> host_stage_x(x_stage_bytes);
+    comm_stream.queue().memcpy(host_stage_x.data(), local_base_ptr + x_stage_offset, x_stage_bytes).wait();
+    auto cpu_stage_x = torch::from_blob(
+                           host_stage_x.data(),
+                           {num_ranks, num_recv_tokens, hidden},
+                           torch::TensorOptions().dtype(x.scalar_type()).device(torch::kCPU))
+                           .clone();
+    auto simple_recv_x = cpu_stage_x.to(torch::kFloat32).sum(0).to(x.options());
+    if (topk_weights.has_value()) {
+        std::vector<float> host_stage_topk(num_ranks * num_recv_tokens * num_topk);
+        comm_stream.queue().memcpy(host_stage_topk.data(), local_base_ptr + topk_stage_offset, topk_stage_bytes).wait();
+        auto cpu_stage_topk = torch::from_blob(host_stage_topk.data(),
+                                               {num_ranks, num_recv_tokens, num_topk},
+                                               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                                  .clone();
+        recv_topk_weights = cpu_stage_topk.sum(0).to(topk_weights->options());
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (simple_bias_opts[i].has_value())
+            simple_recv_x.add_(simple_bias_opts[i].value());
+    }
+
+    std::optional<EventHandle> simple_event;
+    if (async) {
+        simple_event = EventHandle(comm_stream);
+        for (auto& t : {x, src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, simple_recv_x}) {
+            t.record_stream(comm_stream);
+            if (allocate_on_comm_stream)
+                t.record_stream(compute_stream);
+        }
+        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+            to.has_value() ? to->record_stream(comm_stream) : void();
+            if (allocate_on_comm_stream)
+                to.has_value() ? to->record_stream(compute_stream) : void();
+        }
+    } else {
+        stream_wait(compute_stream, comm_stream);
+    }
+
+    if (allocate_on_comm_stream)
+        c10::xpu::setCurrentXPUStream(compute_stream);
+
+    return {simple_recv_x, recv_topk_weights, simple_event};
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
@@ -1631,6 +2074,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens") = 256,
              py::arg("num_max_rdma_chunked_send_tokens") = 6,
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
+        .def_readwrite("num_sms", &deep_ep::Config::num_sms)
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
     m.def("get_low_latency_rdma_size_hint", &get_xpu_low_latency_rdma_size_hint);

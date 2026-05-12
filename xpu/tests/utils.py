@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import os
+import socket
 import sys
 import torch
 import torch.distributed as dist
@@ -22,6 +23,14 @@ def require_xpu_devices(num_local_ranks: int, test_name: str) -> None:
         )
 
 
+def ensure_master_port() -> None:
+    if 'MASTER_PORT' in os.environ:
+        return
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        os.environ['MASTER_PORT'] = str(sock.getsockname()[1])
+
+
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     require_xpu_devices(num_local_ranks, 'DeepEP XPU distributed tests')
@@ -29,15 +38,16 @@ def init_dist(local_rank: int, num_local_ranks: int):
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
+    backend = os.getenv('DEEP_EP_XPU_TEST_BACKEND', 'xccl')
 
     sig = inspect.signature(dist.init_process_group)
     params = {
-        'backend': 'xccl',
+        'backend': backend,
         'init_method': f'tcp://{ip}:{port}',
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
-    if 'device_id' in sig.parameters:
+    if backend != 'gloo' and 'device_id' in sig.parameters:
         # noinspection PyTypeChecker
         params['device_id'] = torch.device(f'xpu:{local_rank}')
     dist.init_process_group(**params)
@@ -46,6 +56,27 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_device('xpu')
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+
+
+def group_all_reduce(tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> None:
+    if dist.get_backend(group) != 'gloo' or tensor.device.type != 'xpu':
+        dist.all_reduce(tensor, group=group)
+        return
+
+    reduced = tensor.cpu()
+    dist.all_reduce(reduced, group=group)
+    tensor.copy_(reduced.to(device=tensor.device, dtype=tensor.dtype))
+
+
+def group_all_gather(output_tensors, tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> None:
+    if dist.get_backend(group) != 'gloo' or tensor.device.type != 'xpu':
+        dist.all_gather(output_tensors, tensor, group=group)
+        return
+
+    gathered = [torch.zeros_like(tensor.cpu()) for _ in output_tensors]
+    dist.all_gather(gathered, tensor.cpu(), group=group)
+    for out, gathered_tensor in zip(output_tensors, gathered):
+        out.copy_(gathered_tensor.to(device=out.device, dtype=out.dtype))
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):

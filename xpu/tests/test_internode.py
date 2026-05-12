@@ -1,12 +1,20 @@
 import argparse
 import os
+import sys
 import time
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
 
+# Ensure `python tests/...` exercises the mirrored XPU tree instead of an installed wheel.
+XPU_ROOT = Path(__file__).resolve().parents[1]
+if str(XPU_ROOT) not in sys.path:
+    sys.path.insert(0, str(XPU_ROOT))
+
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor, require_xpu_devices
+from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, ensure_master_port, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor, require_xpu_devices
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -389,6 +397,7 @@ if __name__ == '__main__':
         raise SystemExit('The experimental XPU internode test currently expects --num-processes 8 (one local rank per XPU on an 8-device node).')
     if int(os.getenv('WORLD_SIZE', '1')) <= 1:
         raise SystemExit('The experimental XPU internode test requires WORLD_SIZE>1 (node count) so the mirrored internode path is exercised across nodes.')
+    ensure_master_port()
     require_xpu_devices(args.num_processes, 'tests/test_internode.py')
 
     # Set default `num_topk_groups` if not provided

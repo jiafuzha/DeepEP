@@ -12,9 +12,8 @@ namespace intranode {
 
 template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
-                                int* moe_recv_counter_mapped,
                                 const int* num_tokens_per_expert,
-                                int* moe_recv_expert_counter_mapped,
+                                int* recv_tokens_per_expert,
                                 int num_experts,
                                 int num_tokens,
                                 int num_channels,
@@ -62,8 +61,6 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             #pragma unroll
             for (int i = 1; i < kNumRanks; ++i)
                 local_per_rank_buffer[i * kNumRanks + thread_id] += local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
-            if (thread_id == rank)
-                *moe_recv_counter_mapped = local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
         }
 
         // Sum per-experts counts and return to CPU
@@ -74,7 +71,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             for (int i = 0; i < kNumRanks; ++i)
                 sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id];
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
-            moe_recv_expert_counter_mapped[thread_id] = sum;
+            recv_tokens_per_expert[thread_id] = sum;
         }
         __syncthreads();
 
@@ -116,10 +113,9 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
 }
 
 void notify_dispatch(const int* num_tokens_per_rank,
-                     int* moe_recv_counter_mapped,
                      int num_ranks,
                      const int* num_tokens_per_expert,
-                     int* moe_recv_expert_counter_mapped,
+                     int* recv_tokens_per_expert,
                      int num_experts,
                      int num_tokens,
                      const bool* is_token_in_rank,
@@ -132,33 +128,45 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int rank,
                      dpct::queue_ptr stream,
                      int num_channels) {
-#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)        \
-    LAUNCH_KERNEL(&cfg,                           \
-                  notify_dispatch<ranks>,         \
-                  num_tokens_per_rank,            \
-                  moe_recv_counter_mapped,        \
-                  num_tokens_per_expert,          \
-                  moe_recv_expert_counter_mapped, \
-                  num_experts,                    \
-                  num_tokens,                     \
-                  num_channels,                   \
-                  is_token_in_rank,               \
-                  channel_prefix_matrix,          \
-                  rank_prefix_matrix_copy,        \
-                  num_memset_int,                 \
-                  expert_alignment,               \
-                  buffer_ptrs,                    \
-                  barrier_signal_ptrs,            \
-                  rank);                          \
-    break
-
     constexpr int kNumThreads = 128;
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
-
-    SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
-    SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
-#undef NOTIFY_DISPATCH_LAUNCH_CASE
+    auto launch = [&](auto ranks_tag) {
+        constexpr int ranks = decltype(ranks_tag)::value;
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (1 + num_ranks) * kNumThreads),
+                                               sycl::range<3>(1, 1, kNumThreads)),
+                             [=](sycl::nd_item<3>) {
+                                 notify_dispatch<ranks>(num_tokens_per_rank,
+                                                        num_tokens_per_expert,
+                                                        recv_tokens_per_expert,
+                                                        num_experts,
+                                                        num_tokens,
+                                                        num_channels,
+                                                        is_token_in_rank,
+                                                        channel_prefix_matrix,
+                                                        rank_prefix_matrix_copy,
+                                                        num_memset_int,
+                                                        expert_alignment,
+                                                        buffer_ptrs,
+                                                        barrier_signal_ptrs,
+                                                        rank);
+                             });
+        });
+    };
+    switch (num_ranks) {
+        case 2:
+            launch(std::integral_constant<int, 2>{});
+            break;
+        case 4:
+            launch(std::integral_constant<int, 4>{});
+            break;
+        case 8:
+            launch(std::integral_constant<int, 8>{});
+            break;
+        default:
+            EP_HOST_ASSERT(false and "Unsupported ranks");
+    }
 }
 
 template <int kNumRanks>
@@ -189,13 +197,30 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
                             int rank,
                             int num_ranks,
                             dpct::queue_ptr stream) {
-#define CACHED_NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                                                   \
-    LAUNCH_KERNEL(&cfg, cached_notify_dispatch<ranks>, rank_prefix_matrix, num_memset_int, buffer_ptrs, barrier_signal_ptrs, rank); \
-    break
-
-    SETUP_LAUNCH_CONFIG(1, 128, stream);
-    SWITCH_RANKS(CACHED_NOTIFY_DISPATCH_LAUNCH_CASE);
-#undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
+    constexpr int kNumThreads = 128;
+    auto launch = [&](auto ranks_tag) {
+        constexpr int ranks = decltype(ranks_tag)::value;
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
+                             [=](sycl::nd_item<3>) {
+                                 cached_notify_dispatch<ranks>(
+                                     rank_prefix_matrix, num_memset_int, buffer_ptrs, barrier_signal_ptrs, rank);
+                             });
+        });
+    };
+    switch (num_ranks) {
+        case 2:
+            launch(std::integral_constant<int, 2>{});
+            break;
+        case 4:
+            launch(std::integral_constant<int, 4>{});
+            break;
+        case 8:
+            launch(std::integral_constant<int, 8>{});
+            break;
+        default:
+            EP_HOST_ASSERT(false and "Unsupported ranks");
+    }
 }
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
@@ -334,7 +359,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
                     // Rare cases to loop again
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
                         trap();
                     }
                 }
@@ -448,10 +472,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
                 // Timeout check
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
-                           rank,
-                           responsible_channel,
-                           num_tokens_to_recv);
                     trap();
                 }
             }
@@ -572,45 +592,55 @@ void dispatch(void* recv_x,
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
 
-#define DISPATCH_LAUNCH_CASE(ranks)                                      \
-    {                                                                    \
-        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
-        SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
-        LAUNCH_KERNEL(&cfg,                                              \
-                      kernel,                                            \
-                      reinterpret_cast<int4*>(recv_x),                   \
-                      recv_x_scales,                                     \
-                      recv_src_idx,                                      \
-                      recv_topk_idx,                                     \
-                      recv_topk_weights,                                 \
-                      recv_channel_offset,                               \
-                      send_head,                                         \
-                      reinterpret_cast<const int4*>(x),                  \
-                      x_scales,                                          \
-                      topk_idx,                                          \
-                      topk_weights,                                      \
-                      is_token_in_rank,                                  \
-                      channel_prefix_matrix,                             \
-                      num_tokens,                                        \
-                      num_worst_tokens,                                  \
-                      hidden_int4,                                       \
-                      num_topk,                                          \
-                      num_experts,                                       \
-                      num_scales,                                        \
-                      scale_token_stride,                                \
-                      scale_hidden_stride,                               \
-                      buffer_ptrs,                                       \
-                      rank,                                              \
-                      num_max_send_tokens,                               \
-                      num_recv_buffer_tokens);                           \
-    }                                                                    \
-    break
-
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
-#undef DISPATCH_LAUNCH_CASE
+    auto launch = [&](auto ranks_tag) {
+        constexpr int ranks = decltype(ranks_tag)::value;
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_sms * kNumThreads),
+                                               sycl::range<3>(1, 1, kNumThreads)),
+                             [=](sycl::nd_item<3>) {
+                                 dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>(reinterpret_cast<int4*>(recv_x),
+                                                                                   recv_x_scales,
+                                                                                   recv_src_idx,
+                                                                                   recv_topk_idx,
+                                                                                   recv_topk_weights,
+                                                                                   recv_channel_offset,
+                                                                                   send_head,
+                                                                                   reinterpret_cast<const int4*>(x),
+                                                                                   x_scales,
+                                                                                   topk_idx,
+                                                                                   topk_weights,
+                                                                                   is_token_in_rank,
+                                                                                   channel_prefix_matrix,
+                                                                                   num_tokens,
+                                                                                   num_worst_tokens,
+                                                                                   hidden_int4,
+                                                                                   num_topk,
+                                                                                   num_experts,
+                                                                                   num_scales,
+                                                                                   scale_token_stride,
+                                                                                   scale_hidden_stride,
+                                                                                   buffer_ptrs,
+                                                                                   rank,
+                                                                                   num_max_send_tokens,
+                                                                                   num_recv_buffer_tokens);
+                             });
+        });
+    };
+    switch (num_ranks) {
+        case 2:
+            launch(std::integral_constant<int, 2>{});
+            break;
+        case 4:
+            launch(std::integral_constant<int, 4>{});
+            break;
+        case 8:
+            launch(std::integral_constant<int, 8>{});
+            break;
+        default:
+            EP_HOST_ASSERT(false and "Unsupported ranks");
+    }
 }
 
 template <int kNumRanks>

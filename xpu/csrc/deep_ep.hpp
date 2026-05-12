@@ -29,7 +29,7 @@
 namespace shared_memory {
 
 struct MemHandleInner {
-    pid_t pid;
+    char socket_path[108];
     ze_ipc_mem_handle_t ze_ipc_mem_handle;
 };
 
@@ -83,6 +83,8 @@ private:
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+    int ipc_socket_fd = -1;
+    char ipc_socket_path[108] = {};
 
     // Stream for communication
     c10::xpu::XPUStream comm_stream;
@@ -101,6 +103,8 @@ private:
 
     // Workspace
     void* workspace = nullptr;
+
+    uint32_t intranode_simple_phase = 0;
 
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
