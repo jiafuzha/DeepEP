@@ -1,0 +1,216 @@
+---
+MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/xpu/csrc/kernels/utils.dp.hpp'
+Replacements:
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          14
+    Length:          24
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n#include \"exception.dp.hpp\""
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          38
+    Length:          0
+    ReplacementText: "\n#include <time.h>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          3525
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          8843
+    Length:          4
+    ReplacementText: 'sycl::int2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          8867
+    Length:          4
+    ReplacementText: 'sycl::int2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          8884
+    Length:          4
+    ReplacementText: 'sycl::int2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          9046
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          9070
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          9087
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          10034
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          10045
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          11866
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          11883
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          17059
+    Length:          42
+    ReplacementText: 'std::min(num_tokens_per_sm * sm_id, num_tokens)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/utils.cuh'
+    Offset:          17123
+    Length:          52
+    ReplacementText: 'std::min(token_start_idx + num_tokens_per_sm, num_tokens)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+MainSourceFilesDigest:
+  - MainSourceFile:  ''
+    Digest:          ''
+    HasCUDASyntax:   false
+DpctVersion:     2025.3.0
+SDKVersionMajor: '12'
+SDKVersionMinor: '9'
+MainHelperFileName: ''
+USMLevel:        ''
+FeatureMap:      {}
+CompileTargets:  {}
+OptionMap:
+  AnalysisScopePath:
+    Value:           ''
+    ValueVec:
+      - '/root/jiafuzha/code-repo/zjf2012/DeepEP'
+    Specified:       false
+  AsyncHandler:
+    Value:           'false'
+    Specified:       false
+  BuildScript:
+    Value:           '0'
+    Specified:       false
+  CodePinEnabled:
+    Value:           'false'
+    Specified:       false
+  CommentsEnabled:
+    Value:           'false'
+    Specified:       false
+  CompilationsDir:
+    Value:           ''
+    Specified:       false
+  CtadEnabled:
+    Value:           'false'
+    Specified:       false
+  EnablepProfiling:
+    Value:           'false'
+    Specified:       false
+  ExperimentalFlag:
+    Value:           '0'
+    Specified:       false
+  ExplicitNamespace:
+    Value:           '20'
+    Specified:       false
+  ExtensionDDFlag:
+    Value:           '0'
+    Specified:       false
+  ExtensionDEFlag:
+    Value:           '4294967295'
+    Specified:       false
+  HelperFuncPreferenceFlag:
+    Value:           '0'
+    Specified:       false
+  NDRangeDim:
+    Value:           '3'
+    Specified:       false
+  NoDRYPattern:
+    Value:           'false'
+    Specified:       false
+  OptimizeMigration:
+    Value:           'false'
+    Specified:       false
+  ProcessAll:
+    Value:           'false'
+    Specified:       false
+  RuleFile:
+    Value:           ''
+    Specified:       false
+  SyclNamedLambda:
+    Value:           'false'
+    Specified:       false
+  UseSYCLCompat:
+    Value:           'false'
+    Specified:       false
+  UsmLevel:
+    Value:           '1'
+    Specified:       false
+...
