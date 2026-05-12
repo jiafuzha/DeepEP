@@ -575,22 +575,25 @@ __forceinline__ void barrier_block(int** barrier_signal_ptrs, int rank) {
         __syncthreads();
     }
 
-    // Add self-ranks, sub other ranks
-    if (thread_id < kNumRanks) {
-        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
-        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    if (thread_id == 0) {
+        auto next_phase = ld_volatile_global(barrier_signal_ptrs[rank] + rank) + 1;
+        st_release_sys_global(barrier_signal_ptrs[rank] + rank, next_phase);
     }
+    __syncthreads();
+
+    auto phase = ld_volatile_global(barrier_signal_ptrs[rank] + rank);
+    if (thread_id < kNumRanks)
+        st_release_sys_global(barrier_signal_ptrs[thread_id] + rank, phase);
     EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
 
     // Check timeout
     auto start_time = clock64();
     while (true) {
-        auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        if (__all_sync(0xffffffff, value <= 0))
+        auto value = thread_id < kNumRanks ? ld_acquire_sys_global(barrier_signal_ptrs[rank] + thread_id) : phase;
+        if (__all_sync(0xffffffff, value >= phase))
             break;
 
         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
             trap();
         }
     }

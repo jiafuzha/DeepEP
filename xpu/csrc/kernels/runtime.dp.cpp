@@ -21,13 +21,31 @@ __global__ void barrier(int** barrier_signal_ptrs, int rank) {
 }
 
 void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, dpct::queue_ptr stream) {
-#define BARRIER_LAUNCH_CASE(ranks)                                  \
-    LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, rank); \
-    break
+    auto launch_barrier = [&](auto ranks_tag) {
+        constexpr int ranks = decltype(ranks_tag)::value;
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)), [=](sycl::nd_item<1>) {
+                barrier_block<ranks>(barrier_signal_ptrs, rank);
+            });
+        });
+    };
 
-    SETUP_LAUNCH_CONFIG(1, 32, stream);
-    SWITCH_RANKS(BARRIER_LAUNCH_CASE);
-#undef BARRIER_LAUNCH_CASE
+    switch (num_ranks) {
+        case 1:
+            launch_barrier(std::integral_constant<int, 1>{});
+            break;
+        case 2:
+            launch_barrier(std::integral_constant<int, 2>{});
+            break;
+        case 4:
+            launch_barrier(std::integral_constant<int, 4>{});
+            break;
+        case 8:
+            launch_barrier(std::integral_constant<int, 8>{});
+            break;
+        default:
+            EP_HOST_ASSERT(false && "Unsupported number of ranks for intranode barrier");
+    }
 }
 
 }  // namespace intranode

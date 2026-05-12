@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
@@ -39,6 +40,12 @@ XPU_LOW_LATENCY_UNSUPPORTED_MESSAGE = (
 
 def _raise_low_latency_unsupported(api: str) -> None:
     raise NotImplementedError(f'{api} is unavailable on XPU. {XPU_LOW_LATENCY_UNSUPPORTED_MESSAGE}')
+
+
+class _ImmediateEvent:
+
+    def current_stream_wait(self) -> None:
+        return
 
 
 class Buffer:
@@ -121,6 +128,7 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+        self._all_gather_object = all_gather_object
         self.runtime = deep_ep_xpu_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
@@ -163,6 +171,11 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+        self._use_intranode_collective_fallback = (
+            self.runtime.get_num_rdma_ranks() == 1 and self.group_size > 1 and
+            os.environ.get('DEEP_EP_XPU_USE_COLLECTIVE_FALLBACK', '0') == '1')
+        if self._use_intranode_collective_fallback and self.rank == 0:
+            print('[DeepEP XPU] Using collective intranode fallback instead of the experimental peer-buffer runtime.', flush=True)
 
     def destroy(self):
         """
@@ -172,6 +185,10 @@ class Buffer:
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
         if self.runtime is None:
+            return
+
+        if self._use_intranode_collective_fallback:
+            self.runtime = None
             return
 
         self.runtime.destroy()
@@ -338,10 +355,59 @@ class Buffer:
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
-        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
-            self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
-                                             async_finish, allocate_on_comm_stream)
+        if previous_event is not None:
+            previous_event.current_stream_wait()
+
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank = \
+            self._get_dispatch_layout_fallback(topk_idx, num_experts)
+        event = _ImmediateEvent() if async_finish else None
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
+
+    def _get_dispatch_layout_fallback(self, topk_idx: torch.Tensor, num_experts: int) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
+        assert num_experts > 0 and num_experts % self.group_size == 0
+
+        device = topk_idx.device
+        num_tokens = topk_idx.size(0)
+        num_experts_per_rank = num_experts // self.group_size
+        valid_topk = topk_idx >= 0
+
+        rank_idx = torch.full_like(topk_idx, -1, dtype=torch.int64)
+        rank_idx[valid_topk] = topk_idx[valid_topk].to(torch.int64) // num_experts_per_rank
+
+        is_token_in_rank = torch.zeros((num_tokens, self.group_size), dtype=torch.bool, device=device)
+        for topk_slot in range(topk_idx.size(1)):
+            selected = rank_idx[:, topk_slot]
+            valid_selected = selected >= 0
+            if valid_selected.any():
+                is_token_in_rank[valid_selected, selected[valid_selected]] = True
+        is_token_in_rank = is_token_in_rank.contiguous()
+
+        num_tokens_per_rank = is_token_in_rank.to(torch.int32).sum(dim=0).to(torch.int32).contiguous()
+        num_tokens_per_expert = torch.bincount(
+            topk_idx[valid_topk].to(torch.int64),
+            minlength=num_experts,
+        ).to(torch.int32).contiguous()
+
+        num_tokens_per_rdma_rank = None
+        num_rdma_ranks = self.runtime.get_num_rdma_ranks()
+        if num_rdma_ranks > 1:
+            assert self.group_size % num_rdma_ranks == 0
+            num_local_ranks = self.group_size // num_rdma_ranks
+            rdma_rank_idx = torch.full_like(rank_idx, -1)
+            valid_rank_idx = rank_idx >= 0
+            rdma_rank_idx[valid_rank_idx] = rank_idx[valid_rank_idx] // num_local_ranks
+
+            is_token_in_rdma_rank = torch.zeros((num_tokens, num_rdma_ranks), dtype=torch.bool, device=device)
+            for topk_slot in range(topk_idx.size(1)):
+                selected = rdma_rank_idx[:, topk_slot]
+                valid_selected = selected >= 0
+                if valid_selected.any():
+                    is_token_in_rdma_rank[valid_selected, selected[valid_selected]] = True
+            num_tokens_per_rdma_rank = is_token_in_rdma_rank.to(torch.int32).sum(dim=0).to(torch.int32).contiguous()
+
+        return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -401,6 +467,9 @@ class Buffer:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                            previous_event, async_finish, allocate_on_comm_stream)
+        if self._use_intranode_collective_fallback:
+            return self._intranode_dispatch_fallback(x, handle, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, topk_idx,
+                                                     topk_weights, num_worst_tokens, previous_event, async_finish)
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -414,11 +483,21 @@ class Buffer:
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
+            num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix = self._get_intranode_dispatch_metadata(
+                num_tokens_per_rank, is_token_in_rank, getattr(config, 'num_sms', Buffer.num_sms) // 2)
+            dist.barrier(group=self.group)
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
-                                                num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
+                                                None, is_token_in_rank, num_tokens_per_expert, num_recv_tokens, rank_prefix_matrix,
+                                                channel_prefix_matrix,
                                                 expert_alignment, num_worst_tokens, config,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            recv_src_idx, _ = self._get_intranode_recv_src_idx(is_token_in_rank)
+            if topk_idx is not None and topk_weights is not None:
+                recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list = self._get_intranode_recv_topk_metadata(
+                    topk_idx, topk_weights, num_tokens_per_expert, num_worst_tokens)
+            elif num_worst_tokens == 0 and not num_recv_tokens_per_expert_list and num_tokens_per_expert is not None:
+                num_recv_tokens_per_expert_list = self._get_intranode_recv_tokens_per_expert_list(num_tokens_per_expert)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (
                 recv_x, recv_x_scales
@@ -460,6 +539,8 @@ class Buffer:
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
             return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
+        if self._use_intranode_collective_fallback:
+            return self._intranode_combine_fallback(x, handle, topk_weights, bias, previous_event, async_finish)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
         rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
@@ -470,6 +551,8 @@ class Buffer:
                                                                           channel_prefix_matrix, send_head, config,
                                                                           getattr(previous_event, 'event',
                                                                                   None), async_finish, allocate_on_comm_stream)
+        if topk_weights is not None:
+            recv_topk_weights = self._combine_topk_weights_metadata(topk_weights, handle)
         return recv_x, recv_topk_weights, EventOverlap(event)
 
     # noinspection PyTypeChecker
@@ -552,6 +635,290 @@ class Buffer:
                                                                                   getattr(previous_event, 'event',
                                                                                           None), async_finish, allocate_on_comm_stream)
         return combined_x, combined_topk_weights, EventOverlap(event)
+
+    def _intranode_dispatch_fallback(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], handle: Optional[Tuple],
+                                     num_tokens_per_rank: Optional[torch.Tensor], is_token_in_rank: Optional[torch.Tensor],
+                                     num_tokens_per_expert: Optional[torch.Tensor], topk_idx: Optional[torch.Tensor],
+                                     topk_weights: Optional[torch.Tensor], num_worst_tokens: int,
+                                     previous_event: Optional[EventOverlap], async_finish: bool) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], List[int], Tuple,
+                  EventOverlap]:
+        if previous_event is not None:
+            previous_event.current_stream_wait()
+        if isinstance(x, tuple):
+            raise NotImplementedError('The XPU intranode collective fallback currently supports tensor inputs only.')
+
+        if handle is not None:
+            rank_prefix_matrix, _, _, recv_src_idx, is_token_in_rank, metadata = handle
+            gathered_x = self._all_gather_object(x.cpu())
+            recv_rows = [gathered_x[src_rank][src_idx] for src_rank, src_idx in zip(metadata['recv_src_rank'], recv_src_idx.cpu().tolist())]
+            recv_x = self._stack_or_empty(recv_rows, x)
+            return recv_x, None, None, [], handle, EventOverlap(_ImmediateEvent() if async_finish else None)
+
+        assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
+        assert topk_idx is not None or topk_weights is None
+
+        payload = {
+            'x': x.cpu(),
+            'topk_idx': topk_idx.cpu() if topk_idx is not None else None,
+            'topk_weights': topk_weights.cpu() if topk_weights is not None else None,
+            'is_token_in_rank': is_token_in_rank.cpu(),
+            'num_tokens_per_expert': num_tokens_per_expert.cpu(),
+        }
+        gathered = self._all_gather_object(payload)
+        num_local_experts = num_tokens_per_expert.numel() // self.group_size
+        local_expert_begin = self.rank * num_local_experts
+        local_expert_end = local_expert_begin + num_local_experts
+
+        recv_rows = []
+        recv_src_rank = []
+        recv_src_idx = []
+        recv_topk_idx_rows = []
+        recv_topk_weight_rows = []
+        counts_by_source = [0] * self.group_size
+        num_recv_tokens_per_expert_list = [0] * num_local_experts
+
+        for src_rank, package in enumerate(gathered):
+            src_x = package['x']
+            src_topk_idx = package['topk_idx']
+            src_topk_weights = package['topk_weights']
+            src_is_token_in_rank = package['is_token_in_rank']
+            src_num_tokens_per_expert = package['num_tokens_per_expert']
+
+            if src_topk_idx is None:
+                num_recv_tokens_per_expert_list = [
+                    curr + incoming for curr, incoming in zip(
+                        num_recv_tokens_per_expert_list,
+                        src_num_tokens_per_expert[local_expert_begin:local_expert_end].tolist(),
+                    )
+                ]
+                for token_idx in range(src_is_token_in_rank.size(0)):
+                    if not bool(src_is_token_in_rank[token_idx, self.rank]):
+                        continue
+                    recv_rows.append(src_x[token_idx].clone())
+                    recv_src_rank.append(src_rank)
+                    recv_src_idx.append(token_idx)
+                    counts_by_source[src_rank] += 1
+                continue
+
+            for token_idx in range(src_topk_idx.size(0)):
+                token_experts = src_topk_idx[token_idx]
+                local_mask = (token_experts >= local_expert_begin) & (token_experts < local_expert_end)
+                if not bool(local_mask.any()):
+                    continue
+
+                recv_rows.append(src_x[token_idx].clone())
+                recv_src_rank.append(src_rank)
+                recv_src_idx.append(token_idx)
+                counts_by_source[src_rank] += 1
+
+                if topk_weights is not None:
+                    local_topk_idx = torch.full_like(token_experts, -1)
+                    local_topk_idx[local_mask] = token_experts[local_mask] - local_expert_begin
+                    recv_topk_idx_rows.append(local_topk_idx)
+
+                    local_topk_weight = torch.zeros_like(src_topk_weights[token_idx])
+                    local_topk_weight[local_mask] = src_topk_weights[token_idx][local_mask]
+                    recv_topk_weight_rows.append(local_topk_weight)
+
+                    for expert_idx in local_topk_idx[local_topk_idx >= 0].tolist():
+                        num_recv_tokens_per_expert_list[expert_idx] += 1
+
+        recv_x = self._stack_or_empty(recv_rows, x)
+        recv_src_idx_tensor = torch.tensor(recv_src_idx, dtype=torch.int32, device=x.device)
+        counts_tensor = torch.tensor(counts_by_source, dtype=torch.int32, device=x.device)
+        gathered_counts = [torch.zeros_like(counts_tensor) for _ in range(self.group_size)]
+        dist.all_gather(gathered_counts, counts_tensor, group=self.group)
+        rank_prefix_matrix = torch.stack(gathered_counts, dim=1).cumsum(dim=0).contiguous()
+
+        metadata = {
+            'fallback': 'intranode_collective',
+            'recv_src_rank': recv_src_rank,
+            'source_num_tokens': x.size(0),
+        }
+        handle = (rank_prefix_matrix, None, None, recv_src_idx_tensor, is_token_in_rank, metadata)
+
+        recv_topk_idx_tensor = None
+        recv_topk_weights_tensor = None
+        if topk_weights is not None:
+            recv_topk_idx_tensor = self._stack_or_empty(recv_topk_idx_rows, topk_idx)
+            recv_topk_weights_tensor = self._stack_or_empty(recv_topk_weight_rows, topk_weights)
+
+        if num_worst_tokens > 0:
+            recv_x = self._pad_rows(recv_x, num_worst_tokens, 0)
+            if recv_topk_idx_tensor is not None:
+                recv_topk_idx_tensor = self._pad_rows(recv_topk_idx_tensor, num_worst_tokens, -1)
+            if recv_topk_weights_tensor is not None:
+                recv_topk_weights_tensor = self._pad_rows(recv_topk_weights_tensor, num_worst_tokens, 0)
+            num_recv_tokens_per_expert_list = []
+
+        return recv_x, recv_topk_idx_tensor, recv_topk_weights_tensor, num_recv_tokens_per_expert_list, handle, EventOverlap(
+            _ImmediateEvent() if async_finish else None)
+
+    def _intranode_combine_fallback(self, x: torch.Tensor, handle: Tuple, topk_weights: Optional[torch.Tensor],
+                                    bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                                    previous_event: Optional[EventOverlap], async_finish: bool) -> \
+            Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        if previous_event is not None:
+            previous_event.current_stream_wait()
+
+        _, _, _, src_idx, _, metadata = handle
+        payload = {
+            'x': x.cpu(),
+            'topk_weights': topk_weights.cpu() if topk_weights is not None else None,
+            'src_rank': metadata['recv_src_rank'],
+            'src_idx': src_idx.cpu(),
+        }
+        gathered = self._all_gather_object(payload)
+
+        combined_x = torch.zeros((metadata['source_num_tokens'], x.size(1)), dtype=torch.float32, device='cpu')
+        combined_topk_weights = None if topk_weights is None else torch.zeros(
+            (metadata['source_num_tokens'], topk_weights.size(1)), dtype=torch.float32, device='cpu')
+
+        for package in gathered:
+            src_rank = torch.tensor(package['src_rank'], dtype=torch.int64, device='cpu')
+            token_idx = package['src_idx'].to(dtype=torch.int64, device='cpu')
+            rank_mask = src_rank == self.rank
+            if not bool(rank_mask.any()):
+                continue
+            selected_idx = token_idx[rank_mask]
+            combined_x.index_add_(0, selected_idx, package['x'][rank_mask].to(torch.float32))
+            if combined_topk_weights is not None:
+                combined_topk_weights.index_add_(0, selected_idx, package['topk_weights'][rank_mask].to(torch.float32))
+
+        combined_x = combined_x.to(device=x.device, dtype=x.dtype)
+        if combined_topk_weights is not None:
+            combined_topk_weights = combined_topk_weights.to(device=x.device, dtype=topk_weights.dtype)
+
+        bias_0, bias_1 = Buffer._unpack_bias(bias)
+        if bias_0 is not None:
+            combined_x = combined_x + bias_0
+        if bias_1 is not None:
+            combined_x = combined_x + bias_1
+
+        return combined_x, combined_topk_weights, EventOverlap(_ImmediateEvent() if async_finish else None)
+
+    @staticmethod
+    def _stack_or_empty(rows: List[torch.Tensor], template: torch.Tensor) -> torch.Tensor:
+        if rows:
+            return torch.stack([row.to(device=template.device, dtype=template.dtype) for row in rows]).contiguous()
+        return template.new_empty((0, *template.shape[1:]))
+
+    @staticmethod
+    def _pad_rows(tensor: torch.Tensor, target_rows: int, fill_value: int) -> torch.Tensor:
+        if tensor.size(0) >= target_rows:
+            return tensor
+        padded = tensor.new_full((target_rows, *tensor.shape[1:]), fill_value)
+        padded[:tensor.size(0)] = tensor
+        return padded
+
+    def _get_intranode_dispatch_metadata(self, num_tokens_per_rank: torch.Tensor, is_token_in_rank: torch.Tensor,
+                                         num_channels: int) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        gathered_rank_counts = [torch.empty_like(num_tokens_per_rank) for _ in range(self.group_size)]
+        dist.all_gather(gathered_rank_counts, num_tokens_per_rank.contiguous(), group=self.group)
+        rank_prefix_matrix = torch.stack(gathered_rank_counts, dim=0).cumsum(dim=0).to(dtype=torch.int32).contiguous()
+
+        num_tokens = is_token_in_rank.size(0)
+        num_tokens_per_channel = math.ceil(num_tokens / num_channels)
+        per_channel_counts = []
+        for channel_id in range(num_channels):
+            token_start = min(num_tokens_per_channel * channel_id, num_tokens)
+            token_end = min(token_start + num_tokens_per_channel, num_tokens)
+            if token_start >= token_end:
+                counts = torch.zeros((self.group_size,), dtype=torch.int32, device=is_token_in_rank.device)
+            else:
+                counts = is_token_in_rank[token_start:token_end].to(dtype=torch.int32).sum(dim=0)
+            per_channel_counts.append(counts.to(dtype=torch.int32))
+        channel_prefix_matrix = torch.stack(per_channel_counts, dim=1).cumsum(dim=1).to(dtype=torch.int32).contiguous()
+
+        return int(rank_prefix_matrix[-1, self.rank].item()), rank_prefix_matrix, channel_prefix_matrix
+
+    def _get_intranode_recv_tokens_per_expert_list(self, num_tokens_per_expert: torch.Tensor) -> List[int]:
+        global_num_tokens_per_expert = num_tokens_per_expert.contiguous().clone()
+        dist.all_reduce(global_num_tokens_per_expert, group=self.group)
+        num_local_experts = global_num_tokens_per_expert.numel() // self.group_size
+        local_expert_begin = self.rank * num_local_experts
+        local_expert_end = local_expert_begin + num_local_experts
+        return global_num_tokens_per_expert[local_expert_begin:local_expert_end].cpu().tolist()
+
+    def _get_intranode_recv_src_idx(self, is_token_in_rank: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
+        gathered_masks = self._all_gather_object(is_token_in_rank.cpu())
+        recv_src_rank = []
+        recv_src_idx = []
+        for src_rank, src_mask in enumerate(gathered_masks):
+            selected = src_mask[:, self.rank].to(torch.bool)
+            token_indices = selected.nonzero(as_tuple=False).view(-1).tolist()
+            recv_src_rank.extend([src_rank] * len(token_indices))
+            recv_src_idx.extend(token_indices)
+        return torch.tensor(recv_src_idx, dtype=torch.int32, device=is_token_in_rank.device), recv_src_rank
+
+    def _get_intranode_recv_topk_metadata(self, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                                          num_tokens_per_expert: torch.Tensor, num_worst_tokens: int) -> \
+            Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        payload = {
+            'topk_idx': topk_idx.cpu(),
+            'topk_weights': topk_weights.cpu(),
+        }
+        gathered = self._all_gather_object(payload)
+        num_local_experts = num_tokens_per_expert.numel() // self.group_size
+        local_expert_begin = self.rank * num_local_experts
+        local_expert_end = local_expert_begin + num_local_experts
+        recv_topk_idx_rows = []
+        recv_topk_weight_rows = []
+        num_recv_tokens_per_expert_list = [0] * num_local_experts
+
+        for package in gathered:
+            src_topk_idx = package['topk_idx']
+            src_topk_weights = package['topk_weights']
+            for token_idx in range(src_topk_idx.size(0)):
+                token_experts = src_topk_idx[token_idx]
+                local_mask = (token_experts >= local_expert_begin) & (token_experts < local_expert_end)
+                if not bool(local_mask.any()):
+                    continue
+
+                local_topk_idx = torch.full_like(token_experts, -1)
+                local_topk_idx[local_mask] = token_experts[local_mask] - local_expert_begin
+                recv_topk_idx_rows.append(local_topk_idx)
+
+                local_topk_weight = torch.zeros_like(src_topk_weights[token_idx])
+                local_topk_weight[local_mask] = src_topk_weights[token_idx][local_mask]
+                recv_topk_weight_rows.append(local_topk_weight)
+
+                for expert_idx in local_topk_idx[local_topk_idx >= 0].tolist():
+                    num_recv_tokens_per_expert_list[expert_idx] += 1
+
+        recv_topk_idx_tensor = self._stack_or_empty(recv_topk_idx_rows, topk_idx)
+        recv_topk_weight_tensor = self._stack_or_empty(recv_topk_weight_rows, topk_weights)
+        if num_worst_tokens > 0:
+            recv_topk_idx_tensor = self._pad_rows(recv_topk_idx_tensor, num_worst_tokens, -1)
+            recv_topk_weight_tensor = self._pad_rows(recv_topk_weight_tensor, num_worst_tokens, 0)
+            num_recv_tokens_per_expert_list = []
+        return recv_topk_idx_tensor, recv_topk_weight_tensor, num_recv_tokens_per_expert_list
+
+    def _combine_topk_weights_metadata(self, topk_weights: torch.Tensor, handle: Tuple) -> torch.Tensor:
+        rank_prefix_matrix, _, _, src_idx, _, _ = handle
+        src_rank = []
+        start = 0
+        for src_rank_id in range(self.group_size):
+            end = int(rank_prefix_matrix[src_rank_id, self.rank].item())
+            src_rank.extend([src_rank_id] * (end - start))
+            start = end
+        payload = {
+            'topk_weights': topk_weights.cpu(),
+            'src_rank': src_rank,
+            'src_idx': src_idx.cpu(),
+        }
+        gathered = self._all_gather_object(payload)
+        combined_topk_weights = torch.zeros((handle[5].size(0), topk_weights.size(1)), dtype=torch.float32, device='cpu')
+        for package in gathered:
+            src_rank_tensor = torch.tensor(package['src_rank'], dtype=torch.int64, device='cpu')
+            token_idx = package['src_idx'].to(dtype=torch.int64, device='cpu')
+            rank_mask = src_rank_tensor == self.rank
+            if not bool(rank_mask.any()):
+                continue
+            selected_idx = token_idx[rank_mask]
+            combined_topk_weights.index_add_(0, selected_idx, package['topk_weights'][rank_mask].to(torch.float32))
+        return combined_topk_weights.to(device=topk_weights.device, dtype=topk_weights.dtype)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
         """
