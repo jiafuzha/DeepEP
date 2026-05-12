@@ -1,0 +1,224 @@
+I’m picking up the XPU migration from the current repo state, starting with recent context and the baseline build/test path using the oneAPI environment and the device masks you specified.
+
+● Find recent migration sessions (sql)
+  │ SELECT s.id, s.summary, s.branch, s.created_at FROM sessions s JOIN turns t
+  │ ON t…
+  └ 1 row(s) returned
+
+● Search (glob)
+  │ "xpu/deep_ep/**/*.py"
+  └ 4 files found
+
+● Search (glob)
+  │ "xpu/tests/**/*.py"
+  └ 9 files found
+
+● Search (grep)
+  │ "setvars\.sh|ZE_AFFINITY_MASK|DEEPEP_BACKEND|DEEPEP_XPU_BUILD_MODE|DEEPEP_XP
+  │ U_FORCE_PY_STUB" in **/*
+  └ 7 lines found
+
+● Check git status and recent commits (shell)
+  │ git --no-pager status --short && echo '---' && git --no-pager log --oneline
+  │ -5
+  └ 10 lines...
+
+● Read prior session checkpoints (sql)
+  │ SELECT checkpoint_number, title, overview, work_done, technical_details FROM
+  │ che…
+  └ Query returned 0 rows.
+
+● Read test_xpu_buffer_fallbacks.py
+  │ xpu/tests/test_xpu_buffer_fallbacks.py
+  └ L1:260 (259 lines read)
+
+● Read conftest.py
+  │ xpu/tests/conftest.py
+  └ L1:220 (71 lines read)
+
+● Read buffer.py
+  │ xpu/deep_ep/buffer.py
+  └ L1:260 (260 lines read)
+
+● Read test_xpu_force_python_stub_dispatch_combine.py
+  │ xpu/tests/test_xpu_force_python_stub_dispatch_combine.py
+  └ L1:260 (73 lines read)
+
+● Read _extension.py
+  │ xpu/deep_ep/_extension.py
+  └ L1:260 (40 lines read)
+
+● Read test_xpu_import.py
+  │ xpu/tests/test_xpu_import.py
+  └ L1:220 (220 lines read)
+
+● Read buffer.py
+  │ xpu/deep_ep/buffer.py
+  └ L260:620 (361 lines read)
+
+I’ve got the current XPU migration context; next I’m running the oneAPI-backed XPU install and pytest baseline so I can fix the next blocking gap instead of guessing.
+
+● Build and install XPU package (shell)
+  │ set -euo pipefail && source /opt/intel/oneapi/setvars.sh --force
+  │ >/tmp/deepep_oneapi_build.log 2>&1 && export ZE_AFFINITY_MASK=0,1 && export
+  │ DEEPEP_BACKEND=xpu && export DEEPEP_XPU_BUILD_MODE=native-staged &&
+  │ ./install.sh
+  └ 123 lines...
+
+● Run XPU pytest baseline (shell)
+  │ set -euo pipefail && source /opt/intel/oneapi/setvars.sh --force
+  │ >/tmp/deepep_oneapi_test.log 2>&1 && export ZE_AFFINITY_MASK=0,1 && python
+  │ -m pytest xpu/tests -q
+  └ 2 lines...
+
+The full XPU test sweep is still running unusually long; I’m reading the live output to see whether it’s just finishing the heavier multi-process cases or stuck on the next migration gap.
+
+● Read test_xpu_import.py
+  │ xpu/tests/test_xpu_import.py
+  └ L220:420 (201 lines read)
+
+● Read test_xpu_stub_backend.py
+  │ xpu/tests/test_xpu_stub_backend.py
+  └ L1:260 (70 lines read)
+
+● Read test_xpu_force_python_stub_low_latency.py
+  │ xpu/tests/test_xpu_force_python_stub_low_latency.py
+  └ L1:260 (52 lines read)
+
+● Read shell output Waiting up to 30 seconds for command output
+  └ 2 lines...
+
+● Read test_xpu_force_python_stub_dispatch_layout.py
+  │ xpu/tests/test_xpu_force_python_stub_dispatch_layout.py
+  └ L1:260 (27 lines read)
+
+● Read test_xpu_force_python_stub_low_latency_zero_copy.py
+  │ xpu/tests/test_xpu_force_python_stub_low_latency_zero_copy.py
+  └ L1:260 (51 lines read)
+
+● Read shell output Waiting up to 120 seconds for command output
+  └ 3 lines...
+
+The current baseline is clean, so I’m moving to the next migration gap by scanning the staged XPU native path for remaining `not implemented` surfaces and then wiring one through with tests.
+
+● Search (glob)
+  │ "xpu/csrc/**/*.{cpp,hpp,cu,h}"
+  └ 11 files found
+
+● Search (grep)
+  │ "not implemented for XPU|TODO|staged|fallback" in
+  │ **/*.{py,cpp,hpp,cu,h,cmake,txt} (xpu)
+  └ 9 lines found
+
+● Summarize migration gaps (shell)
+  │ git --no-pager diff --stat && echo '---' && git --no-pager grep -n "not
+  │ implemented for XPU\|TODO\|fallback" -- xpu || true
+  └ 8 lines...
+
+● Read MIGRATION_STATUS.md
+  │ xpu/MIGRATION_STATUS.md
+  └ L1:260 (108 lines read)
+
+● Read copilot-tool-output-1778529068505-gaglo6.txt
+  │ /tmp/copilot-tool-output-1778529068505-gaglo6.txt
+  └ L1:240 (95 lines read)
+
+● Read copilot-tool-output-1778529068080-dsxai1.txt
+  │ /tmp/copilot-tool-output-1778529068080-dsxai1.txt
+  └ L1:240 (149 lines read)
+
+● Read buffer.py
+  │ xpu/deep_ep/buffer.py
+  └ L680:1210 (287 lines read)
+
+● Search (grep)
+  │ "EP_UNSUPPORTED_XPU|throw std::runtime_error\(|TORCH_CHECK\(false.*XPU|not
+  │ implemented for XPU" in **/*.{cpp,hpp,cu,h} (xpu/csrc)
+  └ 3 lines found
+
+● Read MIGRATION_STATUS.md
+  │ xpu/MIGRATION_STATUS.md
+  └ L109:260 (118 lines read)
+
+● Read utils.py
+  │ xpu/deep_ep/utils.py
+  └ L1:220 (126 lines read)
+
+● Read deep_ep.cpp
+  │ xpu/csrc/deep_ep.cpp
+  └ L1180:1320 (141 lines read)
+
+● Read deep_ep.cpp
+  │ xpu/csrc/deep_ep.cpp
+  └ L1840:1945 (106 lines read)
+
+● Read test_xpu_import.py
+  │ xpu/tests/test_xpu_import.py
+  └ L1:140 (140 lines read)
+
+● Search (grep)
+  │ "__LOCAL_DEVICE__|torch\.xpu\.set_device\(local_device\)|ZE_AFFINITY_MASK"
+  │ (xpu/tests/test_xpu_import.py)
+  └ 118 lines found
+
+I found a concrete migration/testing mismatch with your device-mask requirement: the two-process XPU regression helper was still exposing `ZE_AFFINITY_MASK=0,1` to both workers. I’m switching it to one masked device per process and adding a regression that proves each worker only sees its assigned device.
+
+● Edit
+  └ Edit xpu/tests/test_xpu_import.py
+
+I’ve applied the device-isolation change and I’m rerunning the XPU suite in the oneAPI environment to catch any helper or cross-process assumptions that depended on both devices being visible in each worker.
+
+● Rerun XPU pytest suite (shell)
+  │ set -euo pipefail && source /opt/intel/oneapi/setvars.sh --force
+  │ >/tmp/deepep_oneapi_retest.log 2>&1 && export ZE_AFFINITY_MASK=0,1 && python
+  │ -m pytest xpu/tests -q
+  └ 2 lines...
+
+One cross-process test broke under the stricter mask isolation, which is exactly the kind of hidden assumption this change was meant to flush out. I’m pulling the failure and fixing that path rather than weakening the helper.
+
+● Search (grep)
+  │ "current_device\(|device_count\(|get_local_device_id\(|ZE_AFFINITY_MASK" in
+  │ **/*.{py,cpp,hpp,cu,h} (xpu/csrc, xpu/tests, xpu/deep_ep)
+  └ 95 lines found
+
+● Read shell output Waiting up to 90 seconds for command output
+  └ 37 lines...
+
+The only break was in the new regression itself: I forgot the top-level `pathlib` import for the post-run file checks. I’m fixing that and rerunning the suite.
+
+● Read test_xpu_import.py
+  │ xpu/tests/test_xpu_import.py
+  └ L1:20 (19 lines read)
+
+● Edit
+  └ Edit xpu/tests/test_xpu_import.py
+
+I’ve fixed the import oversight; now I’m rerunning the full XPU suite under the same oneAPI setup to confirm the mask-isolated workers hold across all existing regressions.
+
+● Rerun XPU pytest suite after fix (shell)
+  │ set -euo pipefail && source /opt/intel/oneapi/setvars.sh --force
+  │ >/tmp/deepep_oneapi_retest2.log 2>&1 && export ZE_AFFINITY_MASK=0,1 &&
+  │ python -m pytest xpu/tests -q
+  └ 2 lines...
+
+● Show final test helper diff (shell)
+  │ git --no-pager diff -- xpu/tests/test_xpu_import.py
+  └ 109 lines...
+
+● Read shell output Waiting up to 90 seconds for command output
+  └ 3 lines...
+
+Updated the XPU migration test path to use **one device per worker process**, matching your requested `ZE_AFFINITY_MASK` usage.
+
+In `xpu/tests/test_xpu_import.py` I changed the two-process helper so it:
+- probes device availability with `ZE_AFFINITY_MASK=0` and `ZE_AFFINITY_MASK=1` separately,
+- launches each subprocess with its own single-device mask instead of exposing `0,1` to both,
+- remaps the worker-local XPU selection to visible device `0` while preserving global rank/device identity in the test logic,
+- adds a regression that verifies each worker sees exactly one XPU and the expected affinity mask.
+
+The XPU native-staged build/install completed under the oneAPI environment, and the XPU suite now passes with this stricter isolation: **99 passed, 1 skipped**.
+
+
+Changes   +42 -12
+Requests  1 Premium (14m 31s)
+Tokens    ↑ 1.3m • ↓ 7.7k • 1.2m (cached) • 3.3k (reasoning)

@@ -1,0 +1,2 @@
+deep_ep_cpp_xpu
+xpu
