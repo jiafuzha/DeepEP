@@ -1,6 +1,7 @@
-#include <sycl/sycl.hpp>
+#include <cmath>
 #include <functional>
 #include <optional>
+#include <sycl/sycl.hpp>
 
 #include "buffer.dp.hpp"
 #include "configs.dp.hpp"
@@ -8,7 +9,6 @@
 #include "ibgda_device.dp.hpp"
 #include "launch.dp.hpp"
 #include "utils.dp.hpp"
-#include <cmath>
 
 namespace deep_ep {
 
@@ -1663,7 +1663,7 @@ __device__ int combine_token(bool is_token_in_rank,
             // Read buffers
             // TODO: maybe too many registers here
             sycl::int4 recv_value_int4[kMaxNumRanks];
-#pragma unroll
+            #pragma unroll
             for (int j = 0; j < num_topk_ranks; ++j)
                 recv_value_int4[j] = ld_nc_global(get_addr_fn(topk_ranks[j], slot_indices[j], i));
 

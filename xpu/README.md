@@ -273,6 +273,8 @@ Many design notes in the upstream project discuss CUDA/PTX/NVSHMEM behavior. Kee
 
 For better performance on your cluster, we recommend to run all the tests and use the best auto-tuned configuration. The default configurations are optimized on the DeepSeek's internal cluster.
 
+For the mirrored XPU tree specifically, the native intranode implementation now includes a restored cached no-topk fast path with reusable host-staged Level Zero IPC transport. It passes the smoke/correctness coverage and produces meaningful point benchmarks, but it is still not a CUDA-style steady-state transport/kernel path, so the upstream intranode auto-tuning loop remains intentionally disabled on XPU.
+
 ## License
 
 This code repository is released under [the MIT License](LICENSE), except for codes that reference NVSHMEM (including `csrc/kernels/ibgda_device.cuh` and `third-party/nvshmem.patch`), which are subject to [NVSHMEM SLA](https://docs.nvidia.com/nvshmem/api/sla.html).

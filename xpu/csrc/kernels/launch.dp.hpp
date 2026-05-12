@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+
 #include "configs.dp.hpp"
 #include "exception.dp.hpp"
 
@@ -24,13 +25,13 @@ struct LaunchConfig {
 
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(sms, threads, stream) \
-    ::deep_ep::LaunchConfig cfg{(sms), (threads), 0u, (stream)}
+    ::deep_ep::LaunchConfig cfg { (sms), (threads), 0u, (stream) }
 #endif
 
 #ifndef LAUNCH_KERNEL
-#define LAUNCH_KERNEL(config, kernel, ...)                            \
-    do {                                                              \
-        (void)(config);                                               \
+#define LAUNCH_KERNEL(config, kernel, ...)                                        \
+    do {                                                                          \
+        (void)(config);                                                           \
         ::deep_ep::throw_untranslated_kernel_launch(#kernel, __FILE__, __LINE__); \
     } while (0)
 #endif

@@ -5,14 +5,14 @@
 #undef NDEBUG
 #endif
 
-#include <pybind11/pybind11.h>
-#include <pybind11/pytypes.h>
 #include <c10/xpu/XPUStream.h>
 #include <level_zero/ze_api.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
+#include <sys/types.h>
 #include <torch/types.h>
 
 #include <sycl/sycl.hpp>
-#include <sys/types.h>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -103,6 +103,9 @@ private:
 
     // Workspace
     void* workspace = nullptr;
+    uint8_t* host_staging_slab = nullptr;
+    int64_t host_staging_slab_bytes = 0;
+    torch::Tensor pack_scratch_x;
 
     uint32_t intranode_simple_phase = 0;
 
@@ -119,6 +122,9 @@ private:
     int* moe_recv_rdma_counter_mapped = nullptr;
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
+
+    uint8_t* ensure_host_staging_slab(int64_t bytes);
+    torch::Tensor ensure_pack_scratch_x(const torch::Tensor& like, int64_t rows, int64_t hidden);
 
 public:
     Buffer(int rank,
@@ -186,6 +192,7 @@ public:
                        int cached_num_recv_tokens,
                        const std::optional<torch::Tensor>& cached_rank_prefix_matrix,
                        const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                       const std::optional<torch::Tensor>& cached_send_pos,
                        int expert_alignment,
                        int num_worst_tokens,
                        const Config& config,
@@ -202,6 +209,7 @@ public:
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
         const torch::Tensor& send_head,
+        const std::optional<torch::Tensor>& row_src_rank,
         const Config& config,
         std::optional<EventHandle>& previous_event,
         bool async,

@@ -18,9 +18,7 @@ def require_xpu_devices(num_local_ranks: int, test_name: str) -> None:
         raise RuntimeError(f'{test_name} requires torch.xpu to be available')
     device_count = torch.xpu.device_count()
     if device_count < num_local_ranks:
-        raise RuntimeError(
-            f'{test_name} requested {num_local_ranks} local processes, but only {device_count} XPU devices are visible'
-        )
+        raise RuntimeError(f'{test_name} requested {num_local_ranks} local processes, but only {device_count} XPU devices are visible')
 
 
 def ensure_master_port() -> None:

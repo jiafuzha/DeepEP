@@ -10,12 +10,11 @@ namespace internode_ll {
 namespace {
 
 [[noreturn]] void throw_unsupported() {
-    throw EPException(
-        "XPU",
-        __FILE__,
-        __LINE__,
-        "DeepEP XPU low-latency kernels are intentionally unsupported: the mirrored API surface is kept for compatibility, "
-        "but a portable SYCL/iSHMEM implementation is not available yet.");
+    throw EPException("XPU",
+                      __FILE__,
+                      __LINE__,
+                      "DeepEP XPU low-latency kernels are intentionally unsupported: the mirrored API surface is kept for compatibility, "
+                      "but a portable SYCL/iSHMEM implementation is not available yet.");
 }
 
 }  // namespace

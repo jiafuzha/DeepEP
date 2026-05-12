@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import setuptools
 from torch.utils.cpp_extension import BuildExtension, SyclExtension, library_paths
 
-
 DEFAULT_XPU_ARCH = 'pvc'
 DEFAULT_BUILD_MODE = 'intranode'
 EXPERIMENTAL_BUILD_ENV = 'DEEP_EP_XPU_ALLOW_EXPERIMENTAL_BUILD'
@@ -44,9 +43,7 @@ def env_enabled(name: str, default: str = '0') -> bool:
 def normalize_build_mode() -> str:
     mode = os.getenv(BUILD_MODE_ENV, DEFAULT_BUILD_MODE).strip().lower()
     if mode not in ('intranode', 'full'):
-        raise SystemExit(
-            f'Unsupported {BUILD_MODE_ENV}={mode!r}. Supported values: intranode, full.'
-        )
+        raise SystemExit(f'Unsupported {BUILD_MODE_ENV}={mode!r}. Supported values: intranode, full.')
     return mode
 
 
@@ -81,10 +78,8 @@ def get_build_plan() -> BuildPlan:
 def get_ishmem_dir(required: bool) -> str | None:
     ishmem_dir = os.getenv('ISHMEM_DIR', '/opt/intel/ishmem')
     if required and not os.path.exists(ishmem_dir):
-        raise SystemExit(
-            f'ISHMEM_DIR points to a missing path: {ishmem_dir}\n'
-            'Set ISHMEM_DIR to a valid iSHMEM installation before attempting a full XPU build.'
-        )
+        raise SystemExit(f'ISHMEM_DIR points to a missing path: {ishmem_dir}\n'
+                         'Set ISHMEM_DIR to a valid iSHMEM installation before attempting a full XPU build.')
     return ishmem_dir if os.path.exists(ishmem_dir) else None
 
 
@@ -140,12 +135,8 @@ def format_status(plan: BuildPlan, issues: list[str]) -> str:
     else:
         lines.append(' - Environment checks: OK for an experimental compile attempt.')
     lines.append(' - Notes:')
-    lines.append(
-        f'   * Build commands are blocked by default; set {EXPERIMENTAL_BUILD_ENV}=1 to attempt compilation.'
-    )
-    lines.append(
-        f'   * {BUILD_MODE_ENV}=intranode skips iSHMEM-linked internode/low-latency sources.'
-    )
+    lines.append(f'   * Build commands are blocked by default; set {EXPERIMENTAL_BUILD_ENV}=1 to attempt compilation.')
+    lines.append(f'   * {BUILD_MODE_ENV}=intranode skips iSHMEM-linked internode/low-latency sources.')
     lines.append(
         f'   * {BUILD_MODE_ENV}=full enables the mirrored full tree, requires ISHMEM_DIR, and keeps low-latency entrypoints as explicit unsupported stubs.'
     )
@@ -184,17 +175,13 @@ def guard_build_request(plan: BuildPlan, issues: list[str]) -> None:
     print_status(plan, issues)
 
     if not env_enabled(EXPERIMENTAL_BUILD_ENV):
-        raise SystemExit(
-            'DeepEP XPU extension compilation is intentionally gated because the mirrored XPU tree '
-            'is still experimental.\n'
-            f'Set {EXPERIMENTAL_BUILD_ENV}=1 to attempt the current experimental build anyway.'
-        )
+        raise SystemExit('DeepEP XPU extension compilation is intentionally gated because the mirrored XPU tree '
+                         'is still experimental.\n'
+                         f'Set {EXPERIMENTAL_BUILD_ENV}=1 to attempt the current experimental build anyway.')
 
     if issues:
-        raise SystemExit(
-            'DeepEP XPU experimental build requested, but required toolchain/environment checks failed.\n'
-            'Resolve the issues listed above and retry.'
-        )
+        raise SystemExit('DeepEP XPU experimental build requested, but required toolchain/environment checks failed.\n'
+                         'Resolve the issues listed above and retry.')
 
 
 def build_extension(plan: BuildPlan) -> SyclExtension:

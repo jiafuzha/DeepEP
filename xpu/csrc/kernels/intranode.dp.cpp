@@ -1,14 +1,102 @@
+#include <cmath>
 #include <sycl/sycl.hpp>
+
 #include "buffer.dp.hpp"
 #include "configs.dp.hpp"
 #include "exception.dp.hpp"
 #include "launch.dp.hpp"
 #include "utils.dp.hpp"
-#include <cmath>
 
 namespace deep_ep {
 
 namespace intranode {
+
+namespace {
+
+template <int kNumThreads>
+void simple_dispatch_pack_kernel(const void* x,
+                                 void* packed_x,
+                                 const int* send_pos,
+                                 int num_tokens,
+                                 int num_ranks,
+                                 int hidden_int4,
+                                 int max_send_tokens,
+                                 dpct::queue_ptr stream) {
+    auto* src_ptr = static_cast<const int4*>(x);
+    auto* dst_ptr = static_cast<int4*>(packed_x);
+    int num_pairs = num_tokens * num_ranks;
+    stream->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_pairs * kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
+                         [=](sycl::nd_item<3> item) {
+                             int pair_idx = static_cast<int>(item.get_group_linear_id());
+                             int local_idx = static_cast<int>(item.get_local_linear_id());
+                             int packed_pos = send_pos[pair_idx];
+                             if (packed_pos < 0)
+                                 return;
+                             int token_idx = pair_idx / num_ranks;
+                             int dst_rank = pair_idx % num_ranks;
+                             auto* src_row = src_ptr + static_cast<int64_t>(token_idx) * hidden_int4;
+                             auto* dst_row = dst_ptr + (static_cast<int64_t>(dst_rank) * max_send_tokens + packed_pos) * hidden_int4;
+                             for (int i = local_idx; i < hidden_int4; i += kNumThreads)
+                                 dst_row[i] = src_row[i];
+                         });
+    });
+}
+
+template <int kNumThreads>
+void simple_combine_stage_kernel(const void* x,
+                                 void* packed_x,
+                                 const int* row_src_rank,
+                                 const int* src_idx,
+                                 int num_tokens,
+                                 int num_ranks,
+                                 int num_recv_tokens,
+                                 int hidden_int4,
+                                 dpct::queue_ptr stream) {
+    auto* src_ptr = static_cast<const int4*>(x);
+    auto* dst_ptr = static_cast<int4*>(packed_x);
+    stream->submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_tokens * kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
+                         [=](sycl::nd_item<3> item) {
+                             int row_idx = static_cast<int>(item.get_group_linear_id());
+                             int local_idx = static_cast<int>(item.get_local_linear_id());
+                             int src_rank = row_src_rank[row_idx];
+                             int dst_token = src_idx[row_idx];
+                             auto* src_row = src_ptr + static_cast<int64_t>(row_idx) * hidden_int4;
+                             auto* dst_row = dst_ptr + (static_cast<int64_t>(src_rank) * num_recv_tokens + dst_token) * hidden_int4;
+                             for (int i = local_idx; i < hidden_int4; i += kNumThreads)
+                                 dst_row[i] = src_row[i];
+                         });
+    });
+}
+
+}  // namespace
+
+void simple_dispatch_pack(const void* x,
+                          void* packed_x,
+                          const int* send_pos,
+                          int num_tokens,
+                          int num_ranks,
+                          int hidden_int4,
+                          int max_send_tokens,
+                          dpct::queue_ptr stream) {
+    constexpr int kNumThreads = 128;
+    simple_dispatch_pack_kernel<kNumThreads>(x, packed_x, send_pos, num_tokens, num_ranks, hidden_int4, max_send_tokens, stream);
+}
+
+void simple_combine_stage(const void* x,
+                          void* packed_x,
+                          const int* row_src_rank,
+                          const int* src_idx,
+                          int num_tokens,
+                          int num_ranks,
+                          int num_recv_tokens,
+                          int hidden_int4,
+                          dpct::queue_ptr stream) {
+    constexpr int kNumThreads = 128;
+    simple_combine_stage_kernel<kNumThreads>(
+        x, packed_x, row_src_rank, src_idx, num_tokens, num_ranks, num_recv_tokens, hidden_int4, stream);
+}
 
 template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
@@ -134,8 +222,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
     auto launch = [&](auto ranks_tag) {
         constexpr int ranks = decltype(ranks_tag)::value;
         stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (1 + num_ranks) * kNumThreads),
-                                               sycl::range<3>(1, 1, kNumThreads)),
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (1 + num_ranks) * kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
                              [=](sycl::nd_item<3>) {
                                  notify_dispatch<ranks>(num_tokens_per_rank,
                                                         num_tokens_per_expert,
@@ -203,8 +290,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
         stream->submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
                              [=](sycl::nd_item<3>) {
-                                 cached_notify_dispatch<ranks>(
-                                     rank_prefix_matrix, num_memset_int, buffer_ptrs, barrier_signal_ptrs, rank);
+                                 cached_notify_dispatch<ranks>(rank_prefix_matrix, num_memset_int, buffer_ptrs, barrier_signal_ptrs, rank);
                              });
         });
     };
@@ -597,8 +683,7 @@ void dispatch(void* recv_x,
     auto launch = [&](auto ranks_tag) {
         constexpr int ranks = decltype(ranks_tag)::value;
         stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_sms * kNumThreads),
-                                               sycl::range<3>(1, 1, kNumThreads)),
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_sms * kNumThreads), sycl::range<3>(1, 1, kNumThreads)),
                              [=](sycl::nd_item<3>) {
                                  dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>(reinterpret_cast<int4*>(recv_x),
                                                                                    recv_x_scales,

@@ -1,5 +1,5 @@
-#include <sycl/sycl.hpp>
 #include <cstring>
+#include <sycl/sycl.hpp>
 #include <vector>
 
 #include "configs.dp.hpp"
@@ -24,9 +24,8 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, dpct::queue_ptr
     auto launch_barrier = [&](auto ranks_tag) {
         constexpr int ranks = decltype(ranks_tag)::value;
         stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)), [=](sycl::nd_item<1>) {
-                barrier_block<ranks>(barrier_signal_ptrs, rank);
-            });
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
+                             [=](sycl::nd_item<1>) { barrier_block<ranks>(barrier_signal_ptrs, rank); });
         });
     };
 

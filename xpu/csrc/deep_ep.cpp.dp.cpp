@@ -5,22 +5,23 @@
 #include <c10/xpu/XPUStream.h>
 #include <level_zero/ze_api.h>
 #include <pybind11/functional.h>
-#include <torch/python.h>
-
-#include <cerrno>
-#include <chrono>
-#include <cstring>
-#include <memory>
-#include <sstream>
-#include <thread>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <torch/python.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <thread>
 
 #include "kernels/api.dp.hpp"
 #include "kernels/configs.dp.hpp"
-#include <cmath>
 
 namespace {
 
@@ -63,10 +64,14 @@ dpct::library_data_t scalar_type_to_library_data(torch::ScalarType scalar_type) 
 }
 
 ze_context_handle_t get_ze_context() {
+    static std::once_flag ze_init_once;
+    std::call_once(ze_init_once, []() { ZE_CHECK(zeInit(0)); });
     return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(c10::xpu::get_device_context());
 }
 
 ze_device_handle_t get_ze_device(c10::DeviceIndex device_index = -1) {
+    static std::once_flag ze_init_once;
+    std::call_once(ze_init_once, []() { ZE_CHECK(zeInit(0)); });
     if (device_index < 0)
         device_index = c10::xpu::current_device();
     return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(c10::xpu::get_raw_device(device_index));
@@ -107,7 +112,7 @@ int create_ipc_socket(char* socket_path, size_t socket_path_size, int rank) {
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     EP_HOST_ASSERT(sockfd >= 0);
 
-    sockaddr_un addr {};
+    sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
     unlink(socket_path);
@@ -123,15 +128,15 @@ void close_ipc_socket(int sockfd, const char* socket_path) {
 }
 
 void send_fd_no_connection(int sockfd, const char* remote_socket_path, int fd_to_send, int rank) {
-    sockaddr_un remote_addr {};
+    sockaddr_un remote_addr{};
     remote_addr.sun_family = AF_UNIX;
     std::strncpy(remote_addr.sun_path, remote_socket_path, sizeof(remote_addr.sun_path) - 1);
 
     int payload = rank;
-    iovec iov {.iov_base = &payload, .iov_len = sizeof(payload)};
+    iovec iov{.iov_base = &payload, .iov_len = sizeof(payload)};
 
     char control[CMSG_SPACE(sizeof(int))] = {};
-    msghdr msg {};
+    msghdr msg{};
     msg.msg_name = &remote_addr;
     msg.msg_namelen = sizeof(remote_addr);
     msg.msg_iov = &iov;
@@ -150,10 +155,10 @@ void send_fd_no_connection(int sockfd, const char* remote_socket_path, int fd_to
 
 std::pair<int, int> recv_fd_no_connection(int sockfd) {
     int payload = -1;
-    iovec iov {.iov_base = &payload, .iov_len = sizeof(payload)};
+    iovec iov{.iov_base = &payload, .iov_len = sizeof(payload)};
 
     char control[CMSG_SPACE(sizeof(int))] = {};
-    msghdr msg {};
+    msghdr msg{};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control;
@@ -207,8 +212,8 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
 }
 
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
-    ZE_CHECK(zeMemOpenIpcHandle(
-        get_ze_context(), get_ze_device(), mem_handle->inner.ze_ipc_mem_handle, ZE_IPC_MEMORY_FLAG_BIAS_CACHED, ptr));
+    ZE_CHECK(
+        zeMemOpenIpcHandle(get_ze_context(), get_ze_device(), mem_handle->inner.ze_ipc_mem_handle, ZE_IPC_MEMORY_FLAG_BIAS_CACHED, ptr));
     void* base_ptr = nullptr;
     size_t base_size = 0;
     ZE_CHECK(zeMemGetAddressRange(get_ze_context(), *ptr, &base_ptr, &base_size));
@@ -283,9 +288,7 @@ Buffer::Buffer(int rank,
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
         ipc_socket_fd = create_ipc_socket(ipc_socket_path, sizeof(ipc_socket_path), rank);
-        std::strncpy(ipc_handles[nvl_rank].inner.socket_path,
-                     ipc_socket_path,
-                     sizeof(ipc_handles[nvl_rank].inner.socket_path) - 1);
+        std::strncpy(ipc_handles[nvl_rank].inner.socket_path, ipc_socket_path, sizeof(ipc_handles[nvl_rank].inner.socket_path) - 1);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
@@ -384,6 +387,30 @@ torch::Stream Buffer::get_comm_stream() const {
     return comm_stream;
 }
 
+uint8_t* Buffer::ensure_host_staging_slab(int64_t bytes) {
+    EP_HOST_ASSERT(bytes >= 0);
+    if (bytes == 0)
+        return nullptr;
+    if (host_staging_slab == nullptr || host_staging_slab_bytes < bytes) {
+        if (host_staging_slab != nullptr)
+            sycl::free(host_staging_slab, c10::xpu::get_device_context());
+        host_staging_slab = malloc_host_or_throw<uint8_t>(static_cast<size_t>(bytes), comm_stream);
+        host_staging_slab_bytes = bytes;
+    }
+    return host_staging_slab;
+}
+
+torch::Tensor Buffer::ensure_pack_scratch_x(const torch::Tensor& like, int64_t rows, int64_t hidden) {
+    EP_HOST_ASSERT(rows >= 0 and hidden >= 0);
+    if (rows == 0 || hidden == 0)
+        return torch::Tensor();
+    if (not pack_scratch_x.defined() || pack_scratch_x.scalar_type() != like.scalar_type() || pack_scratch_x.device() != like.device() ||
+        pack_scratch_x.dim() != 2 || pack_scratch_x.size(0) < rows || pack_scratch_x.size(1) != hidden) {
+        pack_scratch_x = torch::empty({rows, hidden}, like.options());
+    }
+    return pack_scratch_x;
+}
+
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
@@ -421,6 +448,11 @@ void Buffer::destroy() {
 
     // Free workspace and MoE counter
     sycl::free(workspace, c10::xpu::get_device_context());
+    if (host_staging_slab != nullptr) {
+        sycl::free(host_staging_slab, c10::xpu::get_device_context());
+        host_staging_slab = nullptr;
+        host_staging_slab_bytes = 0;
+    }
     sycl::free(const_cast<int*>(moe_recv_counter), c10::xpu::get_device_context());
 
     // Free chunked mode staffs
@@ -606,6 +638,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            int cached_num_recv_tokens,
                            const std::optional<torch::Tensor>& cached_rank_prefix_matrix,
                            const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                           const std::optional<torch::Tensor>& cached_send_pos,
                            int expert_alignment,
                            int num_worst_tokens,
                            const Config& config,
@@ -631,6 +664,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     if (precomputed_layout_mode) {
         EP_HOST_ASSERT(cached_rank_prefix_matrix->scalar_type() == torch::kInt32);
         EP_HOST_ASSERT(cached_channel_prefix_matrix->scalar_type() == torch::kInt32);
+        if (cached_send_pos.has_value())
+            EP_HOST_ASSERT(cached_send_pos->scalar_type() == torch::kInt32);
     } else {
         EP_HOST_ASSERT(num_tokens_per_expert->scalar_type() == torch::kInt32);
         EP_HOST_ASSERT(num_tokens_per_rank->scalar_type() == torch::kInt32);
@@ -646,6 +681,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(cached_rank_prefix_matrix->size(0) == num_ranks and cached_rank_prefix_matrix->size(1) == num_ranks);
         EP_HOST_ASSERT(cached_channel_prefix_matrix->dim() == 2 and cached_channel_prefix_matrix->is_contiguous());
         EP_HOST_ASSERT(cached_channel_prefix_matrix->size(0) == num_ranks and cached_channel_prefix_matrix->size(1) == num_channels);
+        if (cached_send_pos.has_value()) {
+            EP_HOST_ASSERT(cached_send_pos->dim() == 2 and cached_send_pos->is_contiguous());
+            EP_HOST_ASSERT(cached_send_pos->size(0) == num_ranks and cached_send_pos->size(1) == x.size(0));
+        }
     }
     if (num_tokens_per_expert.has_value()) {
         EP_HOST_ASSERT(num_tokens_per_expert->dim() == 1 and num_tokens_per_expert->is_contiguous());
@@ -770,9 +809,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             auto recv_tokens_per_expert_cpu = recv_tokens_per_expert.to(torch::kCPU);
             num_recv_tokens = rank_prefix_matrix_cpu.data_ptr<int>()[(num_ranks - 1) * num_ranks + rank];
             actual_num_recv_tokens = num_recv_tokens;
-            num_recv_tokens_per_expert_list =
-                std::vector<int>(recv_tokens_per_expert_cpu.data_ptr<int>(),
-                                 recv_tokens_per_expert_cpu.data_ptr<int>() + num_local_experts);
+            num_recv_tokens_per_expert_list = std::vector<int>(recv_tokens_per_expert_cpu.data_ptr<int>(),
+                                                               recv_tokens_per_expert_cpu.data_ptr<int>() + num_local_experts);
         }
     }
 
@@ -783,6 +821,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
          recv_x_scales = std::optional<torch::Tensor>();
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, xpu_tensor_options(torch::kInt32, device_id));
     auto send_head = torch::empty({num_tokens, num_ranks}, xpu_tensor_options(torch::kInt32, device_id));
+    std::vector<torch::Tensor> dispatch_send_slices;
 
     // Assign pointers
     topk_idx_t* recv_topk_idx_ptr = nullptr;
@@ -803,11 +842,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     if (precomputed_layout_mode) {
         EP_HOST_ASSERT(not x_scales.has_value() and "The simple XPU intranode path currently supports tensor inputs only");
         auto rank_prefix_matrix_cpu = rank_prefix_matrix.to(torch::kCPU);
-        auto is_token_in_rank_cpu = is_token_in_rank.to(torch::kCPU);
         auto* rank_prefix_ptr = rank_prefix_matrix_cpu.data_ptr<int>();
-        auto* is_token_in_rank_ptr = is_token_in_rank_cpu.data_ptr<bool>();
-        auto topk_idx_cpu = topk_idx.has_value() ? topk_idx->to(torch::kCPU) : torch::Tensor();
-        auto* topk_idx_cpu_ptr = topk_idx.has_value() ? topk_idx_cpu.data_ptr<topk_idx_t>() : nullptr;
         std::vector<int> recv_tokens_per_rank(num_ranks);
         for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank)
             recv_tokens_per_rank[dst_rank] = rank_prefix_ptr[(num_ranks - 1) * num_ranks + dst_rank];
@@ -835,8 +870,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
             if (dst_rank == rank)
                 continue;
-            auto* remote_signal_ptr =
-                reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
+            auto* remote_signal_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
             comm_stream.queue().memcpy(remote_signal_ptr, &ready_phase, sizeof(ready_phase));
         }
         comm_stream.queue().memcpy(local_signal_ptr + rank, &ready_phase, sizeof(ready_phase)).wait();
@@ -862,32 +896,61 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             next_offsets[dst_rank] = (rank == 0) ? 0 : rank_prefix_ptr[(rank - 1) * num_ranks + dst_rank];
         }
 
-        std::vector<uint8_t> host_x_row(row_bytes);
-        std::vector<topk_idx_t> local_topk_idx_row(num_topk);
-        std::vector<float> local_topk_weight_row(num_topk);
-        std::vector<float> host_topk_weight_row(num_topk);
-        for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
-            auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(token_idx) * row_bytes;
-            comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
-            if (topk_idx.has_value())
-                comm_stream.queue().memcpy(host_topk_weight_row.data(),
-                                           topk_weights_ptr + static_cast<int64_t>(token_idx) * num_topk,
-                                           num_topk * sizeof(float))
-                    .wait();
+        if (not topk_idx.has_value() and cached_send_pos.has_value()) {
+            auto previous_stream = c10::xpu::getCurrentXPUStream();
+            c10::xpu::setCurrentXPUStream(comm_stream);
+            auto pack_scratch = ensure_pack_scratch_x(x, max_recv_tokens, hidden);
+            auto* host_packed = ensure_host_staging_slab(static_cast<int64_t>(max_recv_tokens) * row_bytes);
             for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                if (not is_token_in_rank_ptr[token_idx * num_ranks + dst_rank])
+                int sender_end_offset = rank_prefix_ptr[rank * num_ranks + dst_rank];
+                int send_count = sender_end_offset - next_offsets[dst_rank];
+                if (send_count <= 0)
                     continue;
-                int dst_offset = next_offsets[dst_rank]++;
+                int base_offset = next_offsets[dst_rank];
                 auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[dst_rank]);
-                comm_stream.queue().memcpy(remote_base_ptr + x_stage_offset + static_cast<int64_t>(dst_offset) * row_bytes,
-                                           host_x_row.data(),
-                                           row_bytes)
+                auto send_indices = cached_send_pos->select(0, dst_rank).slice(0, 0, send_count);
+                auto packed_slice = pack_scratch.narrow(0, 0, send_count);
+                packed_slice.copy_(torch::index_select(x, 0, send_indices.to(torch::kInt64)));
+                comm_stream.queue().memcpy(host_packed, packed_slice.data_ptr(), static_cast<int64_t>(send_count) * row_bytes).wait();
+                comm_stream.queue()
+                    .memcpy(remote_base_ptr + x_stage_offset + static_cast<int64_t>(base_offset) * row_bytes,
+                            host_packed,
+                            static_cast<int64_t>(send_count) * row_bytes)
                     .wait();
-                comm_stream.queue().memcpy(remote_base_ptr + src_idx_stage_offset + static_cast<int64_t>(dst_offset) * sizeof(int),
-                                           &token_idx,
-                                           sizeof(int))
+            }
+            comm_stream.queue().wait();
+            c10::xpu::setCurrentXPUStream(previous_stream);
+        } else {
+            auto is_token_in_rank_cpu = is_token_in_rank.to(torch::kCPU);
+            auto* is_token_in_rank_ptr = is_token_in_rank_cpu.data_ptr<bool>();
+            auto topk_idx_cpu = topk_idx.has_value() ? topk_idx->to(torch::kCPU) : torch::Tensor();
+            auto* topk_idx_cpu_ptr = topk_idx.has_value() ? topk_idx_cpu.data_ptr<topk_idx_t>() : nullptr;
+            std::vector<uint8_t> host_x_row(row_bytes);
+            std::vector<topk_idx_t> local_topk_idx_row(num_topk);
+            std::vector<float> local_topk_weight_row(num_topk);
+            std::vector<float> host_topk_weight_row(num_topk);
+            for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+                auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(token_idx) * row_bytes;
+                comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
+                comm_stream.queue()
+                    .memcpy(host_topk_weight_row.data(),
+                            topk_weights_ptr + static_cast<int64_t>(token_idx) * num_topk,
+                            num_topk * sizeof(float))
                     .wait();
-                if (topk_idx.has_value()) {
+                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                    if (not is_token_in_rank_ptr[token_idx * num_ranks + dst_rank])
+                        continue;
+                    int dst_offset = next_offsets[dst_rank]++;
+                    auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[dst_rank]);
+                    comm_stream.queue()
+                        .memcpy(
+                            remote_base_ptr + x_stage_offset + static_cast<int64_t>(dst_offset) * row_bytes, host_x_row.data(), row_bytes)
+                        .wait();
+                    comm_stream.queue()
+                        .memcpy(remote_base_ptr + src_idx_stage_offset + static_cast<int64_t>(dst_offset) * sizeof(int),
+                                &token_idx,
+                                sizeof(int))
+                        .wait();
                     int local_expert_begin = dst_rank * num_local_experts;
                     int local_expert_end = local_expert_begin + num_local_experts;
                     std::fill(local_topk_idx_row.begin(), local_topk_idx_row.end(), static_cast<topk_idx_t>(-1));
@@ -899,15 +962,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                             local_topk_weight_row[k] = host_topk_weight_row[k];
                         }
                     }
-                    comm_stream.queue().memcpy(remote_base_ptr + topk_idx_stage_offset +
-                                                   static_cast<int64_t>(dst_offset) * num_topk * sizeof(topk_idx_t),
-                                               local_topk_idx_row.data(),
-                                               num_topk * sizeof(topk_idx_t))
+                    comm_stream.queue()
+                        .memcpy(remote_base_ptr + topk_idx_stage_offset + static_cast<int64_t>(dst_offset) * num_topk * sizeof(topk_idx_t),
+                                local_topk_idx_row.data(),
+                                num_topk * sizeof(topk_idx_t))
                         .wait();
-                    comm_stream.queue().memcpy(remote_base_ptr + topk_weight_stage_offset +
-                                                   static_cast<int64_t>(dst_offset) * num_topk * sizeof(float),
-                                               local_topk_weight_row.data(),
-                                               num_topk * sizeof(float))
+                    comm_stream.queue()
+                        .memcpy(remote_base_ptr + topk_weight_stage_offset + static_cast<int64_t>(dst_offset) * num_topk * sizeof(float),
+                                local_topk_weight_row.data(),
+                                num_topk * sizeof(float))
                         .wait();
                 }
             }
@@ -915,8 +978,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
             if (dst_rank == rank)
                 continue;
-            auto* remote_signal_ptr =
-                reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
+            auto* remote_signal_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[dst_rank]) + signal_offset) + rank;
             comm_stream.queue().memcpy(remote_signal_ptr, &done_phase, sizeof(done_phase));
         }
         comm_stream.queue().memcpy(local_signal_ptr + rank, &done_phase, sizeof(done_phase));
@@ -937,9 +999,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        comm_stream.queue().memcpy(recv_x.data_ptr(),
-                                   local_base_ptr + x_stage_offset,
-                                   static_cast<int64_t>(actual_num_recv_tokens) * row_bytes);
+        comm_stream.queue().memcpy(
+            recv_x.data_ptr(), local_base_ptr + x_stage_offset, static_cast<int64_t>(actual_num_recv_tokens) * row_bytes);
         comm_stream.queue().memcpy(recv_src_idx.data_ptr<int>(),
                                    local_base_ptr + src_idx_stage_offset,
                                    static_cast<int64_t>(actual_num_recv_tokens) * sizeof(int));
@@ -967,18 +1028,37 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         std::optional<EventHandle> event;
         if (async) {
             event = EventHandle(comm_stream);
-            for (auto& t :
-                 {x, is_token_in_rank, rank_prefix_matrix, channel_prefix_matrix, recv_x, recv_src_idx, recv_channel_prefix_matrix, send_head}) {
+            for (auto& t : {x,
+                            is_token_in_rank,
+                            rank_prefix_matrix,
+                            channel_prefix_matrix,
+                            recv_x,
+                            recv_src_idx,
+                            recv_channel_prefix_matrix,
+                            send_head}) {
                 t.record_stream(comm_stream);
                 if (allocate_on_comm_stream)
                     t.record_stream(compute_stream);
             }
-            for (auto& to :
-                 {x_scales, topk_idx, topk_weights, num_tokens_per_rank, num_tokens_per_expert, cached_channel_prefix_matrix,
-                  cached_rank_prefix_matrix, recv_topk_idx, recv_topk_weights, recv_x_scales}) {
+            for (auto& to : {x_scales,
+                             topk_idx,
+                             topk_weights,
+                             num_tokens_per_rank,
+                             num_tokens_per_expert,
+                             cached_channel_prefix_matrix,
+                             cached_rank_prefix_matrix,
+                             cached_send_pos,
+                             recv_topk_idx,
+                             recv_topk_weights,
+                             recv_x_scales}) {
                 to.has_value() ? to->record_stream(comm_stream) : void();
                 if (allocate_on_comm_stream)
                     to.has_value() ? to->record_stream(compute_stream) : void();
+            }
+            for (auto& t : dispatch_send_slices) {
+                t.record_stream(comm_stream);
+                if (allocate_on_comm_stream)
+                    t.record_stream(compute_stream);
             }
         } else {
             stream_wait(compute_stream, comm_stream);
@@ -1102,6 +1182,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
     const torch::Tensor& send_head,
+    const std::optional<torch::Tensor>& row_src_rank,
     const Config& config,
     std::optional<EventHandle>& previous_event,
     bool async,
@@ -1113,6 +1194,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                    rank_prefix_matrix.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
                    channel_prefix_matrix.scalar_type() == torch::kInt32);
+    if (row_src_rank.has_value())
+        EP_HOST_ASSERT(row_src_rank->dim() == 1 and row_src_rank->is_contiguous() and row_src_rank->scalar_type() == torch::kInt32);
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1121,6 +1204,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_recv_tokens = static_cast<int>(send_head.size(0));
     EP_HOST_ASSERT(src_idx.size(0) == num_tokens);
+    if (row_src_rank.has_value())
+        EP_HOST_ASSERT(row_src_rank->size(0) == num_tokens);
     EP_HOST_ASSERT(send_head.size(1) == num_ranks);
     EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
     EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
@@ -1156,10 +1241,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     }
 
     auto rank_prefix_matrix_cpu = rank_prefix_matrix.to(torch::kCPU);
-    auto src_idx_cpu = src_idx.to(torch::kCPU);
     auto* rank_prefix_ptr = rank_prefix_matrix_cpu.data_ptr<int>();
-    auto* src_idx_ptr = src_idx_cpu.data_ptr<int>();
     auto simple_bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    std::vector<torch::Tensor> combine_send_slices;
 
     int row_bytes = hidden * static_cast<int>(x.element_size());
     int64_t x_stage_offset = 0;
@@ -1179,8 +1263,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
         if (src_rank_id == rank)
             continue;
-        auto* remote_signal_ptr =
-            reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
+        auto* remote_signal_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
         comm_stream.queue().memcpy(remote_signal_ptr, &ready_phase, sizeof(ready_phase));
     }
     comm_stream.queue().memcpy(local_signal_ptr + rank, &ready_phase, sizeof(ready_phase)).wait();
@@ -1201,38 +1284,69 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    std::vector<uint8_t> host_x_row(row_bytes);
-    std::vector<float> host_topk_row(num_topk);
-    int start = 0;
-    for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
-        int end = rank_prefix_ptr[src_rank_id * num_ranks + rank];
-        auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[src_rank_id]);
-        for (int row = start; row < end; ++row) {
-            int dst_token = src_idx_ptr[row];
-            EP_HOST_ASSERT(dst_token >= 0 and dst_token < num_recv_tokens);
-            auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(row) * row_bytes;
-            auto row_slot = static_cast<int64_t>(rank) * num_recv_tokens + dst_token;
-            comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
-            comm_stream.queue().memcpy(remote_base_ptr + x_stage_offset + row_slot * row_bytes, host_x_row.data(), row_bytes).wait();
-            if (topk_weights.has_value()) {
-                comm_stream.queue().memcpy(host_topk_row.data(),
-                                           topk_weights_ptr + static_cast<int64_t>(row) * num_topk,
-                                           num_topk * sizeof(float))
-                    .wait();
-                comm_stream.queue().memcpy(remote_base_ptr + topk_stage_offset + row_slot * num_topk * sizeof(float),
-                                           host_topk_row.data(),
-                                           num_topk * sizeof(float))
+    bool use_fast_no_topk_combine = not topk_weights.has_value() and not bias_0.has_value() and not bias_1.has_value();
+    if (use_fast_no_topk_combine) {
+        auto previous_stream = c10::xpu::getCurrentXPUStream();
+        c10::xpu::setCurrentXPUStream(comm_stream);
+        auto pack_scratch = ensure_pack_scratch_x(x, static_cast<int64_t>(num_ranks) * num_recv_tokens, hidden);
+        auto* host_packed = ensure_host_staging_slab(static_cast<int64_t>(num_recv_tokens) * row_bytes);
+        int start = 0;
+        for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+            int end = rank_prefix_ptr[src_rank_id * num_ranks + rank];
+            int row_count = end - start;
+            if (row_count > 0) {
+                auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[src_rank_id]);
+                auto row_slot = static_cast<int64_t>(rank) * num_recv_tokens;
+                auto packed_slice = pack_scratch.narrow(0, src_rank_id * num_recv_tokens, num_recv_tokens);
+                packed_slice.zero_();
+                auto dst_indices = src_idx.slice(0, start, end).to(torch::kInt64);
+                auto src_rows = x.slice(0, start, end);
+                packed_slice.index_copy_(0, dst_indices, src_rows);
+                auto* packed_slice_ptr = static_cast<uint8_t*>(packed_slice.data_ptr());
+                comm_stream.queue().memcpy(host_packed, packed_slice_ptr, static_cast<int64_t>(num_recv_tokens) * row_bytes).wait();
+                comm_stream.queue()
+                    .memcpy(remote_base_ptr + x_stage_offset + row_slot * row_bytes,
+                            host_packed,
+                            static_cast<int64_t>(num_recv_tokens) * row_bytes)
                     .wait();
             }
+            start = end;
         }
-        start = end;
+        comm_stream.queue().wait();
+        c10::xpu::setCurrentXPUStream(previous_stream);
+    } else {
+        auto src_idx_cpu = src_idx.to(torch::kCPU);
+        auto* src_idx_ptr = src_idx_cpu.data_ptr<int>();
+        std::vector<uint8_t> host_x_row(row_bytes);
+        std::vector<float> host_topk_row(num_topk);
+        int start = 0;
+        for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
+            int end = rank_prefix_ptr[src_rank_id * num_ranks + rank];
+            auto* remote_base_ptr = static_cast<uint8_t*>(buffer_ptrs[src_rank_id]);
+            for (int row = start; row < end; ++row) {
+                int dst_token = src_idx_ptr[row];
+                EP_HOST_ASSERT(dst_token >= 0 and dst_token < num_recv_tokens);
+                auto* src_row_ptr = static_cast<uint8_t*>(x.data_ptr()) + static_cast<int64_t>(row) * row_bytes;
+                auto row_slot = static_cast<int64_t>(rank) * num_recv_tokens + dst_token;
+                comm_stream.queue().memcpy(host_x_row.data(), src_row_ptr, row_bytes).wait();
+                comm_stream.queue().memcpy(remote_base_ptr + x_stage_offset + row_slot * row_bytes, host_x_row.data(), row_bytes).wait();
+                comm_stream.queue()
+                    .memcpy(host_topk_row.data(), topk_weights_ptr + static_cast<int64_t>(row) * num_topk, num_topk * sizeof(float))
+                    .wait();
+                comm_stream.queue()
+                    .memcpy(remote_base_ptr + topk_stage_offset + row_slot * num_topk * sizeof(float),
+                            host_topk_row.data(),
+                            num_topk * sizeof(float))
+                    .wait();
+            }
+            start = end;
+        }
     }
 
     for (int src_rank_id = 0; src_rank_id < num_ranks; ++src_rank_id) {
         if (src_rank_id == rank)
             continue;
-        auto* remote_signal_ptr =
-            reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
+        auto* remote_signal_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[src_rank_id]) + signal_offset) + rank;
         comm_stream.queue().memcpy(remote_signal_ptr, &done_phase, sizeof(done_phase));
     }
     comm_stream.queue().memcpy(local_signal_ptr + rank, &done_phase, sizeof(done_phase));
@@ -1254,14 +1368,22 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    std::vector<uint8_t> host_stage_x(x_stage_bytes);
-    comm_stream.queue().memcpy(host_stage_x.data(), local_base_ptr + x_stage_offset, x_stage_bytes).wait();
-    auto cpu_stage_x = torch::from_blob(
-                           host_stage_x.data(),
-                           {num_ranks, num_recv_tokens, hidden},
-                           torch::TensorOptions().dtype(x.scalar_type()).device(torch::kCPU))
-                           .clone();
-    auto simple_recv_x = cpu_stage_x.to(torch::kFloat32).sum(0).to(x.options());
+    torch::Tensor simple_recv_x;
+    if (use_fast_no_topk_combine) {
+        auto previous_stream = c10::xpu::getCurrentXPUStream();
+        c10::xpu::setCurrentXPUStream(comm_stream);
+        auto stage_x = torch::from_blob(local_base_ptr + x_stage_offset, {num_ranks, num_recv_tokens, hidden}, x.options());
+        simple_recv_x = stage_x.to(torch::kFloat32).sum(0).to(x.options());
+        c10::xpu::setCurrentXPUStream(previous_stream);
+    } else {
+        std::vector<uint8_t> host_stage_x(x_stage_bytes);
+        comm_stream.queue().memcpy(host_stage_x.data(), local_base_ptr + x_stage_offset, x_stage_bytes).wait();
+        auto cpu_stage_x = torch::from_blob(host_stage_x.data(),
+                                            {num_ranks, num_recv_tokens, hidden},
+                                            torch::TensorOptions().dtype(x.scalar_type()).device(torch::kCPU))
+                               .clone();
+        simple_recv_x = cpu_stage_x.to(torch::kFloat32).sum(0).to(x.options());
+    }
     if (topk_weights.has_value()) {
         std::vector<float> host_stage_topk(num_ranks * num_recv_tokens * num_topk);
         comm_stream.queue().memcpy(host_stage_topk.data(), local_base_ptr + topk_stage_offset, topk_stage_bytes).wait();
@@ -1285,10 +1407,15 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1, row_src_rank}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
+        }
+        for (auto& t : combine_send_slices) {
+            t.record_stream(comm_stream);
+            if (allocate_on_comm_stream)
+                t.record_stream(compute_stream);
         }
     } else {
         stream_wait(compute_stream, comm_stream);

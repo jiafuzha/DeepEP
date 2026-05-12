@@ -1,7 +1,8 @@
 #pragma once
 
-#include <sycl/sycl.hpp>
 #include <time.h>
+
+#include <sycl/sycl.hpp>
 #include <type_traits>
 
 #include "exception.dp.hpp"
@@ -82,83 +83,56 @@ __forceinline__ void memory_fence_cta() {
 }
 
 __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     ref.store(val);
 }
 
 __forceinline__ void st_release_sys_global(const int* ptr, int val) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     ref.store(val);
 }
 
 __forceinline__ void st_release_cta(const int* ptr, int val) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::work_group,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     ref.store(val);
 }
 
 __forceinline__ int ld_acquire_sys_global(const int* ptr) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     return ref.load();
 }
 
 __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
-    sycl::atomic_ref<uint64_t,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<uint64_t*>(ptr));
+    sycl::atomic_ref<uint64_t, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(
+        *const_cast<uint64_t*>(ptr));
     return ref.load();
 }
 
 __forceinline__ int ld_acquire_global(const int* ptr) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::device, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     return ref.load();
 }
 
 __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     return ref.fetch_add(value);
 }
 
 __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::device, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     return ref.fetch_add(value);
 }
 
 __forceinline__ int ld_acquire_cta(const int* ptr) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::work_group,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     return ref.load();
 }
 
@@ -258,29 +232,20 @@ __forceinline__ void st_na_relaxed(const sycl::int4* ptr, sycl::int4 val) {
 }
 
 __forceinline__ void st_na_release(const int* ptr, int val) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<int*>(ptr));
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::device, sycl::access::address_space::generic_space> ref(
+        *const_cast<int*>(ptr));
     ref.store(val);
 }
 
 __forceinline__ void st_na_release(const uint32_t* ptr, uint32_t val) {
-    sycl::atomic_ref<uint32_t,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<uint32_t*>(ptr));
+    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst, sycl::memory_scope::device, sycl::access::address_space::generic_space> ref(
+        *const_cast<uint32_t*>(ptr));
     ref.store(val);
 }
 
 __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val) {
-    sycl::atomic_ref<uint64_t,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     sycl::access::address_space::generic_space>
-        ref(*const_cast<uint64_t*>(ptr));
+    sycl::atomic_ref<uint64_t, sycl::memory_order::seq_cst, sycl::memory_scope::device, sycl::access::address_space::generic_space> ref(
+        *const_cast<uint64_t*>(ptr));
     ref.store(val);
 }
 
@@ -601,22 +566,16 @@ __forceinline__ void barrier_block(int** barrier_signal_ptrs, int rank) {
 }
 
 __forceinline__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::work_group,
-                     sycl::access::address_space::generic_space>
-        ref(*addr);
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> ref(
+        *addr);
     int expected = x;
     ref.compare_exchange_strong(expected, y);
     return expected;
 }
 
 __forceinline__ int atomic_exch_cta_release(int* addr, int x) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::work_group,
-                     sycl::access::address_space::generic_space>
-        ref(*addr);
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> ref(
+        *addr);
     return ref.exchange(x);
 }
 

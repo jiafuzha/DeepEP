@@ -30,19 +30,23 @@ def assert_low_latency_unsupported(buffer: deep_ep.Buffer, group: dist.ProcessGr
     hidden = 128
 
     messages = {
-        'raw_get_low_latency_rdma_size_hint': _expect_not_supported(
+        'raw_get_low_latency_rdma_size_hint':
+        _expect_not_supported(
             'deep_ep_xpu_cpp.get_low_latency_rdma_size_hint',
             lambda: deep_ep_xpu_cpp.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts),
         ),
-        'get_low_latency_rdma_size_hint': _expect_not_supported(
+        'get_low_latency_rdma_size_hint':
+        _expect_not_supported(
             'Buffer.get_low_latency_rdma_size_hint',
             lambda: deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts),
         ),
-        'constructor': _expect_not_supported(
+        'constructor':
+        _expect_not_supported(
             'Buffer(..., low_latency_mode=True)',
             lambda: deep_ep.Buffer(group, 0, 0, low_latency_mode=True, explicitly_destroy=True),
         ),
-        'clean_low_latency_buffer': _expect_not_supported(
+        'clean_low_latency_buffer':
+        _expect_not_supported(
             'Buffer.clean_low_latency_buffer',
             lambda: buffer.clean_low_latency_buffer(num_tokens, hidden, num_experts),
         ),
@@ -54,7 +58,7 @@ def assert_low_latency_unsupported(buffer: deep_ep.Buffer, group: dist.ProcessGr
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32, device='xpu')
     src_info = torch.zeros((1, num_ranks * num_tokens), dtype=torch.int32, device='xpu')
     layout_range = torch.zeros((1, num_ranks), dtype=torch.int64, device='xpu')
-    mask_status = torch.zeros((num_ranks,), dtype=torch.int32, device='xpu')
+    mask_status = torch.zeros((num_ranks, ), dtype=torch.int32, device='xpu')
     handle = (src_info, layout_range, num_tokens, hidden, num_experts)
 
     messages['low_latency_dispatch'] = _expect_not_supported(

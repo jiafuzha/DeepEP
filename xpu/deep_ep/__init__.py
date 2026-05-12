@@ -16,8 +16,7 @@ except Exception as exc:  # pragma: no cover - exercised when the native extensi
     def _raise_backend_unavailable() -> None:
         raise ModuleNotFoundError(
             "deep_ep_xpu_cpp is not available. The Python XPU wrapper can be imported, "
-            "but Buffer/Config operations require the native extension to be built and importable."
-        ) from _BACKEND_IMPORT_ERROR
+            "but Buffer/Config operations require the native extension to be built and importable.") from _BACKEND_IMPORT_ERROR
 
     class Config:  # type: ignore[no-redef]
         """Compatibility placeholder until `deep_ep_xpu_cpp.Config` is available."""
