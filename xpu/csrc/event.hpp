@@ -2,8 +2,8 @@
 #include <c10/core/Event.h>
 #include <c10/xpu/XPUStream.h>
 
-#include <sycl/sycl.hpp>
 #include <memory>
+#include <sycl/sycl.hpp>
 
 #include "kernels/exception.dp.hpp"
 

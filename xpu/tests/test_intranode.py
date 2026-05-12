@@ -17,8 +17,14 @@ from utils import bench, calc_diff, ensure_master_port, group_all_gather, group_
 
 
 # noinspection PyShadowingNames
-def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: deep_ep.Buffer,
-              group: dist.ProcessGroup, skip_benchmark: bool = False):
+def test_main(args: argparse.Namespace,
+              num_sms: int,
+              local_rank: int,
+              num_ranks: int,
+              rank: int,
+              buffer: deep_ep.Buffer,
+              group: dist.ProcessGroup,
+              skip_benchmark: bool = False):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
@@ -198,6 +204,13 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
 
     if skip_benchmark:
         return
+    if not buffer.supports_intranode_autotune():
+        if local_rank == 0:
+            print(
+                '[tuning] Skipped: the current XPU intranode path uses a host-staged PCIe transport, so the CUDA-style auto-tuning loop is still intentionally disabled.',
+                flush=True)
+            print('', flush=True)
+        return
 
     # Tune dispatch performance
     best_dispatch_results = None
@@ -205,7 +218,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     for current_x in filter(lambda elem: elem is not None, (x_e4m3, x)):
         best_time, best_results = 1e10, None
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
-        for nvl_chunk_size in tuple(range(4, 33, 2)) + (0, ):
+        for nvl_chunk_size in tuple(range(4, 8, 2)) + (0, ):
             if nvl_chunk_size > 0:
                 config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
             else:
@@ -305,9 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256)')
     parser.add_argument('--allow-mnnvl', action="store_true", help='Enable MNNVL support')
     parser.add_argument('--use-fabric', action="store_true", help='Enable fabric mode')
-    parser.add_argument('--smoke-only',
-                        action='store_true',
-                        help='Run correctness coverage only and skip the long auto-tuning loops')
+    parser.add_argument('--smoke-only', action='store_true', help='Run correctness coverage only and skip the long auto-tuning loops')
     args = parser.parse_args()
 
     num_processes = args.num_processes

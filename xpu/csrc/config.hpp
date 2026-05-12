@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+
 #include "kernels/api.dp.hpp"
 #include "kernels/exception.dp.hpp"
 

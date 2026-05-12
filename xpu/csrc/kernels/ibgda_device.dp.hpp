@@ -3,10 +3,9 @@
 // reachable high-throughput operations through public iSHMEM device APIs.
 #pragma once
 
-#include <sycl/sycl.hpp>
-
 #include <cstddef>
 #include <cstdint>
+#include <sycl/sycl.hpp>
 
 #include "configs.dp.hpp"
 #include "utils.dp.hpp"

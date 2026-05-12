@@ -1,13 +1,12 @@
 #pragma once
 
-#include <sycl/ext/oneapi/experimental/clock.hpp>
-#include <sycl/sycl.hpp>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 
 #define NUM_MAX_NVL_PEERS 8
@@ -89,7 +88,7 @@
 #endif
 #endif
 #ifndef __launch_bounds__
-#define __launch_bounds__(...) 
+#define __launch_bounds__(...)
 #endif
 #ifndef __align__
 #define __align__(n)
@@ -152,9 +151,7 @@ inline dim3 thread_idx() {
 inline dim3 block_idx() {
 #ifdef __SYCL_DEVICE_ONLY__
     const auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    return {static_cast<uint32_t>(item.get_group(2)),
-            static_cast<uint32_t>(item.get_group(1)),
-            static_cast<uint32_t>(item.get_group(0))};
+    return {static_cast<uint32_t>(item.get_group(2)), static_cast<uint32_t>(item.get_group(1)), static_cast<uint32_t>(item.get_group(0))};
 #else
     return {};
 #endif
@@ -244,20 +241,12 @@ inline T ldg(const T* ptr) {
 }
 
 inline int atomic_add_system(int* ptr, int value) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*ptr);
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(*ptr);
     return ref.fetch_add(value);
 }
 
 inline int atomic_sub_system(int* ptr, int value) {
-    sycl::atomic_ref<int,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::system,
-                     sycl::access::address_space::generic_space>
-        ref(*ptr);
+    sycl::atomic_ref<int, sycl::memory_order::seq_cst, sycl::memory_scope::system, sycl::access::address_space::generic_space> ref(*ptr);
     return ref.fetch_sub(value);
 }
 
@@ -291,11 +280,7 @@ inline const char* get_error_string_dummy(int error) {
 
 template <sycl::access::address_space AddressSpace = sycl::access::address_space::generic_space, typename T>
 inline bool atomic_compare_exchange_strong(T* addr, T& expected, T desired) {
-    sycl::atomic_ref<T,
-                     sycl::memory_order::seq_cst,
-                     sycl::memory_scope::device,
-                     AddressSpace>
-        ref(*addr);
+    sycl::atomic_ref<T, sycl::memory_order::seq_cst, sycl::memory_scope::device, AddressSpace> ref(*addr);
     return ref.compare_exchange_strong(expected, desired);
 }
 

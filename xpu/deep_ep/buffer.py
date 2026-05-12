@@ -18,6 +18,7 @@ except Exception as exc:  # pragma: no cover - exercised when the native extensi
     _BACKEND_IMPORT_ERROR = exc
 
     class Config:  # type: ignore[no-redef]
+
         def __init__(self, *args, **kwargs):
             _require_backend()
 
@@ -28,14 +29,12 @@ def _require_backend() -> None:
     if deep_ep_xpu_cpp is None:
         raise ModuleNotFoundError(
             "deep_ep_xpu_cpp is not available. The Python XPU wrapper can be imported, "
-            "but Buffer operations require the native extension to be built and importable."
-        ) from _BACKEND_IMPORT_ERROR
+            "but Buffer operations require the native extension to be built and importable.") from _BACKEND_IMPORT_ERROR
 
 
 XPU_LOW_LATENCY_UNSUPPORTED_MESSAGE = (
     "DeepEP XPU low-latency kernels are intentionally unsupported: the mirrored API surface is kept for compatibility, "
-    "but a portable SYCL/iSHMEM implementation is not available yet."
-)
+    "but a portable SYCL/iSHMEM implementation is not available yet.")
 
 
 def _raise_low_latency_unsupported(api: str) -> None:
@@ -129,8 +128,8 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
         self._all_gather_object = all_gather_object
-        self.runtime = deep_ep_xpu_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
-                                          enable_shrink, use_fabric)
+        self.runtime = deep_ep_xpu_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
+                                              explicitly_destroy, enable_shrink, use_fabric)
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
@@ -171,9 +170,8 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
-        self._use_intranode_collective_fallback = (
-            self.runtime.get_num_rdma_ranks() == 1 and self.group_size > 1 and
-            os.environ.get('DEEP_EP_XPU_USE_COLLECTIVE_FALLBACK', '0') == '1')
+        self._use_intranode_collective_fallback = (self.runtime.get_num_rdma_ranks() == 1 and self.group_size > 1
+                                                   and os.environ.get('DEEP_EP_XPU_USE_COLLECTIVE_FALLBACK', '0') == '1')
         if self._use_intranode_collective_fallback and self.rank == 0:
             print('[DeepEP XPU] Using collective intranode fallback instead of the experimental peer-buffer runtime.', flush=True)
 
@@ -220,6 +218,18 @@ class Buffer:
         """
         _require_backend()
         return EventOverlap(EventHandle())
+
+    @staticmethod
+    def supports_intranode_autotune() -> bool:
+        """
+        Whether the current XPU intranode path provides meaningful throughput auto-tuning data.
+
+        The native XPU path now includes a cached no-topk fast path, but it still uses
+        host-staged Level Zero IPC over the active PCIe transport rather than the original
+        CUDA-style steady-state kernel path. Keep the CUDA auto-tuning loop disabled until
+        the XPU transport/kernel configuration itself becomes the thing being tuned.
+        """
+        return False
 
     @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
@@ -475,30 +485,39 @@ class Buffer:
         x, x_scales = x if isinstance(x, tuple) else (x, None)
         if handle is not None:
             assert topk_idx is None and topk_weights is None
-            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
+            if len(handle) == 6:
+                rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
+                send_pos = None
+                row_src_rank = None
+            else:
+                rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head, send_pos, row_src_rank = handle
             num_recv_tokens = recv_src_idx.size(0)
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
-                x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
+                x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix, send_pos,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
             num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix = self._get_intranode_dispatch_metadata(
-                num_tokens_per_rank, is_token_in_rank, getattr(config, 'num_sms', Buffer.num_sms) // 2)
+                num_tokens_per_rank, is_token_in_rank,
+                getattr(config, 'num_sms', Buffer.num_sms) // 2)
+            send_pos = self._get_intranode_send_pos(is_token_in_rank)
             dist.barrier(group=self.group)
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 None, is_token_in_rank, num_tokens_per_expert, num_recv_tokens, rank_prefix_matrix,
-                                                channel_prefix_matrix,
+                                                channel_prefix_matrix, send_pos,
                                                 expert_alignment, num_worst_tokens, config,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             recv_src_idx, _ = self._get_intranode_recv_src_idx(is_token_in_rank)
+            row_src_rank = self._get_intranode_row_src_rank(rank_prefix_matrix)
             if topk_idx is not None and topk_weights is not None:
                 recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list = self._get_intranode_recv_topk_metadata(
                     topk_idx, topk_weights, num_tokens_per_expert, num_worst_tokens)
             elif num_worst_tokens == 0 and not num_recv_tokens_per_expert_list and num_tokens_per_expert is not None:
                 num_recv_tokens_per_expert_list = self._get_intranode_recv_tokens_per_expert_list(num_tokens_per_expert)
-            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
+            handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head,
+                      send_pos, row_src_rank)
             return (
                 recv_x, recv_x_scales
             ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(
@@ -543,12 +562,16 @@ class Buffer:
             return self._intranode_combine_fallback(x, handle, topk_weights, bias, previous_event, async_finish)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
-        rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
+        if len(handle) == 6:
+            rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
+            row_src_rank = None
+        else:
+            rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head, _, row_src_rank = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
         recv_x, recv_topk_weights, event = self.runtime.intranode_combine(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix,
-                                                                          channel_prefix_matrix, send_head, config,
+                                                                          channel_prefix_matrix, send_head, row_src_rank, config,
                                                                           getattr(previous_event, 'event',
                                                                                   None), async_finish, allocate_on_comm_stream)
         if topk_weights is not None:
@@ -825,7 +848,7 @@ class Buffer:
             token_start = min(num_tokens_per_channel * channel_id, num_tokens)
             token_end = min(token_start + num_tokens_per_channel, num_tokens)
             if token_start >= token_end:
-                counts = torch.zeros((self.group_size,), dtype=torch.int32, device=is_token_in_rank.device)
+                counts = torch.zeros((self.group_size, ), dtype=torch.int32, device=is_token_in_rank.device)
             else:
                 counts = is_token_in_rank[token_start:token_end].to(dtype=torch.int32).sum(dim=0)
             per_channel_counts.append(counts.to(dtype=torch.int32))
@@ -840,6 +863,16 @@ class Buffer:
         local_expert_begin = self.rank * num_local_experts
         local_expert_end = local_expert_begin + num_local_experts
         return global_num_tokens_per_expert[local_expert_begin:local_expert_end].cpu().tolist()
+
+    def _get_intranode_send_pos(self, is_token_in_rank: torch.Tensor) -> torch.Tensor:
+        send_pos_cpu = torch.full((self.group_size, is_token_in_rank.size(0)), -1, dtype=torch.int32, device='cpu')
+        mask_cpu = is_token_in_rank.cpu()
+        for dst_rank in range(self.group_size):
+            dst_tokens = mask_cpu[:, dst_rank].to(torch.bool).nonzero(as_tuple=False).view(-1)
+            if dst_tokens.numel() == 0:
+                continue
+            send_pos_cpu[dst_rank, :dst_tokens.numel()] = dst_tokens.to(dtype=torch.int32)
+        return send_pos_cpu.to(device=is_token_in_rank.device)
 
     def _get_intranode_recv_src_idx(self, is_token_in_rank: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
         gathered_masks = self._all_gather_object(is_token_in_rank.cpu())
@@ -896,7 +929,7 @@ class Buffer:
         return recv_topk_idx_tensor, recv_topk_weight_tensor, num_recv_tokens_per_expert_list
 
     def _combine_topk_weights_metadata(self, topk_weights: torch.Tensor, handle: Tuple) -> torch.Tensor:
-        rank_prefix_matrix, _, _, src_idx, _, _ = handle
+        rank_prefix_matrix, _, _, src_idx, _, _ = handle[:6]
         src_rank = []
         start = 0
         for src_rank_id in range(self.group_size):
@@ -919,6 +952,16 @@ class Buffer:
             selected_idx = token_idx[rank_mask]
             combined_topk_weights.index_add_(0, selected_idx, package['topk_weights'][rank_mask].to(torch.float32))
         return combined_topk_weights.to(device=topk_weights.device, dtype=topk_weights.dtype)
+
+    def _get_intranode_row_src_rank(self, rank_prefix_matrix: torch.Tensor) -> torch.Tensor:
+        rank_prefix_cpu = rank_prefix_matrix.cpu()
+        row_src_rank = []
+        start = 0
+        for src_rank_id in range(self.group_size):
+            end = int(rank_prefix_cpu[src_rank_id, self.rank].item())
+            row_src_rank.extend([src_rank_id] * (end - start))
+            start = end
+        return torch.tensor(row_src_rank, dtype=torch.int32, device=rank_prefix_matrix.device)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
         """

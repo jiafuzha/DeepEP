@@ -137,6 +137,25 @@ void combine(dpct::library_data_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens);
 
+void simple_dispatch_pack(const void* x,
+                          void* packed_x,
+                          const int* send_pos,
+                          int num_tokens,
+                          int num_ranks,
+                          int hidden_int4,
+                          int max_send_tokens,
+                          dpct::queue_ptr stream);
+
+void simple_combine_stage(const void* x,
+                          void* packed_x,
+                          const int* row_src_rank,
+                          const int* src_idx,
+                          int num_tokens,
+                          int num_ranks,
+                          int num_recv_tokens,
+                          int hidden_int4,
+                          dpct::queue_ptr stream);
+
 }  // namespace intranode
 
 // Internode kernels

@@ -328,12 +328,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_sms = 24
     num_qps_per_rank = num_sms
 
-    buffer = deep_ep.Buffer(group,
-                            int(2e9),
-                            int(1e9),
-                            low_latency_mode=False,
-                            num_qps_per_rank=num_qps_per_rank,
-                            explicitly_destroy=True)
+    buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=False, num_qps_per_rank=num_qps_per_rank, explicitly_destroy=True)
     assert num_local_ranks == 8 and num_ranks > 8
 
     for seed in range(int(1e9)):
@@ -342,8 +337,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         torch.manual_seed(rank + seed)
         ref_hash = 0
         for i in (num_sms, ):
-            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                  args.smoke_only or args.pressure_test_mode == 1)
+            ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.smoke_only
+                                  or args.pressure_test_mode == 1)
             if local_rank == 0:
                 print('', flush=True)
         if args.pressure_test_mode == 0:
@@ -357,8 +352,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             torch.manual_seed(rank + seed)
             current_hash = 0
             for i in (num_sms, ):
-                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                          args.smoke_only or args.pressure_test_mode == 1)
+                current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args.smoke_only
+                                          or args.pressure_test_mode == 1)
                 if local_rank == 0:
                     print('', flush=True)
             assert current_hash == ref_hash
@@ -386,17 +381,19 @@ if __name__ == '__main__':
         default=0,
         help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256')
-    parser.add_argument('--smoke-only',
+    parser.add_argument('--smoke-only', action='store_true', help='Run one correctness pass without the long tuning loops')
+    parser.add_argument('--test-ll-compatibility',
                         action='store_true',
-                        help='Run one correctness pass without the long tuning loops')
-    parser.add_argument('--test-ll-compatibility', action='store_true',
-                         help='verify that the mirrored XPU low-latency APIs fail explicitly as unsupported')
+                        help='verify that the mirrored XPU low-latency APIs fail explicitly as unsupported')
     args = parser.parse_args()
 
     if args.num_processes != 8:
-        raise SystemExit('The experimental XPU internode test currently expects --num-processes 8 (one local rank per XPU on an 8-device node).')
+        raise SystemExit(
+            'The experimental XPU internode test currently expects --num-processes 8 (one local rank per XPU on an 8-device node).')
     if int(os.getenv('WORLD_SIZE', '1')) <= 1:
-        raise SystemExit('The experimental XPU internode test requires WORLD_SIZE>1 (node count) so the mirrored internode path is exercised across nodes.')
+        raise SystemExit(
+            'The experimental XPU internode test requires WORLD_SIZE>1 (node count) so the mirrored internode path is exercised across nodes.'
+        )
     ensure_master_port()
     require_xpu_devices(args.num_processes, 'tests/test_internode.py')
 
