@@ -1,0 +1,1356 @@
+---
+MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/MainSrcFiles_placehold'
+Replacements:
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          0
+    Length:          0
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          95
+    Length:          26
+    ReplacementText: ''
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          218
+    Length:          26
+    ReplacementText: '#include "kernels/api.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          245
+    Length:          30
+    ReplacementText: '#include "kernels/configs.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          275
+    Length:          0
+    ReplacementText: "\n#include <cmath>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          430
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:4: Migration of CUmemAccessDesc is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          528
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:5: Migration of CU_MEM_LOCATION_TYPE_DEVICE is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          642
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:6: Migration of CU_MEM_ACCESS_FLAGS_PROT_READWRITE is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          718
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:9: Migration of cuMemSetAccess is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          731
+    Length:          65
+    ReplacementText: 'cuMemSetAccess((dpct::device_ptr)ptr, size, access_desc, device_count)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          832
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:11: Migration of CUmemGenericAllocationHandle is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          873
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1007:12: Migration of cuMemRetainAllocationHandle is not supported.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          952
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1007:13: Migration of cuMemGetAddressRange is not supported.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1000
+    Length:          11
+    ReplacementText: 'dpct::device_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1020
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:14: Migration of cuMemUnmap is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1033
+    Length:          34
+    ReplacementText: 'cuMemUnmap((dpct::device_ptr)ptr, size)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1070
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:15: Migration of cuMemAddressFree is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1083
+    Length:          40
+    ReplacementText: 'cuMemAddressFree((dpct::device_ptr)ptr, size)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1126
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1119:16: Migration of cuMemRelease is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1564
+    Length:          8
+    ReplacementText: int
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1598
+    Length:          23
+    ReplacementText: 'DPCT_CHECK_ERROR(device = dpct::get_current_device_id())'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1625
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:17: Migration of CUmemAllocationProp is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1664
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:18: Migration of CU_MEM_ALLOCATION_TYPE_PINNED is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1715
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:19: Migration of CU_MEM_LOCATION_TYPE_DEVICE is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1904
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:20: Migration of cuMemGetAllocationGranularity is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n        /*\n        DPCT1119:21: Migration of CU_MEM_ALLOC_GRANULARITY_MINIMUM is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          1921
+    Length:          84
+    ReplacementText: 'cuMemGetAllocationGranularity(&granularity, &prop, sycl::ext::oneapi::experimental::granularity_mode::minimum)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2086
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:22: Migration of CUmemGenericAllocationHandle is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2131
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:23: Migration of cuMemCreate is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2188
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:24: Migration of cuMemAddressReserve is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2205
+    Length:          63
+    ReplacementText: 'cuMemAddressReserve((dpct::device_ptr*)ptr, size, granularity, 0, 0)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2271
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:25: Migration of cuMemMap is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2288
+    Length:          47
+    ReplacementText: 'cuMemMap((dpct::device_ptr)*ptr, size, 0, handle, 0)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2701
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1007:26: Migration of cuMemGetAddressRange is not supported.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2749
+    Length:          11
+    ReplacementText: 'dpct::device_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2821
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:27: Migration of CUmemGenericAllocationHandle is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          2866
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1007:28: Migration of cuMemRetainAllocationHandle is not supported.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          3307
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:29: Migration of CUmemGenericAllocationHandle is not supported, please try to remigrate with option: --use-experimental-features=virtual_memory.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          3480
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:30: Migration of cuMemAddressReserve is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          3497
+    Length:          53
+    ReplacementText: 'cuMemAddressReserve((dpct::device_ptr*)ptr, size, 0, 0, 0)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          3553
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1119:31: Migration of cuMemMap is not supported, please try to remigrate with option: --use-experimental-features=virtual_mem.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          3570
+    Length:          47
+    ReplacementText: 'cuMemMap((dpct::device_ptr)*ptr, size, 0, handle, 0)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          7898
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1048:0: The original value cudaHostAllocMapped is not meaningful in the migrated code and was removed or replaced with 0. You may need to check the migrated code.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          7964
+    Length:          19
+    ReplacementText: '0'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          8155
+    Length:          0
+    ReplacementText: "    /*\n    DPCT1048:1: The original value cudaHostAllocMapped is not meaningful in the migrated code and was removed or replaced with 0. You may need to check the migrated code.\n    */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          8248
+    Length:          19
+    ReplacementText: '0'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          8546
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1048:2: The original value cudaHostAllocMapped is not meaningful in the migrated code and was removed or replaced with 0. You may need to check the migrated code.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Offset:          8617
+    Length:          19
+    ReplacementText: '0'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          0
+    Length:          0
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          43
+    Length:          21
+    ReplacementText: '#include "buffer.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          65
+    Length:          22
+    ReplacementText: '#include "configs.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          88
+    Length:          24
+    ReplacementText: '#include "exception.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          113
+    Length:          27
+    ReplacementText: '#include "ibgda_device.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          141
+    Length:          21
+    ReplacementText: '#include "launch.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          163
+    Length:          20
+    ReplacementText: '#include "utils.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          183
+    Length:          0
+    ReplacementText: "\n#include <cmath>\n\n#include <dpct/lib_common_utils.hpp>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          5860
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          18653
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          66503
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          74066
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          79024
+    Length:          58
+    ReplacementText: 'std::max(token_start_idx, batch_end_idx - num_tokens_per_batch)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          81634
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          84724
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          84838
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          84892
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          85564
+    Length:          0
+    ReplacementText: "        /*\n        DPCT1121:3: Make sure that the \"is_token_in_rank\" which is used in the SYCL group function/algorithm is initialized.\n        */\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          85576
+    Length:          44
+    ReplacementText: 'dpct::select_from_sub_group(sycl::ext::oneapi::this_work_item::get_sub_group(), is_token_in_rank, i)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          86265
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          86309
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          86447
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          86491
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          89304
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          89729
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          90933
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          124322
+    Length:          14
+    ReplacementText: 'dpct::library_data_t'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          125328
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Offset:          130398
+    Length:          11
+    ReplacementText: 'dpct::library_data_t::real_bfloat16'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          0
+    Length:          22
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n#include \"configs.dp.hpp\""
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          23
+    Length:          24
+    ReplacementText: '#include "exception.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          48
+    Length:          27
+    ReplacementText: '#include "ibgda_device.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          76
+    Length:          21
+    ReplacementText: '#include "launch.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          97
+    Length:          0
+    ReplacementText: "\n#include <time.h>\n\n#include <cmath>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          4568
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          9700
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          10816
+    Length:          11
+    ReplacementText: 'sycl::ext::oneapi::bfloat16'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          11172
+    Length:          34
+    ReplacementText: 'sycl::fmax(amax, sycl::fabs(fp32_values[j]))'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          11957
+    Length:          6
+    ReplacementText: 'sycl::float2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          13793
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          13878
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          18382
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          24997
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          28467
+    Length:          12
+    ReplacementText: 'sycl::vec<sycl::ext::oneapi::bfloat16, 2>'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          28784
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          28941
+    Length:          12
+    ReplacementText: 'sycl::vec<sycl::ext::oneapi::bfloat16, 2>'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          30551
+    Length:          14
+    ReplacementText: 'sycl::vec<sycl::ext::oneapi::bfloat16, 2>'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          32972
+    Length:          6
+    ReplacementText: 'sycl::float2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          32997
+    Length:          6
+    ReplacementText: 'sycl::float2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          33398
+    Length:          14
+    ReplacementText: 'sycl::vec<sycl::ext::oneapi::bfloat16, 2>'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          41432
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          43222
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          44987
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          45123
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          45158
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          55589
+    Length:          6
+    ReplacementText: 'sycl::float2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          55673
+    Length:          6
+    ReplacementText: 'sycl::float2'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          60243
+    Length:          4
+    ReplacementText: 'sycl::int4'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          61268
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          62795
+    Length:          35
+    ReplacementText: 'std::max(smem_send_size, smem_recv_size)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          67977
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          68667
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Offset:          69263
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          0
+    Length:          21
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n#include \"buffer.dp.hpp\""
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          22
+    Length:          22
+    ReplacementText: '#include "configs.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          45
+    Length:          24
+    ReplacementText: '#include "exception.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          70
+    Length:          21
+    ReplacementText: '#include "launch.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          92
+    Length:          20
+    ReplacementText: '#include "utils.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          112
+    Length:          0
+    ReplacementText: "\n#include <cmath>\n\n#include <dpct/lib_common_utils.hpp>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          1040
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          5715
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          7277
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          8179
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          29026
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          32345
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          33772
+    Length:          45
+    ReplacementText: 'std::min(32, token_idx_tail - token_start_idx + 1)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          34674
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          53915
+    Length:          14
+    ReplacementText: 'dpct::library_data_t'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Offset:          54501
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          0
+    Length:          22
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n#include \"configs.dp.hpp\""
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          23
+    Length:          24
+    ReplacementText: '#include "exception.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          48
+    Length:          21
+    ReplacementText: '#include "launch.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          710
+    Length:          0
+    ReplacementText: "auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();\n    "
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          991
+    Length:          53
+    ReplacementText: 'std::min(expert_begin_idx + kNumExpertsPerSM, num_experts)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          2808
+    Length:          47
+    ReplacementText: 'std::min(rank_begin_idx + kNumRanksPerSM, num_ranks)'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Offset:          6085
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          0
+    Length:          0
+    ReplacementText: "#include <sycl/sycl.hpp>\n#include <dpct/dpct.hpp>\n"
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          38
+    Length:          22
+    ReplacementText: '#include "configs.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          61
+    Length:          24
+    ReplacementText: '#include "exception.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          86
+    Length:          21
+    ReplacementText: '#include "launch.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          108
+    Length:          20
+    ReplacementText: '#include "utils.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          154
+    Length:          27
+    ReplacementText: '#include "ibgda_device.dp.hpp"'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+  - FilePath:        '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Offset:          468
+    Length:          12
+    ReplacementText: 'dpct::queue_ptr'
+    ConstantFlag:    ''
+    ConstantOffset:  0
+    InitStr:         ''
+    NewHostVarName:  ''
+    BlockLevelFormatFlag: false
+MainSourceFilesDigest:
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/deep_ep.cpp'
+    Digest:          2eff1cea111602a58a3697866c95f2fc
+    HasCUDASyntax:   true
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode.cu'
+    Digest:          2c2225432b6f70544c6daa12628bcadc
+    HasCUDASyntax:   true
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/internode_ll.cu'
+    Digest:          33ab5eb3b590b46f96e9191290032cf9
+    HasCUDASyntax:   true
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/intranode.cu'
+    Digest:          7ba05cc1e49bb06302bbee8a3496c40a
+    HasCUDASyntax:   true
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/layout.cu'
+    Digest:          f3d89d0804a901d15930873c42dc8ec6
+    HasCUDASyntax:   true
+  - MainSourceFile:  '/root/jiafuzha/code-repo/zjf2012/DeepEP/csrc/kernels/runtime.cu'
+    Digest:          63bdc0e8a45743e1bcf01e401ea2aa09
+    HasCUDASyntax:   true
+DpctVersion:     2025.3.0
+SDKVersionMajor: '12'
+SDKVersionMinor: '9'
+MainHelperFileName: ''
+USMLevel:        ''
+FeatureMap:      {}
+CompileTargets:  {}
+OptionMap:
+  AnalysisScopePath:
+    Value:           ''
+    ValueVec:
+      - '/root/jiafuzha/code-repo/zjf2012/DeepEP'
+    Specified:       false
+  AsyncHandler:
+    Value:           'false'
+    Specified:       false
+  BuildScript:
+    Value:           '0'
+    Specified:       false
+  CodePinEnabled:
+    Value:           'false'
+    Specified:       false
+  CommentsEnabled:
+    Value:           'false'
+    Specified:       false
+  CompilationsDir:
+    Value:           ''
+    Specified:       false
+  CtadEnabled:
+    Value:           'false'
+    Specified:       false
+  EnablepProfiling:
+    Value:           'false'
+    Specified:       false
+  ExperimentalFlag:
+    Value:           '0'
+    Specified:       false
+  ExplicitNamespace:
+    Value:           '20'
+    Specified:       false
+  ExtensionDDFlag:
+    Value:           '0'
+    Specified:       false
+  ExtensionDEFlag:
+    Value:           '4294967295'
+    Specified:       false
+  HelperFuncPreferenceFlag:
+    Value:           '0'
+    Specified:       false
+  NDRangeDim:
+    Value:           '3'
+    Specified:       false
+  NoDRYPattern:
+    Value:           'false'
+    Specified:       false
+  OptimizeMigration:
+    Value:           'false'
+    Specified:       false
+  ProcessAll:
+    Value:           'false'
+    Specified:       false
+  RuleFile:
+    Value:           ''
+    Specified:       false
+  SyclNamedLambda:
+    Value:           'false'
+    Specified:       false
+  UseSYCLCompat:
+    Value:           'false'
+    Specified:       false
+  UsmLevel:
+    Value:           '1'
+    Specified:       false
+...
