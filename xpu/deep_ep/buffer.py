@@ -512,8 +512,17 @@ class Buffer:
             recv_src_idx, _ = self._get_intranode_recv_src_idx(is_token_in_rank)
             row_src_rank = self._get_intranode_row_src_rank(rank_prefix_matrix)
             if topk_idx is not None and topk_weights is not None:
-                recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list = self._get_intranode_recv_topk_metadata(
-                    topk_idx, topk_weights, num_tokens_per_expert, num_worst_tokens)
+                assert recv_topk_idx is not None and recv_topk_weights is not None
+                if num_worst_tokens > 0:
+                    num_recv_tokens_per_expert_list = []
+                elif not num_recv_tokens_per_expert_list and num_tokens_per_expert is not None:
+                    num_local_experts = num_tokens_per_expert.numel() // self.group_size
+                    recv_topk_idx_cpu = recv_topk_idx.cpu()
+                    flat_recv_topk_idx = recv_topk_idx_cpu[recv_topk_idx_cpu >= 0].to(torch.int64)
+                    num_recv_tokens_per_expert_list = torch.bincount(
+                        flat_recv_topk_idx,
+                        minlength=num_local_experts,
+                    ).tolist()
             elif num_worst_tokens == 0 and not num_recv_tokens_per_expert_list and num_tokens_per_expert is not None:
                 num_recv_tokens_per_expert_list = self._get_intranode_recv_tokens_per_expert_list(num_tokens_per_expert)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head,
@@ -574,8 +583,6 @@ class Buffer:
                                                                           channel_prefix_matrix, send_head, row_src_rank, config,
                                                                           getattr(previous_event, 'event',
                                                                                   None), async_finish, allocate_on_comm_stream)
-        if topk_weights is not None:
-            recv_topk_weights = self._combine_topk_weights_metadata(topk_weights, handle)
         return recv_x, recv_topk_weights, EventOverlap(event)
 
     # noinspection PyTypeChecker

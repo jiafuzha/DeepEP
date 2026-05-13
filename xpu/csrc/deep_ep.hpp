@@ -106,6 +106,7 @@ private:
     uint8_t* host_staging_slab = nullptr;
     int64_t host_staging_slab_bytes = 0;
     torch::Tensor pack_scratch_x;
+    torch::Tensor pack_scratch_topk_weights;
 
     uint32_t intranode_simple_phase = 0;
 
@@ -125,6 +126,7 @@ private:
 
     uint8_t* ensure_host_staging_slab(int64_t bytes);
     torch::Tensor ensure_pack_scratch_x(const torch::Tensor& like, int64_t rows, int64_t hidden);
+    torch::Tensor ensure_pack_scratch_topk_weights(const torch::Tensor& like, int64_t rows, int64_t num_topk);
 
 public:
     Buffer(int rank,
