@@ -373,8 +373,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
-    if get_device_type() == 'xpu':
-        raise SystemExit('Internode kernels are not implemented on the XPU bring-up path yet')
+    if not deep_ep.supports_internode():
+        print(f'Internode kernels are not implemented on the {deep_ep.get_runtime_backend()} backend yet', flush=True)
+        raise SystemExit(0)
 
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')

@@ -2,6 +2,10 @@
 
 #include "exception.cuh"
 
+#include <algorithm>
+#include <type_traits>
+#include <utility>
+
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                     \
     {                                                                                                                                 \
         constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                                                                             \
@@ -28,6 +32,123 @@
     }
 
 namespace deep_ep {
+
+namespace backend_primitives {
+
+#if defined(DEEPEP_XPU_NATIVE)
+template <typename T, sycl::memory_scope kScope>
+using atomic_ref_t = sycl::atomic_ref<T, sycl::memory_order::acq_rel, kScope, sycl::access::address_space::global_space>;
+
+EP_DEVICE EP_FORCEINLINE void system_fence() {
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+}
+
+EP_DEVICE EP_FORCEINLINE void gpu_fence() {
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+}
+
+EP_DEVICE EP_FORCEINLINE void cta_fence() {
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+}
+
+EP_DEVICE EP_FORCEINLINE void store_relaxed_system(const int* ptr, int val) {
+    atomic_ref_t<int, sycl::memory_scope::system>(*const_cast<int*>(ptr)).store(val, sycl::memory_order::relaxed);
+}
+
+EP_DEVICE EP_FORCEINLINE void store_release_system(const int* ptr, int val) {
+    atomic_ref_t<int, sycl::memory_scope::system>(*const_cast<int*>(ptr)).store(val, sycl::memory_order::release);
+}
+
+EP_DEVICE EP_FORCEINLINE void store_release_cta(const int* ptr, int val) {
+    atomic_ref_t<int, sycl::memory_scope::work_group>(*const_cast<int*>(ptr)).store(val, sycl::memory_order::release);
+}
+
+EP_DEVICE EP_FORCEINLINE int load_acquire_system(const int* ptr) {
+    return atomic_ref_t<int, sycl::memory_scope::system>(*const_cast<int*>(ptr)).load(sycl::memory_order::acquire);
+}
+
+EP_DEVICE EP_FORCEINLINE uint64_t load_acquire_system(const uint64_t* ptr) {
+    return atomic_ref_t<uint64_t, sycl::memory_scope::system>(*const_cast<uint64_t*>(ptr)).load(sycl::memory_order::acquire);
+}
+
+EP_DEVICE EP_FORCEINLINE int load_acquire_gpu(const int* ptr) {
+    return atomic_ref_t<int, sycl::memory_scope::device>(*const_cast<int*>(ptr)).load(sycl::memory_order::acquire);
+}
+
+EP_DEVICE EP_FORCEINLINE int load_acquire_cta(const int* ptr) {
+    return atomic_ref_t<int, sycl::memory_scope::work_group>(*const_cast<int*>(ptr)).load(sycl::memory_order::acquire);
+}
+
+EP_DEVICE EP_FORCEINLINE int atomic_add_release_system(const int* ptr, int value) {
+    return atomic_ref_t<int, sycl::memory_scope::system>(*const_cast<int*>(ptr)).fetch_add(value, sycl::memory_order::acq_rel);
+}
+
+EP_DEVICE EP_FORCEINLINE int atomic_add_release_gpu(const int* ptr, int value) {
+    return atomic_ref_t<int, sycl::memory_scope::device>(*const_cast<int*>(ptr)).fetch_add(value, sycl::memory_order::acq_rel);
+}
+#else
+__device__ __forceinline__ void system_fence() {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
+
+__device__ __forceinline__ void gpu_fence() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+__device__ __forceinline__ void cta_fence() {
+    asm volatile("fence.acq_rel.cta;" ::: "memory");
+}
+
+__device__ __forceinline__ void store_relaxed_system(const int* ptr, int val) {
+    asm volatile("st.relaxed.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ void store_release_system(const int* ptr, int val) {
+    asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ void store_release_cta(const int* ptr, int val) {
+    asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ int load_acquire_system(const int* ptr) {
+    int ret;
+    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ uint64_t load_acquire_system(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int load_acquire_gpu(const int* ptr) {
+    int ret;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int load_acquire_cta(const int* ptr) {
+    int ret;
+    asm volatile("ld.acquire.cta.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int atomic_add_release_system(const int* ptr, int value) {
+    int ret;
+    asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+
+__device__ __forceinline__ int atomic_add_release_gpu(const int* ptr, int value) {
+    int ret;
+    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+#endif
+
+}  // namespace backend_primitives
 
 template <int kBytes>
 struct VecInt {};
@@ -56,75 +177,102 @@ template <typename FuncT>
 struct PatternVisitor {
     FuncT func;
 
-    __device__ __host__ explicit PatternVisitor(FuncT&& func) : func(std::forward<FuncT>(func)) {}
+    EP_HOST_DEVICE explicit PatternVisitor(FuncT&& func) : func(std::forward<FuncT>(func)) {}
 
-    __device__ __host__ auto operator[](const uint32_t& i) { return func(i); }
+    EP_HOST_DEVICE auto operator[](const uint32_t& i) { return func(i); }
 };
 
-__device__ __forceinline__ void trap() {
+EP_DEVICE EP_FORCEINLINE void trap() {
+#if defined(DEEPEP_XPU_NATIVE)
+    __builtin_trap();
+#else
     asm("trap;");
+#endif
 }
 
-__device__ __forceinline__ void memory_fence() {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+EP_DEVICE EP_FORCEINLINE void memory_fence() {
+    backend_primitives::system_fence();
 }
 
-__device__ __forceinline__ void memory_fence_gpu() {
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+EP_DEVICE EP_FORCEINLINE void memory_fence_gpu() {
+    backend_primitives::gpu_fence();
 }
 
-__device__ __forceinline__ void memory_fence_cta() {
-    asm volatile("fence.acq_rel.cta;" ::: "memory");
+EP_DEVICE EP_FORCEINLINE void memory_fence_cta() {
+    backend_primitives::cta_fence();
 }
 
-__device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
-    asm volatile("st.relaxed.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+EP_DEVICE EP_FORCEINLINE void st_relaxed_sys_global(const int* ptr, int val) {
+    backend_primitives::store_relaxed_system(ptr, val);
 }
 
-__device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
-    asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+EP_DEVICE EP_FORCEINLINE void st_release_sys_global(const int* ptr, int val) {
+    backend_primitives::store_release_system(ptr, val);
 }
 
-__device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
-    asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+EP_DEVICE EP_FORCEINLINE void st_release_cta(const int* ptr, int val) {
+    backend_primitives::store_release_cta(ptr, val);
 }
 
-__device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+EP_DEVICE EP_FORCEINLINE int ld_acquire_sys_global(const int* ptr) {
+    return backend_primitives::load_acquire_system(ptr);
 }
 
-__device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
-    uint64_t ret;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
+EP_DEVICE EP_FORCEINLINE uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
+    return backend_primitives::load_acquire_system(ptr);
 }
 
-__device__ __forceinline__ int ld_acquire_global(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+EP_DEVICE EP_FORCEINLINE int ld_acquire_global(const int* ptr) {
+    return backend_primitives::load_acquire_gpu(ptr);
 }
 
-__device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    int ret;
-    asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-    return ret;
+EP_DEVICE EP_FORCEINLINE int atomic_add_release_sys_global(const int* ptr, int value) {
+    return backend_primitives::atomic_add_release_system(ptr, value);
 }
 
-__device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
-    int ret;
-    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-    return ret;
+EP_DEVICE EP_FORCEINLINE int atomic_add_release_global(const int* ptr, int value) {
+    return backend_primitives::atomic_add_release_gpu(ptr, value);
 }
 
-__device__ __forceinline__ int ld_acquire_cta(const int* ptr) {
-    int ret;
-    asm volatile("ld.acquire.cta.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
+EP_DEVICE EP_FORCEINLINE int ld_acquire_cta(const int* ptr) {
+    return backend_primitives::load_acquire_cta(ptr);
 }
 
+#if defined(DEEPEP_XPU_NATIVE)
+template <typename dtype_t>
+EP_DEVICE EP_FORCEINLINE dtype_t ld_nc_global(const dtype_t* ptr) {
+    return *ptr;
+}
+
+EP_DEVICE EP_FORCEINLINE uint8_t ld_na_relaxed(const uint8_t* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE uint16_t ld_na_relaxed(const uint16_t* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE uint32_t ld_na_relaxed(const uint32_t* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE uint64_t ld_na_relaxed(const uint64_t* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE int ld_volatile_global(const int* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE float ld_volatile_global(const float* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE int64_t ld_volatile_global(const int64_t* ptr) { return *ptr; }
+EP_DEVICE EP_FORCEINLINE int64_t ld_volatile_global(const uint64_t* ptr) { return static_cast<int64_t>(*ptr); }
+EP_DEVICE EP_FORCEINLINE void st_na_relaxed(const uint8_t* ptr, uint8_t val) { *const_cast<uint8_t*>(ptr) = val; }
+EP_DEVICE EP_FORCEINLINE void st_na_relaxed(const uint16_t* ptr, uint16_t val) { *const_cast<uint16_t*>(ptr) = val; }
+EP_DEVICE EP_FORCEINLINE void st_na_relaxed(const uint32_t* ptr, uint32_t val) { *const_cast<uint32_t*>(ptr) = val; }
+EP_DEVICE EP_FORCEINLINE void st_na_relaxed(const int* ptr, int val) { *const_cast<int*>(ptr) = val; }
+EP_DEVICE EP_FORCEINLINE void st_na_relaxed(const int4* ptr, int4 val) { *const_cast<int4*>(ptr) = val; }
+EP_DEVICE EP_FORCEINLINE void st_na_release(const int* ptr, int val) {
+    backend_primitives::store_release_system(ptr, val);
+}
+EP_DEVICE EP_FORCEINLINE void st_na_release(const uint32_t* ptr, uint32_t val) {
+    backend_primitives::atomic_ref_t<uint32_t, sycl::memory_scope::system>(*const_cast<uint32_t*>(ptr)).store(val, sycl::memory_order::release);
+}
+EP_DEVICE EP_FORCEINLINE void st_na_release(const uint64_t* ptr, uint64_t val) {
+    backend_primitives::atomic_ref_t<uint64_t, sycl::memory_scope::system>(*const_cast<uint64_t*>(ptr)).store(val, sycl::memory_order::release);
+}
+template <typename dtype_t>
+EP_DEVICE EP_FORCEINLINE void st_na_global(const dtype_t* ptr, const dtype_t& value) {
+    *const_cast<dtype_t*>(ptr) = value;
+}
+EP_DEVICE EP_FORCEINLINE float log2f_approx(const float& x) { return sycl::log2(x); }
+EP_DEVICE EP_FORCEINLINE float exp2f_approx(const float& x) { return sycl::exp2(x); }
+#else
 __device__ __forceinline__ uint8_t ld_na_relaxed(const uint8_t* ptr) {
     uint16_t ret;
     asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b8 %0, [%1];" : "=h"(ret) : "l"(ptr));
@@ -307,14 +455,22 @@ __device__ __forceinline__ float exp2f_approx(const float& x) {
     asm volatile("ex2.approx.f32 %0, %1;" : "=f"(ret) : "f"(x));
     return ret;
 }
+#endif
 
-__forceinline__ __device__ int get_lane_id() {
+EP_DEVICE EP_FORCEINLINE int get_lane_id() {
+#if defined(DEEPEP_XPU_NATIVE)
+    return 0;
+#else
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
+#endif
 }
 
-__device__ __forceinline__ uint32_t elect_one_sync() {
+EP_DEVICE EP_FORCEINLINE uint32_t elect_one_sync() {
+#if defined(DEEPEP_XPU_NATIVE)
+    return 1;
+#else
 #ifndef DISABLE_SM90_FEATURES
     uint32_t pred = 0;
     asm volatile(
@@ -329,6 +485,7 @@ __device__ __forceinline__ uint32_t elect_one_sync() {
     return pred;
 #else
     return get_lane_id() == 0;
+#endif
 #endif
 }
 
@@ -417,28 +574,28 @@ __device__ __forceinline__ void tma_store_wait() {
 #endif
 
 template <typename dtype_t>
-__host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
+EP_HOST_DEVICE constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
     return (a + b - 1) / b;
 }
 
 template <typename dtype_t>
-__host__ __device__ constexpr dtype_t align_up(dtype_t a, dtype_t b) {
+EP_HOST_DEVICE constexpr dtype_t align_up(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
 template <typename dtype_t>
-__host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
+EP_HOST_DEVICE constexpr dtype_t align_down(dtype_t a, dtype_t b) {
     return a / b * b;
 }
 
-__forceinline__ __device__ void get_channel_task_range(int num_tokens, int num_sms, int sm_id, int& token_start_idx, int& token_end_idx) {
+EP_DEVICE EP_FORCEINLINE void get_channel_task_range(int num_tokens, int num_sms, int sm_id, int& token_start_idx, int& token_end_idx) {
     int num_tokens_per_sm = ceil_div(num_tokens, num_sms);
-    token_start_idx = min(num_tokens_per_sm * sm_id, num_tokens);
-    token_end_idx = min(token_start_idx + num_tokens_per_sm, num_tokens);
+    token_start_idx = std::min(num_tokens_per_sm * sm_id, num_tokens);
+    token_end_idx = std::min(token_start_idx + num_tokens_per_sm, num_tokens);
 }
 
 template <typename dtype_a_t, typename dtype_b_t>
-__device__ __forceinline__ dtype_b_t pack2(const dtype_a_t& x, const dtype_a_t& y) {
+EP_DEVICE EP_FORCEINLINE dtype_b_t pack2(const dtype_a_t& x, const dtype_a_t& y) {
     EP_STATIC_ASSERT(sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t), "Invalid dtypes");
     dtype_b_t packed;
     auto unpacked_ptr = reinterpret_cast<dtype_a_t*>(&packed);
@@ -447,41 +604,46 @@ __device__ __forceinline__ dtype_b_t pack2(const dtype_a_t& x, const dtype_a_t& 
 }
 
 template <typename dtype_a_t, typename dtype_b_t>
-__device__ __forceinline__ void unpack2(const dtype_b_t& packed, dtype_a_t& x, dtype_a_t& y) {
+EP_DEVICE EP_FORCEINLINE void unpack2(const dtype_b_t& packed, dtype_a_t& x, dtype_a_t& y) {
     EP_STATIC_ASSERT(sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t), "Invalid dtypes");
     auto unpacked_ptr = reinterpret_cast<const dtype_a_t*>(&packed);
     x = unpacked_ptr[0], y = unpacked_ptr[1];
 }
 
 template <typename dtype_t>
-__device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
+EP_DEVICE EP_FORCEINLINE dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
+#if defined(DEEPEP_XPU_NATIVE)
+    (void)src_lane_idx;
+    return ptr;
+#else
     auto send_int_values = reinterpret_cast<int*>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
     #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
         recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t*>(recv_int_values);
+#endif
 }
 
 constexpr float kFP8Margin = 1e-4;
 constexpr float kFinfoAmaxE4M3 = 448.0f;
 constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
 
-__forceinline__ __device__ float fast_pow2(int x) {
+EP_DEVICE EP_FORCEINLINE float fast_pow2(int x) {
     // We can ensure `-126 <= x and x <= 127`
     uint32_t bits_x = (x + 127) << 23;
     return *reinterpret_cast<float*>(&bits_x);
 }
 
-__forceinline__ __device__ int fast_log2_ceil(float x) {
+EP_DEVICE EP_FORCEINLINE int fast_log2_ceil(float x) {
     auto bits_x = *reinterpret_cast<uint32_t*>(&x);
     auto exp_x = (bits_x >> 23) & 0xff;
     auto man_bits = bits_x & ((1 << 23) - 1);
     return exp_x - 127 + (man_bits != 0);
 }
 
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
+EP_DEVICE EP_FORCEINLINE void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
     if (round_scale) {
         auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
         scale = fast_pow2(-exp_scale_inv);
@@ -493,13 +655,66 @@ __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, f
 }
 
 template <bool kIsUE8M0, typename out_dtype_t = std::conditional_t<kIsUE8M0, uint8_t, float>>
-__forceinline__ __device__ out_dtype_t extract_required_scale_format(float value) {
+EP_DEVICE EP_FORCEINLINE out_dtype_t extract_required_scale_format(float value) {
     if constexpr (kIsUE8M0) {
         return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
     } else {
         return value;
     }
 }
+
+#if defined(DEEPEP_XPU_NATIVE)
+template <int kNumRanks, bool kSyncOnly = false>
+EP_DEVICE EP_FORCEINLINE void barrier_block(int**, int) {}
+
+EP_DEVICE EP_FORCEINLINE int atomic_cas_cta_acquire(int* addr, int x, int y) {
+    auto ref = backend_primitives::atomic_ref_t<int, sycl::memory_scope::work_group>(*addr);
+    int expected = x;
+    ref.compare_exchange_strong(expected, y, sycl::memory_order::acq_rel, sycl::memory_order::acquire);
+    return expected;
+}
+
+EP_DEVICE EP_FORCEINLINE int atomic_exch_cta_release(int* addr, int x) {
+    return backend_primitives::atomic_ref_t<int, sycl::memory_scope::work_group>(*addr).exchange(x, sycl::memory_order::release);
+}
+
+EP_DEVICE EP_FORCEINLINE void acquire_lock(int* mutex) {
+    while (atomic_cas_cta_acquire(mutex, 0, 1) != 0) {
+    }
+}
+
+EP_DEVICE EP_FORCEINLINE void release_lock(int* mutex) {
+    atomic_exch_cta_release(mutex, 0);
+}
+
+template <typename T>
+struct ReduceSum {
+    EP_DEVICE T operator()(T a, T b) const { return a + b; }
+};
+template <typename T>
+struct ReduceMax {
+    EP_DEVICE T operator()(T a, T b) const { return a > b ? a : b; }
+};
+template <typename T>
+struct ReduceMin {
+    EP_DEVICE T operator()(T a, T b) const { return a < b ? a : b; }
+};
+template <typename T>
+struct ReduceAnd {
+    EP_DEVICE T operator()(T a, T b) const { return a & b; }
+};
+template <typename T>
+struct ReduceOr {
+    EP_DEVICE T operator()(T a, T b) const { return a | b; }
+};
+
+template <int kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
+EP_DEVICE EP_FORCEINLINE T warp_reduce(T value, Op) {
+    (void)kIntergroupReduce;
+    static_assert(kNumLanesPerGroup >= 1, "Invalid number of lanes");
+    return value;
+}
+#else
 
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
@@ -610,30 +825,31 @@ __forceinline__ __device__ T warp_reduce(T value, Op op) {
     }
     return value;
 }
+#endif
 
 // Convenience aliases
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__forceinline__ __device__ T warp_reduce_sum(T value) {
+EP_DEVICE EP_FORCEINLINE T warp_reduce_sum(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceSum<T>{});
 }
 
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__forceinline__ __device__ T warp_reduce_max(T value) {
+EP_DEVICE EP_FORCEINLINE T warp_reduce_max(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMax<T>{});
 }
 
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__forceinline__ __device__ T warp_reduce_min(T value) {
+EP_DEVICE EP_FORCEINLINE T warp_reduce_min(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMin<T>{});
 }
 
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__forceinline__ __device__ T warp_reduce_and(T value) {
+EP_DEVICE EP_FORCEINLINE T warp_reduce_and(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceAnd<T>{});
 }
 
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__forceinline__ __device__ T warp_reduce_or(T value) {
+EP_DEVICE EP_FORCEINLINE T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }
 

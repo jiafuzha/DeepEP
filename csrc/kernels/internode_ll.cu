@@ -1,7 +1,7 @@
 #include "configs.cuh"
 #include "exception.cuh"
-#include "ibgda_device.cuh"
 #include "launch.cuh"
+#include "transport_device.cuh"
 
 namespace deep_ep {
 
@@ -20,17 +20,21 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
 }
 
 template <int kNumThreads>
+__forceinline__ __device__ void quiet_all_remote_qps(int thread_id, int rank, int num_ranks) {
+    auto qps_per_rank = low_latency_transport::get_num_queue_pairs_per_rank();
+    for (int i = thread_id; i < qps_per_rank * (num_ranks - 1); i += kNumThreads) {
+        auto dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks;
+        auto qp_id = i % qps_per_rank;
+        low_latency_transport::quiet(dst_rank, qp_id);
+    }
+}
+
+template <int kNumThreads>
 __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr) {
     EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
 
     // Quiet all QPs
-    auto qps_per_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
-
-    for (int i = thread_id; i < qps_per_rank * (num_ranks - 1); i += kNumThreads) {
-        auto dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks;
-        auto qp_id = i % qps_per_rank;
-        nvshmemi_ibgda_quiet(dst_rank, qp_id);
-    }
+    quiet_all_remote_qps<kNumThreads>(thread_id, rank, num_ranks);
 
     // Update local counter
     if (thread_id == 0)
@@ -42,14 +46,10 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
     if (thread_id < num_ranks && thread_id != rank) {
         const auto dst_rank = thread_id;
         const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
-        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        const auto dst_p2p_ptr = low_latency_transport::get_p2p_ptr(dst_ptr, rank, dst_rank);
 
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-            if (dst_p2p_ptr == 0) {
-                nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), cnt, dst_rank, 0);
-            } else {
-                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), cnt);
-            }
+            low_latency_transport::store_or_write_p2p_int(dst_ptr, dst_p2p_ptr, cnt, dst_rank);
 
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
@@ -82,7 +82,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void clean_low_latency_buffer(int* 
 
     // Barrier before cleaning (in case of unfinished chunked EP)
     if (sync_buffer_ptr == nullptr)
-        nvshmemx_barrier_all_block();
+        low_latency_transport::barrier_all_block();
     else
         barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
 
@@ -96,7 +96,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void clean_low_latency_buffer(int* 
 
     // Barrier after cleaning (make sure the low-latency mode works fine)
     if (sync_buffer_ptr == nullptr)
-        nvshmemx_barrier_all_block();
+        low_latency_transport::barrier_all_block();
     else
         barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
 }
@@ -261,11 +261,16 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = low_latency_transport::get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
-                    if (dst_p2p_ptr == 0) {
-                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
-                    } else {
+                    if (not low_latency_transport::put_if_remote(dst_ptr,
+                                                                 dst_p2p_ptr,
+                                                                 src_ptr,
+                                                                 num_bytes_per_msg,
+                                                                 dst_rank,
+                                                                 dst_expert_local_idx,
+                                                                 lane_id,
+                                                                 slot_idx)) {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
@@ -282,7 +287,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for checking QPs
-            EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
+            EP_DEVICE_ASSERT(low_latency_transport::get_num_queue_pairs_per_pe() >= num_local_experts);
 
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
@@ -331,13 +336,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
-        auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        auto dst_p2p_ptr = low_latency_transport::get_p2p_ptr(dst_ptr, rank, dst_rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-            if (dst_p2p_ptr == 0) {
-                nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
-            } else {
-                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
-            }
+            low_latency_transport::atomic_add_or_write_p2p_int(dst_ptr, dst_p2p_ptr, -num_tokens_sent - 1, dst_rank,
+                                                               dst_expert_local_idx);
         }
 
         // Clean workspace for next use
@@ -844,7 +846,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = low_latency_transport::get_p2p_ptr(dst_ptr, rank, dst_rank);
                 int num_send_bytes = hidden * sizeof(nv_bfloat16);
 
                 if (not zero_copy or dst_p2p_ptr != 0) {
@@ -908,8 +910,14 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 
                 // Issue RDMA
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
-                if (dst_p2p_ptr == 0)
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                low_latency_transport::put_if_remote(dst_ptr,
+                                                     dst_p2p_ptr,
+                                                     buf_ptr,
+                                                     num_send_bytes,
+                                                     dst_rank,
+                                                     local_expert_idx,
+                                                     lane_id,
+                                                     token_idx - offset);
             }
         }
 
@@ -920,13 +928,9 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
-            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            auto dst_p2p_ptr = low_latency_transport::get_p2p_ptr(dst_ptr, rank, dst_rank);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-                if (dst_p2p_ptr == 0) {
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
-                } else {
-                    st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
-                }
+                low_latency_transport::atomic_add_or_write_p2p_int(dst_ptr, dst_p2p_ptr, 1, dst_rank, local_expert_idx);
             }
             atomic_add_release_global(atomic_clean_flag, -1);
         }

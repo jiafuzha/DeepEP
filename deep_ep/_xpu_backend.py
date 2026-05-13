@@ -3,6 +3,10 @@ import torch.distributed as dist
 
 from .utils import EventOverlap
 
+SUPPORTS_INTRANODE = True
+SUPPORTS_INTERNODE = False
+SUPPORTS_LOW_LATENCY = False
+
 
 def _to_cpu_object(tensor):
     return None if tensor is None else tensor.detach().cpu()

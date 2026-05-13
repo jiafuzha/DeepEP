@@ -315,8 +315,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
-    if get_device_type() == 'xpu':
-        raise SystemExit('Low-latency kernels are not implemented on the XPU bring-up path yet')
+    if not deep_ep.supports_low_latency():
+        print(f'Low-latency kernels are not implemented on the {deep_ep.get_runtime_backend()} backend yet', flush=True)
+        raise SystemExit(0)
 
     # TODO: you may modify NUMA binding for less CPU overhead
     # TODO: buggy with `num_tokens=512`

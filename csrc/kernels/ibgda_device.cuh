@@ -15,6 +15,8 @@
 
 namespace deep_ep {
 
+namespace low_latency_transport {
+
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
 
 __device__ static __forceinline__ uint64_t HtoBE64(uint64_t x) {
@@ -502,5 +504,85 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
     uint64_t prod_idx = state->use_async_postsend ? ld_na_relaxed(qp->tx_wq.prod_idx) : ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
 }
+
+__device__ static __forceinline__ int get_num_queue_pairs_per_rank() {
+    auto state = ibgda_get_state();
+    return state->num_rc_per_pe * state->num_devices_initialized;
+}
+
+__device__ static __forceinline__ int get_num_queue_pairs_per_pe() {
+    return ibgda_get_state()->num_rc_per_pe;
+}
+
+template <bool kLowLatencyMode>
+__device__ static __forceinline__ void sync_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
+    kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
+}
+
+__device__ static __forceinline__ void quiet(int dst_rank, int qp_id) {
+    nvshmemi_ibgda_quiet(dst_rank, qp_id);
+}
+
+__device__ static __forceinline__ uint64_t get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank) {
+    return nvshmemi_get_p2p_ptr(ptr, rank, dst_rank);
+}
+
+__device__ static __forceinline__ void store_remote_int(int* dst_ptr, int value, int dst_rank, int qp_id) {
+    nvshmemi_ibgda_rma_p(dst_ptr, value, dst_rank, qp_id);
+}
+
+__device__ static __forceinline__ void store_or_write_p2p_int(uint64_t dst_ptr, uint64_t dst_p2p_ptr, int value, int dst_rank) {
+    if (dst_p2p_ptr == 0) {
+        store_remote_int(reinterpret_cast<int*>(dst_ptr), value, dst_rank, 0);
+    } else {
+        st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), value);
+    }
+}
+
+__device__ static __forceinline__ void put_warp(void* dst_ptr,
+                                                const void* src_ptr,
+                                                size_t size,
+                                                int dst_rank,
+                                                int qp_id,
+                                                int lane_id,
+                                                int slot_idx) {
+    nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, size, dst_rank, qp_id, lane_id, slot_idx);
+}
+
+__device__ static __forceinline__ bool put_if_remote(uint64_t dst_ptr,
+                                                     uint64_t dst_p2p_ptr,
+                                                     uint64_t src_ptr,
+                                                     size_t size,
+                                                     int dst_rank,
+                                                     int qp_id,
+                                                     int lane_id,
+                                                     int slot_idx) {
+    if (dst_p2p_ptr != 0)
+        return false;
+    put_warp(reinterpret_cast<void*>(dst_ptr), reinterpret_cast<const void*>(src_ptr), size, dst_rank, qp_id, lane_id, slot_idx);
+    return true;
+}
+
+__device__ static __forceinline__ void atomic_add(int* dst_ptr, int value, int dst_rank, int qp_id) {
+    nvshmemi_ibgda_amo_nonfetch_add(dst_ptr, value, dst_rank, qp_id);
+}
+
+__device__ static __forceinline__ void atomic_add_or_write_p2p_int(uint64_t dst_ptr,
+                                                                   uint64_t dst_p2p_ptr,
+                                                                   int value,
+                                                                   int dst_rank,
+                                                                   int qp_id) {
+    if (dst_p2p_ptr == 0) {
+        atomic_add(reinterpret_cast<int*>(dst_ptr), value, dst_rank, qp_id);
+    } else {
+        st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), value);
+    }
+}
+
+__device__ static __forceinline__ void barrier_all_block() {
+    nvshmemx_barrier_all_block();
+}
+
+}  // namespace low_latency_transport
 
 }  // namespace deep_ep

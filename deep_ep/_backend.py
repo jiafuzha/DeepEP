@@ -6,10 +6,14 @@ import torch
 try:
     import deep_ep_cpp as _cpp_backend
 except ImportError:
-    _cpp_backend = None
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        from . import _xpu_cpp_stub as _cpp_backend
+    else:
+        _cpp_backend = None
 
 
 CPP_BACKEND_AVAILABLE = _cpp_backend is not None
+CPP_RUNTIME_AVAILABLE = _cpp_backend is not None and hasattr(_cpp_backend, 'Buffer')
 
 
 @dataclass(frozen=True)
@@ -51,5 +55,42 @@ def get_cpp_backend():
     return _cpp_backend
 
 
+def _get_default_device_type() -> str:
+    try:
+        return torch.get_default_device().type
+    except (AttributeError, RuntimeError):
+        return 'cpu'
+
+
+def get_runtime_backend_name() -> str:
+    default_device_type = _get_default_device_type()
+    if default_device_type == 'xpu' and hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return 'xpu'
+    if default_device_type == 'cuda' and torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch, 'xpu') and torch.xpu.is_available() and not torch.cuda.is_available():
+        return 'xpu'
+    if torch.cuda.is_available():
+        return 'cuda'
+    return default_device_type
+
+
+def supports_native_runtime() -> bool:
+    return CPP_RUNTIME_AVAILABLE and get_runtime_backend_name() != 'xpu'
+
+
+def supports_intranode() -> bool:
+    runtime_backend = get_runtime_backend_name()
+    return runtime_backend == 'xpu' or supports_native_runtime()
+
+
+def supports_internode() -> bool:
+    return supports_native_runtime()
+
+
+def supports_low_latency() -> bool:
+    return supports_native_runtime()
+
+
 def using_python_backend() -> bool:
-    return not CPP_BACKEND_AVAILABLE
+    return get_runtime_backend_name() == 'xpu' or not supports_native_runtime()

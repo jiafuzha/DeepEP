@@ -14,6 +14,7 @@
 
 #include "config.hpp"
 #include "event.hpp"
+#include "runtime.hpp"
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
 
@@ -81,7 +82,7 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    RuntimeStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -111,6 +112,13 @@ private:
     int* moe_recv_rdma_counter_mapped = nullptr;
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
+
+    void destroy_intranode_resources();
+    void destroy_internode_resources();
+    void destroy_host_resources();
+    void sync_intranode_handles(const std::vector<int>& device_ids,
+                                const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles);
+    void sync_internode_runtime(const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
 public:
     Buffer(int rank,
