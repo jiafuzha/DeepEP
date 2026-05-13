@@ -11,6 +11,59 @@ import torch.distributed as dist
 from typing import Optional, Union
 
 
+def get_device_type():
+    return 'xpu' if hasattr(torch, 'xpu') and torch.xpu.is_available() and not torch.cuda.is_available() else 'cuda'
+
+
+def get_device_module():
+    return getattr(torch, get_device_type())
+
+
+def get_device_string(index: Optional[int] = None):
+    device_type = get_device_type()
+    return f'{device_type}:{index}' if index is not None else device_type
+
+
+def get_profiler_activity():
+    return torch.profiler.ProfilerActivity.XPU if get_device_type() == 'xpu' else torch.profiler.ProfilerActivity.CUDA
+
+
+def synchronize_device():
+    get_device_module().synchronize()
+
+
+def get_dist_backend():
+    if get_device_type() == 'xpu':
+        return 'gloo'
+    return 'nccl'
+
+
+def get_bench_iterations(num_warmups: int, num_tests: int):
+    if get_device_type() == 'xpu':
+        return min(num_warmups, 5), min(num_tests, 5)
+    return num_warmups, num_tests
+
+
+def dist_all_reduce(tensor: torch.Tensor, group=None):
+    if get_device_type() == 'xpu':
+        reduced = tensor.detach().cpu()
+        dist.all_reduce(reduced, group=group)
+        tensor.copy_(reduced.to(tensor.device))
+        return tensor
+    dist.all_reduce(tensor, group=group)
+    return tensor
+
+
+def dist_all_gather(tensor: torch.Tensor, group=None):
+    if get_device_type() == 'xpu':
+        gathered = [None for _ in range(dist.get_world_size(group=group))]
+        dist.all_gather_object(gathered, tensor.detach().cpu(), group=group)
+        return [item.to(tensor.device) for item in gathered]
+    gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size(group=group))]
+    dist.all_gather(gathered, tensor, group=group)
+    return gathered
+
+
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
@@ -19,20 +72,24 @@ def init_dist(local_rank: int, num_local_ranks: int):
     node_rank = int(os.getenv('RANK', 0))
 
     sig = inspect.signature(dist.init_process_group)
+    device_type = get_device_type()
+    backend = get_dist_backend()
     params = {
-        'backend': 'nccl',
+        'backend': backend,
         'init_method': f'tcp://{ip}:{port}',
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
-    if 'device_id' in sig.parameters:
+    if 'device_id' in sig.parameters and backend != 'gloo':
         # noinspection PyTypeChecker
-        params['device_id'] = torch.device(f'cuda:{local_rank}')
+        params['device_id'] = torch.device(get_device_string(local_rank))
     dist.init_process_group(**params)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
+    torch.set_default_device(get_device_string(local_rank))
+    get_device_module().set_device(local_rank)
 
+    if backend == 'gloo':
+        return dist.get_rank(), dist.get_world_size(), dist.group.WORLD
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
@@ -98,9 +155,11 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
 
 
 def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+    num_warmups, num_tests = get_bench_iterations(num_warmups, num_tests)
+
     # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+    synchronize_device()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=get_device_string())
 
     # Warmup
     for _ in range(num_warmups):
@@ -110,8 +169,9 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     cache.zero_()
 
     # Testing
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    device_module = get_device_module()
+    start_events = [device_module.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [device_module.Event(enable_timing=True) for _ in range(num_tests)]
     for i in range(num_tests):
         # Record
         start_events[i].record()
@@ -119,7 +179,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
         end_events[i].record()
         if post_fn is not None:
             post_fn()
-    torch.cuda.synchronize()
+    synchronize_device()
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
     return np.average(times), np.min(times), np.max(times)
@@ -177,21 +237,23 @@ def bench_kineto(fn,
                  trace_path: Optional[str] = None,
                  barrier_comm_profiling: bool = False,
                  num_kernels_per_period: int = 1):
+    _, num_tests = get_bench_iterations(0, num_tests)
+
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
+        with torch.profiler.profile(activities=[get_profiler_activity()], schedule=schedule) as prof:
             for _ in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
                 if barrier_comm_profiling:
-                    lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                    rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    lhs = torch.randn((8192, 8192), dtype=torch.float, device=get_device_string())
+                    rhs = torch.randn((8192, 8192), dtype=torch.float, device=get_device_string())
                     lhs @ rhs
-                    dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
+                    dist_all_reduce(torch.ones(1, dtype=torch.float, device=get_device_string()))
                 for _ in range(num_tests):
                     fn()
-                torch.cuda.synchronize()
+                synchronize_device()
                 prof.step()
 
     # Parse the profiling table

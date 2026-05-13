@@ -3,8 +3,7 @@ import torch
 import torch.distributed as dist
 from typing import Any, Optional, Tuple
 
-# noinspection PyUnresolvedReferences
-from deep_ep_cpp import EventHandle
+from ._backend import EventHandle
 
 
 class EventOverlap:
@@ -34,7 +33,8 @@ class EventOverlap:
         """
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
         """
-        assert self.event is not None
+        if self.event is None:
+            return
         self.event.current_stream_wait()
 
     def __enter__(self) -> Any:
@@ -68,6 +68,9 @@ def check_nvlink_connections(group: dist.ProcessGroup):
     Arguments:
         group: the communication group.
     """
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return
+
     # Check NVLink connection
     # NOTES: some A100 PCIE GPUs only have pairwise NVLink connection, so that we can only use EP2
     # TODO: check all cases, all local-node GPUs in the group should be connected via NVLink

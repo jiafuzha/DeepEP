@@ -1,12 +1,16 @@
 import argparse
 import os
+import sys
 import time
 import torch
 import torch.distributed as dist
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor
+from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor, get_device_type
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -369,6 +373,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
+    if get_device_type() == 'xpu':
+        raise SystemExit('Internode kernels are not implemented on the XPU bring-up path yet')
+
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')

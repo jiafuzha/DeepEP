@@ -71,6 +71,22 @@ python tests/test_internode.py
 python tests/test_low_latency.py
 ```
 
+For the current Intel XPU bring-up path, use the required environment and the intranode test with 2 spawned processes:
+
+```bash
+conda activate jiafuzha_deepep
+source /opt/intel/oneapi/setvars.sh --force
+export ZE_AFFINITY_MASK=0,1
+export CC=icx
+export CXX=icpx
+export ISHMEM_IBGDA_BAR_BACKEND=igub
+export ISHMEM_IB_ENABLE_IBGDA=1
+export ISHMEM_IBGDA_DIRECT_DOORBELL=1
+
+DEEPEP_BACKEND=xpu python setup.py build
+DEEPEP_BACKEND=xpu python tests/test_intranode.py --num-processes 2
+```
+
 ### Installation
 
 ```bash

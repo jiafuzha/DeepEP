@@ -1,12 +1,16 @@
 import argparse
 import random
+import sys
 import torch
 import torch.distributed as dist
 from functools import partial
+from pathlib import Path
 from typing import Literal, Set
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back, get_device_type
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -311,6 +315,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
+    if get_device_type() == 'xpu':
+        raise SystemExit('Low-latency kernels are not implemented on the XPU bring-up path yet')
+
     # TODO: you may modify NUMA binding for less CPU overhead
     # TODO: buggy with `num_tokens=512`
     parser = argparse.ArgumentParser(description='Test low-latency EP kernels')
