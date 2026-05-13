@@ -532,19 +532,20 @@ __forceinline__ out_dtype_t extract_required_scale_format(float value) {
 
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ void barrier_block(int** barrier_signal_ptrs, int rank) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto thread_id = static_cast<int>(threadIdx.x);
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
         memory_fence();
-        __syncthreads();
+        sycl::group_barrier(item_ct1.get_group());
     }
 
     if (thread_id == 0) {
         auto next_phase = ld_volatile_global(barrier_signal_ptrs[rank] + rank) + 1;
         st_release_sys_global(barrier_signal_ptrs[rank] + rank, next_phase);
     }
-    __syncthreads();
+    sycl::group_barrier(item_ct1.get_group());
 
     auto phase = ld_volatile_global(barrier_signal_ptrs[rank] + rank);
     if (thread_id < kNumRanks)
@@ -562,7 +563,7 @@ __forceinline__ void barrier_block(int** barrier_signal_ptrs, int rank) {
             trap();
         }
     }
-    __syncthreads();
+    sycl::group_barrier(item_ct1.get_group());
 }
 
 __forceinline__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
