@@ -193,7 +193,7 @@ inline void syncwarp() {
 
 inline uint64_t clock64() {
 #ifdef __SYCL_DEVICE_ONLY__
-    return sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+    return sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::device>();
 #else
     return 0;
 #endif

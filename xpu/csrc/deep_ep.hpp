@@ -46,7 +46,7 @@ public:
     void malloc(void** ptr, size_t size);
     void free(void* ptr);
     void get_mem_handle(MemHandle* mem_handle, void* ptr);
-    void open_mem_handle(void** ptr, MemHandle* mem_handle);
+    void open_mem_handle(void** ptr, MemHandle* mem_handle, int remote_device_index);
     void close_mem_handle(void* ptr);
 
 private:

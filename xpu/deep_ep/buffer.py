@@ -223,13 +223,8 @@ class Buffer:
     def supports_intranode_autotune() -> bool:
         """
         Whether the current XPU intranode path provides meaningful throughput auto-tuning data.
-
-        The native XPU path now includes a cached no-topk fast path, but it still uses
-        host-staged Level Zero IPC over the active PCIe transport rather than the original
-        CUDA-style steady-state kernel path. Keep the CUDA auto-tuning loop disabled until
-        the XPU transport/kernel configuration itself becomes the thing being tuned.
         """
-        return False
+        return True
 
     @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
