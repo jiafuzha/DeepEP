@@ -21,13 +21,15 @@
 #define LOW_LATENCY_RECV_PHASE 2
 
 // Make CLion CUDA indexing work
+#if !defined(DEEPEP_XPU_NATIVE)
 #ifdef __CLION_IDE__
 #define __CUDA_ARCH__ 900  // NOLINT(*-reserved-identifier)
 #define __CUDACC_RDC__     // NOLINT(*-reserved-identifier)
 #endif
+#endif
 
 // Define __CUDACC_RDC__ to ensure proper extern declarations for NVSHMEM device symbols
-#ifndef DISABLE_NVSHMEM
+#if !defined(DEEPEP_XPU_NATIVE) && !defined(DISABLE_NVSHMEM)
 #ifndef __CUDACC_RDC__
 #define __CUDACC_RDC__  // NOLINT(*-reserved-identifier)
 #endif
@@ -50,14 +52,17 @@
 #undef __CUDA_NO_BFLOAT162_OPERATORS__
 #endif
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
 #include <cstdint>
 
-#ifndef DISABLE_SM90_FEATURES
+#if defined(DEEPEP_XPU_NATIVE)
+#include "xpu_compat.cuh"
+#elif !defined(DISABLE_SM90_FEATURES)
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #else
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 // Ampere does not support FP8 features
 #define __NV_E4M3 0
 #define __NV_E5M2 1
@@ -80,7 +85,7 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 
 }  // namespace deep_ep
 
-#ifndef DISABLE_NVSHMEM
+#if !defined(DEEPEP_XPU_NATIVE) && !defined(DISABLE_NVSHMEM)
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <infiniband/mlx5dv.h>
 #include <nvshmem.h>

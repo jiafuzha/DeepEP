@@ -6,7 +6,12 @@ import setuptools
 import torch
 
 from pathlib import Path
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension
+
+try:
+    from torch.utils.cpp_extension import SyclExtension
+except ImportError:
+    SyclExtension = None
 
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
@@ -29,6 +34,8 @@ def detect_backend():
 
 
 def get_cuda_extension():
+    from torch.utils.cpp_extension import CUDAExtension
+
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -114,6 +121,71 @@ def get_cuda_extension():
                           extra_link_args=extra_link_args)]
 
 
+def get_xpu_extension():
+    assert SyclExtension is not None, 'PyTorch SyclExtension is unavailable in this environment'
+    ishmem_dir = os.getenv('ISHMEM_DIR', '/opt/intel/ishmem')
+    assert os.path.exists(ishmem_dir), f'The specified iSHMEM directory does not exist: {ishmem_dir}'
+
+    cxx_flags = [
+        '-O3',
+        '-fsycl',
+        '-Wno-deprecated-declarations',
+        '-Wno-unused-variable',
+        '-Wno-sign-compare',
+        '-Wno-reorder',
+        '-Wno-attributes',
+        '-DDEEPEP_XPU_NATIVE',
+        '-DDEEPEP_USE_ISHMEM',
+        '-DDISABLE_NVSHMEM',
+        '-DDISABLE_SM90_FEATURES',
+        '-DDISABLE_AGGRESSIVE_PTX_INSTRS',
+    ]
+    original_sources = [
+        'csrc/xpu_native_module.cpp',
+        'csrc/xpu_native_runtime.cpp',
+        'csrc/xpu_native_stubs.cpp',
+        'csrc/kernels/layout.cu',
+        'csrc/kernels/internode_ll_xpu.cpp',
+    ]
+    generated_source_dir = Path('build/xpu_native_sources')
+    generated_source_dir.mkdir(parents=True, exist_ok=True)
+    sources = []
+    for source in original_sources:
+        if source.endswith('.cu'):
+            source_path = Path(source).resolve()
+            generated_path = generated_source_dir / f'{source_path.stem}_sycl.cpp'
+            generated_path.write_text(f'#include "{source_path}"\n')
+            sources.append(str(generated_path))
+        else:
+            sources.append(source)
+    include_dirs = ['csrc/', f'{ishmem_dir}/include']
+    library_dirs = [f'{ishmem_dir}/lib']
+    torch_lib_dir = str(Path(torch.__file__).resolve().parent / 'lib')
+    extra_link_args = [f'-L{ishmem_dir}/lib', '-lishmem', '-lze_loader', f'-Wl,-rpath,{ishmem_dir}/lib', f'-Wl,-rpath,{torch_lib_dir}']
+
+    if "TOPK_IDX_BITS" in os.environ:
+        topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
+        cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+
+    print('Build summary:')
+    print(' > Backend: xpu')
+    print(' > Native XPU extension build: enabled')
+    print(f' > Sources: {sources}')
+    print(f' > Includes: {include_dirs}')
+    print(f' > Libraries: {library_dirs}')
+    print(f' > Compilation flags: {cxx_flags}')
+    print(f' > Link flags: {extra_link_args}')
+    print(f' > iSHMEM path: {ishmem_dir}')
+    print()
+
+    return [SyclExtension(name='deep_ep_cpp',
+                          include_dirs=include_dirs,
+                          library_dirs=library_dirs,
+                          sources=sources,
+                          extra_compile_args={'cxx': cxx_flags},
+                          extra_link_args=extra_link_args)]
+
+
 if __name__ == '__main__':
     backend = detect_backend()
     ext_modules = []
@@ -121,11 +193,14 @@ if __name__ == '__main__':
     if backend == 'cuda':
         ext_modules = get_cuda_extension()
     elif backend == 'xpu':
-        print('Build summary:')
-        print(' > Backend: xpu')
-        print(' > Using the Python intranode fallback backend for Intel XPU bring-up')
-        print(' > No compiled extension is built in this mode yet')
-        print()
+        if int(os.getenv('DEEPEP_BUILD_XPU_NATIVE', '0')):
+            ext_modules = get_xpu_extension()
+        else:
+            print('Build summary:')
+            print(' > Backend: xpu')
+            print(' > Using the Python intranode fallback backend and XPU capability shim for Intel XPU bring-up')
+            print(' > Set DEEPEP_BUILD_XPU_NATIVE=1 to attempt a native XPU extension build')
+            print()
     else:
         print('Build summary:')
         print(f' > Backend: {backend}')
