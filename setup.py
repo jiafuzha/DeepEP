@@ -1,7 +1,9 @@
+import importlib
 import os
 import subprocess
+
 import setuptools
-import importlib
+import torch
 
 from pathlib import Path
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -15,7 +17,18 @@ def get_nvshmem_host_lib_name(base_dir):
     raise ModuleNotFoundError('libnvshmem_host.so not found')
 
 
-if __name__ == '__main__':
+def detect_backend():
+    forced_backend = os.getenv('DEEPEP_BACKEND')
+    if forced_backend is not None:
+        return forced_backend
+    if torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return 'xpu'
+    return 'cpu'
+
+
+def get_cuda_extension():
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -43,7 +56,6 @@ if __name__ == '__main__':
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
-    # NVSHMEM flags
     if disable_nvshmem:
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
@@ -55,39 +67,27 @@ if __name__ == '__main__':
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '8.0')
-
-        # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
-
-        # Disable internode and low-latency kernels
         assert disable_nvshmem
     else:
-        # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
-
-        # CUDA 12 flags
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
-    # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
         assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
         os.environ['DISABLE_AGGRESSIVE_PTX_INSTRS'] = '1'
 
-    # Disable aggressive PTX instructions
     if int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', '1')):
         cxx_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
         nvcc_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
 
-    # Bits of `topk_idx.dtype`, choices are 32 and 64
     if "TOPK_IDX_BITS" in os.environ:
         topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
-    # Put them together
     extra_compile_args = {
         'cxx': cxx_flags,
         'nvcc': nvcc_flags,
@@ -95,8 +95,8 @@ if __name__ == '__main__':
     if len(nvcc_dlink) > 0:
         extra_compile_args['nvcc_dlink'] = nvcc_dlink
 
-    # Summary
     print('Build summary:')
+    print(' > Backend: cuda')
     print(f' > Sources: {sources}')
     print(f' > Includes: {include_dirs}')
     print(f' > Libraries: {library_dirs}')
@@ -106,7 +106,32 @@ if __name__ == '__main__':
     print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
-    # noinspection PyBroadException
+    return [CUDAExtension(name='deep_ep_cpp',
+                          include_dirs=include_dirs,
+                          library_dirs=library_dirs,
+                          sources=sources,
+                          extra_compile_args=extra_compile_args,
+                          extra_link_args=extra_link_args)]
+
+
+if __name__ == '__main__':
+    backend = detect_backend()
+    ext_modules = []
+
+    if backend == 'cuda':
+        ext_modules = get_cuda_extension()
+    elif backend == 'xpu':
+        print('Build summary:')
+        print(' > Backend: xpu')
+        print(' > Using the Python intranode fallback backend for Intel XPU bring-up')
+        print(' > No compiled extension is built in this mode yet')
+        print()
+    else:
+        print('Build summary:')
+        print(f' > Backend: {backend}')
+        print(' > No supported accelerator backend detected, packaging Python sources only')
+        print()
+
     try:
         cmd = ['git', 'rev-parse', '--short', 'HEAD']
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
@@ -116,12 +141,5 @@ if __name__ == '__main__':
     setuptools.setup(name='deep_ep',
                      version='1.2.1' + revision,
                      packages=setuptools.find_packages(include=['deep_ep']),
-                     ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
-                                       include_dirs=include_dirs,
-                                       library_dirs=library_dirs,
-                                       sources=sources,
-                                       extra_compile_args=extra_compile_args,
-                                       extra_link_args=extra_link_args)
-                     ],
+                     ext_modules=ext_modules,
                      cmdclass={'build_ext': BuildExtension})

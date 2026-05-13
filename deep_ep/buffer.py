@@ -3,11 +3,11 @@ import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
-# noinspection PyUnresolvedReferences
-import deep_ep_cpp
-# noinspection PyUnresolvedReferences
-from deep_ep_cpp import Config, EventHandle
+from ._backend import Config, EventHandle, get_cpp_backend, get_low_latency_rdma_size_hint, is_sm90_compiled
+from ._xpu_backend import XpuIntranodeBuffer
 from .utils import EventOverlap, check_nvlink_connections
+
+deep_ep_cpp = get_cpp_backend()
 
 
 class Buffer:
@@ -64,6 +64,7 @@ class Buffer:
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
         check_nvlink_connections(group)
+        self._xpu_backend: Optional[XpuIntranodeBuffer] = None
 
         # Initialize the CPP runtime
         if group is not None:
@@ -89,6 +90,12 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+
+        if hasattr(torch, 'xpu') and torch.xpu.is_available() and torch.get_default_device().type == 'xpu':
+            self.runtime = None
+            self._xpu_backend = XpuIntranodeBuffer(self, group, low_latency_mode)
+            return
+
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
@@ -143,12 +150,17 @@ class Buffer:
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
 
+        if self._xpu_backend is not None:
+            self._xpu_backend.destroy()
+            self.runtime = None
+            return
+
         self.runtime.destroy()
         self.runtime = None
 
     @staticmethod
     def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
+        return is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -170,7 +182,7 @@ class Buffer:
         Returns:
             event: the captured event.
         """
-        return EventOverlap(EventHandle())
+        return EventOverlap(None if (hasattr(torch, 'xpu') and torch.xpu.is_available() and not torch.cuda.is_available()) else EventHandle())
 
     @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
@@ -186,7 +198,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     def get_comm_stream(self) -> torch.Stream:
         """
@@ -195,6 +207,9 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
+        if self._xpu_backend is not None:
+            return self._xpu_backend.get_comm_stream()
+
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
@@ -212,6 +227,9 @@ class Buffer:
             offset: the offset of the beginning element.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
+        if self._xpu_backend is not None:
+            return self._xpu_backend.get_local_buffer_tensor(dtype, size=size, offset=offset, use_rdma_buffer=use_rdma_buffer)
+
         tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
         if size is None:
             return tensor
@@ -313,6 +331,9 @@ class Buffer:
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        if self._xpu_backend is not None:
+            return self._xpu_backend.get_dispatch_layout(topk_idx, num_experts)
+
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
             self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
                                              async_finish, allocate_on_comm_stream)
@@ -371,6 +392,11 @@ class Buffer:
         """
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
+
+        if self._xpu_backend is not None:
+            assert not isinstance(x, tuple), 'FP8 dispatch is not yet implemented on the Python XPU backend'
+            return self._xpu_backend.dispatch(x, handle, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+                                              topk_idx, topk_weights, num_worst_tokens)
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
@@ -433,6 +459,9 @@ class Buffer:
         """
         # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
+
+        if self._xpu_backend is not None:
+            return self._xpu_backend.combine(x, handle, topk_weights, bias)
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
@@ -542,6 +571,8 @@ class Buffer:
             hidden: the hidden dimension of each token.
             num_experts: the number of all experts.
         """
+        if self._xpu_backend is not None:
+            raise NotImplementedError("Low-latency mode is not implemented on the Python XPU backend")
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     # noinspection PyTypeChecker
