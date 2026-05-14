@@ -13,41 +13,35 @@ size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int 
 
 namespace {
 
-struct Config {
-    int num_sms;
-    int nvl_chunk_size;
-    int nvl_buffer_size;
-    int rdma_chunk_size;
-    int rdma_buffer_size;
-};
-
-struct EventHandle {
-    void current_stream_wait() const {}
-};
-
 bool is_sm90_compiled() {
+    return false;
+}
+
+bool supports_xpu_native_intranode() {
     return false;
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<Config>(m, "Config")
+    py::class_<deep_ep::Config>(m, "Config")
         .def(py::init<int, int, int, int, int>(),
-             py::arg("num_sms"),
-             py::arg("nvl_chunk_size"),
-             py::arg("nvl_buffer_size"),
-             py::arg("rdma_chunk_size") = 0,
-             py::arg("rdma_buffer_size") = 0)
-        .def_readonly("num_sms", &Config::num_sms)
-        .def_readonly("nvl_chunk_size", &Config::nvl_chunk_size)
-        .def_readonly("nvl_buffer_size", &Config::nvl_buffer_size)
-        .def_readonly("rdma_chunk_size", &Config::rdma_chunk_size)
-        .def_readonly("rdma_buffer_size", &Config::rdma_buffer_size);
+              py::arg("num_sms"),
+              py::arg("num_max_nvl_chunked_send_tokens"),
+              py::arg("num_max_nvl_chunked_recv_tokens"),
+              py::arg("num_max_rdma_chunked_send_tokens") = 6,
+              py::arg("num_max_rdma_chunked_recv_tokens") = 128)
+        .def_readonly("num_sms", &deep_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_send_tokens", &deep_ep::Config::num_max_nvl_chunked_send_tokens)
+        .def_readonly("num_max_nvl_chunked_recv_tokens", &deep_ep::Config::num_max_nvl_chunked_recv_tokens)
+        .def_readonly("num_max_rdma_chunked_send_tokens", &deep_ep::Config::num_max_rdma_chunked_send_tokens)
+        .def_readonly("num_max_rdma_chunked_recv_tokens", &deep_ep::Config::num_max_rdma_chunked_recv_tokens)
+        .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
+        .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
 
-    py::class_<EventHandle>(m, "EventHandle")
+    py::class_<deep_ep::EventHandle>(m, "EventHandle")
         .def(py::init<>())
-        .def("current_stream_wait", &EventHandle::current_stream_wait);
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     py::class_<deep_ep::Buffer>(m, "Buffer")
         .def(py::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
@@ -62,6 +56,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
+        .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
+        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
+        .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
@@ -69,6 +66,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", &is_sm90_compiled);
+    m.def("supports_xpu_native_intranode", &supports_xpu_native_intranode);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
     m.attr("topk_idx_t") =
         py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));

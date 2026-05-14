@@ -5,7 +5,7 @@ from .utils import EventOverlap
 
 SUPPORTS_INTRANODE = True
 SUPPORTS_INTERNODE = False
-SUPPORTS_LOW_LATENCY = False
+SUPPORTS_LOW_LATENCY = True
 
 
 def _to_cpu_object(tensor):
@@ -19,15 +19,18 @@ def _to_device_tensor(value, device):
 class XpuIntranodeBuffer:
 
     def __init__(self, parent, group, low_latency_mode: bool) -> None:
-        if low_latency_mode:
-            raise NotImplementedError("Low-latency mode is not yet implemented on the Python XPU backend")
         self.parent = parent
         self.group = group
         self.rank = parent.rank
         self.group_size = parent.group_size
         self.device = torch.device(f"xpu:{torch.xpu.current_device()}")
+        self.low_latency_mode = low_latency_mode
+        self._low_latency_mask = torch.zeros((self.group_size,), dtype=torch.int32, device=self.device)
+        self._next_combine_buffer_idx = 0
+        self._combine_buffers = {}
 
     def destroy(self) -> None:
+        self._combine_buffers.clear()
         return
 
     def get_comm_stream(self):
@@ -212,3 +215,170 @@ class XpuIntranodeBuffer:
                 combined_x = combined_x + bias_1
 
         return combined_x, combined_topk_weights, EventOverlap()
+
+    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
+        for idx in range(2):
+            key = (idx, num_max_dispatch_tokens_per_rank, hidden, num_experts)
+            if key in self._combine_buffers:
+                self._combine_buffers[key].zero_()
+
+    def low_latency_update_mask_buffer(self, rank_to_mask: int, mask: bool = False) -> None:
+        self._low_latency_mask[rank_to_mask] = int(mask)
+
+    def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
+        mask_status.copy_(self._low_latency_mask.to(mask_status.dtype))
+
+    def low_latency_clean_mask_buffer(self):
+        self._low_latency_mask.zero_()
+
+    def _per_token_cast_to_fp8(self, x: torch.Tensor, round_scale: bool):
+        num_tokens, hidden = x.shape
+        x_view = x.to(torch.float32).view(num_tokens, hidden // 128, 128)
+        amax = x_view.abs().amax(dim=-1).clamp(1e-4)
+        if round_scale:
+            scale_inv = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+        else:
+            scale_inv = amax / 448.0
+        scale = torch.reciprocal(scale_inv)
+        x_fp8 = (x_view * scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(num_tokens, hidden).contiguous()
+        return x_fp8, scale_inv.contiguous()
+
+    def _build_low_latency_dispatch(self,
+                                    x: torch.Tensor,
+                                    topk_idx: torch.Tensor,
+                                    num_max_dispatch_tokens_per_rank: int,
+                                    num_experts: int,
+                                    cumulative_local_expert_recv_stats: torch.Tensor | None,
+                                    use_fp8: bool,
+                                    round_scale: bool):
+        num_tokens, hidden = x.shape
+        num_local_experts = num_experts // self.group_size
+        capacity = self.group_size * num_max_dispatch_tokens_per_rank
+        all_x = self._all_gather_fixed(x)
+        all_topk_idx = self._all_gather_fixed(topk_idx)
+
+        packed_recv_x_bf16 = torch.zeros((num_local_experts, capacity, hidden), dtype=torch.bfloat16, device=self.device)
+        packed_recv_src_info = torch.full((num_local_experts, capacity), -1, dtype=torch.int32, device=self.device)
+        packed_recv_layout_range = torch.zeros((num_local_experts, self.group_size), dtype=torch.int64, device=self.device)
+        packed_recv_count = torch.zeros((num_local_experts,), dtype=torch.int32, device=self.device)
+
+        for local_expert_idx in range(num_local_experts):
+            expert_id = self.rank * num_local_experts + local_expert_idx
+            write_offset = 0
+            for src_rank in range(self.group_size):
+                if self._low_latency_mask[src_rank].item() != 0:
+                    continue
+                selected = (all_topk_idx[src_rank] == expert_id).any(dim=1)
+                token_indices = selected.nonzero(as_tuple=False).squeeze(-1)
+                count = int(token_indices.numel())
+                packed_recv_layout_range[local_expert_idx, src_rank] = (int(write_offset) << 32) | count
+                if count == 0:
+                    continue
+                packed_recv_x_bf16[local_expert_idx, write_offset:write_offset + count] = all_x[src_rank].index_select(0, token_indices)
+                packed_recv_src_info[local_expert_idx, write_offset:write_offset + count] = token_indices.to(torch.int32)
+                write_offset += count
+            packed_recv_count[local_expert_idx] = write_offset
+
+        if cumulative_local_expert_recv_stats is not None:
+            cumulative_local_expert_recv_stats.add_(packed_recv_count.to(cumulative_local_expert_recv_stats.dtype))
+
+        if use_fp8:
+            flat_fp8, flat_scales = self._per_token_cast_to_fp8(packed_recv_x_bf16.view(-1, hidden), round_scale)
+            packed_recv_x = flat_fp8.view_as(packed_recv_x_bf16)
+            packed_recv_x_scales = flat_scales.view(num_local_experts, capacity, hidden // 128)
+        else:
+            packed_recv_x = packed_recv_x_bf16
+            packed_recv_x_scales = None
+
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle
+
+    def low_latency_dispatch(self,
+                             x: torch.Tensor,
+                             topk_idx: torch.Tensor,
+                             num_max_dispatch_tokens_per_rank: int,
+                             num_experts: int,
+                             cumulative_local_expert_recv_stats=None,
+                             dispatch_wait_recv_cost_stats=None,
+                             use_fp8: bool = True,
+                             round_scale: bool = False,
+                             use_ue8m0: bool = False,
+                             async_finish: bool = False,
+                             return_recv_hook: bool = False):
+        del dispatch_wait_recv_cost_stats, use_ue8m0, async_finish
+
+        packed_recv_x = None
+        packed_recv_x_scales = None
+        packed_recv_count = None
+        handle = None
+
+        def finalize():
+            nonlocal packed_recv_x, packed_recv_x_scales, packed_recv_count, handle
+            if packed_recv_x is None:
+                packed_recv_x, packed_recv_x_scales, packed_recv_count, handle = self._build_low_latency_dispatch(
+                    x,
+                    topk_idx,
+                    num_max_dispatch_tokens_per_rank,
+                    num_experts,
+                    cumulative_local_expert_recv_stats,
+                    use_fp8,
+                    round_scale)
+
+        finalize()
+        hook = finalize if return_recv_hook else (lambda: None)
+        return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, EventOverlap(), hook
+
+    def get_next_low_latency_combine_buffer(self, handle):
+        _, _, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle[:5]
+        num_local_experts = num_experts // self.group_size
+        capacity = self.group_size * num_max_dispatch_tokens_per_rank
+        key = (self._next_combine_buffer_idx, num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        buffer = self._combine_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty((num_local_experts, capacity, hidden), dtype=torch.bfloat16, device=self.device)
+            self._combine_buffers[key] = buffer
+        self._next_combine_buffer_idx = (self._next_combine_buffer_idx + 1) % 2
+        return buffer
+
+    def low_latency_combine(self,
+                            x: torch.Tensor,
+                            topk_idx: torch.Tensor,
+                            topk_weights: torch.Tensor,
+                            handle: tuple,
+                            use_logfmt: bool = False,
+                            zero_copy: bool = False,
+                            async_finish: bool = False,
+                            return_recv_hook: bool = False,
+                            out: torch.Tensor | None = None,
+                            combine_wait_recv_cost_stats: torch.Tensor | None = None):
+        del use_logfmt, zero_copy, async_finish, combine_wait_recv_cost_stats
+        packed_recv_src_info, packed_recv_layout_range, _, _, num_experts = handle[:5]
+        num_local_experts = num_experts // self.group_size
+        payload = {
+            "x": _to_cpu_object(x),
+            "src_info": _to_cpu_object(packed_recv_src_info),
+            "layout_range": _to_cpu_object(packed_recv_layout_range),
+        }
+        gathered = self._all_gather_object(payload)
+
+        combined_x = torch.zeros_like(topk_weights[:, :1], dtype=x.dtype).expand(topk_idx.size(0), x.size(-1)).clone() if out is None else out
+        combined_x.zero_()
+
+        for owner_rank, item in enumerate(gathered):
+            owner_x = _to_device_tensor(item["x"], self.device)
+            owner_src_info = _to_device_tensor(item["src_info"], self.device)
+            owner_layout_range = _to_device_tensor(item["layout_range"], self.device)
+            for local_expert_idx in range(num_local_experts):
+                expert_id = owner_rank * num_local_experts + local_expert_idx
+                layout_entry = int(owner_layout_range[local_expert_idx, self.rank].item())
+                begin_idx = layout_entry >> 32
+                count = layout_entry & ((1 << 32) - 1)
+                if count == 0:
+                    continue
+                token_indices = owner_src_info[local_expert_idx, begin_idx:begin_idx + count].to(torch.long)
+                weight_mask = topk_idx.index_select(0, token_indices).eq(expert_id)
+                weights = topk_weights.index_select(0, token_indices).masked_fill(~weight_mask, 0).sum(dim=1).to(x.dtype)
+                combined_x.index_add_(0, token_indices, owner_x[local_expert_idx, begin_idx:begin_idx + count] * weights.unsqueeze(1))
+
+        hook = (lambda: None)
+        return combined_x, EventOverlap(), hook

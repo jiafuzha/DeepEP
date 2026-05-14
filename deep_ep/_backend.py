@@ -55,6 +55,15 @@ def get_cpp_backend():
     return _cpp_backend
 
 
+def supports_xpu_native_intranode() -> bool:
+    if get_runtime_backend_name() != 'xpu' or not CPP_RUNTIME_AVAILABLE:
+        return False
+    if hasattr(_cpp_backend, 'supports_xpu_native_intranode'):
+        return _cpp_backend.supports_xpu_native_intranode()
+    required_methods = ('get_dispatch_layout', 'intranode_dispatch', 'intranode_combine')
+    return all(hasattr(_cpp_backend.Buffer, name) for name in required_methods)
+
+
 def _get_default_device_type() -> str:
     try:
         return torch.get_default_device().type
@@ -76,7 +85,10 @@ def get_runtime_backend_name() -> str:
 
 
 def supports_native_runtime() -> bool:
-    return CPP_RUNTIME_AVAILABLE and get_runtime_backend_name() != 'xpu'
+    runtime_backend = get_runtime_backend_name()
+    if runtime_backend == 'xpu':
+        return supports_xpu_native_intranode()
+    return CPP_RUNTIME_AVAILABLE
 
 
 def supports_intranode() -> bool:
@@ -89,8 +101,10 @@ def supports_internode() -> bool:
 
 
 def supports_low_latency() -> bool:
-    return supports_native_runtime()
+    runtime_backend = get_runtime_backend_name()
+    return runtime_backend == 'xpu' or supports_native_runtime()
 
 
 def using_python_backend() -> bool:
-    return get_runtime_backend_name() == 'xpu' or not supports_native_runtime()
+    runtime_backend = get_runtime_backend_name()
+    return (runtime_backend == 'xpu' and not supports_native_runtime()) or not CPP_RUNTIME_AVAILABLE
