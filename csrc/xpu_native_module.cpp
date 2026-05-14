@@ -65,6 +65,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
+        .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", &is_sm90_compiled);
