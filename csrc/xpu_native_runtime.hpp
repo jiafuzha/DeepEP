@@ -4,6 +4,7 @@
 #include <torch/types.h>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "event.hpp"
@@ -31,7 +32,7 @@ private:
     int num_rdma_ranks = 1;
     int num_nvl_ranks = 1;
 
-    RuntimeStream comm_stream;
+    std::optional<RuntimeStream> comm_stream;
     bool available = false;
     bool explicitly_destroy = false;
     bool destroyed = false;
@@ -67,6 +68,7 @@ public:
     void low_latency_update_mask_buffer(int rank_to_mask, bool mask);
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
     void low_latency_clean_mask_buffer();
+    void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
     torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const;
 };
 

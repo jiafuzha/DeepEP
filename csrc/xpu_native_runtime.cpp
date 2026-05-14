@@ -2,6 +2,7 @@
 
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
 #include <torch/python.h>
 
 #include <cstring>
@@ -18,6 +19,23 @@
 #endif
 
 namespace {
+
+sycl::queue make_init_queue_for_device(int device_index) {
+    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+    EP_HOST_ASSERT(device_index >= 0 && device_index < static_cast<int>(devices.size()));
+    auto& device = devices[device_index];
+    EP_HOST_ASSERT(device.get_backend() == sycl::backend::ext_oneapi_level_zero);
+    return sycl::queue(device);
+}
+
+void zero_symmetric_buffer(void* ptr, size_t num_bytes, int device_index) {
+    if (ptr == nullptr || num_bytes == 0) {
+        return;
+    }
+    auto queue = make_init_queue_for_device(device_index);
+    queue.memset(ptr, 0, num_bytes);
+    queue.wait_and_throw();
+}
 
 }  // namespace
 
@@ -48,8 +66,12 @@ std::vector<uint8_t> get_unique_id() {
 int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode) {
 #if defined(DEEPEP_USE_ISHMEM)
     ishmemx_uniqueid_t root_unique_id;
-    ishmemx_attr_t attr;
+    ishmemx_attr_t attr{};
     std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(ishmemx_uniqueid_t));
+    attr.runtime = ISHMEMX_RUNTIME_MPI;
+    attr.initialize_runtime = true;
+    attr.gpu = true;
+    attr.device_idx = c10::xpu::current_device();
     attr.use_uid = true;
     attr.uid = &root_unique_id;
     attr.rank = rank;
@@ -130,7 +152,6 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       rank(rank),
       num_ranks(num_ranks),
-      comm_stream(get_stream_from_pool(true)),
       explicitly_destroy(explicitly_destroy) {
     (void)use_fabric;
 
@@ -157,9 +178,7 @@ Buffer::Buffer(int rank,
     num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS);
     num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
 
-    auto& queue = c10::xpu::XPUStream(comm_stream).queue();
-    EP_HOST_ASSERT(queue.get_backend() == sycl::backend::ext_oneapi_level_zero &&
-                   "DeepEP XPU native runtime requires a Level Zero-backed SYCL queue");
+    auto queue = make_init_queue_for_device(device_id);
     num_device_sms = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
     EP_HOST_ASSERT(num_device_sms > 0);
 
@@ -218,7 +237,8 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
 }
 
 torch::Stream Buffer::get_comm_stream() const {
-    return comm_stream;
+    EP_HOST_ASSERT(comm_stream.has_value());
+    return comm_stream.value();
 }
 
 void Buffer::sync_internode_runtime(const pybind11::object& root_unique_id_obj) {
@@ -227,12 +247,32 @@ void Buffer::sync_internode_runtime(const pybind11::object& root_unique_id_obj) 
     }
 
     EP_HOST_ASSERT(!root_unique_id_obj.is_none());
-    throw std::runtime_error(
-        "DeepEP XPU native RDMA buffer ownership cannot be enabled with the installed iSHMEM/oneAPI stack: "
-        "`ishmem_align()` returns symmetric memory, but the public host API exposes no host-safe initialization or pointer-export path for it. "
-        "`ishmem_ptr()` is device-only (`ISHMEM_DEVICE_ATTRIBUTES`), SYCL/UR queue operations on the returned pointer fail with "
-        "`UR_RESULT_ERROR_INVALID_ARGUMENT`, and direct host access to that pointer segfaults in this environment. "
-        "A usable XPU runtime owner needs either an iSHMEM host API for symmetric-buffer initialization/export or a Level Zero/UR external-memory import path for iSHMEM allocations.");
+    auto root_unique_id_bytes = root_unique_id_obj.cast<pybind11::bytearray>();
+    auto root_unique_id_str = root_unique_id_bytes.cast<std::string>();
+    std::vector<uint8_t> root_unique_id(root_unique_id_bytes.size());
+    std::memcpy(root_unique_id.data(), root_unique_id_str.data(), root_unique_id_bytes.size());
+    auto transport_rank = low_latency_mode ? rank : rdma_rank;
+    auto transport_num_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+    EP_HOST_ASSERT(transport_rank == internode::init(root_unique_id, transport_rank, transport_num_ranks, low_latency_mode));
+    transport_initialized = true;
+    internode::barrier();
+
+    rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+    EP_HOST_ASSERT(rdma_buffer_ptr != nullptr);
+    zero_symmetric_buffer(rdma_buffer_ptr, num_rdma_bytes, device_id);
+
+    if (enable_shrink) {
+        int num_mask_buffer_bytes = num_ranks * static_cast<int>(sizeof(int));
+        int num_sync_buffer_bytes = num_ranks * static_cast<int>(sizeof(int));
+        mask_buffer_ptr = reinterpret_cast<int*>(internode::alloc(num_mask_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES));
+        sync_buffer_ptr = reinterpret_cast<int*>(internode::alloc(num_sync_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES));
+        EP_HOST_ASSERT(mask_buffer_ptr != nullptr && sync_buffer_ptr != nullptr);
+        zero_symmetric_buffer(mask_buffer_ptr, num_mask_buffer_bytes, device_id);
+        zero_symmetric_buffer(sync_buffer_ptr, num_sync_buffer_bytes, device_id);
+    }
+
+    internode::barrier();
+    comm_stream = get_stream_from_pool(true);
 }
 
 void Buffer::sync(const std::vector<int>& device_ids,
@@ -277,18 +317,42 @@ void Buffer::destroy() {
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr && "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 && rank_to_mask < num_ranks);
-    internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, get_current_stream());
+    internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, get_comm_stream());
 }
 
 void Buffer::low_latency_query_mask_buffer(const torch::Tensor& mask_status) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr && "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == num_ranks && mask_status.scalar_type() == torch::kInt32);
-    internode_ll::query_mask_buffer(mask_buffer_ptr, num_ranks, reinterpret_cast<int*>(mask_status.data_ptr()), get_current_stream());
+    internode_ll::query_mask_buffer(mask_buffer_ptr, num_ranks, reinterpret_cast<int*>(mask_status.data_ptr()), get_comm_stream());
 }
 
 void Buffer::low_latency_clean_mask_buffer() {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr && "Shrink mode must be enabled");
-    internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, get_current_stream());
+    internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, get_comm_stream());
+}
+
+void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+    EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(rdma_buffer_ptr != nullptr);
+
+    auto layout = LowLatencyLayout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    auto clean_meta_0 = layout.buffers[0].clean_meta();
+    auto clean_meta_1 = layout.buffers[1].clean_meta();
+
+    auto check_boundary = [this](const int* ptr, int num_ints) {
+        auto offset = reinterpret_cast<int64_t>(ptr) - reinterpret_cast<int64_t>(rdma_buffer_ptr);
+        auto num_bytes = static_cast<int64_t>(num_ints) * static_cast<int64_t>(sizeof(int));
+        EP_HOST_ASSERT(0 <= offset && offset + num_bytes <= num_rdma_bytes);
+    };
+    check_boundary(clean_meta_0.first, clean_meta_0.second);
+    check_boundary(clean_meta_1.first, clean_meta_1.second);
+
+    auto& queue = c10::xpu::XPUStream(get_comm_stream()).queue();
+    internode::barrier();
+    queue.memset(clean_meta_0.first, 0, static_cast<size_t>(clean_meta_0.second) * sizeof(int));
+    queue.memset(clean_meta_1.first, 0, static_cast<size_t>(clean_meta_1.second) * sizeof(int));
+    queue.wait_and_throw();
+    internode::barrier();
 }
 
 torch::Tensor Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
