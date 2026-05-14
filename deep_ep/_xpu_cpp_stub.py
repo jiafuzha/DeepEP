@@ -27,5 +27,8 @@ def is_sm90_compiled() -> bool:
 
 
 def get_low_latency_rdma_size_hint(*_args, **_kwargs) -> int:
-    raise NotImplementedError('Low-latency kernels are not available in the Python XPU backend')
+    return 0
 
+
+def supports_xpu_native_intranode() -> bool:
+    return False

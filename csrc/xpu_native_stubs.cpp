@@ -12,34 +12,6 @@ namespace {
 
 namespace deep_ep {
 
-namespace intranode {
-
-void barrier(int**, int, int, cudaStream_t) { throw_xpu_unported("intranode::barrier"); }
-
-void notify_dispatch(const int*, int*, int, const int*, int*, int, int, const bool*, int*, int*, int, int, void**, int**, int, cudaStream_t, int) {
-    throw_xpu_unported("intranode::notify_dispatch");
-}
-
-void cached_notify_dispatch(const int*, int, void**, int**, int, int, cudaStream_t) {
-    throw_xpu_unported("intranode::cached_notify_dispatch");
-}
-
-void dispatch(void*, float*, int*, topk_idx_t*, float*, int*, int*, const void*, const float*, const topk_idx_t*, const float*, const bool*,
-              const int*, int, int, int, int, int, int, int, int, void**, int, int, cudaStream_t, int, int, int) {
-    throw_xpu_unported("intranode::dispatch");
-}
-
-void cached_notify_combine(void**, int*, int, int, int, int**, int, int, cudaStream_t) {
-    throw_xpu_unported("intranode::cached_notify_combine");
-}
-
-void combine(cudaDataType_t, void*, float*, const void*, const float*, const void*, const void*, const int*, const int*, const int*, int*,
-             int, int, int, int, void**, int, int, cudaStream_t, int, int, int) {
-    throw_xpu_unported("intranode::combine");
-}
-
-}  // namespace intranode
-
 namespace internode {
 
 int get_source_meta_bytes() {

@@ -6,6 +6,11 @@
 #include <type_traits>
 #include <utility>
 
+#if defined(DEEPEP_XPU_NATIVE)
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <sycl/ext/oneapi/free_function_queries.hpp>
+#endif
+
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                     \
     {                                                                                                                                 \
         constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                                                                             \
@@ -32,6 +37,49 @@
     }
 
 namespace deep_ep {
+
+#if defined(DEEPEP_XPU_NATIVE)
+namespace xpu_named_barrier {
+
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+extern SYCL_EXTERNAL void named_barrier_init(int id);
+
+template <int N>
+EP_DEVICE EP_FORCEINLINE void init() {
+    if constexpr (N > 0) {
+        init<N - 1>();
+        named_barrier_init(N - 1);
+    }
+}
+
+EP_DEVICE EP_FORCEINLINE void wait(uint8_t id) {
+    asm volatile("nbarrier.wait %0(0,0)<0;1,0>\n" ::"rw"(id));
+}
+
+EP_DEVICE EP_FORCEINLINE void signal(uint8_t id, uint8_t num_threads) {
+    asm volatile("nbarrier.signal %0(0,0)<0;1,0> %1(0,0)<0;1,0>\n" ::"rw"(id), "rw"(num_threads));
+}
+
+EP_DEVICE EP_FORCEINLINE void sync(uint8_t id, uint8_t num_threads) {
+    signal(id, num_threads);
+    wait(id);
+}
+#else
+template <int N>
+EP_DEVICE EP_FORCEINLINE void init() {}
+EP_DEVICE EP_FORCEINLINE void wait(uint8_t) {}
+EP_DEVICE EP_FORCEINLINE void signal(uint8_t, uint8_t) {}
+EP_DEVICE EP_FORCEINLINE void sync(uint8_t, uint8_t) {}
+#endif
+
+}  // namespace xpu_named_barrier
+
+EP_DEVICE EP_FORCEINLINE void visa_spin_hint() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+    asm volatile("pause\n");
+#endif
+}
+#endif
 
 namespace backend_primitives {
 
@@ -459,7 +507,7 @@ __device__ __forceinline__ float exp2f_approx(const float& x) {
 
 EP_DEVICE EP_FORCEINLINE int get_lane_id() {
 #if defined(DEEPEP_XPU_NATIVE)
-    return 0;
+    return static_cast<int>(sycl::ext::oneapi::this_work_item::get_sub_group().get_local_linear_id());
 #else
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
@@ -467,9 +515,60 @@ EP_DEVICE EP_FORCEINLINE int get_lane_id() {
 #endif
 }
 
+template <typename T>
+EP_DEVICE EP_FORCEINLINE T warp_shuffle(T value, int src_lane_idx) {
+#if defined(DEEPEP_XPU_NATIVE)
+    return sycl::select_from_group(sycl::ext::oneapi::this_work_item::get_sub_group(), value, src_lane_idx);
+#else
+    return __shfl_sync(0xffffffff, value, src_lane_idx);
+#endif
+}
+
+template <typename T>
+EP_DEVICE EP_FORCEINLINE T warp_shuffle_xor(T value, int lane_mask) {
+#if defined(DEEPEP_XPU_NATIVE)
+    return sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), value, lane_mask);
+#else
+    return __shfl_xor_sync(0xffffffff, value, lane_mask);
+#endif
+}
+
+EP_DEVICE EP_FORCEINLINE void warp_sync() {
+#if defined(DEEPEP_XPU_NATIVE)
+    sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+#else
+    __syncwarp();
+#endif
+}
+
+EP_DEVICE EP_FORCEINLINE bool warp_all(bool predicate) {
+#if defined(DEEPEP_XPU_NATIVE)
+    return sycl::all_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), predicate);
+#else
+    return __all_sync(0xffffffff, predicate);
+#endif
+}
+
+EP_DEVICE EP_FORCEINLINE bool warp_any(bool predicate) {
+#if defined(DEEPEP_XPU_NATIVE)
+    return sycl::any_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), predicate);
+#else
+    return __any_sync(0xffffffff, predicate);
+#endif
+}
+
+EP_DEVICE EP_FORCEINLINE uint64_t device_clock64() {
+#if defined(DEEPEP_XPU_NATIVE)
+    using clock_scope = sycl::ext::oneapi::experimental::clock_scope;
+    return sycl::ext::oneapi::experimental::clock<clock_scope::device>();
+#else
+    return clock64();
+#endif
+}
+
 EP_DEVICE EP_FORCEINLINE uint32_t elect_one_sync() {
 #if defined(DEEPEP_XPU_NATIVE)
-    return 1;
+    return get_lane_id() == 0;
 #else
 #ifndef DISABLE_SM90_FEATURES
     uint32_t pred = 0;
@@ -613,17 +712,12 @@ EP_DEVICE EP_FORCEINLINE void unpack2(const dtype_b_t& packed, dtype_a_t& x, dty
 template <typename dtype_t>
 EP_DEVICE EP_FORCEINLINE dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
-#if defined(DEEPEP_XPU_NATIVE)
-    (void)src_lane_idx;
-    return ptr;
-#else
     auto send_int_values = reinterpret_cast<int*>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
     #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
-        recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+        recv_int_values[i] = warp_shuffle(send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t*>(recv_int_values);
-#endif
 }
 
 constexpr float kFP8Margin = 1e-4;
@@ -665,7 +759,40 @@ EP_DEVICE EP_FORCEINLINE out_dtype_t extract_required_scale_format(float value) 
 
 #if defined(DEEPEP_XPU_NATIVE)
 template <int kNumRanks, bool kSyncOnly = false>
-EP_DEVICE EP_FORCEINLINE void barrier_block(int**, int) {}
+EP_DEVICE EP_FORCEINLINE void barrier_block(int** barrier_signal_ptrs, int rank) {
+    if constexpr (not kSyncOnly) {
+        memory_fence();
+    }
+
+    const auto lane_id = get_lane_id();
+    const int epoch = backend_primitives::load_acquire_system(barrier_signal_ptrs[rank] + rank) + 1;
+    if (lane_id < kNumRanks) {
+        backend_primitives::store_release_system(barrier_signal_ptrs[lane_id] + rank, epoch);
+    }
+
+    if (lane_id < kNumRanks) {
+        int32_t* local_slot = barrier_signal_ptrs[rank] + lane_id;
+        const auto start_time = device_clock64();
+        while (true) {
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            if (*local_slot == epoch) {
+                break;
+            }
+            visa_spin_hint();
+            if (device_clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                trap();
+            }
+        }
+    }
+    xpu_named_barrier::sync(0, 32);
+}
+
+EP_DEVICE EP_FORCEINLINE void named_bar_sync(int barrier_id, int num_threads) {
+    if (num_threads > 255) {
+        trap();
+    }
+    xpu_named_barrier::sync(static_cast<uint8_t>(barrier_id), static_cast<uint8_t>(num_threads));
+}
 
 EP_DEVICE EP_FORCEINLINE int atomic_cas_cta_acquire(int* addr, int x, int y) {
     auto ref = backend_primitives::atomic_ref_t<int, sycl::memory_scope::work_group>(*addr);
@@ -710,11 +837,44 @@ struct ReduceOr {
 
 template <int kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
 EP_DEVICE EP_FORCEINLINE T warp_reduce(T value, Op) {
-    (void)kIntergroupReduce;
     static_assert(kNumLanesPerGroup >= 1, "Invalid number of lanes");
+    auto op = Op{};
+    const auto lane_id = get_lane_id();
+    if constexpr (kIntergroupReduce) {
+        if constexpr (kNumLanesPerGroup <= 1)
+            value = op(value, warp_shuffle_xor(value, 1));
+        if constexpr (kNumLanesPerGroup <= 2)
+            value = op(value, warp_shuffle_xor(value, 2));
+        if constexpr (kNumLanesPerGroup <= 4)
+            value = op(value, warp_shuffle_xor(value, 4));
+        if constexpr (kNumLanesPerGroup <= 8)
+            value = op(value, warp_shuffle_xor(value, 8));
+        if constexpr (kNumLanesPerGroup <= 16)
+            value = op(value, warp_shuffle_xor(value, 16));
+    } else {
+        auto grouped_shuffle_xor = [&](int mask) {
+            const auto group_base = (lane_id / kNumLanesPerGroup) * kNumLanesPerGroup;
+            const auto intra_group_lane = lane_id - group_base;
+            return warp_shuffle(value, group_base + (intra_group_lane ^ mask));
+        };
+        if constexpr (kNumLanesPerGroup >= 32)
+            value = op(value, grouped_shuffle_xor(16));
+        if constexpr (kNumLanesPerGroup >= 16)
+            value = op(value, grouped_shuffle_xor(8));
+        if constexpr (kNumLanesPerGroup >= 8)
+            value = op(value, grouped_shuffle_xor(4));
+        if constexpr (kNumLanesPerGroup >= 4)
+            value = op(value, grouped_shuffle_xor(2));
+        if constexpr (kNumLanesPerGroup >= 2)
+            value = op(value, grouped_shuffle_xor(1));
+    }
     return value;
 }
 #else
+
+__forceinline__ __device__ void named_bar_sync(int barrier_id, int num_threads) {
+    asm volatile("bar.sync %0, %1;" ::"r"(barrier_id), "r"(num_threads));
+}
 
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
@@ -734,13 +894,13 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
 
     // Check timeout
-    auto start_time = clock64();
+    auto start_time = device_clock64();
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        if (__all_sync(0xffffffff, value <= 0))
+        if (warp_all(value <= 0))
             break;
 
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
+        if (device_clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
             printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
             trap();
         }

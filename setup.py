@@ -145,6 +145,7 @@ def get_xpu_extension():
         'csrc/xpu_native_runtime.cpp',
         'csrc/xpu_native_stubs.cpp',
         'csrc/kernels/layout.cu',
+        'csrc/kernels/intranode_xpu.cpp',
         'csrc/kernels/internode_ll_xpu.cpp',
     ]
     generated_source_dir = Path('build/xpu_native_sources')

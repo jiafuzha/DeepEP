@@ -102,7 +102,7 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
 
-        if self.runtime_backend == 'xpu':
+        if self.runtime_backend == 'xpu' and not supports_native_runtime():
             self.runtime = None
             self._xpu_backend = XpuIntranodeBuffer(self, group, low_latency_mode)
             return
@@ -237,6 +237,8 @@ class Buffer:
             return self._xpu_backend.get_comm_stream()
 
         ts: torch.Stream = self.runtime.get_comm_stream()
+        if self.runtime_backend == 'xpu':
+            return ts
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
     def get_local_buffer_tensor(self,
@@ -603,6 +605,9 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency mode is not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            self._xpu_backend.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+            return
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     # noinspection PyTypeChecker
@@ -662,6 +667,12 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency dispatch is not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, event, hook = self._xpu_backend.low_latency_dispatch(
+                x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
+                cumulative_local_expert_recv_stats, dispatch_wait_recv_cost_stats,
+                use_fp8, round_scale, use_ue8m0, async_finish, return_recv_hook)
+            return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, event, hook
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
@@ -717,6 +728,10 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency combine is not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            return self._xpu_backend.low_latency_combine(x, topk_idx, topk_weights, handle,
+                                                         use_logfmt, zero_copy, async_finish, return_recv_hook, out,
+                                                         combine_wait_recv_cost_stats)
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
@@ -736,6 +751,9 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency mask updates are not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            self._xpu_backend.low_latency_update_mask_buffer(rank_to_mask, mask)
+            return
         self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)
 
     def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
@@ -748,6 +766,9 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency mask queries are not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            self._xpu_backend.low_latency_query_mask_buffer(mask_status)
+            return
         self.runtime.low_latency_query_mask_buffer(mask_status)
 
     def low_latency_clean_mask_buffer(self):
@@ -757,6 +778,9 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency mask cleanup is not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            self._xpu_backend.low_latency_clean_mask_buffer()
+            return
         self.runtime.low_latency_clean_mask_buffer()
 
     def get_next_low_latency_combine_buffer(self, handle: object):
@@ -773,5 +797,7 @@ class Buffer:
         """
         if not supports_low_latency():
             raise NotImplementedError(f'Low-latency zero-copy buffers are not implemented on the {self.runtime_backend} backend')
+        if self._xpu_backend is not None:
+            return self._xpu_backend.get_next_low_latency_combine_buffer(handle)
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
