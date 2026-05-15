@@ -44,17 +44,6 @@ Use these mappings as first-choice migration targets.
 - `__global__`, `__device__`, `__host__`, `__host__ __device__` -> standard C++ function declarations in SYCL.
 - `__CUDA_ARCH__` conditional paths -> `__SYCL_DEVICE_ONLY__` conditional paths.
 
-### Memory Model and Allocation
-- CUDA shared memory `__shared__` -> SYCL local memory (`sycl::local_accessor`).
-- CUDA global memory -> SYCL global memory (typically USM device allocations).
-- CUDA unified memory (`cudaMallocManaged`) -> `sycl::malloc_shared`.
-- `cudaMalloc` -> `sycl::malloc_device`
-- `cudaMallocHost` -> `sycl::malloc_host`
-- `cudaMemcpy` -> `queue.memcpy`
-- `cudaMemset` -> `queue.memset`
-- `cudaFree`/`cudaFreeHost` -> `sycl::free`
-- CUDA constant memory has no SYCL 2020 direct equivalent; use explicit data plumbing or helper abstractions.
-
 ### Synchronization and Fences
 - `__syncthreads()` -> `sycl::group_barrier(group)`
 - `__syncwarp()` -> `sycl::group_barrier(sub_group)`
@@ -197,3 +186,44 @@ The migration is complete only when:
 - Cross-file references and invocations are consistent.
 - The SYCL build compiles successfully for the migrated scope.
 - Open gaps are either resolved or explicitly raised as questions.
+
+# DeepEP CUDA-to-SYCL Migration Patterns (excluding memory semantics/PTX)
+
+## 1. Kernel Structure & Launch
+- CUDA `__global__` kernels → SYCL functors/lambdas with `parallel_for`.
+- Use `sycl::nd_item<1>` for 1D block/thread mapping.
+- Host-side wrapper launches kernel via `queue.submit` and `cgh.parallel_for`.
+
+## 2. Thread/Block/Group Mapping
+- `blockIdx.x` → `item.get_group(0)`
+- `threadIdx.x` → `item.get_local_id(0)`
+- `blockDim.x` → `item.get_local_range(0)`
+- Use `item.get_sub_group()` for warp/sub-group logic.
+
+## 3. Synchronization
+- `__syncthreads()` → `item.barrier(sycl::access::fence_space::local_space)`
+- `__syncwarp()` → `sycl::group_barrier(item.get_sub_group())`
+- Partial/named barriers: use SLM counters + atomics (see utils.hpp in migrated repo).
+
+## 4. Warp/Sub-group Primitives
+- Reductions: `sycl::reduce_over_group(sg, val, sycl::plus<T>())`
+- Shuffles: `sycl::select_from_group`, `sycl::group_broadcast`
+- Voting: `sycl::any_of_group`
+
+## 5. Shared Memory & Vectorization
+- Shared memory: `sycl::local_accessor` or functor field.
+- Vector loads/stores: define `int4`/vector types, use unrolled copy macros for backend vectorization.
+- Special registers: `lane_id` → `item.get_sub_group().get_local_linear_id()`
+
+## 6. Portability & Code Structure
+- Use macros for kernel specialization (e.g., `SWITCH_RANKS` for template instantiation).
+- Buffer wrappers for pointer/size/offset logic.
+- Atomics: use `sycl::atomic_ref` with `memory_scope::system` for global atomics.
+- Error handling: replace device asserts with SYCL-compatible logging or omit in hot paths.
+
+## 7. General Recommendations
+- Always use explicit sub-group queries for portability.
+- Implement vectorization helpers to encourage efficient backend codegen.
+- Use template specialization and macro dispatch for performance-critical kernels.
+
+(Do NOT duplicate memory semantics or PTX assembly translation; see separate skill for those.)

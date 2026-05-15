@@ -1,6 +1,6 @@
 ---
-name: ptx-assembly-converter
-description: 'Convert CUDA inline PTX (bar.sync, barrier.sync, mbarrier, cp.async, fences, atomics, special registers) into SYCL-equivalent implementations for DeepEP XPU migration. Use when removing PTX from CUDA kernels and preserving synchronization/memory semantics.'
+name: memory-semantics-and-ptx-assembly-converter
+description: 'Convert CUDA inline PTX (bar.sync, barrier.sync, mbarrier, cp.async, fences, atomics, load/store, special registers) and memory semantics to SYCL-equivalent implementations for DeepEP XPU migration. Use when removing PTX or CUDA memory ordering from kernels and preserving synchronization/memory correctness.'
 argument-hint: 'Provide PTX sites or target files, required portability level (portable SYCL vs Intel-specific), and expected validation commands.'
 user-invocable: true
 ---
@@ -190,3 +190,34 @@ while (true) {
 ## Notes
 - SYCLomatic (`c2s`/`dpct`) can accelerate baseline migration, but PTX-heavy sections require manual conversion and semantic review.
 - For this repository, prioritize removing TMA/PTX coupling in `csrc/kernels/utils.cuh` and all `bar.sync`/`barrier.sync` sites in intranode/internode kernels.
+
+# Additional Migration Skills Learned from CUDA→SYCL Comparison (DeepEP SYCL Fork )
+
+## 1. PTX Barrier/Synchronization
+- **CUDA PTX:** `bar.sync`, `barrier.sync`, `mbarrier.*`, `cp.async.*`
+- **SYCL Intel-Specific:** Use `nbarrier_signal`/`nbarrier_wait` (TVISA style) for named/subset barriers; use `sycl::group_barrier` for full-group sync.
+- **SYCL Portable:** Emulate named barriers in local memory with `sycl::atomic_ref` and polling; always provide a fallback for non-Intel targets.
+
+## 2. Memory Fences and Ordering
+- **CUDA PTX:** `fence.acq_rel.sys`, `fence.acq_rel.gpu`, `fence.acq_rel.cta`
+- **SYCL:** Use `sycl::atomic_fence` with correct `memory_order` and `memory_scope`. Map `sys`→`system`, `gpu`→`device`, `cta`→`work_group`.
+
+## 3. Atomics and Memory Operations
+- **CUDA PTX:** `atom.add.release.*`, `atom.acquire.cta.shared::cta.cas`, `ld.acquire.*`, `st.release.*`
+- **SYCL:** Use `sycl::atomic_ref` with explicit ordering and scope. For loads/stores, use acquire/release orderings.
+
+## 4. SM90/TMA/Async Copy
+- **CUDA PTX:** `mbarrier.*`, `cp.async.bulk.*`
+- **SYCL:** Rewrite to explicit staged local-memory copies, double/triple buffering, and group barriers. Remove TMA dependency before porting.
+
+## 5. Special Registers and Utility
+- **CUDA PTX:** `mov.s32 ..., %laneid`, `elect.sync`, `prmt.b32`
+- **SYCL:** Use `item.get_sub_group().get_local_id()[0]` for lane id, `sycl::group_ballot`/`reduce` for election, and bitwise ops for permute.
+
+## 6. General Principles
+- Always remove all inline PTX from migrated SYCL files.
+- Validate correctness with stress/race tests after migration.
+- Guard Intel-specific code with portable SYCL fallbacks.
+
+---
+These patterns are distilled from direct comparison of CUDA and SYCL kernels in the DeepEP migration fork https://github.com/leizhenyuan/DeepEP/tree/zhenyuan_enable_intel_intranode/csrc/sycl, and should be applied to all future PTX-to-SYCL conversions in this repository.
