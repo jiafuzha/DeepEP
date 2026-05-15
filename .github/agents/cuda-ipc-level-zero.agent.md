@@ -36,6 +36,22 @@ Do not duplicate PTX/memory-semantics conversion guidance already captured in th
 - Obtain Level Zero native handles from SYCL queue/context/device.
 - Create a runtime-owned IPC manager state and register cleanup handlers.
 
+### Intranode IPC Barrier Polling Rule
+- For barrier-like polling on mapped remote memory via IPC in intranode paths, do not use `sycl::atomic_ref` loads in the polling loop.
+- Use acquire fence + plain mapped-memory load + spin hint, following the distributed-gemm pattern in:
+   https://github.com/intel-sandbox/distributed-gemm/blob/main/examples/distributed-gemm/allgather.hpp
+- Preferred pattern:
+   ```cpp
+   int32_t* local_slot = sync_buffer_ptr[rank] + tid;
+   while (true) {
+         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+         if (*local_slot == epoch) {
+               break;
+         }
+         visa_spin_hint();
+   }
+   ```
+
 2. Export Local Allocation
 - For each local device pointer, call `zeMemGetAddressRange` to get exportable base and range.
 - Call `zeMemGetIpcHandle` on base address.
