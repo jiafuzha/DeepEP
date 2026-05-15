@@ -17,6 +17,8 @@ Before migrating any code, read and apply these references:
    https://www.intel.com/content/www/us/en/docs/dpcpp-compatibility-tool/developer-guide-reference/2024-0/cuda-and-sycl-programming-model-comparison.html
 3. SYCLomatic reference/tooling:
    https://github.com/oneapi-src/SYCLomatic
+4. Existing DeepEP CUDA->SYCL migration reference:
+   https://github.com/leizhenyuan/DeepEP/tree/zhenyuan_enable_intel_intranode/csrc/sycl
 
 If web access fails, explicitly state what could not be loaded and proceed with best-effort migration based on existing repository patterns.
 
