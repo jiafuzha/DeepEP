@@ -1,3 +1,10 @@
+---
+name: nvshmem-ibgda-to-ishmem
+description: 'Automate migration of NVSHMEM and IBGDA APIs to iSHMEM equivalents for DeepEP XPU/SYCL targets, including API mapping, replacement patterns, and validation checks.'
+argument-hint: 'Provide migration scope (files/modules), whether to include host and device APIs, and expected validation commands.'
+user-invocable: true
+---
+
 # nvshmem(ibgda)-to-ishmem Migration Skill
 
 ## Purpose
