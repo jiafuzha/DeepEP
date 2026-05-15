@@ -53,6 +53,22 @@ Use these mappings as first-choice migration targets.
 - `__threadfence()` -> `sycl::atomic_fence(..., sycl::memory_scope::device)`
 - `__threadfence_system()` -> `sycl::atomic_fence(..., sycl::memory_scope::system)`
 
+### Intranode IPC Barrier Polling Rule
+- For barrier-like polling on mapped remote memory via IPC in intranode paths, do not use `sycl::atomic_ref` loads in the polling loop.
+- Use acquire fence + plain mapped-memory load + spin hint, following the distributed-gemm pattern in:
+   https://github.com/intel-sandbox/distributed-gemm/blob/main/examples/distributed-gemm/allgather.hpp
+- Preferred pattern:
+   ```cpp
+   int32_t* local_slot = sync_buffer_ptr[rank] + tid;
+   while (true) {
+         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+         if (*local_slot == epoch) {
+               break;
+         }
+         visa_spin_hint();
+   }
+   ```
+
 ### Warp Intrinsics to Group Algorithms
 - `__all_sync`/`__all` -> `sycl::all_of_group`
 - `__any_sync`/`__any` -> `sycl::any_of_group`
