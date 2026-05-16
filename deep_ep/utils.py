@@ -68,6 +68,9 @@ def check_nvlink_connections(group: dist.ProcessGroup):
     Arguments:
         group: the communication group.
     """
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return
+
     # Check NVLink connection
     # NOTES: some A100 PCIE GPUs only have pairwise NVLink connection, so that we can only use EP2
     # TODO: check all cases, all local-node GPUs in the group should be connected via NVLink

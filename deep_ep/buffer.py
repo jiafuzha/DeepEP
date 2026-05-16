@@ -1,6 +1,11 @@
 import os
+import socket
+import struct
+import tempfile
+import time
 import torch
 import torch.distributed as dist
+from contextlib import suppress
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
@@ -99,6 +104,8 @@ class Buffer:
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         ipc_handles = all_gather_object(local_ipc_handle)
+        if num_nvl_bytes > 0 and self.group_size > 1 and hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd'):
+            ipc_handles = self._exchange_xpu_ipc_fds(ipc_handles, all_gather_object)
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
@@ -134,6 +141,77 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+
+    def _exchange_xpu_ipc_fds(self, ipc_handles, all_gather_object):
+        local_fd = deep_ep_cpp._xpu_get_ipc_handle_fd(ipc_handles[self.rank])
+        if local_fd < 0:
+            raise RuntimeError('XPU IPC FD exchange required but no local FD was exported')
+
+        fd_size = struct.calcsize('i')
+        socket_path = os.path.join(tempfile.gettempdir(), f'deep_ep_xpu_ipc_{os.getpid()}_{self.rank}_{id(self)}.sock')
+        timeout_s = 30.0
+        with suppress(FileNotFoundError):
+            os.unlink(socket_path)
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(socket_path)
+            listener.listen(self.group_size)
+            listener.settimeout(timeout_s)
+            socket_paths = all_gather_object(socket_path)
+            if len(socket_paths) != self.group_size:
+                raise RuntimeError(f'XPU IPC socket path list size mismatch: {len(socket_paths)}')
+
+            for dst_rank, dst_socket_path in enumerate(socket_paths):
+                if dst_rank == self.rank:
+                    continue
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sender:
+                    sender.settimeout(timeout_s)
+                    deadline = time.monotonic() + timeout_s
+                    while True:
+                        try:
+                            sender.connect(dst_socket_path)
+                            break
+                        except (FileNotFoundError, ConnectionRefusedError) as exc:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(f'timed out connecting to XPU IPC socket for rank {dst_rank}') from exc
+                            time.sleep(0.01)
+                    sender.sendmsg([struct.pack('i', self.rank)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', local_fd))])
+
+            for _ in range(self.group_size - 1):
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout as exc:
+                    raise TimeoutError('timed out waiting for XPU IPC socket connection') from exc
+                with conn:
+                    conn.settimeout(timeout_s)
+                    try:
+                        msg, ancdata, _, _ = conn.recvmsg(fd_size, socket.CMSG_SPACE(fd_size))
+                    except socket.timeout as exc:
+                        raise TimeoutError('timed out receiving XPU IPC file descriptor') from exc
+                if len(msg) != fd_size:
+                    raise RuntimeError('failed to receive XPU IPC source rank')
+                src_rank = struct.unpack('i', msg)[0]
+                if src_rank < 0 or src_rank >= self.group_size or src_rank == self.rank:
+                    raise RuntimeError(f'invalid XPU IPC source rank received: {src_rank}')
+                remote_fd = None
+                for level, kind, data in ancdata:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        remote_fd = struct.unpack('i', data[:fd_size])[0]
+                        break
+                if remote_fd is None:
+                    raise RuntimeError(f'failed to receive XPU IPC file descriptor from rank {src_rank}')
+                try:
+                    ipc_handles[src_rank] = deep_ep_cpp._xpu_set_ipc_handle_fd(ipc_handles[src_rank], remote_fd)
+                except Exception:
+                    os.close(remote_fd)
+                    raise
+        finally:
+            listener.close()
+            with suppress(FileNotFoundError):
+                os.unlink(socket_path)
+
+        return ipc_handles
 
     def destroy(self):
         """
@@ -196,6 +274,8 @@ class Buffer:
             stream: the communication stream.
         """
         ts: torch.Stream = self.runtime.get_comm_stream()
+        if hasattr(torch, 'xpu') and torch.xpu.is_available() and ts.device_type == torch.xpu.current_stream().device_type:
+            return torch.xpu.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
     def get_local_buffer_tensor(self,

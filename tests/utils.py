@@ -11,27 +11,44 @@ import torch.distributed as dist
 from typing import Optional, Union
 
 
+def get_accelerator_device_type() -> str:
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return 'xpu'
+    return 'cuda'
+
+
+def get_accelerator_module():
+    return getattr(torch, get_accelerator_device_type())
+
+
+def get_dist_backend() -> str:
+    default_backend = 'xccl' if get_accelerator_device_type() == 'xpu' else 'nccl'
+    return os.getenv('DEEP_EP_DIST_BACKEND', default_backend)
+
+
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
+    device_type = get_accelerator_device_type()
+    accelerator = get_accelerator_module()
 
     sig = inspect.signature(dist.init_process_group)
     params = {
-        'backend': 'nccl',
+        'backend': get_dist_backend(),
         'init_method': f'tcp://{ip}:{port}',
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
     if 'device_id' in sig.parameters:
         # noinspection PyTypeChecker
-        params['device_id'] = torch.device(f'cuda:{local_rank}')
+        params['device_id'] = torch.device(f'{device_type}:{local_rank}')
     dist.init_process_group(**params)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
+    torch.set_default_device(device_type)
+    accelerator.set_device(local_rank)
 
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
@@ -98,9 +115,12 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
 
 
 def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+    device_type = get_accelerator_device_type()
+    accelerator = get_accelerator_module()
+
     # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+    accelerator.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=device_type)
 
     # Warmup
     for _ in range(num_warmups):
@@ -110,8 +130,8 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     cache.zero_()
 
     # Testing
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    start_events = [accelerator.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [accelerator.Event(enable_timing=True) for _ in range(num_tests)]
     for i in range(num_tests):
         # Record
         start_events[i].record()
@@ -119,7 +139,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
         end_events[i].record()
         if post_fn is not None:
             post_fn()
-    torch.cuda.synchronize()
+    accelerator.synchronize()
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
     return np.average(times), np.min(times), np.max(times)
@@ -178,26 +198,30 @@ def bench_kineto(fn,
                  barrier_comm_profiling: bool = False,
                  num_kernels_per_period: int = 1):
     # Profile
+    device_type = get_accelerator_device_type()
+    accelerator = get_accelerator_module()
+    profiler_activity = (torch.profiler.ProfilerActivity.XPU if device_type == 'xpu' else torch.profiler.ProfilerActivity.CUDA)
+    profiler_sort_key = 'xpu_time_total' if device_type == 'xpu' else 'cuda_time_total'
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
+        with torch.profiler.profile(activities=[profiler_activity], schedule=schedule) as prof:
             for _ in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
                 if barrier_comm_profiling:
-                    lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                    rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    lhs = torch.randn((8192, 8192), dtype=torch.float, device=device_type)
+                    rhs = torch.randn((8192, 8192), dtype=torch.float, device=device_type)
                     lhs @ rhs
-                    dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
+                    dist.all_reduce(torch.ones(1, dtype=torch.float, device=device_type))
                 for _ in range(num_tests):
                     fn()
-                torch.cuda.synchronize()
+                accelerator.synchronize()
                 prof.step()
 
     # Parse the profiling table
     assert isinstance(kernel_names, (str, tuple))
     is_tuple = isinstance(kernel_names, tuple)
-    prof_lines = prof.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
+    prof_lines = prof.key_averages().table(sort_by=profiler_sort_key, max_name_column_width=100).split('\n')
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     for name in kernel_names:
