@@ -32,8 +32,39 @@ if __name__ == '__main__':
             '-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING',
         ]
         sycl_flags = ['-O3', '-fsycl', '-DDEEP_EP_XPU']
-        sources = ['csrc/xpu/deep_ep_xpu.cpp', 'csrc/xpu/layout.sycl', 'csrc/xpu/intranode.sycl']
+        sources = ['csrc/xpu/deep_ep_xpu.cpp', 'csrc/xpu/layout.sycl', 'csrc/xpu/intranode.sycl', 'csrc/xpu/internode.sycl']
         include_dirs = [str(Path('csrc').resolve())]
+        library_dirs = []
+        extra_link_args = ['-lze_loader']
+
+        ishmem_dir = os.getenv('ISHMEM_DIR', '/opt/intel/ishmem')
+        ishmem_pkg_config = Path(ishmem_dir) / 'lib' / 'pkgconfig'
+        if ishmem_pkg_config.exists():
+            env = os.environ.copy()
+            env['PKG_CONFIG_PATH'] = f'{ishmem_pkg_config}:{env.get("PKG_CONFIG_PATH", "")}'
+            try:
+                ishmem_cflags = subprocess.check_output(['pkg-config', '--cflags', 'ishmem'], env=env, text=True).split()
+                ishmem_libs = subprocess.check_output(['pkg-config', '--libs', 'ishmem'], env=env, text=True).split()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                ishmem_cflags, ishmem_libs = [], []
+            if ishmem_cflags and ishmem_libs:
+                cxx_flags.append('-DDEEP_EP_ENABLE_ISHMEM')
+                sycl_flags.append('-DDEEP_EP_ENABLE_ISHMEM')
+                for flag in ishmem_cflags:
+                    if flag.startswith('-I'):
+                        include_dirs.append(flag[2:])
+                    else:
+                        cxx_flags.append(flag)
+                        sycl_flags.append(flag)
+                for flag in ishmem_libs:
+                    if flag.startswith('-L'):
+                        library_dirs.append(flag[2:])
+                    else:
+                        extra_link_args.append(flag)
+            else:
+                print(f'Warning: iSHMEM pkg-config metadata was found at {ishmem_pkg_config}, but flags could not be resolved')
+        else:
+            print(f'Warning: iSHMEM was not found at {ishmem_dir}; XPU internode runtime will be disabled')
 
         if "TOPK_IDX_BITS" in os.environ:
             topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
@@ -51,7 +82,9 @@ if __name__ == '__main__':
         print(' > Target: xpu')
         print(f' > Sources: {sources}')
         print(f' > Includes: {include_dirs}')
+        print(f' > Libraries: {library_dirs}')
         print(f' > Compilation flags: {extra_compile_args}')
+        print(f' > Link flags: {extra_link_args}')
         print()
 
         try:
@@ -66,9 +99,10 @@ if __name__ == '__main__':
                          ext_modules=[
                              SyclExtension(name='deep_ep_cpp',
                                            include_dirs=include_dirs,
+                                           library_dirs=library_dirs,
                                            sources=sources,
                                            extra_compile_args=extra_compile_args,
-                                           extra_link_args=['-lze_loader'])
+                                           extra_link_args=extra_link_args)
                          ],
                          cmdclass={'build_ext': BuildExtension})
         raise SystemExit

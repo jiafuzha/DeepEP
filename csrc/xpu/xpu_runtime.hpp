@@ -109,6 +109,77 @@ void launch_get_dispatch_layout(const topk_idx_t* topk_idx,
 
 size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts);
 
+namespace internode {
+
+struct SourceMeta {
+    int src_rdma_rank;
+    int is_token_in_nvl_rank_bits;
+};
+
+std::vector<uint8_t> get_unique_id();
+
+int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode);
+
+void* alloc(size_t size, size_t alignment);
+
+void free(void* ptr);
+
+void barrier();
+
+void finalize();
+
+int get_source_meta_bytes();
+
+void dispatch(void* recv_x,
+              float* recv_x_scales,
+              topk_idx_t* recv_topk_idx,
+              float* recv_topk_weights,
+              void* recv_src_meta,
+              const void* x,
+              const float* x_scales,
+              const topk_idx_t* topk_idx,
+              const float* topk_weights,
+              int* send_rdma_head,
+              int* send_nvl_head,
+              int* recv_rdma_channel_prefix_matrix,
+              int* recv_gbl_channel_prefix_matrix,
+              const int* rdma_channel_prefix_matrix,
+              const int* recv_rdma_rank_prefix_sum,
+              const int* gbl_channel_prefix_matrix,
+              const int* recv_gbl_rank_prefix_sum,
+              const bool* is_token_in_rank,
+              int num_tokens,
+              int num_recv_tokens,
+              int hidden,
+              int num_topk,
+              int rank,
+              int num_ranks,
+              sycl::queue& queue);
+
+void combine(DataType type,
+             void* combined_x,
+             float* combined_topk_weights,
+             const bool* is_combined_token_in_rank,
+             const void* x,
+             const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
+             const int* combined_rdma_head,
+             const int* combined_nvl_head,
+             const void* src_meta,
+             const int* rdma_channel_prefix_matrix,
+             const int* rdma_rank_prefix_sum,
+             const int* gbl_channel_prefix_matrix,
+             int num_tokens,
+             int num_combined_tokens,
+             int hidden,
+             int num_topk,
+             int rank,
+             int num_ranks,
+             sycl::queue& queue);
+
+}  // namespace internode
+
 namespace intranode {
 
 void notify_dispatch(const int* num_tokens_per_rank,

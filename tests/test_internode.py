@@ -6,7 +6,8 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor
+from utils import (init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, get_accelerator_device_type, hash_tensor,
+                   inplace_unique, per_token_cast_back, per_token_cast_to_fp8)
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -26,25 +27,26 @@ def test_main(args: argparse.Namespace,
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
+    device_type = get_accelerator_device_type()
 
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
     # Random data
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
-    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device_type) * rank
+    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device_type)
     x_e4m3 = per_token_cast_to_fp8(x)
     x_pure_rand_e4m3 = per_token_cast_to_fp8(x_pure_rand)
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device_type).abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
-    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device=device_type) * rank
+    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device=device_type)
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx = rank_idx.to(torch.int64)
     rank_idx.masked_fill_(topk_idx == -1, -1)
@@ -61,23 +63,23 @@ def test_main(args: argparse.Namespace,
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
 
     # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
+    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device=device_type)
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
     # Rank layout meta
-    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
-    num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
-    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device=device_type)
+    num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device=device_type)
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device=device_type)
     for i in range(num_ranks):
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         token_sel = (rank_idx == i).max(dim=-1)[0]
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device=device_type)
     for i in range(num_nodes):
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
@@ -198,8 +200,8 @@ def test_main(args: argparse.Namespace,
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
-                    bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                    bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device_type)
+                    bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device_type)
                     combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
@@ -265,7 +267,7 @@ def test_main(args: argparse.Namespace,
 
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
-            best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device='cuda')
+            best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device=device_type)
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
