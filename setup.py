@@ -4,7 +4,7 @@ import setuptools
 import importlib
 
 from pathlib import Path
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, SyclExtension
 
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
@@ -16,6 +16,63 @@ def get_nvshmem_host_lib_name(base_dir):
 
 
 if __name__ == '__main__':
+    target = os.getenv('DEEP_EP_TARGET', 'xpu').lower()
+    if target not in ('cuda', 'xpu'):
+        raise ValueError(f'Unsupported DEEP_EP_TARGET={target!r}, expected "cuda" or "xpu"')
+
+    if target == 'xpu':
+        cxx_flags = [
+            '-O3',
+            '-Wno-deprecated-declarations',
+            '-Wno-unused-variable',
+            '-Wno-sign-compare',
+            '-Wno-reorder',
+            '-Wno-attributes',
+            '-DDEEP_EP_XPU',
+            '-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING',
+        ]
+        sycl_flags = ['-O3', '-fsycl', '-DDEEP_EP_XPU']
+        sources = ['csrc/xpu/deep_ep_xpu.cpp', 'csrc/xpu/layout.sycl', 'csrc/xpu/intranode.sycl']
+        include_dirs = [str(Path('csrc').resolve())]
+
+        if "TOPK_IDX_BITS" in os.environ:
+            topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
+            if topk_idx_bits not in (32, 64):
+                raise ValueError(f'Unsupported TOPK_IDX_BITS={topk_idx_bits}, expected 32 or 64')
+            cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+            sycl_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+
+        extra_compile_args = {
+            'cxx': cxx_flags,
+            'sycl': sycl_flags,
+        }
+
+        print('Build summary:')
+        print(' > Target: xpu')
+        print(f' > Sources: {sources}')
+        print(f' > Includes: {include_dirs}')
+        print(f' > Compilation flags: {extra_compile_args}')
+        print()
+
+        try:
+            cmd = ['git', 'rev-parse', '--short', 'HEAD']
+            revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+        except Exception as _:
+            revision = ''
+
+        setuptools.setup(name='deep_ep',
+                         version='1.2.1' + revision,
+                         packages=setuptools.find_packages(include=['deep_ep']),
+                         ext_modules=[
+                             SyclExtension(name='deep_ep_cpp',
+                                           include_dirs=include_dirs,
+                                           sources=sources,
+                                           extra_compile_args=extra_compile_args,
+                                           extra_link_args=['-lze_loader'])
+                         ],
+                         cmdclass={'build_ext': BuildExtension})
+        raise SystemExit
+
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'

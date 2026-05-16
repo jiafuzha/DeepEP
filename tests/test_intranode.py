@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+from utils import init_dist, bench, calc_diff, get_accelerator_device_type, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -17,43 +17,44 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
+    device = get_accelerator_device_type()
 
     assert num_experts % num_ranks == 0
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}', flush=True)
 
     # Random data
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
-    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * rank
+    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device)
     x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device).abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
-    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device=device) * rank
+    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device=device)
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx = rank_idx.to(torch.int64)
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
 
     # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
+    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device=device)
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
     # Rank layout meta
-    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
-    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device=device)
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device=device)
     for i in range(num_ranks):
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         token_sel = (rank_idx == i).max(dim=-1)[0]
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device=device)
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
@@ -221,7 +222,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
 
         # Gather the best config from rank 0 and the first test setting
         if best_dispatch_results is None:
-            best_dispatch_results = torch.tensor([best_results[0], best_results[1]], dtype=torch.int32, device='cuda')
+            best_dispatch_results = torch.tensor([best_results[0], best_results[1]], dtype=torch.int32, device=device)
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
