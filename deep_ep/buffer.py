@@ -97,6 +97,11 @@ class Buffer:
         self.enable_shrink = enable_shrink
         self.is_xpu_runtime = hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd')
         self._xpu_internode_handle_cache = {}
+        self._xpu_low_latency_handle_cache = {}
+        self._xpu_low_latency_combine_buffer_cache = {}
+        self._xpu_low_latency_mask_status = None
+        if self.is_xpu_runtime and enable_shrink:
+            self._xpu_low_latency_mask_status = torch.zeros((self.group_size, ), dtype=torch.int32, device='xpu')
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
@@ -114,11 +119,10 @@ class Buffer:
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
             if self.is_xpu_runtime:
-                if low_latency_mode:
-                    raise RuntimeError('XPU low-latency mode is not migrated yet')
                 os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
                 if os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == os.environ.get('MASTER_PORT', ''):
                     os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(os.environ['MASTER_PORT']) + 1)
+                self.nvshmem_qp_depth = max(int(os.environ.get('ISHMEM_QP_DEPTH', '1024')), (num_qps_per_rank + 1) * 2)
             else:
                 # Enable IBGDA
                 assert num_qps_per_rank > 0
@@ -556,6 +560,21 @@ class Buffer:
     def _xpu_internode_event(self, async_finish: bool) -> EventOverlap:
         return EventOverlap(EventHandle() if async_finish else None)
 
+    @staticmethod
+    def _xpu_per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert x.dim() == 2
+        m, n = x.shape
+        aligned_n = ((n + 127) // 128) * 128
+        x_padded = torch.nn.functional.pad(x, (0, aligned_n - n), mode='constant', value=0)
+        x_view = x_padded.view(m, -1, 128)
+        x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+        x_fp8 = (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, aligned_n)[:, :n].contiguous()
+        return x_fp8, (x_amax / 448.0).contiguous()
+
+    @staticmethod
+    def _xpu_noop_hook() -> None:
+        return None
+
     def _xpu_internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                                 handle: Optional[Tuple],
                                 num_tokens_per_rank: Optional[torch.Tensor],
@@ -819,7 +838,91 @@ class Buffer:
             hidden: the hidden dimension of each token.
             num_experts: the number of all experts.
         """
+        if self.is_xpu_runtime:
+            self._xpu_low_latency_handle_cache.clear()
+            self._xpu_low_latency_combine_buffer_cache.clear()
+            if self._xpu_low_latency_mask_status is not None:
+                gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
+                self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
+            self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+            if self._xpu_low_latency_mask_status is not None:
+                for rank_to_mask, value in enumerate(self._xpu_low_latency_mask_status.cpu().tolist()):
+                    if value:
+                        self.runtime.low_latency_update_mask_buffer(rank_to_mask, True)
+            return
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+
+    def _xpu_low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                                  num_max_dispatch_tokens_per_rank: int, num_experts: int,
+                                  cumulative_local_expert_recv_stats: Optional[torch.Tensor],
+                                  use_fp8: bool, async_finish: bool, return_recv_hook: bool) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
+        assert not (async_finish and return_recv_hook)
+        assert num_experts % self.group_size == 0
+        num_tokens, hidden = x.shape
+        num_local_experts = num_experts // self.group_size
+        num_slots = self.group_size * num_max_dispatch_tokens_per_rank
+        device = x.device
+        mask_status = self._xpu_low_latency_mask_status
+        active_mask = None if mask_status is None else mask_status == 0
+
+        gathered_x = self._xpu_all_gather_tensor(x)
+        gathered_topk_idx = self._xpu_all_gather_tensor(topk_idx)
+        packed_bf16 = torch.empty((num_local_experts, num_slots, hidden), dtype=torch.bfloat16, device=device)
+        packed_bf16.zero_()
+        packed_recv_src_info = torch.empty((num_local_experts, num_slots), dtype=torch.int32, device=device)
+        packed_recv_src_info.fill_(-1)
+        packed_recv_layout_range = torch.empty((num_local_experts, self.group_size), dtype=torch.int64, device=device)
+        packed_recv_layout_range.zero_()
+        packed_recv_count = torch.empty((num_local_experts, ), dtype=torch.int32, device=device)
+        packed_recv_count.zero_()
+
+        handle_entries = []
+        local_expert_begin = self.rank * num_local_experts
+        int_mask = (1 << 32) - 1
+        for local_expert in range(num_local_experts):
+            global_expert = local_expert_begin + local_expert
+            write_offset = 0
+            for src_rank in range(self.group_size):
+                if active_mask is not None and not bool(active_mask[src_rank].item()):
+                    continue
+                src_topk = gathered_topk_idx[src_rank]
+                selected = (src_topk == global_expert).any(dim=1)
+                token_indices = torch.nonzero(selected, as_tuple=False).flatten()
+                count = int(token_indices.numel())
+                begin = write_offset
+                if count > 0:
+                    end = begin + count
+                    if end > num_slots:
+                        raise RuntimeError('XPU low-latency dispatch receive buffer is too small')
+                    packed_bf16[local_expert, begin:end].copy_(gathered_x[src_rank].index_select(0, token_indices))
+                    packed_recv_src_info[local_expert, begin:end].copy_(token_indices.to(torch.int32))
+                    handle_entries.append((local_expert, global_expert, src_rank, begin, count, token_indices.to(torch.int64)))
+                    write_offset = end
+                packed_recv_layout_range[local_expert, src_rank] = (begin << 32) | (count & int_mask)
+            packed_recv_count[local_expert] = write_offset
+
+        if cumulative_local_expert_recv_stats is not None:
+            cumulative_local_expert_recv_stats.add_(packed_recv_count)
+
+        if use_fp8:
+            flat_fp8, flat_scales = self._xpu_per_token_cast_to_fp8(packed_bf16.view(-1, hidden))
+            packed_recv_x = flat_fp8.view(num_local_experts, num_slots, hidden)
+            packed_recv_x_scales = flat_scales.view(num_local_experts, num_slots, -1)
+            recv_payload = (packed_recv_x, packed_recv_x_scales)
+        else:
+            packed_recv_x = packed_bf16
+            packed_recv_x_scales = None
+            recv_payload = packed_recv_x
+
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        self._xpu_low_latency_handle_cache[id(handle)] = {
+            'entries': handle_entries,
+            'num_tokens': num_tokens,
+            'num_local_experts': num_local_experts,
+        }
+        return recv_payload, packed_recv_count, handle, self._xpu_internode_event(
+            async_finish), self._xpu_noop_hook if return_recv_hook else None
 
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
@@ -876,6 +979,25 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        if self.is_xpu_runtime:
+            if not use_fp8 and not use_ue8m0:
+                packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+                    self.runtime.low_latency_dispatch(x, topk_idx,
+                                                      cumulative_local_expert_recv_stats,
+                                                      dispatch_wait_recv_cost_stats,
+                                                      num_max_dispatch_tokens_per_rank, num_experts,
+                                                      use_fp8, round_scale, use_ue8m0,
+                                                      async_finish, return_recv_hook)
+                handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+                tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range,
+                                     cumulative_local_expert_recv_stats)
+                return packed_recv_x, packed_recv_count, handle, \
+                    EventOverlap(event, tensors_to_record if async_finish else None), hook
+            packed_recv_x, packed_recv_count, handle, event, hook = self._xpu_low_latency_dispatch(
+                x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, cumulative_local_expert_recv_stats, use_fp8, async_finish,
+                return_recv_hook)
+            tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_count, cumulative_local_expert_recv_stats)
+            return packed_recv_x, packed_recv_count, handle, EventOverlap(event.event, tensors_to_record if async_finish else None), hook
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
@@ -889,6 +1011,37 @@ class Buffer:
                              packed_recv_layout_range, cumulative_local_expert_recv_stats)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
+
+    def _xpu_low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor, handle: tuple,
+                                 async_finish: bool, return_recv_hook: bool,
+                                 out: Optional[torch.Tensor]) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        assert not (async_finish and return_recv_hook)
+        cache = self._xpu_low_latency_handle_cache.get(id(handle))
+        if cache is None:
+            raise RuntimeError('missing XPU low-latency combine metadata')
+        _, _, _, hidden, num_experts = handle
+        num_combined_tokens = topk_idx.size(0)
+        contributions = []
+        for local_expert, global_expert, src_rank, begin, count, token_indices in cache['entries']:
+            if count == 0:
+                continue
+            values = x[local_expert, begin:begin + count].detach().cpu()
+            contributions.append((global_expert, src_rank, token_indices.cpu(), values))
+        gathered = [None] * self.group_size
+        dist.all_gather_object(gathered, contributions, self.group)
+
+        combined_x = out if out is not None else torch.empty((num_combined_tokens, hidden), dtype=x.dtype, device=x.device)
+        combined_x.zero_()
+        for rank_contribs in gathered:
+            for global_expert, src_rank, token_indices_cpu, values_cpu in rank_contribs:
+                if src_rank != self.rank:
+                    continue
+                token_indices = token_indices_cpu.to(device=x.device, dtype=torch.long)
+                values = values_cpu.to(device=x.device, dtype=x.dtype)
+                weight_mask = topk_idx.index_select(0, token_indices) == global_expert
+                weights = topk_weights.index_select(0, token_indices).masked_fill(~weight_mask, 0).sum(dim=1).to(x.dtype)
+                combined_x.index_add_(0, token_indices, values * weights.view(-1, 1))
+        return combined_x, self._xpu_internode_event(async_finish), self._xpu_noop_hook if return_recv_hook else None
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
@@ -929,6 +1082,18 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        if self.is_xpu_runtime:
+            if id(handle) not in self._xpu_low_latency_handle_cache:
+                src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+                combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
+                                                                           combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                                                                           num_experts, use_logfmt, zero_copy, async_finish,
+                                                                           return_recv_hook, out)
+                tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
+                return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+            combined_x, event, hook = self._xpu_low_latency_combine(x, topk_idx, topk_weights, handle, async_finish, return_recv_hook, out)
+            tensors_to_record = (x, topk_idx, topk_weights, combined_x)
+            return combined_x, EventOverlap(event.event, tensors_to_record if async_finish else None), hook
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
@@ -946,6 +1111,11 @@ class Buffer:
             mask: if True, will mask the rank (do not recvfrom/sendto the rank), otherwise will unmask the rank.
 
         """
+        if self.is_xpu_runtime:
+            if self._xpu_low_latency_mask_status is None:
+                raise RuntimeError('XPU low-latency shrink mode is not enabled')
+            self._xpu_low_latency_mask_status[rank_to_mask] = 1 if mask else 0
+            return
         self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)
 
     def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
@@ -956,6 +1126,13 @@ class Buffer:
             mask_status: `[num_ranks]` with `torch.int`, the mask status of each rank. `1` means mask and `0` means unmasked.
 
         """
+        if self.is_xpu_runtime:
+            if self._xpu_low_latency_mask_status is None:
+                raise RuntimeError('XPU low-latency shrink mode is not enabled')
+            gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
+            self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
+            mask_status.copy_(self._xpu_low_latency_mask_status.to(mask_status.device))
+            return
         self.runtime.low_latency_query_mask_buffer(mask_status)
 
     def low_latency_clean_mask_buffer(self):
@@ -963,6 +1140,11 @@ class Buffer:
         Clean the mask buffer
 
         """
+        if self.is_xpu_runtime:
+            if self._xpu_low_latency_mask_status is None:
+                raise RuntimeError('XPU low-latency shrink mode is not enabled')
+            self._xpu_low_latency_mask_status.zero_()
+            return
         self.runtime.low_latency_clean_mask_buffer()
 
     def get_next_low_latency_combine_buffer(self, handle: object):
@@ -978,4 +1160,9 @@ class Buffer:
                 by yourself.
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        if self.is_xpu_runtime:
+            shape = (num_experts // self.group_size, self.group_size * num_max_dispatch_tokens_per_rank, hidden)
+            buffer = torch.empty(shape, dtype=torch.bfloat16, device=src_info.device)
+            self._xpu_low_latency_combine_buffer_cache[id(handle)] = buffer
+            return buffer
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)

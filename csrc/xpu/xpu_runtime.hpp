@@ -180,6 +180,64 @@ void combine(DataType type,
 
 }  // namespace internode
 
+namespace internode_ll {
+
+void clean_low_latency_buffer(int* clean_0,
+                              int num_clean_int_0,
+                              int* clean_1,
+                              int num_clean_int_1,
+                              int rank,
+                              int num_ranks,
+                              int* mask_buffer_ptr,
+                              int* sync_buffer_ptr,
+                              sycl::queue& queue);
+
+void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, sycl::queue& queue);
+
+void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, sycl::queue& queue);
+
+void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, sycl::queue& queue);
+
+void dispatch_bf16(void* packed_recv_x,
+                   int* packed_recv_src_info,
+                   int64_t* packed_recv_layout_range,
+                   int* packed_recv_count,
+                   int* cumulative_local_expert_recv_stats,
+                   int64_t* dispatch_wait_recv_cost_stats,
+                   void* rdma_buffer,
+                   int* mask_buffer_ptr,
+                   const void* x,
+                   const topk_idx_t* topk_idx,
+                   int num_tokens,
+                   int hidden,
+                   int num_max_dispatch_tokens_per_rank,
+                   int num_topk,
+                   int num_experts,
+                   int rank,
+                   int num_ranks,
+                   sycl::queue& queue);
+
+void combine_bf16(void* combined_x,
+                  void* rdma_buffer,
+                  int* mask_buffer_ptr,
+                  const void* x,
+                  const topk_idx_t* topk_idx,
+                  const float* topk_weights,
+                  const int* src_info,
+                  const int64_t* layout_range,
+                  int64_t* combine_wait_recv_cost_stats,
+                  int num_combined_tokens,
+                  int hidden,
+                  int num_max_dispatch_tokens_per_rank,
+                  int num_topk,
+                  int num_experts,
+                  int rank,
+                  int num_ranks,
+                  sycl::queue& queue,
+                  bool zero_copy);
+
+}  // namespace internode_ll
+
 namespace intranode {
 
 void notify_dispatch(const int* num_tokens_per_rank,
