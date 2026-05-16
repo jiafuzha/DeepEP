@@ -50,6 +50,40 @@ struct XpuIpcHandle {
 
 void check_xpu_tensor(const torch::Tensor& tensor, const char* name);
 
+struct LowLatencyBufferLayout {
+    size_t mask_offset = 0;
+    size_t sync_offset = 0;
+    size_t total_bytes = 0;
+};
+
+LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+    TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
+    const int num_local_experts = num_experts / num_ranks;
+    const size_t hidden_bytes = static_cast<size_t>(hidden) * sizeof(sycl::ext::oneapi::bfloat16);
+    const size_t num_dispatch_slots = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
+    const size_t num_send_slots = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
+    const size_t num_combine_slots = static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank;
+    size_t offset = 0;
+    auto add = [&](size_t bytes) {
+        const size_t old = offset;
+        offset = align_up<size_t>(offset + bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        return old;
+    };
+    add(num_dispatch_slots * hidden_bytes);
+    add(num_dispatch_slots * sizeof(int));
+    add(static_cast<size_t>(num_local_experts) * num_ranks * sizeof(int));
+    add(num_send_slots * hidden_bytes);
+    add(num_send_slots * sizeof(int));
+    add(static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int));
+    add(num_combine_slots * hidden_bytes);
+    add(static_cast<size_t>(num_experts) * sizeof(int));
+    LowLatencyBufferLayout layout;
+    layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
+    layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
+    layout.total_bytes = offset;
+    return layout;
+}
+
 DataType scalar_type_to_data_type(c10::ScalarType scalar_type) {
     if (scalar_type == torch::kBFloat16) {
         return DataType::kBFloat16;
@@ -102,8 +136,7 @@ std::vector<uint8_t> get_unique_id() {
     return bytes;
 }
 
-int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode) {
-    TORCH_CHECK(!low_latency_mode, "XPU low-latency iSHMEM runtime is not migrated yet");
+int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool) {
     TORCH_CHECK(root_unique_id_val.size() == sizeof(ishmemx_uniqueid_t), "unexpected iSHMEM unique ID size");
 
     int initialized = 0;
@@ -255,7 +288,11 @@ size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int 
     const size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
     const size_t signaling_buffer_bytes = static_cast<size_t>(num_experts) * sizeof(int);
     const size_t signaling_buffer_bytes_aligned = align_up<size_t>(signaling_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
-    return align_up<size_t>((send_buffer_bytes + recv_buffer_bytes + signaling_buffer_bytes_aligned) * 2, NUM_BUFFER_ALIGNMENT_BYTES);
+    const size_t legacy_hint =
+        align_up<size_t>((send_buffer_bytes + recv_buffer_bytes + signaling_buffer_bytes_aligned) * 2, NUM_BUFFER_ALIGNMENT_BYTES);
+    const size_t xpu_layout_bytes =
+        get_low_latency_buffer_layout(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
+    return std::max(legacy_hint, xpu_layout_bytes);
 }
 
 struct Buffer {
@@ -293,6 +330,11 @@ struct Buffer {
 
     void* workspace = nullptr;
     void* rdma_buffer_ptr = nullptr;
+    int* low_latency_mask_buffer_ptr = nullptr;
+    int* low_latency_sync_buffer_ptr = nullptr;
+    int low_latency_num_max_dispatch_tokens_per_rank = 0;
+    int low_latency_hidden = 0;
+    int low_latency_num_experts = 0;
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
     volatile int* moe_recv_rdma_counter = nullptr;
@@ -316,11 +358,11 @@ struct Buffer {
           comm_stream(c10::xpu::getStreamFromPool(true)) {
         TORCH_CHECK(rank >= 0 && rank < num_ranks, "rank must be in [0, num_ranks)");
         TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
-        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
         TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS || num_ranks % NUM_MAX_NVL_PEERS == 0,
                     "XPU internode ranks must be divisible by ",
                     NUM_MAX_NVL_PEERS);
-        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS, "XPU RDMA buffer is only valid for internode ranks");
+        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS || low_latency_mode,
+                    "XPU RDMA buffer is only valid for internode or low-latency ranks");
         TORCH_CHECK(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_nvl_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
         TORCH_CHECK(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_rdma_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
         TORCH_CHECK(num_rdma_ranks == 1 || num_rdma_bytes > 0, "XPU internode mode requires a non-empty RDMA buffer");
@@ -535,7 +577,9 @@ struct Buffer {
             auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
             std::vector<uint8_t> root_unique_id(root_unique_id_str.size());
             std::memcpy(root_unique_id.data(), root_unique_id_str.data(), root_unique_id.size());
-            TORCH_CHECK(internode::init(root_unique_id, rdma_rank, num_rdma_ranks, low_latency_mode) == rdma_rank,
+            const int ishmem_rank = low_latency_mode ? rank : rdma_rank;
+            const int num_ishmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+            TORCH_CHECK(internode::init(root_unique_id, ishmem_rank, num_ishmem_ranks, low_latency_mode) == ishmem_rank,
                         "XPU iSHMEM initialized with an unexpected rank");
             internode::barrier();
             rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
@@ -1133,7 +1177,7 @@ struct Buffer {
                        bool allocate_on_comm_stream) {
         pybind11::gil_scoped_release release;
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
-        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
+        TORCH_CHECK(!low_latency_mode, "XPU internode_dispatch requires a high-throughput buffer, not a low-latency buffer");
         TORCH_CHECK(num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr, "XPU internode_dispatch requires an iSHMEM RDMA buffer");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_dispatch currently supports BF16 tensors only");
         TORCH_CHECK(!x_scales.has_value(), "XPU internode_dispatch FP8/x_scales path is not migrated yet");
@@ -1298,7 +1342,7 @@ struct Buffer {
         bool async,
         bool allocate_on_comm_stream) {
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_combine");
-        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
+        TORCH_CHECK(!low_latency_mode, "XPU internode_combine requires a high-throughput buffer, not a low-latency buffer");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_combine currently supports BF16 tensors only");
         check_xpu_tensor(x, "x");
         check_xpu_tensor(src_meta, "src_meta");
@@ -1401,16 +1445,220 @@ struct Buffer {
         return {combined_x, combined_topk_weights, event};
     }
 
-    void clean_low_latency_buffer(int, int, int) { TORCH_CHECK(false, "XPU low-latency clean kernel is not migrated yet"); }
+    void configure_low_latency_layout(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+        TORCH_CHECK(low_latency_mode, "XPU low-latency APIs require a low-latency buffer");
+        TORCH_CHECK(rdma_buffer_ptr != nullptr, "XPU low-latency APIs require an RDMA/iSHMEM buffer");
+        auto layout = get_low_latency_buffer_layout(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+        TORCH_CHECK(layout.total_bytes <= static_cast<size_t>(num_rdma_bytes),
+                    "XPU RDMA buffer is too small for low-latency mode: need ",
+                    layout.total_bytes,
+                    " bytes, got ",
+                    num_rdma_bytes);
+        low_latency_mask_buffer_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_buffer_ptr) + layout.mask_offset);
+        low_latency_sync_buffer_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_buffer_ptr) + layout.sync_offset);
+        low_latency_num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank;
+        low_latency_hidden = hidden;
+        low_latency_num_experts = num_experts;
+    }
 
-    void low_latency_update_mask_buffer(int, bool) { TORCH_CHECK(false, "XPU low-latency mask update is not migrated yet"); }
+    void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+        configure_low_latency_layout(num_max_dispatch_tokens_per_rank, hidden, num_experts);
+        internode_ll::clean_low_latency_buffer(static_cast<int*>(rdma_buffer_ptr),
+                                               static_cast<int>(num_rdma_bytes / sizeof(int)),
+                                               nullptr,
+                                               0,
+                                               rank,
+                                               num_ranks,
+                                               low_latency_mask_buffer_ptr,
+                                               low_latency_sync_buffer_ptr,
+                                               comm_stream.queue());
+        comm_stream.queue().wait_and_throw();
+    }
 
-    void low_latency_query_mask_buffer(const torch::Tensor&) { TORCH_CHECK(false, "XPU low-latency mask query is not migrated yet"); }
+    void low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
+        TORCH_CHECK(low_latency_mask_buffer_ptr != nullptr,
+                    "low-latency buffer layout is not configured; call clean_low_latency_buffer first");
+        TORCH_CHECK(rank_to_mask >= 0 && rank_to_mask < num_ranks, "rank_to_mask out of range");
+        internode_ll::update_mask_buffer(low_latency_mask_buffer_ptr, rank_to_mask, mask, comm_stream.queue());
+    }
 
-    void low_latency_clean_mask_buffer() { TORCH_CHECK(false, "XPU low-latency mask clean is not migrated yet"); }
+    void low_latency_query_mask_buffer(const torch::Tensor& output_mask_tensor) {
+        TORCH_CHECK(low_latency_mask_buffer_ptr != nullptr,
+                    "low-latency buffer layout is not configured; call clean_low_latency_buffer first");
+        check_xpu_tensor(output_mask_tensor, "output_mask_tensor");
+        TORCH_CHECK(output_mask_tensor.scalar_type() == torch::kInt32 && output_mask_tensor.numel() >= num_ranks,
+                    "output_mask_tensor must be int32 with at least num_ranks elements");
+        internode_ll::query_mask_buffer(low_latency_mask_buffer_ptr, num_ranks, output_mask_tensor.data_ptr<int>(), comm_stream.queue());
+    }
 
-    torch::Tensor get_next_low_latency_combine_buffer(int, int, int) const {
-        TORCH_CHECK(false, "XPU low-latency combine buffer is not migrated yet");
+    void low_latency_clean_mask_buffer() {
+        TORCH_CHECK(low_latency_mask_buffer_ptr != nullptr,
+                    "low-latency buffer layout is not configured; call clean_low_latency_buffer first");
+        internode_ll::clean_mask_buffer(low_latency_mask_buffer_ptr, num_ranks, comm_stream.queue());
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, EventHandle, pybind11::object>
+    low_latency_dispatch(const torch::Tensor& x,
+                         const torch::Tensor& topk_idx,
+                         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                         const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                         int num_max_dispatch_tokens_per_rank,
+                         int num_experts,
+                         bool use_fp8,
+                         bool,
+                         bool use_ue8m0,
+                         bool async_finish,
+                         bool return_recv_hook) {
+        TORCH_CHECK(is_available(), "XPU Buffer must be synced before low_latency_dispatch");
+        TORCH_CHECK(low_latency_mode, "low_latency_dispatch requires a low-latency buffer");
+        TORCH_CHECK(!use_fp8 && !use_ue8m0, "XPU kernel-backed low_latency_dispatch currently supports BF16 output only");
+        TORCH_CHECK(!(async_finish && return_recv_hook), "async_finish and return_recv_hook cannot both be true");
+        check_xpu_tensor(x, "x");
+        check_xpu_tensor(topk_idx, "topk_idx");
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
+        TORCH_CHECK(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value, "topk_idx dtype mismatch");
+        TORCH_CHECK(x.dim() == 2 && topk_idx.dim() == 2 && topk_idx.size(0) == x.size(0), "low-latency dispatch shape mismatch");
+        if (cumulative_local_expert_recv_stats.has_value()) {
+            check_xpu_tensor(*cumulative_local_expert_recv_stats, "cumulative_local_expert_recv_stats");
+            TORCH_CHECK(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt32, "stats must be int32");
+        }
+        if (dispatch_wait_recv_cost_stats.has_value()) {
+            check_xpu_tensor(*dispatch_wait_recv_cost_stats, "dispatch_wait_recv_cost_stats");
+            TORCH_CHECK(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64, "wait stats must be int64");
+        }
+        const int num_tokens = static_cast<int>(x.size(0));
+        const int hidden = static_cast<int>(x.size(1));
+        const int num_topk = static_cast<int>(topk_idx.size(1));
+        const int num_local_experts = num_experts / num_ranks;
+        configure_low_latency_layout(num_max_dispatch_tokens_per_rank, hidden, num_experts);
+
+        auto compute_stream = c10::xpu::getCurrentXPUStream();
+        if (comm_stream != compute_stream) {
+            stream_wait(comm_stream, compute_stream);
+        }
+        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden}, x.options());
+        auto int_options = x.options().dtype(torch::kInt32);
+        auto long_options = x.options().dtype(torch::kInt64);
+        auto packed_recv_count = torch::empty({num_local_experts}, int_options);
+        auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, int_options);
+        auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, long_options);
+
+        internode_ll::dispatch_bf16(
+            packed_recv_x.data_ptr(),
+            packed_recv_src_info.data_ptr<int>(),
+            packed_recv_layout_range.data_ptr<int64_t>(),
+            packed_recv_count.data_ptr<int>(),
+            cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+            dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+            rdma_buffer_ptr,
+            low_latency_mask_buffer_ptr,
+            x.data_ptr(),
+            topk_idx.data_ptr<topk_idx_t>(),
+            num_tokens,
+            hidden,
+            num_max_dispatch_tokens_per_rank,
+            num_topk,
+            num_experts,
+            rank,
+            num_ranks,
+            comm_stream.queue());
+
+        EventHandle event(comm_stream);
+        if (!async_finish && comm_stream != compute_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
+        pybind11::object hook = pybind11::none();
+        if (return_recv_hook) {
+            hook = pybind11::cpp_function([]() {});
+        }
+        return {packed_recv_x, std::nullopt, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook};
+    }
+
+    std::tuple<torch::Tensor, EventHandle, pybind11::object> low_latency_combine(
+        const torch::Tensor& x,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& src_info,
+        const torch::Tensor& layout_range,
+        const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
+        int num_max_dispatch_tokens_per_rank,
+        int num_experts,
+        bool use_logfmt,
+        bool zero_copy,
+        bool async_finish,
+        bool return_recv_hook,
+        const std::optional<torch::Tensor>& out) {
+        TORCH_CHECK(is_available(), "XPU Buffer must be synced before low_latency_combine");
+        TORCH_CHECK(low_latency_mode, "low_latency_combine requires a low-latency buffer");
+        TORCH_CHECK(!use_logfmt, "XPU kernel-backed low_latency_combine does not support LogFMT");
+        TORCH_CHECK(!(async_finish && return_recv_hook), "async_finish and return_recv_hook cannot both be true");
+        check_xpu_tensor(x, "x");
+        check_xpu_tensor(topk_idx, "topk_idx");
+        check_xpu_tensor(topk_weights, "topk_weights");
+        check_xpu_tensor(src_info, "src_info");
+        check_xpu_tensor(layout_range, "layout_range");
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
+        TORCH_CHECK(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value, "topk_idx dtype mismatch");
+        TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32, "topk_weights must be float32");
+        TORCH_CHECK(src_info.scalar_type() == torch::kInt32 && layout_range.scalar_type() == torch::kInt64,
+                    "combine handle tensors have invalid dtypes");
+        if (combine_wait_recv_cost_stats.has_value()) {
+            check_xpu_tensor(*combine_wait_recv_cost_stats, "combine_wait_recv_cost_stats");
+            TORCH_CHECK(combine_wait_recv_cost_stats->scalar_type() == torch::kInt64, "wait stats must be int64");
+        }
+        const int hidden = static_cast<int>(x.size(2));
+        const int num_combined_tokens = static_cast<int>(topk_idx.size(0));
+        const int num_topk = static_cast<int>(topk_idx.size(1));
+        configure_low_latency_layout(num_max_dispatch_tokens_per_rank, hidden, num_experts);
+
+        auto compute_stream = c10::xpu::getCurrentXPUStream();
+        if (comm_stream != compute_stream) {
+            stream_wait(comm_stream, compute_stream);
+        }
+        torch::Tensor combined_x;
+        if (out.has_value()) {
+            check_xpu_tensor(*out, "out");
+            TORCH_CHECK(
+                out->scalar_type() == x.scalar_type() && out->dim() == 2 && out->size(0) == num_combined_tokens && out->size(1) == hidden,
+                "out shape or dtype mismatch");
+            combined_x = *out;
+        } else {
+            combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        }
+        internode_ll::combine_bf16(combined_x.data_ptr(),
+                                   rdma_buffer_ptr,
+                                   low_latency_mask_buffer_ptr,
+                                   x.data_ptr(),
+                                   topk_idx.data_ptr<topk_idx_t>(),
+                                   topk_weights.data_ptr<float>(),
+                                   src_info.data_ptr<int>(),
+                                   layout_range.data_ptr<int64_t>(),
+                                   combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                                   num_combined_tokens,
+                                   hidden,
+                                   num_max_dispatch_tokens_per_rank,
+                                   num_topk,
+                                   num_experts,
+                                   rank,
+                                   num_ranks,
+                                   comm_stream.queue(),
+                                   zero_copy);
+        EventHandle event(comm_stream);
+        if (!async_finish && comm_stream != compute_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
+        pybind11::object hook = pybind11::none();
+        if (return_recv_hook) {
+            hook = pybind11::cpp_function([]() {});
+        }
+        return {combined_x, event, hook};
+    }
+
+    torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
+        configure_low_latency_layout(num_max_dispatch_tokens_per_rank, hidden, num_experts);
+        TORCH_CHECK(
+            false,
+            "XPU get_next_low_latency_combine_buffer zero-copy path is not implemented; call low_latency_combine with zero_copy=False");
     }
 };
 
@@ -1457,14 +1705,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("internode_dispatch", &Buffer::internode_dispatch)
         .def("internode_combine", &Buffer::internode_combine)
         .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer)
-        .def("low_latency_dispatch",
-             [](Buffer&, const pybind11::args&, const pybind11::kwargs&) {
-                 TORCH_CHECK(false, "XPU low-latency dispatch kernel is not migrated yet");
-             })
-        .def("low_latency_combine",
-             [](Buffer&, const pybind11::args&, const pybind11::kwargs&) {
-                 TORCH_CHECK(false, "XPU low-latency combine kernel is not migrated yet");
-             })
+        .def("low_latency_dispatch", &Buffer::low_latency_dispatch)
+        .def("low_latency_combine", &Buffer::low_latency_combine)
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)

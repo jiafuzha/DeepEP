@@ -2,6 +2,7 @@ import os
 import subprocess
 import setuptools
 import importlib
+import torch.utils.cpp_extension as torch_cpp_extension
 
 from pathlib import Path
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, SyclExtension
@@ -13,6 +14,36 @@ def get_nvshmem_host_lib_name(base_dir):
     for file in path.rglob('libnvshmem_host.so.*'):
         return file.name
     raise ModuleNotFoundError('libnvshmem_host.so not found')
+
+
+def extract_archive_objects_for_sycl_dlink(archive_path, output_dir):
+    archive_path = Path(archive_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = output_dir / '.archive-stamp'
+    archive_state = f'{archive_path}:{archive_path.stat().st_mtime_ns}:{archive_path.stat().st_size}\n'
+    objects = sorted(output_dir.glob('*.o'))
+    if objects and stamp.exists() and stamp.read_text() == archive_state:
+        return [str(path) for path in objects]
+
+    for path in objects:
+        path.unlink()
+    subprocess.check_call(['ar', 'x', str(archive_path)], cwd=output_dir)
+    objects = sorted(output_dir.glob('*.o'))
+    if not objects:
+        raise RuntimeError(f'No object files were extracted from {archive_path}')
+    stamp.write_text(archive_state)
+    return [str(path) for path in objects]
+
+
+def append_sycl_dlink_objects(object_paths):
+    original_get_sycl_device_flags = torch_cpp_extension._get_sycl_device_flags
+
+    def patched_get_sycl_device_flags(cflags):
+        return original_get_sycl_device_flags(cflags) + object_paths
+
+    torch_cpp_extension._get_sycl_device_flags = patched_get_sycl_device_flags
 
 
 if __name__ == '__main__':
@@ -31,11 +62,18 @@ if __name__ == '__main__':
             '-DDEEP_EP_XPU',
             '-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING',
         ]
-        sycl_flags = ['-O3', '-fsycl', '-DDEEP_EP_XPU']
-        sources = ['csrc/xpu/deep_ep_xpu.cpp', 'csrc/xpu/layout.sycl', 'csrc/xpu/intranode.sycl', 'csrc/xpu/internode.sycl']
+        sycl_flags = ['-O3', '-fsycl', '-fsycl-rdc', '-DDEEP_EP_XPU']
+        sources = [
+            'csrc/xpu/deep_ep_xpu.cpp',
+            'csrc/xpu/layout.sycl',
+            'csrc/xpu/intranode.sycl',
+            'csrc/xpu/internode.sycl',
+            'csrc/xpu/internode_ll.sycl',
+        ]
         include_dirs = [str(Path('csrc').resolve())]
         library_dirs = []
         extra_link_args = ['-lze_loader']
+        sycl_dlink_objects = []
 
         ishmem_dir = os.getenv('ISHMEM_DIR', '/opt/intel/ishmem')
         ishmem_pkg_config = Path(ishmem_dir) / 'lib' / 'pkgconfig'
@@ -61,6 +99,10 @@ if __name__ == '__main__':
                         library_dirs.append(flag[2:])
                     else:
                         extra_link_args.append(flag)
+                ishmem_archive = Path(ishmem_dir) / 'lib' / 'libishmem.a'
+                if ishmem_archive.exists():
+                    sycl_dlink_objects = extract_archive_objects_for_sycl_dlink(ishmem_archive, Path('build') / 'ishmem-sycl-dlink')
+                    append_sycl_dlink_objects(sycl_dlink_objects)
             else:
                 print(f'Warning: iSHMEM pkg-config metadata was found at {ishmem_pkg_config}, but flags could not be resolved')
         else:
@@ -85,6 +127,7 @@ if __name__ == '__main__':
         print(f' > Libraries: {library_dirs}')
         print(f' > Compilation flags: {extra_compile_args}')
         print(f' > Link flags: {extra_link_args}')
+        print(f' > iSHMEM SYCL device-link objects: {len(sycl_dlink_objects)}')
         print()
 
         try:

@@ -6,7 +6,7 @@ from functools import partial
 from typing import Literal, Set
 
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from utils import init_dist, bench, bench_kineto, calc_diff, get_accelerator_device_type, hash_tensor, per_token_cast_back
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -47,6 +47,7 @@ def test_main(num_tokens: int,
               seed: int = 0):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
+    device_type = get_accelerator_device_type()
 
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
@@ -55,30 +56,30 @@ def test_main(num_tokens: int,
     rank_offset = 128
     assert num_ranks - rank_offset < 257, 'Too many ranks (exceeding test precision limit)'
 
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * (rank - rank_offset)
-    x[:, -128:] = torch.arange(num_tokens, device='cuda').to(torch.bfloat16).view(-1, 1)
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device_type) * (rank - rank_offset)
+    x[:, -128:] = torch.arange(num_tokens, device=device_type).to(torch.bfloat16).view(-1, 1)
     x_list = [x]
     for _ in range(4 if use_logfmt else 0):
         # NOTES: make more LogFMT casts and also with some BF16
-        x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.5 * random.random())
+        x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device_type) * 0.5 * random.random())
     # NOTES: the last one is for performance testing
     # Most of the values in the perf case is lower than the threshold, casting most channels
-    x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
+    x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device_type) * 0.1)
 
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device_type).abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
+    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device=device_type).abs()
 
     # Randomly mask some positions
     for _ in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
-    all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
+    all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device=device_type)
     dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
 
     # For failure simulation and shrink testing
-    mask_status = torch.zeros((num_ranks, ), dtype=torch.int, device='cuda')
+    mask_status = torch.zeros((num_ranks, ), dtype=torch.int, device=device_type)
     expected_masked_ranks = set()
 
     # Check dispatch correctness
@@ -93,7 +94,7 @@ def test_main(num_tokens: int,
                             break
                         num_times += 1
                         for _ in range((num_times % 2) + 1):
-                            cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
+                            cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device=device_type)
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
@@ -152,7 +153,7 @@ def test_main(num_tokens: int,
                         for zero_copy in (False, ) if use_logfmt else (False, True):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device_type)
                             combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
                                                                                  topk_idx,
                                                                                  topk_weights,
@@ -167,10 +168,10 @@ def test_main(num_tokens: int,
                                 query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)
                             if do_check:
                                 if shrink_test:
-                                    owner_by_expert = (torch.arange(num_experts, device='cuda') // num_local_experts)
+                                    owner_by_expert = (torch.arange(num_experts, device=device_type) // num_local_experts)
                                     fail_owner_mask = (mask_status == 1).index_select(0, owner_by_expert)
                                     valid_topk_idx = topk_idx >= 0
-                                    failed_topk_idx = torch.zeros_like(topk_idx, device='cuda', dtype=torch.bool)
+                                    failed_topk_idx = torch.zeros_like(topk_idx, device=device_type, dtype=torch.bool)
                                     failed_topk_idx[valid_topk_idx] = fail_owner_mask.index_select(0, topk_idx[valid_topk_idx])
                                     topk_idx[failed_topk_idx] = -1
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
