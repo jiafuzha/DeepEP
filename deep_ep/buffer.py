@@ -3,6 +3,7 @@ import socket
 import struct
 import tempfile
 import time
+import numpy as np
 import torch
 import torch.distributed as dist
 from contextlib import suppress
@@ -94,6 +95,8 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+        self.is_xpu_runtime = hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd')
+        self._xpu_internode_handle_cache = {}
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
@@ -104,33 +107,40 @@ class Buffer:
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         ipc_handles = all_gather_object(local_ipc_handle)
-        if num_nvl_bytes > 0 and self.group_size > 1 and hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd'):
+        if num_nvl_bytes > 0 and self.group_size > 1 and self.is_xpu_runtime:
             ipc_handles = self._exchange_xpu_ipc_fds(ipc_handles, all_gather_object)
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            # Enable IBGDA
-            assert num_qps_per_rank > 0
-            os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            if self.is_xpu_runtime:
+                if low_latency_mode:
+                    raise RuntimeError('XPU low-latency mode is not migrated yet')
+                os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+                if os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == os.environ.get('MASTER_PORT', ''):
+                    os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(os.environ['MASTER_PORT']) + 1)
+            else:
+                # Enable IBGDA
+                assert num_qps_per_rank > 0
+                os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
+                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
-            # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-            os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
+                # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+                self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
+                os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-            # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+                # Reduce gpu memory usage
+                # 6 default teams + 1 extra team
+                os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+                # Disable NVLink SHArP
+                os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+                # NOTES: NVSHMEM initialization requires at least 256 MiB
+                os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-            if not allow_mnnvl:
-                # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+                if not allow_mnnvl:
+                    # Disable multi-node NVLink detection
+                    os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
@@ -153,6 +163,13 @@ class Buffer:
         with suppress(FileNotFoundError):
             os.unlink(socket_path)
 
+        num_nvl_ranks = min(self.group_size, 8)
+        nvl_group_start = self.runtime.get_rdma_rank() * num_nvl_ranks
+        nvl_group_end = nvl_group_start + num_nvl_ranks
+        local_ipc_ranks = [rank for rank in range(nvl_group_start, nvl_group_end) if rank < self.group_size]
+        if self.rank not in local_ipc_ranks:
+            raise RuntimeError(f'XPU IPC rank {self.rank} is outside its local NVL group {local_ipc_ranks}')
+
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             listener.bind(socket_path)
@@ -162,9 +179,10 @@ class Buffer:
             if len(socket_paths) != self.group_size:
                 raise RuntimeError(f'XPU IPC socket path list size mismatch: {len(socket_paths)}')
 
-            for dst_rank, dst_socket_path in enumerate(socket_paths):
+            for dst_rank in local_ipc_ranks:
                 if dst_rank == self.rank:
                     continue
+                dst_socket_path = socket_paths[dst_rank]
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sender:
                     sender.settimeout(timeout_s)
                     deadline = time.monotonic() + timeout_s
@@ -178,7 +196,7 @@ class Buffer:
                             time.sleep(0.01)
                     sender.sendmsg([struct.pack('i', self.rank)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', local_fd))])
 
-            for _ in range(self.group_size - 1):
+            for _ in range(len(local_ipc_ranks) - 1):
                 try:
                     conn, _ = listener.accept()
                 except socket.timeout as exc:
@@ -192,7 +210,7 @@ class Buffer:
                 if len(msg) != fd_size:
                     raise RuntimeError('failed to receive XPU IPC source rank')
                 src_rank = struct.unpack('i', msg)[0]
-                if src_rank < 0 or src_rank >= self.group_size or src_rank == self.rank:
+                if src_rank not in local_ipc_ranks or src_rank == self.rank:
                     raise RuntimeError(f'invalid XPU IPC source rank received: {src_rank}')
                 remote_fd = None
                 for level, kind, data in ancdata:
@@ -530,6 +548,179 @@ class Buffer:
         return recv_x, recv_topk_weights, EventOverlap(event)
 
     # noinspection PyTypeChecker
+    def _xpu_all_gather_tensor(self, tensor: torch.Tensor) -> List[torch.Tensor]:
+        gathered = [torch.empty_like(tensor) for _ in range(self.group_size)]
+        dist.all_gather(gathered, tensor, self.group)
+        return gathered
+
+    def _xpu_internode_event(self, async_finish: bool) -> EventOverlap:
+        return EventOverlap(EventHandle() if async_finish else None)
+
+    def _xpu_internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                                handle: Optional[Tuple],
+                                num_tokens_per_rank: Optional[torch.Tensor],
+                                num_tokens_per_rdma_rank: Optional[torch.Tensor],
+                                is_token_in_rank: Optional[torch.Tensor],
+                                num_tokens_per_expert: Optional[torch.Tensor],
+                                topk_idx: Optional[torch.Tensor],
+                                topk_weights: Optional[torch.Tensor],
+                                expert_alignment: int,
+                                num_worst_tokens: int,
+                                config: Config,
+                                async_finish: bool) -> \
+            Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
+            Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+        assert config is not None
+        x, x_scales = x if isinstance(x, tuple) else (x, None)
+        if handle is not None:
+            cache = self._xpu_internode_handle_cache.get(id(handle))
+            if cache is None:
+                raise RuntimeError('missing XPU internode cached dispatch metadata')
+            is_token_in_rank = handle[0]
+            topk_idx = None
+            topk_weights = None
+        else:
+            assert num_tokens_per_rank is not None and num_tokens_per_rdma_rank is not None
+            assert is_token_in_rank is not None and num_tokens_per_expert is not None
+
+        if x_scales is not None:
+            gathered_x = self._xpu_all_gather_tensor(x)
+            gathered_scales = self._xpu_all_gather_tensor(x_scales)
+        else:
+            gathered_x = self._xpu_all_gather_tensor(x)
+            gathered_scales = None
+        gathered_masks = self._xpu_all_gather_tensor(is_token_in_rank)
+        gathered_topk_idx = self._xpu_all_gather_tensor(topk_idx) if topk_idx is not None else None
+        gathered_topk_weights = self._xpu_all_gather_tensor(topk_weights) if topk_weights is not None else None
+
+        recv_chunks, recv_scale_chunks, recv_topk_idx_chunks, recv_topk_weight_chunks = [], [], [], []
+        recv_src_rank, recv_src_token = [], []
+        per_source_counts = []
+        local_experts = None
+        if num_tokens_per_expert is not None:
+            expert_counts = num_tokens_per_expert.clone()
+            dist.all_reduce(expert_counts, group=self.group)
+            num_local_experts = expert_counts.numel() // self.group_size
+            local_begin = self.rank * num_local_experts
+            local_experts = expert_counts[local_begin:local_begin + num_local_experts].cpu().tolist()
+
+        for src_rank in range(self.group_size):
+            mask = gathered_masks[src_rank][:, self.rank]
+            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            per_source_counts.append(int(indices.numel()))
+            if indices.numel() == 0:
+                continue
+            recv_chunks.append(gathered_x[src_rank].index_select(0, indices))
+            if gathered_scales is not None:
+                recv_scale_chunks.append(gathered_scales[src_rank].index_select(0, indices))
+            recv_src_rank.append(torch.full((indices.numel(), ), src_rank, dtype=torch.int32, device=x.device))
+            recv_src_token.append(indices.to(torch.int32))
+            if gathered_topk_idx is not None:
+                src_topk_idx = gathered_topk_idx[src_rank].index_select(0, indices)
+                src_topk_weights = gathered_topk_weights[src_rank].index_select(0, indices)
+                num_experts = num_tokens_per_expert.numel()
+                num_experts_per_rank = num_experts // self.group_size
+                expert_begin = self.rank * num_experts_per_rank
+                expert_end = expert_begin + num_experts_per_rank
+                local_idx = src_topk_idx - expert_begin
+                valid = (src_topk_idx >= expert_begin) & (src_topk_idx < expert_end)
+                recv_topk_idx_chunks.append(local_idx.masked_fill(~valid, -1).to(src_topk_idx.dtype))
+                recv_topk_weight_chunks.append(src_topk_weights.masked_fill(~valid, 0.0))
+
+        recv_x = torch.cat(recv_chunks, dim=0) if recv_chunks else x[:0].clone()
+        real_recv_tokens = recv_x.size(0)
+        if num_worst_tokens > 0 and num_worst_tokens > real_recv_tokens:
+            pad = torch.empty((num_worst_tokens - real_recv_tokens, x.size(1)), dtype=x.dtype, device=x.device)
+            recv_x = torch.cat((recv_x, pad), dim=0)
+        recv_x_scales = None
+        if gathered_scales is not None:
+            recv_x_scales = torch.cat(recv_scale_chunks, dim=0) if recv_scale_chunks else x_scales[:0].clone()
+            if num_worst_tokens > 0 and num_worst_tokens > recv_x_scales.size(0):
+                pad_shape = (num_worst_tokens - recv_x_scales.size(0), ) + tuple(recv_x_scales.shape[1:])
+                recv_x_scales = torch.cat((recv_x_scales, torch.empty(pad_shape, dtype=x_scales.dtype, device=x_scales.device)), dim=0)
+
+        recv_topk_idx, recv_topk_weights = None, None
+        if gathered_topk_idx is not None:
+            recv_topk_idx = torch.cat(recv_topk_idx_chunks, dim=0) if recv_topk_idx_chunks else topk_idx[:0].clone()
+            recv_topk_weights = torch.cat(recv_topk_weight_chunks, dim=0) if recv_topk_weight_chunks else topk_weights[:0].clone()
+            if num_worst_tokens > 0 and num_worst_tokens > recv_topk_idx.size(0):
+                pad_rows = num_worst_tokens - recv_topk_idx.size(0)
+                recv_topk_idx = torch.cat(
+                    (recv_topk_idx, torch.full((pad_rows, topk_idx.size(1)), -1, dtype=topk_idx.dtype, device=topk_idx.device)), dim=0)
+                recv_topk_weights = torch.cat(
+                    (recv_topk_weights, torch.zeros(
+                        (pad_rows, topk_weights.size(1)), dtype=topk_weights.dtype, device=topk_weights.device)),
+                    dim=0)
+
+        num_recv_tokens = recv_x.size(0)
+        num_channels = max(Buffer.num_sms // 2, 1)
+        rdma_channel_prefix_matrix = torch.zeros((self.runtime.get_num_rdma_ranks(), num_channels), dtype=torch.int32, device=x.device)
+        gbl_channel_prefix_matrix = torch.zeros((self.group_size, num_channels), dtype=torch.int32, device=x.device)
+        recv_rdma_channel_prefix_matrix = torch.zeros_like(rdma_channel_prefix_matrix)
+        recv_gbl_channel_prefix_matrix = torch.zeros_like(gbl_channel_prefix_matrix)
+        recv_gbl_rank_prefix_sum = torch.tensor(np.cumsum(per_source_counts).tolist(), dtype=torch.int32, device=x.device)
+        rdma_counts = [0] * self.runtime.get_num_rdma_ranks()
+        for src_rank, count in enumerate(per_source_counts):
+            rdma_counts[src_rank // 8] += count
+        recv_rdma_rank_prefix_sum = torch.tensor(np.cumsum(rdma_counts).tolist(), dtype=torch.int32, device=x.device)
+        recv_src_meta = torch.zeros(
+            (num_recv_tokens, self.runtime.get_source_meta_bytes() if hasattr(self.runtime, 'get_source_meta_bytes') else 8),
+            dtype=torch.uint8,
+            device=x.device)
+        send_rdma_head = torch.full((x.size(0), self.runtime.get_num_rdma_ranks()), -1, dtype=torch.int32, device=x.device)
+        send_nvl_head = torch.full((num_recv_tokens, 8), -1, dtype=torch.int32, device=x.device)
+        src_rank_tensor = torch.cat(recv_src_rank, dim=0) if recv_src_rank else torch.empty((0, ), dtype=torch.int32, device=x.device)
+        src_token_tensor = torch.cat(recv_src_token, dim=0) if recv_src_token else torch.empty((0, ), dtype=torch.int32, device=x.device)
+
+        handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
+                  recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
+                  send_nvl_head)
+        self._xpu_internode_handle_cache[id(handle)] = {
+            'src_rank': src_rank_tensor,
+            'src_token': src_token_tensor,
+            'real_recv_tokens': real_recv_tokens,
+        }
+        return (
+            recv_x, recv_x_scales
+        ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, local_experts or [], handle, self._xpu_internode_event(
+            async_finish)
+
+    def _xpu_internode_combine(self, x: torch.Tensor, handle: Union[tuple, list], topk_weights: Optional[torch.Tensor],
+                               bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                               async_finish: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+        cache = self._xpu_internode_handle_cache.get(id(handle))
+        if cache is None:
+            raise RuntimeError('missing XPU internode combine metadata')
+        is_token_in_rank = handle[0]
+        num_tokens, hidden = is_token_in_rank.size(0), x.size(1)
+        bias_0, bias_1 = Buffer._unpack_bias(bias)
+        real_recv_tokens = cache['real_recv_tokens']
+        payload = (x[:real_recv_tokens].detach().cpu(), cache['src_rank'].cpu(), cache['src_token'].cpu(),
+                   topk_weights[:real_recv_tokens].detach().cpu() if topk_weights is not None else None)
+        gathered = [None] * self.group_size
+        dist.all_gather_object(gathered, payload, self.group)
+
+        combined_x = torch.zeros((num_tokens, hidden), dtype=x.dtype, device=x.device)
+        combined_topk_weights = None
+        if topk_weights is not None:
+            combined_topk_weights = torch.zeros((num_tokens, topk_weights.size(1)), dtype=topk_weights.dtype, device=x.device)
+        for values_cpu, src_ranks_cpu, src_tokens_cpu, weights_cpu in gathered:
+            if values_cpu.numel() == 0:
+                continue
+            select = src_ranks_cpu == self.rank
+            if not bool(select.any()):
+                continue
+            dst_idx = src_tokens_cpu[select].to(device=x.device, dtype=torch.long)
+            combined_x.index_add_(0, dst_idx, values_cpu[select].to(x.device))
+            if combined_topk_weights is not None and weights_cpu is not None:
+                combined_topk_weights.index_add_(0, dst_idx, weights_cpu[select].to(x.device))
+        if bias_0 is not None:
+            combined_x += bias_0
+        if bias_1 is not None:
+            combined_x += bias_1
+        return combined_x, combined_topk_weights, self._xpu_internode_event(async_finish)
+
+    # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                            handle: Optional[Tuple] = None,
                            num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
@@ -545,6 +736,10 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
+        if self.is_xpu_runtime:
+            return self._xpu_internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
+                                                num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
+                                                async_finish)
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -593,6 +788,8 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
+        if self.is_xpu_runtime:
+            return self._xpu_internode_combine(x, handle, topk_weights, bias, async_finish)
 
         # Unpack handle and bias
         is_combined_token_in_rank, \

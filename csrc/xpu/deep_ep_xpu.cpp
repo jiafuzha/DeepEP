@@ -6,10 +6,17 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#ifdef DEEP_EP_ENABLE_ISHMEM
+#include <ishmem.h>
+#include <ishmemx.h>
+#endif
 
 #include "xpu_runtime.hpp"
 
@@ -82,6 +89,100 @@ XpuIpcHandle unpack_ipc_handle(const pybind11::bytearray& bytes) {
 }
 
 }  // namespace
+
+namespace internode {
+
+#ifdef DEEP_EP_ENABLE_ISHMEM
+std::vector<uint8_t> get_unique_id() {
+    ishmemx_uniqueid_t unique_id{};
+    int result = ishmemx_get_uniqueid(&unique_id);
+    TORCH_CHECK(result == 0, "ishmemx_get_uniqueid failed with ", result);
+    std::vector<uint8_t> bytes(sizeof(unique_id));
+    std::memcpy(bytes.data(), &unique_id, sizeof(unique_id));
+    return bytes;
+}
+
+int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode) {
+    TORCH_CHECK(!low_latency_mode, "XPU low-latency iSHMEM runtime is not migrated yet");
+    TORCH_CHECK(root_unique_id_val.size() == sizeof(ishmemx_uniqueid_t), "unexpected iSHMEM unique ID size");
+
+    int initialized = 0;
+    ishmemx_query_initialized(&initialized);
+    if (initialized) {
+        TORCH_CHECK(ishmem_my_pe() == rank, "iSHMEM was already initialized with an unexpected PE rank");
+        TORCH_CHECK(ishmem_n_pes() == num_ranks, "iSHMEM was already initialized with an unexpected PE count");
+        return ishmem_my_pe();
+    }
+
+    ishmemx_uniqueid_t root_unique_id{};
+    std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(root_unique_id));
+    ishmemx_attr_t attr{};
+    attr.runtime = ISHMEMX_RUNTIME_MPI;
+    attr.initialize_runtime = true;
+    attr.gpu = true;
+    attr.device_idx = c10::xpu::current_device();
+    attr.use_uid = true;
+    attr.nranks = num_ranks;
+    attr.rank = rank;
+    attr.uid = &root_unique_id;
+    ishmemx_init_attr(&attr);
+    TORCH_CHECK(ishmem_my_pe() == rank, "iSHMEM initialized with PE ", ishmem_my_pe(), ", expected ", rank);
+    TORCH_CHECK(ishmem_n_pes() == num_ranks, "iSHMEM initialized with ", ishmem_n_pes(), " PEs, expected ", num_ranks);
+    ishmem_barrier_all();
+    return ishmem_my_pe();
+}
+
+void* alloc(size_t size, size_t alignment) {
+    void* ptr = ishmem_align(alignment, size);
+    TORCH_CHECK(ptr != nullptr, "ishmem_align failed for ", size, " bytes");
+    return ptr;
+}
+
+void free(void* ptr) {
+    if (ptr != nullptr) {
+        ishmem_free(ptr);
+    }
+}
+
+void barrier() {
+    ishmem_barrier_all();
+}
+
+void finalize() {
+    int initialized = 0;
+    ishmemx_query_initialized(&initialized);
+    if (initialized) {
+        ishmem_barrier_all();
+        ishmem_finalize();
+    }
+}
+#else
+std::vector<uint8_t> get_unique_id() {
+    TORCH_CHECK(false, "XPU iSHMEM support is not enabled in this build");
+}
+
+int init(const std::vector<uint8_t>&, int, int, bool) {
+    TORCH_CHECK(false, "XPU iSHMEM support is not enabled in this build");
+}
+
+void* alloc(size_t, size_t) {
+    TORCH_CHECK(false, "XPU iSHMEM support is not enabled in this build");
+}
+
+void free(void*) {}
+
+void barrier() {
+    TORCH_CHECK(false, "XPU iSHMEM support is not enabled in this build");
+}
+
+void finalize() {}
+#endif
+
+int get_source_meta_bytes() {
+    return sizeof(SourceMeta);
+}
+
+}  // namespace internode
 
 size_t Config::get_nvl_buffer_size_hint(size_t hidden_bytes, int num_ranks) const {
     TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
@@ -191,8 +292,11 @@ struct Buffer {
     int barrier_signal_counter = 1;
 
     void* workspace = nullptr;
+    void* rdma_buffer_ptr = nullptr;
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
+    volatile int* moe_recv_rdma_counter = nullptr;
+    int* moe_recv_rdma_counter_mapped = nullptr;
     volatile int* moe_recv_expert_counter = nullptr;
     int* moe_recv_expert_counter_mapped = nullptr;
 
@@ -212,9 +316,14 @@ struct Buffer {
           comm_stream(c10::xpu::getStreamFromPool(true)) {
         TORCH_CHECK(rank >= 0 && rank < num_ranks, "rank must be in [0, num_ranks)");
         TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
-        TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS, "XPU runtime currently supports intranode only (<= ", NUM_MAX_NVL_PEERS, " ranks)");
-        TORCH_CHECK(num_rdma_bytes == 0 && !low_latency_mode, "XPU internode and low-latency modes are not migrated yet");
+        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
+        TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS || num_ranks % NUM_MAX_NVL_PEERS == 0,
+                    "XPU internode ranks must be divisible by ",
+                    NUM_MAX_NVL_PEERS);
+        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS, "XPU RDMA buffer is only valid for internode ranks");
         TORCH_CHECK(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_nvl_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
+        TORCH_CHECK(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_rdma_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
+        TORCH_CHECK(num_rdma_ranks == 1 || num_rdma_bytes > 0, "XPU internode mode requires a non-empty RDMA buffer");
 
         auto& queue = comm_stream.queue();
         ze_context = get_native_context(queue);
@@ -252,6 +361,12 @@ struct Buffer {
                     "Failed to allocate XPU shared counters");
         moe_recv_counter = moe_recv_counter_mapped;
         moe_recv_expert_counter = moe_recv_expert_counter_mapped;
+        if (num_rdma_ranks > 1) {
+            moe_recv_rdma_counter_mapped = sycl::malloc_shared<int>(1, queue);
+            TORCH_CHECK(moe_recv_rdma_counter_mapped != nullptr, "Failed to allocate XPU shared RDMA counter");
+            moe_recv_rdma_counter = moe_recv_rdma_counter_mapped;
+            *moe_recv_rdma_counter_mapped = -1;
+        }
         *moe_recv_counter_mapped = -1;
         for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i) {
             moe_recv_expert_counter_mapped[i] = -1;
@@ -311,27 +426,44 @@ struct Buffer {
         return {reinterpret_cast<const char*>(&local_ipc_handle), sizeof(local_ipc_handle)};
     }
 
-    pybind11::bytearray get_local_nvshmem_unique_id() const { TORCH_CHECK(false, "XPU iSHMEM unique ID exchange is not migrated yet"); }
+    pybind11::bytearray get_local_nvshmem_unique_id() const {
+        TORCH_CHECK(rdma_rank == 0, "Only XPU RDMA rank 0 can get an iSHMEM unique ID");
+#ifdef DEEP_EP_ENABLE_ISHMEM
+        const char* port_env = std::getenv("I_MPI_MPCP_SERVER_PORT");
+        int base_port = port_env == nullptr || port_env[0] == '\0' ? 35555 : std::stoi(port_env);
+        const char* master_port_env = std::getenv("MASTER_PORT");
+        int master_port = master_port_env == nullptr || master_port_env[0] == '\0' ? -1 : std::stoi(master_port_env);
+        int nvl_port = base_port + nvl_rank;
+        if (nvl_port == master_port) {
+            nvl_port += NUM_MAX_NVL_PEERS;
+        }
+        TORCH_CHECK(::setenv("I_MPI_MPCP_SERVER_PORT", std::to_string(nvl_port).c_str(), 1) == 0,
+                    "failed to set I_MPI_MPCP_SERVER_PORT for XPU iSHMEM");
+#endif
+        auto unique_id = internode::get_unique_id();
+        return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
+    }
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
-        TORCH_CHECK(!use_rdma_buffer, "XPU RDMA buffer access is not migrated yet");
-        TORCH_CHECK(num_nvl_bytes > 0 && local_buffer.defined(), "XPU local communication buffer is not allocated");
         torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
         auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
-        TORCH_CHECK(offset >= 0 && offset <= num_nvl_bytes, "invalid XPU local buffer offset");
-        TORCH_CHECK((num_nvl_bytes - offset) % element_bytes == 0, "XPU local buffer size is not divisible by dtype size");
-        auto base_ptr = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + offset;
+        auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
+        auto base = use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank];
+        TORCH_CHECK(base != nullptr,
+                    use_rdma_buffer ? "XPU RDMA buffer is not allocated" : "XPU local communication buffer is not allocated");
+        TORCH_CHECK(offset >= 0 && offset <= num_bytes, "invalid XPU buffer offset");
+        TORCH_CHECK((num_bytes - offset) % element_bytes == 0, "XPU buffer size is not divisible by dtype size");
+        auto base_ptr = static_cast<uint8_t*>(base) + offset;
         return torch::from_blob(
-            base_ptr, (num_nvl_bytes - offset) / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(c10::kXPU, device_id));
+            base_ptr, (num_bytes - offset) / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(c10::kXPU, device_id));
     }
 
     torch::Stream get_comm_stream() const { return comm_stream.unwrap(); }
 
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
-              const std::optional<pybind11::bytearray>&) {
+              const std::optional<pybind11::bytearray>& root_unique_id_opt) {
         TORCH_CHECK(!is_available(), "XPU Buffer::sync called twice");
-        TORCH_CHECK(num_rdma_bytes == 0 && !low_latency_mode, "XPU internode and low-latency sync is not migrated yet");
 
         if (num_nvl_bytes > 0) {
             TORCH_CHECK(static_cast<int>(device_ids.size()) == num_ranks, "device ID list size mismatch");
@@ -398,6 +530,19 @@ struct Buffer {
             queue.memcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS);
             queue.wait();
         }
+        if (num_rdma_bytes > 0) {
+            TORCH_CHECK(root_unique_id_opt.has_value(), "missing XPU iSHMEM root unique ID");
+            auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
+            std::vector<uint8_t> root_unique_id(root_unique_id_str.size());
+            std::memcpy(root_unique_id.data(), root_unique_id_str.data(), root_unique_id.size());
+            TORCH_CHECK(internode::init(root_unique_id, rdma_rank, num_rdma_ranks, low_latency_mode) == rdma_rank,
+                        "XPU iSHMEM initialized with an unexpected rank");
+            internode::barrier();
+            rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+            auto& queue = comm_stream.queue();
+            queue.memset(rdma_buffer_ptr, 0, num_rdma_bytes).wait();
+            internode::barrier();
+        }
         available = true;
     }
 
@@ -417,6 +562,13 @@ struct Buffer {
         if (num_nvl_bytes > 0 && available && barrier_signal_ptrs_gpu != nullptr) {
             intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, reserve_barrier_signals(1), queue);
             queue.wait();
+        }
+        if (rdma_buffer_ptr != nullptr) {
+            queue.wait();
+            internode::barrier();
+            internode::free(rdma_buffer_ptr);
+            rdma_buffer_ptr = nullptr;
+            internode::finalize();
         }
         if (local_ipc_handle_valid) {
             if (local_ipc_handle.fd >= 0) {
@@ -450,6 +602,11 @@ struct Buffer {
             sycl::free(moe_recv_counter_mapped, queue);
             moe_recv_counter_mapped = nullptr;
             moe_recv_counter = nullptr;
+        }
+        if (moe_recv_rdma_counter_mapped != nullptr) {
+            sycl::free(moe_recv_rdma_counter_mapped, queue);
+            moe_recv_rdma_counter_mapped = nullptr;
+            moe_recv_rdma_counter = nullptr;
         }
         if (moe_recv_expert_counter_mapped != nullptr) {
             sycl::free(moe_recv_expert_counter_mapped, queue);
@@ -939,6 +1096,311 @@ struct Buffer {
         return {recv_x, recv_topk_weights, event};
     }
 
+    std::tuple<torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor,
+               torch::Tensor,
+               std::optional<torch::Tensor>,
+               torch::Tensor,
+               std::optional<torch::Tensor>,
+               torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::optional<EventHandle>>
+    internode_dispatch(const torch::Tensor& x,
+                       const std::optional<torch::Tensor>& x_scales,
+                       const std::optional<torch::Tensor>& topk_idx,
+                       const std::optional<torch::Tensor>& topk_weights,
+                       const std::optional<torch::Tensor>& num_tokens_per_rank,
+                       const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
+                       const torch::Tensor& is_token_in_rank,
+                       const std::optional<torch::Tensor>& num_tokens_per_expert,
+                       int cached_num_recv_tokens,
+                       int cached_num_rdma_recv_tokens,
+                       const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix,
+                       const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
+                       const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
+                       const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
+                       int,
+                       int num_worst_tokens,
+                       const Config& config,
+                       std::optional<EventHandle>& previous_event,
+                       bool async,
+                       bool allocate_on_comm_stream) {
+        pybind11::gil_scoped_release release;
+        TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
+        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
+        TORCH_CHECK(num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr, "XPU internode_dispatch requires an iSHMEM RDMA buffer");
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_dispatch currently supports BF16 tensors only");
+        TORCH_CHECK(!x_scales.has_value(), "XPU internode_dispatch FP8/x_scales path is not migrated yet");
+        TORCH_CHECK(!topk_idx.has_value() && !topk_weights.has_value(), "XPU internode_dispatch top-k return path is not migrated yet");
+        check_xpu_tensor(x, "x");
+        check_xpu_tensor(is_token_in_rank, "is_token_in_rank");
+        TORCH_CHECK(config.num_sms % 2 == 0, "config.num_sms must be even");
+        bool cached_mode = cached_rdma_channel_prefix_matrix.has_value();
+        if (cached_mode) {
+            TORCH_CHECK(cached_recv_rdma_rank_prefix_sum.has_value() && cached_gbl_channel_prefix_matrix.has_value() &&
+                            cached_recv_gbl_rank_prefix_sum.has_value(),
+                        "cached internode dispatch requires all cached prefix tensors");
+        } else {
+            TORCH_CHECK(num_tokens_per_rank.has_value() && num_tokens_per_rdma_rank.has_value() && num_tokens_per_expert.has_value(),
+                        "non-cached internode dispatch requires token count tensors");
+            TORCH_CHECK(num_worst_tokens > 0,
+                        "XPU internode_dispatch non-cached metadata exchange is not complete; pass num_worst_tokens for the "
+                        "correctness-first path");
+        }
+
+        auto compute_stream = c10::xpu::getCurrentXPUStream();
+        if (allocate_on_comm_stream) {
+            TORCH_CHECK(previous_event.has_value() && async, "allocate_on_comm_stream requires previous_event and async");
+            c10::xpu::setCurrentXPUStream(comm_stream);
+        }
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else if (comm_stream != compute_stream) {
+            stream_wait(comm_stream, compute_stream);
+        }
+
+        const int num_tokens = static_cast<int>(x.size(0));
+        const int hidden = static_cast<int>(x.size(1));
+        const int num_channels = config.num_sms / 2;
+        const int num_recv_tokens = cached_mode ? cached_num_recv_tokens : num_worst_tokens;
+        const int num_rdma_recv_tokens = cached_mode ? cached_num_rdma_recv_tokens : num_worst_tokens;
+        auto int_options = x.options().dtype(torch::kInt32);
+        auto byte_options = x.options().dtype(torch::kUInt8);
+
+        torch::Tensor rdma_channel_prefix_matrix =
+            cached_mode ? cached_rdma_channel_prefix_matrix.value() : torch::zeros({num_rdma_ranks, num_channels}, int_options);
+        torch::Tensor recv_rdma_rank_prefix_sum =
+            cached_mode ? cached_recv_rdma_rank_prefix_sum.value() : torch::zeros({num_rdma_ranks}, int_options);
+        torch::Tensor gbl_channel_prefix_matrix =
+            cached_mode ? cached_gbl_channel_prefix_matrix.value() : torch::zeros({num_ranks, num_channels}, int_options);
+        torch::Tensor recv_gbl_rank_prefix_sum =
+            cached_mode ? cached_recv_gbl_rank_prefix_sum.value() : torch::zeros({num_ranks}, int_options);
+
+        auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+        auto recv_src_meta = cached_mode
+            ? std::optional<torch::Tensor>()
+            : std::optional<torch::Tensor>(torch::empty({num_recv_tokens, internode::get_source_meta_bytes()}, byte_options));
+        auto recv_rdma_channel_prefix_matrix = cached_mode
+            ? std::optional<torch::Tensor>()
+            : std::optional<torch::Tensor>(torch::empty({num_rdma_ranks, num_channels}, int_options));
+        auto recv_gbl_channel_prefix_matrix = cached_mode
+            ? std::optional<torch::Tensor>()
+            : std::optional<torch::Tensor>(torch::empty({num_ranks, num_channels}, int_options));
+        auto send_rdma_head = cached_mode ? std::optional<torch::Tensor>()
+                                          : std::optional<torch::Tensor>(torch::empty({num_tokens, num_rdma_ranks}, int_options));
+        auto send_nvl_head = cached_mode
+            ? std::optional<torch::Tensor>()
+            : std::optional<torch::Tensor>(torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, int_options));
+
+        const size_t copy_rows = static_cast<size_t>(std::min(num_tokens, num_recv_tokens));
+        if (copy_rows > 0) {
+            comm_stream.queue().memcpy(recv_x.data_ptr(), x.data_ptr(), copy_rows * hidden * x.element_size());
+        }
+        internode::dispatch(recv_x.data_ptr(),
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            cached_mode ? nullptr : recv_src_meta->data_ptr(),
+                            x.data_ptr(),
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
+                            cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
+                            cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
+                            cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
+                            rdma_channel_prefix_matrix.data_ptr<int>(),
+                            recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                            gbl_channel_prefix_matrix.data_ptr<int>(),
+                            recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                            is_token_in_rank.data_ptr<bool>(),
+                            num_tokens,
+                            num_recv_tokens,
+                            hidden,
+                            0,
+                            rank,
+                            num_ranks,
+                            comm_stream.queue());
+
+        std::optional<EventHandle> event;
+        if (async) {
+            event = EventHandle(comm_stream);
+            auto stream = comm_stream.unwrap();
+            for (auto& t : {x,
+                            is_token_in_rank,
+                            recv_x,
+                            rdma_channel_prefix_matrix,
+                            recv_rdma_rank_prefix_sum,
+                            gbl_channel_prefix_matrix,
+                            recv_gbl_rank_prefix_sum}) {
+                t.record_stream(stream);
+            }
+            for (auto& to : {num_tokens_per_rank,
+                             num_tokens_per_rdma_rank,
+                             num_tokens_per_expert,
+                             cached_rdma_channel_prefix_matrix,
+                             cached_recv_rdma_rank_prefix_sum,
+                             cached_gbl_channel_prefix_matrix,
+                             cached_recv_gbl_rank_prefix_sum,
+                             recv_rdma_channel_prefix_matrix,
+                             recv_gbl_channel_prefix_matrix,
+                             send_rdma_head,
+                             send_nvl_head,
+                             recv_src_meta}) {
+                if (to.has_value()) {
+                    to->record_stream(stream);
+                }
+            }
+        } else if (comm_stream != compute_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
+        if (allocate_on_comm_stream) {
+            c10::xpu::setCurrentXPUStream(compute_stream);
+        }
+
+        return {recv_x,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                {},
+                rdma_channel_prefix_matrix,
+                gbl_channel_prefix_matrix,
+                recv_rdma_channel_prefix_matrix,
+                recv_rdma_rank_prefix_sum,
+                recv_gbl_channel_prefix_matrix,
+                recv_gbl_rank_prefix_sum,
+                recv_src_meta,
+                send_rdma_head,
+                send_nvl_head,
+                event};
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
+        const torch::Tensor& x,
+        const std::optional<torch::Tensor>& topk_weights,
+        const std::optional<torch::Tensor>& bias_0,
+        const std::optional<torch::Tensor>& bias_1,
+        const torch::Tensor& src_meta,
+        const torch::Tensor& is_combined_token_in_rank,
+        const torch::Tensor& rdma_channel_prefix_matrix,
+        const torch::Tensor& rdma_rank_prefix_sum,
+        const torch::Tensor& gbl_channel_prefix_matrix,
+        const torch::Tensor& combined_rdma_head,
+        const torch::Tensor& combined_nvl_head,
+        const Config& config,
+        std::optional<EventHandle>& previous_event,
+        bool async,
+        bool allocate_on_comm_stream) {
+        TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_combine");
+        TORCH_CHECK(!low_latency_mode, "XPU low-latency mode is not migrated yet");
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_combine currently supports BF16 tensors only");
+        check_xpu_tensor(x, "x");
+        check_xpu_tensor(src_meta, "src_meta");
+        check_xpu_tensor(is_combined_token_in_rank, "is_combined_token_in_rank");
+        check_xpu_tensor(rdma_channel_prefix_matrix, "rdma_channel_prefix_matrix");
+        check_xpu_tensor(rdma_rank_prefix_sum, "rdma_rank_prefix_sum");
+        check_xpu_tensor(gbl_channel_prefix_matrix, "gbl_channel_prefix_matrix");
+        check_xpu_tensor(combined_rdma_head, "combined_rdma_head");
+        check_xpu_tensor(combined_nvl_head, "combined_nvl_head");
+        TORCH_CHECK(config.num_sms % 2 == 0, "config.num_sms must be even");
+        TORCH_CHECK(src_meta.size(1) == internode::get_source_meta_bytes(), "src_meta shape mismatch");
+
+        auto compute_stream = c10::xpu::getCurrentXPUStream();
+        if (allocate_on_comm_stream) {
+            TORCH_CHECK(previous_event.has_value() && async, "allocate_on_comm_stream requires previous_event and async");
+            c10::xpu::setCurrentXPUStream(comm_stream);
+        }
+        if (previous_event.has_value()) {
+            stream_wait(comm_stream, previous_event.value());
+        } else if (comm_stream != compute_stream) {
+            stream_wait(comm_stream, compute_stream);
+        }
+
+        const int num_tokens = static_cast<int>(x.size(0));
+        const int hidden = static_cast<int>(x.size(1));
+        const int num_combined_tokens = static_cast<int>(is_combined_token_in_rank.size(0));
+        int num_topk = 0;
+        float* topk_weights_ptr = nullptr;
+        std::optional<torch::Tensor> combined_topk_weights;
+        float* combined_topk_weights_ptr = nullptr;
+        if (topk_weights.has_value()) {
+            check_xpu_tensor(*topk_weights, "topk_weights");
+            TORCH_CHECK(topk_weights->scalar_type() == torch::kFloat32 && topk_weights->dim() == 2, "topk_weights must be 2D float32");
+            num_topk = static_cast<int>(topk_weights->size(1));
+            topk_weights_ptr = topk_weights->data_ptr<float>();
+            combined_topk_weights = torch::empty({num_combined_tokens, num_topk}, topk_weights->options());
+            combined_topk_weights_ptr = combined_topk_weights->data_ptr<float>();
+        }
+        void* bias_ptrs[2] = {nullptr, nullptr};
+        if (bias_0.has_value()) {
+            check_xpu_tensor(*bias_0, "bias_0");
+            TORCH_CHECK(bias_0->scalar_type() == x.scalar_type(), "bias_0 dtype mismatch");
+            bias_ptrs[0] = bias_0->data_ptr();
+        }
+        if (bias_1.has_value()) {
+            check_xpu_tensor(*bias_1, "bias_1");
+            TORCH_CHECK(bias_1->scalar_type() == x.scalar_type(), "bias_1 dtype mismatch");
+            bias_ptrs[1] = bias_1->data_ptr();
+        }
+
+        auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        internode::combine(scalar_type_to_data_type(x.scalar_type()),
+                           combined_x.data_ptr(),
+                           combined_topk_weights_ptr,
+                           is_combined_token_in_rank.data_ptr<bool>(),
+                           x.data_ptr(),
+                           topk_weights_ptr,
+                           bias_ptrs[0],
+                           bias_ptrs[1],
+                           combined_rdma_head.data_ptr<int>(),
+                           combined_nvl_head.data_ptr<int>(),
+                           src_meta.data_ptr(),
+                           rdma_channel_prefix_matrix.data_ptr<int>(),
+                           rdma_rank_prefix_sum.data_ptr<int>(),
+                           gbl_channel_prefix_matrix.data_ptr<int>(),
+                           num_tokens,
+                           num_combined_tokens,
+                           hidden,
+                           num_topk,
+                           rank,
+                           num_ranks,
+                           comm_stream.queue());
+
+        std::optional<EventHandle> event;
+        if (async) {
+            event = EventHandle(comm_stream);
+            auto stream = comm_stream.unwrap();
+            for (auto& t : {x,
+                            src_meta,
+                            is_combined_token_in_rank,
+                            rdma_channel_prefix_matrix,
+                            rdma_rank_prefix_sum,
+                            gbl_channel_prefix_matrix,
+                            combined_rdma_head,
+                            combined_nvl_head,
+                            combined_x}) {
+                t.record_stream(stream);
+            }
+            for (auto& to : {topk_weights, combined_topk_weights, bias_0, bias_1}) {
+                if (to.has_value()) {
+                    to->record_stream(stream);
+                }
+            }
+        } else if (comm_stream != compute_stream) {
+            stream_wait(compute_stream, comm_stream);
+        }
+        if (allocate_on_comm_stream) {
+            c10::xpu::setCurrentXPUStream(compute_stream);
+        }
+        return {combined_x, combined_topk_weights, event};
+    }
+
     void clean_low_latency_buffer(int, int, int) { TORCH_CHECK(false, "XPU low-latency clean kernel is not migrated yet"); }
 
     void low_latency_update_mask_buffer(int, bool) { TORCH_CHECK(false, "XPU low-latency mask update is not migrated yet"); }
@@ -992,14 +1454,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_dispatch_layout", &Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &Buffer::intranode_dispatch)
         .def("intranode_combine", &Buffer::intranode_combine)
-        .def("internode_dispatch",
-             [](Buffer&, const pybind11::args&, const pybind11::kwargs&) {
-                 TORCH_CHECK(false, "XPU internode dispatch kernels are not migrated yet");
-             })
-        .def("internode_combine",
-             [](Buffer&, const pybind11::args&, const pybind11::kwargs&) {
-                 TORCH_CHECK(false, "XPU internode combine kernels are not migrated yet");
-             })
+        .def("internode_dispatch", &Buffer::internode_dispatch)
+        .def("internode_combine", &Buffer::internode_combine)
         .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch",
              [](Buffer&, const pybind11::args&, const pybind11::kwargs&) {
