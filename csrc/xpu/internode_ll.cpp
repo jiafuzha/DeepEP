@@ -15,9 +15,19 @@ class QueryMaskBufferKernel;
 class CleanMaskBufferKernel;
 class LowLatencyDispatchClearKernel;
 class LowLatencyDispatchSendKernel;
+class LowLatencyDispatchNormalizeSendKernel;
+class LowLatencyDispatchCountsPutKernel;
+class LowLatencyDispatchSrcPutKernel;
+class LowLatencyDispatchDataPutKernel;
+class LowLatencyDispatchSrcQuietKernel;
+class LowLatencyDispatchQuietKernel;
+class LowLatencyDispatchNormalizeRecvKernel;
 class LowLatencyDispatchPackKernel;
 class LowLatencyCombineClearKernel;
 class LowLatencyCombineStageKernel;
+class LowLatencyCombinePutKernel;
+class LowLatencyCombineQuietKernel;
+class LowLatencyCombineWaitKernel;
 class LowLatencyCombineRecvKernel;
 
 struct LowLatencyLayout {
@@ -58,7 +68,7 @@ inline LowLatencyLayout make_layout(int num_max_dispatch_tokens_per_rank, int hi
     l.send_src_bytes = num_send_slots * sizeof(int);
     l.send_count_bytes = static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int);
     l.combine_data_bytes = num_combine_slots * hidden_bytes;
-    l.combine_flag_bytes = static_cast<size_t>(num_experts) * sizeof(int);
+    l.combine_flag_bytes = static_cast<size_t>(num_experts) * sizeof(uint64_t);
     l.mask_bytes = static_cast<size_t>(num_ranks) * sizeof(int);
 
     size_t offset = 0;
@@ -250,29 +260,137 @@ void dispatch_bf16(void* packed_recv_x,
     });
     queue.wait();
 
-    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-            const size_t send_slot = (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
-            const size_t recv_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-            ishmemx_putmem_on_queue(dispatch_count + local_expert * num_ranks + rank,
-                                    send_count + dst_rank * num_local_experts + local_expert,
-                                    sizeof(int),
-                                    dst_rank,
-                                    queue);
-            ishmemx_putmem_on_queue(dispatch_src + recv_slot,
-                                    send_src + send_slot,
-                                    static_cast<size_t>(num_max_dispatch_tokens_per_rank) * sizeof(int),
-                                    dst_rank,
-                                    queue);
-            ishmemx_putmem_on_queue(dispatch_data + recv_slot * hidden_bytes,
-                                    send_data + send_slot * hidden_bytes,
-                                    static_cast<size_t>(num_max_dispatch_tokens_per_rank) * hidden_bytes,
-                                    dst_rank,
-                                    queue);
-        }
-    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyDispatchNormalizeSendKernel>(
+            sycl::range<1>(static_cast<size_t>(num_ranks) * num_local_experts), [=](sycl::id<1> id) {
+                const int linear = static_cast<int>(id[0]);
+                const int local_expert = linear % num_local_experts;
+                const int dst_rank = linear / num_local_experts;
+                int write_slot = 0;
+                for (int slot = 0; slot < num_max_dispatch_tokens_per_rank; ++slot) {
+                    const size_t read_slot =
+                        (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank + slot;
+                    const int token = send_src[read_slot];
+                    if (token < 0) {
+                        continue;
+                    }
+                    const size_t write_idx =
+                        (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank + write_slot;
+                    if (write_idx != read_slot) {
+                        send_src[write_idx] = token;
+                        auto* dst = send_data + write_idx * hidden_bytes;
+                        auto* src = send_data + read_slot * hidden_bytes;
+                        for (size_t b = 0; b < hidden_bytes; ++b) {
+                            dst[b] = src[b];
+                            src[b] = 0;
+                        }
+                        send_src[read_slot] = -1;
+                    }
+                    ++write_slot;
+                }
+                send_count[dst_rank * num_local_experts + local_expert] = write_slot;
+            });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyDispatchCountsPutKernel>(
+            sycl::range<1>(static_cast<size_t>(num_ranks) * num_local_experts), [=](sycl::id<1> id) {
+                const int linear = static_cast<int>(id[0]);
+                const int local_expert = linear % num_local_experts;
+                const int dst_rank = linear / num_local_experts;
+                auto* dst = dispatch_count + local_expert * num_ranks + rank;
+                auto* src = send_count + dst_rank * num_local_experts + local_expert;
+                if (dst_rank == rank) {
+                    *dst = *src;
+                } else {
+                    ishmem_int_put_nbi(dst, src, 1, dst_rank);
+                }
+            });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyDispatchSrcPutKernel>(
+            sycl::range<1>(static_cast<size_t>(num_ranks) * num_local_experts), [=](sycl::id<1> id) {
+                const int linear = static_cast<int>(id[0]);
+                const int local_expert = linear % num_local_experts;
+                const int dst_rank = linear / num_local_experts;
+                const size_t src_slot =
+                    (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
+                const size_t dst_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                auto* dst = dispatch_src + dst_slot;
+                auto* src = send_src + src_slot;
+                if (dst_rank == rank) {
+                    for (int slot = 0; slot < num_max_dispatch_tokens_per_rank; ++slot) {
+                        dst[slot] = src[slot];
+                    }
+                } else {
+                    ishmem_putmem(dst, src, static_cast<size_t>(num_max_dispatch_tokens_per_rank) * sizeof(int), dst_rank);
+                }
+        });
+    });
+    queue.wait();
+    queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyDispatchSrcQuietKernel>([=]() { ishmem_quiet(); }); });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        const size_t send_slots = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
+        cgh.parallel_for<LowLatencyDispatchDataPutKernel>(sycl::range<1>(send_slots), [=](sycl::id<1> id) {
+            const size_t linear = id[0];
+            const int slot = static_cast<int>(linear % num_max_dispatch_tokens_per_rank);
+            const int local_expert = static_cast<int>((linear / num_max_dispatch_tokens_per_rank) % num_local_experts);
+            const int dst_rank = static_cast<int>(linear / (static_cast<size_t>(num_max_dispatch_tokens_per_rank) * num_local_experts));
+            const size_t dst_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot;
+            auto* dst = dispatch_data + dst_slot * hidden_bytes;
+            auto* src = send_data + linear * hidden_bytes;
+            if (dst_rank == rank) {
+                for (size_t b = 0; b < hidden_bytes; ++b) {
+                    dst[b] = src[b];
+                }
+            } else {
+                ishmem_putmem_nbi(dst, src, hidden_bytes, dst_rank);
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyDispatchQuietKernel>([=]() { ishmem_quiet(); }); });
     queue.wait();
     internode::barrier();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyDispatchNormalizeRecvKernel>(
+            sycl::range<1>(static_cast<size_t>(num_local_experts) * num_ranks), [=](sycl::id<1> id) {
+                const int linear = static_cast<int>(id[0]);
+                const int src_rank = linear % num_ranks;
+                const int local_expert = linear / num_ranks;
+                int write_slot = 0;
+                for (int slot = 0; slot < num_max_dispatch_tokens_per_rank; ++slot) {
+                    const size_t read_slot =
+                        (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank + slot;
+                    const int token = dispatch_src[read_slot];
+                    if (token < 0) {
+                        continue;
+                    }
+                    const size_t write_idx =
+                        (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank + write_slot;
+                    if (write_idx != read_slot) {
+                        dispatch_src[write_idx] = token;
+                        auto* dst = dispatch_data + write_idx * hidden_bytes;
+                        auto* src = dispatch_data + read_slot * hidden_bytes;
+                        for (size_t b = 0; b < hidden_bytes; ++b) {
+                            dst[b] = src[b];
+                            src[b] = 0;
+                        }
+                        dispatch_src[read_slot] = -1;
+                    }
+                    ++write_slot;
+                }
+                dispatch_count[local_expert * num_ranks + src_rank] = write_slot;
+            });
+    });
+    queue.wait();
 
     const size_t pack_work = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
     queue.submit([&](sycl::handler& cgh) {
@@ -343,7 +461,7 @@ void combine_bf16(void* combined_x,
     auto* base = static_cast<uint8_t*>(rdma_buffer);
     auto* send_data = base + layout.send_data_offset;
     auto* combine_data = base + layout.combine_data_offset;
-    auto* combine_flag = reinterpret_cast<int*>(base + layout.combine_flag_offset);
+    auto* combine_flag = reinterpret_cast<uint64_t*>(base + layout.combine_flag_offset);
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t combine_elems = static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank;
@@ -399,17 +517,34 @@ void combine_bf16(void* combined_x,
     });
     queue.wait();
 
-    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-            const int global_expert = rank * num_local_experts + local_expert;
-            auto* src = send_data +
-                (static_cast<size_t>(src_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank) * hidden_bytes;
-            auto* dst = combine_data + static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank * hidden_bytes;
-            ishmemx_putmem_on_queue(dst, src, static_cast<size_t>(num_max_dispatch_tokens_per_rank) * hidden_bytes, src_rank, queue);
+    for (int owner_turn = 0; owner_turn < num_ranks; ++owner_turn) {
+        if (rank == owner_turn) {
+            const size_t combine_put_work = static_cast<size_t>(num_ranks) * num_local_experts;
+            queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for<LowLatencyCombinePutKernel>(sycl::range<1>(combine_put_work), [=](sycl::id<1> id) {
+                    const int linear = static_cast<int>(id[0]);
+                    const int local_expert = linear % num_local_experts;
+                    const int dst_rank = linear / num_local_experts;
+                    const int global_expert = rank * num_local_experts + local_expert;
+                    auto* src = send_data +
+                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank) * hidden_bytes;
+                    auto* dst = combine_data + static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank * hidden_bytes;
+                    const size_t bytes = static_cast<size_t>(num_max_dispatch_tokens_per_rank) * hidden_bytes;
+                    if (dst_rank == rank) {
+                        for (size_t b = 0; b < bytes; ++b) {
+                            dst[b] = src[b];
+                        }
+                    } else {
+                        ishmem_putmem_nbi(dst, src, bytes, dst_rank);
+                    }
+                });
+            });
+            queue.wait();
+        }
+        for (int i = 0; i < 16; ++i) {
+            internode::barrier();
         }
     }
-    queue.wait();
-    internode::barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<LowLatencyCombineRecvKernel>(

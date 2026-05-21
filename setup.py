@@ -46,6 +46,16 @@ def append_sycl_dlink_objects(object_paths):
     torch_cpp_extension._get_sycl_device_flags = patched_get_sycl_device_flags
 
 
+def register_cpp_sycl_sources(source_paths):
+    sycl_source_paths = {str(Path(path).resolve()) for path in source_paths}
+    original_is_sycl_file = torch_cpp_extension._is_sycl_file
+
+    def patched_is_sycl_file(path):
+        return original_is_sycl_file(path) or str(Path(path).resolve()) in sycl_source_paths
+
+    torch_cpp_extension._is_sycl_file = patched_is_sycl_file
+
+
 if __name__ == '__main__':
     target = os.getenv('DEEP_EP_TARGET', 'xpu').lower()
     if target not in ('cuda', 'xpu'):
@@ -62,13 +72,17 @@ if __name__ == '__main__':
             '-DDEEP_EP_XPU',
             '-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING',
         ]
-        sycl_flags = ['-O3', '-fsycl', '-fsycl-rdc', '-DDEEP_EP_XPU']
+        sycl_flags = ['-O3', '-fsycl', '-fsycl-rdc', '-fsycl-targets=spir64', '-DDEEP_EP_XPU']
+        sycl_sources = [
+            'csrc/xpu/layout.cpp',
+            'csrc/xpu/intranode.cpp',
+            'csrc/xpu/internode.cpp',
+            'csrc/xpu/internode_ll.cpp',
+        ]
+        register_cpp_sycl_sources(sycl_sources)
         sources = [
             'csrc/xpu/deep_ep_xpu.cpp',
-            'csrc/xpu/layout.sycl',
-            'csrc/xpu/intranode.sycl',
-            'csrc/xpu/internode.sycl',
-            'csrc/xpu/internode_ll.sycl',
+            *sycl_sources,
         ]
         include_dirs = [str(Path('csrc').resolve())]
         library_dirs = []
