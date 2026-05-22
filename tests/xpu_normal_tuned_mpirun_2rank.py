@@ -14,6 +14,37 @@ def route(src_rank, token, world):
     return (src_rank + token) % world
 
 
+def count_to_rank(src_rank, dst_rank, world, num_tokens):
+    return sum(1 for token in range(num_tokens) if route(src_rank, token, world) == dst_rank)
+
+
+def compact_row(src_rank, token, dst_rank, world, num_tokens):
+    prefix = sum(count_to_rank(prev_src, dst_rank, world, num_tokens) for prev_src in range(src_rank))
+    ordinal = sum(1 for prior_token in range(token) if route(src_rank, prior_token, world) == dst_rank)
+    return prefix + ordinal
+
+
+def channel_cumulative(src_rank, dst_rank, world, num_tokens, num_channels):
+    values = []
+    total = 0
+    for channel in range(num_channels):
+        start = num_tokens * channel // num_channels
+        end = num_tokens * (channel + 1) // num_channels
+        total += sum(1 for token in range(start, end) if route(src_rank, token, world) == dst_rank)
+        values.append(total)
+    return values
+
+
+def recv_channel_offsets(src_rank, dst_rank, world, num_tokens, num_channels):
+    prefix = sum(count_to_rank(prev_src, dst_rank, world, num_tokens) for prev_src in range(src_rank))
+    values = []
+    previous = 0
+    for cumulative in channel_cumulative(src_rank, dst_rank, world, num_tokens, num_channels):
+        values.append(prefix + previous)
+        previous = cumulative
+    return values
+
+
 def make_input(rank, num_tokens, hidden, device):
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * (rank + 1)
     x[:, -1] = torch.arange(num_tokens, dtype=torch.bfloat16, device=device)
@@ -60,7 +91,8 @@ def main():
         num_tokens_per_rank = is_token_in_rank.sum(dim=0).to(torch.int32).contiguous()
         num_tokens_per_rdma_rank = num_tokens_per_rank.clone()
         num_tokens_per_expert = torch.zeros((world, ), dtype=torch.int32, device=device)
-        config = deep_ep.Config(2, 1, 2, 1, 64)
+        num_channels = 2
+        config = deep_ep.Config(num_channels * 2, 1, 2, 1, 64)
 
         print(f"[rank {rank}] starting normal dispatch", flush=True)
         recv_x, recv_topk_idx, recv_topk_weights, _, handle, event = buffer.dispatch(
@@ -82,21 +114,33 @@ def main():
         assert recv_topk_idx is not None and recv_topk_weights is not None
 
         recv_prefix = handle[6].cpu().tolist()
-        assert recv_prefix == [(src_rank + 1) * num_tokens for src_rank in range(world)]
+        expected_recv_prefix = [
+            sum(count_to_rank(src, rank, world, num_tokens) for src in range(src_rank + 1)) for src_rank in range(world)
+        ]
+        assert recv_prefix == expected_recv_prefix
+        assert handle[1].cpu().tolist() == [
+            channel_cumulative(rank, dst_rank, world, num_tokens, num_channels) for dst_rank in range(world)
+        ]
+        assert handle[3].cpu().tolist() == [
+            channel_cumulative(src_rank, rank, world, num_tokens, num_channels) for src_rank in range(world)
+        ]
+        assert handle[5].cpu().tolist() == [
+            recv_channel_offsets(src_rank, rank, world, num_tokens, num_channels) for src_rank in range(world)
+        ]
         recv_meta = handle[7].view(torch.int32).view(num_worst_tokens, 2)
         send_rdma_head = handle[8]
         send_nvl_head = handle[9]
         assert torch.all(send_nvl_head == -1).item()
         for dst_rank in range(world):
             for token in range(num_tokens):
-                expected_head = rank * num_tokens + token if route(rank, token, world) == dst_rank else -1
+                expected_head = compact_row(rank, token, dst_rank, world, num_tokens) if route(rank, token, world) == dst_rank else -1
                 actual_head = send_rdma_head[token, dst_rank].item()
                 assert actual_head == expected_head, (
                     f"rank {rank} token {token} dst {dst_rank}: send_rdma_head {actual_head} != {expected_head}")
         for src_rank in range(world):
             tokens = [token for token in range(num_tokens) if route(src_rank, token, world) == rank]
             for token in tokens:
-                row = src_rank * num_tokens + token
+                row = compact_row(src_rank, token, rank, world, num_tokens)
                 expected_x = torch.ones((hidden, ), dtype=torch.bfloat16, device=device) * (src_rank + 1)
                 expected_x[-1] = token
                 actual_x = recv_x[row]
@@ -130,6 +174,25 @@ def main():
         assert max_abs == 0.0
         assert weight_max_abs == 0.0
 
+        print(f"[rank {rank}] starting cached normal dispatch", flush=True)
+        x_cached = x + torch.full_like(x, 7)
+        recv_cached_x, recv_cached_topk_idx, recv_cached_topk_weights, _, _, event = buffer.dispatch(x_cached,
+                                                                                                     handle=handle,
+                                                                                                     config=config,
+                                                                                                     async_finish=False)
+        if event.event is not None:
+            event.current_stream_wait()
+        torch.xpu.synchronize()
+        assert recv_cached_topk_idx is None and recv_cached_topk_weights is None
+        combined_cached_x, combined_cached_topk_weights, event = buffer.combine(recv_cached_x, handle, config=config, async_finish=False)
+        if event.event is not None:
+            event.current_stream_wait()
+        torch.xpu.synchronize()
+        assert combined_cached_topk_weights is None
+        cached_max_abs = (combined_cached_x - x_cached).abs().max().item()
+        print(f"[rank {rank}] cached combine max_abs={cached_max_abs}", flush=True)
+        assert cached_max_abs == 0.0
+
         print(f"[rank {rank}] starting normal FP8 dispatch", flush=True)
         x_fp8 = x.to(torch.float8_e4m3fn)
         x_scales = torch.ones((num_tokens, hidden // 128), dtype=torch.float32, device=device)
@@ -153,7 +216,7 @@ def main():
         for src_rank in range(world):
             tokens = [token for token in range(num_tokens) if route(src_rank, token, world) == rank]
             for token in tokens:
-                row = src_rank * num_tokens + token
+                row = compact_row(src_rank, token, rank, world, num_tokens)
                 expected_fp8 = (torch.ones((hidden, ), dtype=torch.bfloat16, device=device) * (src_rank + 1)).to(torch.float8_e4m3fn)
                 expected_fp8[-1] = torch.tensor(token, dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
                 assert torch.equal(recv_fp8[row].cpu(), expected_fp8.cpu())
@@ -165,7 +228,7 @@ def main():
                 ]
                 expected_weights = torch.tensor([token + src_rank + 0.25, token + src_rank + 0.75], dtype=torch.float32, device=device)
                 assert torch.allclose(recv_fp8_topk_weights[row], expected_weights)
-        print(f"[rank {rank}] PASS normal internode BF16 dispatch+combine and FP8 dispatch", flush=True)
+        print(f"[rank {rank}] PASS normal internode compact BF16/cached/FP8 validation", flush=True)
     finally:
         buffer.destroy()
         dist.destroy_process_group()

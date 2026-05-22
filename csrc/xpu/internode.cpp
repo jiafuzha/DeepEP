@@ -13,6 +13,7 @@ namespace internode {
 namespace {
 
 class DispatchInitKernel;
+class DispatchCountExchangeKernel;
 class DispatchPackKernel;
 class DispatchOffsetComputeKernel;
 class DispatchPayloadKernel;
@@ -54,10 +55,11 @@ void dispatch(void* recv_x,
               int* send_nvl_head,
               int* recv_rdma_channel_prefix_matrix,
               int* recv_gbl_channel_prefix_matrix,
-              const int* rdma_channel_prefix_matrix,
+              int* rdma_channel_prefix_matrix,
               int* recv_rdma_rank_prefix_sum,
-              const int* gbl_channel_prefix_matrix,
+              int* gbl_channel_prefix_matrix,
               int* recv_gbl_rank_prefix_sum,
+              const int* num_tokens_per_rank,
               const bool* is_token_in_rank,
               int num_tokens,
               int num_recv_tokens,
@@ -65,14 +67,15 @@ void dispatch(void* recv_x,
               int element_size,
               int num_topk,
               int num_scales,
+              int num_channels,
               int rank,
               int num_ranks,
               sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(recv_x != nullptr && x != nullptr, "XPU internode dispatch requires input and output tensors");
-    TORCH_CHECK(recv_src_meta != nullptr, "XPU internode dispatch requires source metadata in non-cached mode");
     TORCH_CHECK(rdma_buffer_ptr != nullptr, "XPU internode dispatch requires a symmetric iSHMEM RDMA buffer");
     TORCH_CHECK(is_token_in_rank != nullptr, "XPU internode dispatch requires is_token_in_rank");
+    TORCH_CHECK(num_channels > 0, "XPU internode dispatch requires a positive channel count");
     TORCH_CHECK(element_size > 0, "XPU internode dispatch element size must be positive");
     TORCH_CHECK((x_scales == nullptr) == (recv_x_scales == nullptr), "XPU internode dispatch scale tensors must be paired");
     TORCH_CHECK((num_scales == 0) == (x_scales == nullptr), "XPU internode dispatch scale shape mismatch");
@@ -88,6 +91,12 @@ void dispatch(void* recv_x,
     auto* meta = static_cast<SourceMeta*>(recv_src_meta);
     auto* rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr);
     size_t offset = 0;
+    auto* rdma_count_matrix = reinterpret_cast<int*>(rdma_base + offset);
+    offset += static_cast<size_t>(num_ranks) * num_ranks * sizeof(int);
+    offset = align_offset(offset, alignof(int));
+    auto* rdma_channel_count_matrix = reinterpret_cast<int*>(rdma_base + offset);
+    offset += static_cast<size_t>(num_ranks) * num_ranks * num_channels * sizeof(int);
+    offset = align_offset(offset, std::max({alignof(SourceMeta), alignof(topk_idx_t), alignof(float)}));
     auto* rdma_x = rdma_base + offset;
     offset += static_cast<size_t>(num_recv_tokens) * row_bytes;
     offset = align_offset(offset, alignof(SourceMeta));
@@ -103,25 +112,36 @@ void dispatch(void* recv_x,
     auto* rdma_x_scales = reinterpret_cast<float*>(rdma_base + offset);
     offset += static_cast<size_t>(num_recv_tokens) * num_scales * sizeof(float);
     auto* rdma_send_x = rdma_base + offset;
-    offset += static_cast<size_t>(num_recv_tokens) * row_bytes;
+    const size_t num_send_slots = static_cast<size_t>(num_recv_tokens) * num_ranks;
+    offset += num_send_slots * row_bytes;
     offset = align_offset(offset, alignof(SourceMeta));
     auto* rdma_send_meta = reinterpret_cast<SourceMeta*>(rdma_base + offset);
-    offset += static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
+    offset += num_send_slots * sizeof(SourceMeta);
     offset = align_offset(offset, alignof(topk_idx_t));
     auto* rdma_send_topk_idx = reinterpret_cast<topk_idx_t*>(rdma_base + offset);
-    offset += static_cast<size_t>(num_recv_tokens) * num_topk * sizeof(topk_idx_t);
+    offset += num_send_slots * num_topk * sizeof(topk_idx_t);
     offset = align_offset(offset, alignof(float));
     auto* rdma_send_topk_weights = reinterpret_cast<float*>(rdma_base + offset);
-    offset += static_cast<size_t>(num_recv_tokens) * num_topk * sizeof(float);
+    offset += num_send_slots * num_topk * sizeof(float);
     offset = align_offset(offset, alignof(float));
     auto* rdma_send_x_scales = reinterpret_cast<float*>(rdma_base + offset);
     const size_t total_recv_elements = static_cast<size_t>(num_recv_tokens) * row_bytes;
+    const size_t total_send_elements = num_send_slots * row_bytes;
     const size_t total_topk_elements = static_cast<size_t>(num_recv_tokens) * num_topk;
+    const size_t total_send_topk_elements = num_send_slots * num_topk;
     const size_t total_scale_elements = static_cast<size_t>(num_recv_tokens) * num_scales;
+    const size_t total_send_scale_elements = num_send_slots * num_scales;
+    const size_t total_count_elements = static_cast<size_t>(num_ranks) * num_ranks;
+    const size_t total_channel_count_elements = total_count_elements * num_channels;
     const size_t init_range = std::max({total_recv_elements,
+                                        total_send_elements,
                                         static_cast<size_t>(num_recv_tokens),
+                                        num_send_slots,
                                         total_topk_elements,
+                                        total_send_topk_elements,
                                         total_scale_elements,
+                                        total_send_scale_elements,
+                                        total_channel_count_elements,
                                         static_cast<size_t>(num_tokens) * num_ranks,
                                         static_cast<size_t>(num_recv_tokens) * NUM_MAX_NVL_PEERS});
 
@@ -131,13 +151,19 @@ void dispatch(void* recv_x,
             if (linear < total_recv_elements) {
                 dst[linear] = 0;
                 rdma_x[linear] = 0;
+            }
+            if (linear < total_send_elements) {
                 rdma_send_x[linear] = 0;
             }
             if (linear < static_cast<size_t>(num_recv_tokens)) {
-                meta[linear].src_rdma_rank = -1;
-                meta[linear].is_token_in_nvl_rank_bits = -1;
+                if (meta != nullptr) {
+                    meta[linear].src_rdma_rank = -1;
+                    meta[linear].is_token_in_nvl_rank_bits = -1;
+                }
                 rdma_meta[linear].src_rdma_rank = -1;
                 rdma_meta[linear].is_token_in_nvl_rank_bits = -1;
+            }
+            if (linear < num_send_slots) {
                 rdma_send_meta[linear].src_rdma_rank = -1;
                 rdma_send_meta[linear].is_token_in_nvl_rank_bits = -1;
             }
@@ -148,6 +174,8 @@ void dispatch(void* recv_x,
                 }
                 rdma_topk_idx[linear] = -1;
                 rdma_topk_weights[linear] = 0.0f;
+            }
+            if (linear < total_send_topk_elements) {
                 rdma_send_topk_idx[linear] = -1;
                 rdma_send_topk_weights[linear] = 0.0f;
             }
@@ -156,7 +184,15 @@ void dispatch(void* recv_x,
                     recv_x_scales[linear] = 0.0f;
                 }
                 rdma_x_scales[linear] = 0.0f;
+            }
+            if (linear < total_send_scale_elements) {
                 rdma_send_x_scales[linear] = 0.0f;
+            }
+            if (linear < total_count_elements) {
+                rdma_count_matrix[linear] = 0;
+            }
+            if (linear < total_channel_count_elements) {
+                rdma_channel_count_matrix[linear] = 0;
             }
             if (send_rdma_head != nullptr && linear < static_cast<size_t>(num_tokens) * num_ranks) {
                 send_rdma_head[linear] = -1;
@@ -170,12 +206,89 @@ void dispatch(void* recv_x,
     internode::barrier();
 
     queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<DispatchCountExchangeKernel>([=]() {
+            auto* local_count_row = rdma_count_matrix + rank * num_ranks;
+            for (int i = 0; i < num_ranks; ++i) {
+                if (num_tokens_per_rank != nullptr) {
+                    local_count_row[i] = num_tokens_per_rank[i];
+                } else {
+                    int count = 0;
+                    for (int token = 0; token < num_tokens; ++token) {
+                        count += is_token_in_rank[token * num_ranks + i] ? 1 : 0;
+                    }
+                    local_count_row[i] = count;
+                }
+            }
+            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                auto* remote_count_row = rdma_count_matrix + rank * num_ranks;
+                if (dst_rank != rank) {
+                    ishmem_putmem(remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank);
+                }
+            }
+
+            auto* local_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
+            for (int dst = 0; dst < num_ranks; ++dst) {
+                int cumulative = 0;
+                for (int channel = 0; channel < num_channels; ++channel) {
+                    const int start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
+                    const int end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
+                    int count = 0;
+                    for (int token = start; token < end; ++token) {
+                        count += is_token_in_rank[token * num_ranks + dst] ? 1 : 0;
+                    }
+                    cumulative += count;
+                    local_channel_row[dst * num_channels + channel] = cumulative;
+                }
+            }
+            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                auto* remote_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
+                if (dst_rank != rank) {
+                    ishmem_putmem(
+                        remote_channel_row, local_channel_row, static_cast<size_t>(num_ranks) * num_channels * sizeof(int), dst_rank);
+                }
+            }
+        });
+    });
+    queue.wait();
+    internode::barrier();
+
+    queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchOffsetComputeKernel>([=]() {
+            int recv_sum = 0;
             for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                recv_gbl_rank_prefix_sum[src_rank] = (src_rank + 1) * num_tokens;
+                const int src_count = rdma_count_matrix[src_rank * num_ranks + rank];
+                for (int channel = 0; channel < num_channels; ++channel) {
+                    const int channel_end =
+                        rdma_channel_count_matrix[(static_cast<size_t>(src_rank) * num_ranks + rank) * num_channels + channel];
+                    const int channel_start = channel == 0
+                        ? 0
+                        : rdma_channel_count_matrix[(static_cast<size_t>(src_rank) * num_ranks + rank) * num_channels + channel - 1];
+                    if (recv_gbl_channel_prefix_matrix != nullptr) {
+                        recv_gbl_channel_prefix_matrix[src_rank * num_channels + channel] = recv_sum + channel_start;
+                    }
+                    if (recv_rdma_channel_prefix_matrix != nullptr) {
+                        recv_rdma_channel_prefix_matrix[src_rank * num_channels + channel] = channel_end;
+                    }
+                }
+                recv_sum += src_count;
+                recv_gbl_rank_prefix_sum[src_rank] = recv_sum;
             }
             if (recv_rdma_rank_prefix_sum != nullptr) {
-                recv_rdma_rank_prefix_sum[0] = num_tokens * num_ranks;
+                int rdma_sum = 0;
+                for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                    rdma_sum += rdma_count_matrix[src_rank * num_ranks + rank];
+                    recv_rdma_rank_prefix_sum[src_rank] = rdma_sum;
+                }
+            }
+            if (rdma_channel_prefix_matrix != nullptr) {
+                for (int dst = 0; dst < num_ranks; ++dst) {
+                    for (int channel = 0; channel < num_channels; ++channel) {
+                        const int channel_end =
+                            rdma_channel_count_matrix[(static_cast<size_t>(rank) * num_ranks + dst) * num_channels + channel];
+                        rdma_channel_prefix_matrix[dst * num_channels + channel] = channel_end;
+                        gbl_channel_prefix_matrix[dst * num_channels + channel] = channel_end;
+                    }
+                }
             }
         });
     });
@@ -189,7 +302,13 @@ void dispatch(void* recv_x,
                 return;
             }
 
-            const int dst_token = rank * num_tokens + token;
+            int dst_token = 0;
+            for (int src_rank = 0; src_rank < rank; ++src_rank) {
+                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
+            }
+            for (int prior_token = 0; prior_token < token; ++prior_token) {
+                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+            }
             if (dst_token >= num_recv_tokens) {
                 return;
             }
@@ -197,22 +316,23 @@ void dispatch(void* recv_x,
                 send_rdma_head[token * num_ranks + dst_rank] = dst_token;
             }
 
-            auto* send_x = rdma_send_x + static_cast<size_t>(dst_token) * row_bytes;
+            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
+            auto* send_x = rdma_send_x + send_slot * row_bytes;
             auto* src_x = src + static_cast<size_t>(token) * row_bytes;
             for (size_t h = 0; h < row_bytes; ++h) {
                 send_x[h] = src_x[h];
             }
-            rdma_send_meta[dst_token] = SourceMeta{rank, token};
+            rdma_send_meta[send_slot] = SourceMeta{rank, token};
             if (x_scales != nullptr) {
-                auto* send_scales = rdma_send_x_scales + static_cast<size_t>(dst_token) * num_scales;
+                auto* send_scales = rdma_send_x_scales + send_slot * num_scales;
                 auto* src_scales = x_scales + static_cast<size_t>(token) * num_scales;
                 for (int k = 0; k < num_scales; ++k) {
                     send_scales[k] = src_scales[k];
                 }
             }
             if (topk_idx != nullptr) {
-                auto* send_topk_idx = rdma_send_topk_idx + static_cast<size_t>(dst_token) * num_topk;
-                auto* send_topk_weights = rdma_send_topk_weights + static_cast<size_t>(dst_token) * num_topk;
+                auto* send_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
+                auto* send_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
                 auto* src_topk_idx = topk_idx + static_cast<size_t>(token) * num_topk;
                 auto* src_topk_weights = topk_weights + static_cast<size_t>(token) * num_topk;
                 for (int k = 0; k < num_topk; ++k) {
@@ -233,22 +353,29 @@ void dispatch(void* recv_x,
                 return;
             }
 
-            const int dst_token = rank * num_tokens + token;
+            int dst_token = 0;
+            for (int src_rank = 0; src_rank < rank; ++src_rank) {
+                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
+            }
+            for (int prior_token = 0; prior_token < token; ++prior_token) {
+                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+            }
             if (dst_token >= num_recv_tokens) {
                 return;
             }
 
             SourceMeta token_meta{rank, token};
             auto* dst_x = rdma_x + static_cast<size_t>(dst_token) * row_bytes;
-            auto* src_x = rdma_send_x + static_cast<size_t>(dst_token) * row_bytes;
+            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
+            auto* src_x = rdma_send_x + send_slot * row_bytes;
             auto* dst_meta = rdma_meta + dst_token;
-            auto* src_meta = rdma_send_meta + dst_token;
+            auto* src_meta = rdma_send_meta + send_slot;
             auto* dst_topk_idx = rdma_topk_idx + static_cast<size_t>(dst_token) * num_topk;
             auto* dst_topk_weights = rdma_topk_weights + static_cast<size_t>(dst_token) * num_topk;
-            auto* src_topk_idx = rdma_send_topk_idx + static_cast<size_t>(dst_token) * num_topk;
-            auto* src_topk_weights = rdma_send_topk_weights + static_cast<size_t>(dst_token) * num_topk;
+            auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
+            auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
             auto* dst_scales = rdma_x_scales + static_cast<size_t>(dst_token) * num_scales;
-            auto* src_scales = rdma_send_x_scales + static_cast<size_t>(dst_token) * num_scales;
+            auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
             if (dst_rank == rank) {
                 for (size_t h = 0; h < row_bytes; ++h) {
                     dst_x[h] = src_x[h];
@@ -283,7 +410,9 @@ void dispatch(void* recv_x,
                 dst[linear] = rdma_x[linear];
             }
             if (linear < static_cast<size_t>(num_recv_tokens)) {
-                meta[linear] = rdma_meta[linear];
+                if (meta != nullptr) {
+                    meta[linear] = rdma_meta[linear];
+                }
             }
             if (linear < total_topk_elements && recv_topk_idx != nullptr) {
                 recv_topk_idx[linear] = rdma_topk_idx[linear];

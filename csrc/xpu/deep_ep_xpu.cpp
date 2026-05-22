@@ -1333,6 +1333,7 @@ struct Buffer {
                             recv_rdma_rank_prefix_sum.data_ptr<int>(),
                             gbl_channel_prefix_matrix.data_ptr<int>(),
                             recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                            cached_mode ? nullptr : num_tokens_per_rank->data_ptr<int>(),
                             is_token_in_rank.data_ptr<bool>(),
                             num_tokens,
                             num_recv_tokens,
@@ -1340,6 +1341,7 @@ struct Buffer {
                             static_cast<int>(x.element_size()),
                             num_topk,
                             num_scales,
+                            num_channels,
                             rank,
                             num_ranks,
                             comm_stream.queue());
