@@ -9,6 +9,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 cases=(
+    init_attr_uniqueid
     normal_putmem_blocking
     normal_putmem_nbi_quiet
     normal_putmem_parallel_work_items
@@ -16,6 +17,8 @@ cases=(
     atomic_add_remote
     atomic_add_remote_many
     ll_ptr_device
+    team_split_sync_destroy
+    device_barrier_all
     quiet_empty
     intranode_no_mapped_ishmem_api
     normal_sync_all_device
@@ -59,6 +62,7 @@ run_case() {
         -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
         -genv ISHMEM_IBGDA_BAR_BACKEND igub \
         -genv I_MPI_FABRICS shm \
+        -genv MASTER_ADDR 127.0.0.1 \
         -genv ISHMEM_DEBUG 0 \
         "$BIN" --case "$case_name"
 }

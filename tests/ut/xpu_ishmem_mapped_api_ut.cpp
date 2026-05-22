@@ -15,6 +15,7 @@ constexpr int kSentinel = -777777;
 void usage(const char* argv0) {
     std::cerr << "Usage: " << argv0 << " --case CASE [--num-elems N]\n"
               << "Cases:\n"
+              << "  init_attr_uniqueid\n"
               << "  normal_putmem_blocking\n"
               << "  normal_putmem_nbi_quiet\n"
               << "  normal_putmem_parallel_work_items\n"
@@ -24,6 +25,8 @@ void usage(const char* argv0) {
               << "  atomic_add_remote_many\n"
               << "  atomic_add_all_pes\n"
               << "  ll_ptr_device\n"
+              << "  team_split_sync_destroy\n"
+              << "  device_barrier_all\n"
               << "  normal_sync_all_device\n"
               << "  ll_barrier_work_group\n"
               << "  quiet_empty\n"
@@ -46,6 +49,11 @@ int parse_num_elems(int argc, char** argv, int default_value) {
         }
     }
     return default_value;
+}
+
+int env_int_or(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? default_value : std::atoi(value);
 }
 
 void init_buffers(sycl::queue& queue, int* recv, int* src, int num_elems, int rank, bool zero_recv) {
@@ -106,7 +114,24 @@ int main(int argc, char** argv) {
         num_elems = parse_num_elems(argc, argv, 64);
     }
 
-    ishmem_init();
+    if (test_case == "init_attr_uniqueid") {
+        ishmemx_uniqueid_t unique_id{};
+        if (ishmemx_get_uniqueid(&unique_id) != 0) {
+            std::cerr << "ishmemx_get_uniqueid failed\n";
+            return 2;
+        }
+        ishmemx_attr_t attr{};
+        attr.runtime = ISHMEMX_RUNTIME_MPI;
+        attr.initialize_runtime = true;
+        attr.gpu = true;
+        attr.use_uid = true;
+        attr.nranks = env_int_or("PMI_SIZE", env_int_or("WORLD_SIZE", 2));
+        attr.rank = env_int_or("PMI_RANK", env_int_or("RANK", 0));
+        attr.uid = &unique_id;
+        ishmemx_init_attr(&attr);
+    } else {
+        ishmem_init();
+    }
     sycl::queue queue;
     const int rank = ishmem_my_pe();
     const int world = ishmem_n_pes();
@@ -134,7 +159,17 @@ int main(int argc, char** argv) {
     bool ptr_was_null = false;
     bool ran = true;
 
-    if (test_case == "intranode_no_mapped_ishmem_api") {
+    if (test_case == "init_attr_uniqueid") {
+        init_buffers(queue, recv, src, num_elems, rank, false);
+        ishmem_barrier_all();
+        queue
+            .submit([&](sycl::handler& h) {
+                h.single_task([=]() { ishmem_putmem(recv, src, static_cast<size_t>(num_elems) * sizeof(int), peer); });
+            })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        errors = count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+    } else if (test_case == "intranode_no_mapped_ishmem_api") {
         init_buffers(queue, recv, src, num_elems, rank, false);
         errors = count_constant_errors(queue, recv, num_elems, kSentinel);
         std::cout << "[rank " << rank << "] intranode path has no mapped NVSHMEM/iSHMEM API in csrc/kernels/intranode.cu\n";
@@ -297,6 +332,51 @@ int main(int argc, char** argv) {
         sycl::free(ptr_state, queue);
         errors = ptr_was_null ? count_constant_errors(queue, recv, num_elems, kSentinel)
                               : count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+    } else if (test_case == "team_split_sync_destroy") {
+        init_buffers(queue, recv, src, num_elems, rank, false);
+        queue
+            .single_task([=]() {
+                recv[flag_idx] = 0;
+                src[flag_idx] = 0;
+            })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        ishmem_team_t rdma_like_team = ISHMEM_TEAM_INVALID;
+        ishmem_team_config_t* config = nullptr;
+        int ret = ishmem_team_split_strided(ISHMEM_TEAM_WORLD, 0, 1, world, config, 0, &rdma_like_team);
+        if (ret != 0 || rdma_like_team == ISHMEM_TEAM_INVALID) {
+            std::cout << "  team split failed ret=" << ret << "\n";
+            ++errors;
+        } else {
+            queue
+                .submit([&](sycl::handler& h) {
+                    h.single_task([=]() {
+                        ishmem_int_put(recv, src, static_cast<size_t>(num_elems), peer);
+                        ishmem_team_sync(rdma_like_team);
+                    });
+                })
+                .wait_and_throw();
+            errors += count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+            ishmem_team_destroy(rdma_like_team);
+        }
+    } else if (test_case == "device_barrier_all") {
+        init_buffers(queue, recv, src, num_elems, rank, false);
+        queue
+            .single_task([=]() {
+                recv[flag_idx] = 0;
+                src[flag_idx] = 0;
+            })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        queue
+            .submit([&](sycl::handler& h) {
+                h.single_task([=]() {
+                    ishmem_int_put(recv, src, static_cast<size_t>(num_elems), peer);
+                    ishmem_barrier_all();
+                });
+            })
+            .wait_and_throw();
+        errors = count_errors(queue, recv, num_elems, (peer + 1) * 100000);
     } else if (test_case == "normal_sync_all_device") {
         init_buffers(queue, recv, src, num_elems, rank, false);
         queue
