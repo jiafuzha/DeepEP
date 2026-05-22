@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -52,6 +53,12 @@ def make_input(rank, num_tokens, hidden, device):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", type=int, default=9)
+    parser.add_argument("--rdma-send-window", type=int, default=2)
+    parser.add_argument("--rdma-recv-window", type=int, default=4)
+    args = parser.parse_args()
+
     rank = int(os.environ.get("PMI_RANK", os.environ.get("PMIX_RANK", "0")))
     world = int(os.environ.get("PMI_SIZE", os.environ.get("PMIX_SIZE", "2")))
     assert world == 2, f"expected 2 ranks, got {world}"
@@ -64,7 +71,7 @@ def main():
     dist.init_process_group(backend="xccl")
     group = dist.new_group(list(range(world)))
 
-    num_tokens, hidden = 4, 128
+    num_tokens, hidden = args.num_tokens, 128
     num_worst_tokens = num_tokens * world
     buffer = deep_ep.Buffer(group,
                             num_nvl_bytes=0,
@@ -92,7 +99,7 @@ def main():
         num_tokens_per_rdma_rank = num_tokens_per_rank.clone()
         num_tokens_per_expert = torch.zeros((world, ), dtype=torch.int32, device=device)
         num_channels = 2
-        config = deep_ep.Config(num_channels * 2, 1, 2, 1, 64)
+        config = deep_ep.Config(num_channels * 2, 1, 2, args.rdma_send_window, args.rdma_recv_window)
 
         print(f"[rank {rank}] starting normal dispatch", flush=True)
         recv_x, recv_topk_idx, recv_topk_weights, _, handle, event = buffer.dispatch(
