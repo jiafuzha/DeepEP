@@ -15,13 +15,16 @@ def main():
     world = int(os.environ.get("PMI_SIZE", os.environ.get("PMIX_SIZE", "2")))
     assert world == 2, f"expected 2 ranks, got {world}"
 
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world)
+
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "28741")
-    torch.xpu.set_device(0)
+    os.environ.setdefault("MASTER_PORT", "29513")
+    # torch.xpu.set_device(0)
 
     # Use gloo for host metadata collectives. XCCL object collectives allocate
-    # invalid huge XPU tensors when each MPI rank has a narrow ZE affinity mask.
-    dist.init_process_group("gloo", init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}", rank=rank, world_size=world)
+    # dist.init_process_group("gloo", init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}", rank=rank, world_size=world)
+    dist.init_process_group(backend="xccl")
     group = dist.new_group(list(range(world)))
 
     num_tokens, hidden, num_experts, num_topk = 4, 128, 4, 2
@@ -63,7 +66,7 @@ def main():
 
         gathered_topk_idx = [None] * world
         print(f"[rank {rank}] gathering metadata", flush=True)
-        dist.all_gather_object(gathered_topk_idx, topk_idx.cpu(), group=group)
+        dist.all_gather_object(gathered_topk_idx, topk_idx, group=group)
         print(f"[rank {rank}] validating dispatch counts", flush=True)
         all_topk_idx = torch.stack(gathered_topk_idx).to(device="xpu", dtype=topk_idx.dtype)
         for local_expert in range(num_experts // world):

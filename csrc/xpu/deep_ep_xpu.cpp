@@ -50,6 +50,45 @@ struct XpuIpcHandle {
 
 void check_xpu_tensor(const torch::Tensor& tensor, const char* name);
 
+bool try_parse_env_int(const char* name, int* value) {
+    const char* env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    *value = static_cast<int>(parsed);
+    return true;
+}
+
+int resolve_xpu_device_index() {
+    const int num_devices = static_cast<int>(c10::xpu::device_count_ensure_non_zero());
+    const int current = static_cast<int>(c10::xpu::current_device());
+
+    int local_rank = -1;
+    for (const char* key : {"LOCAL_RANK", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID",
+                            "PMI_LOCAL_RANK", "PALS_LOCAL_RANKID"}) {
+        if (try_parse_env_int(key, &local_rank)) {
+            if (local_rank < 0) {
+                continue;
+            }
+            return local_rank % num_devices;
+        }
+    }
+
+    if (current >= 0 && current < num_devices) {
+        return current;
+    }
+    return 0;
+}
+
 struct LowLatencyBufferLayout {
     size_t mask_offset = 0;
     size_t sync_offset = 0;
@@ -153,7 +192,7 @@ int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks
     attr.runtime = ISHMEMX_RUNTIME_MPI;
     attr.initialize_runtime = true;
     attr.gpu = true;
-    attr.device_idx = c10::xpu::current_device();
+    attr.device_idx = resolve_xpu_device_index();
     attr.use_uid = true;
     attr.nranks = num_ranks;
     attr.rank = rank;
@@ -292,6 +331,7 @@ size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int 
         align_up<size_t>((send_buffer_bytes + recv_buffer_bytes + signaling_buffer_bytes_aligned) * 2, NUM_BUFFER_ALIGNMENT_BYTES);
     const size_t xpu_layout_bytes =
         get_low_latency_buffer_layout(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
+    std::cout << "xpu_layout_bytes: " << xpu_layout_bytes << ", legacy_hint: " << legacy_hint << std::endl;
     return std::max(legacy_hint, xpu_layout_bytes);
 }
 
@@ -350,12 +390,12 @@ struct Buffer {
           nvl_rank(rank % NUM_MAX_NVL_PEERS),
           num_rdma_ranks(low_latency_mode ? num_ranks : std::max(1, num_ranks / NUM_MAX_NVL_PEERS)),
           num_nvl_ranks(std::min(num_ranks, NUM_MAX_NVL_PEERS)),
-          device_id(c10::xpu::current_device()),
+          device_id(resolve_xpu_device_index()),
           num_nvl_bytes(num_nvl_bytes),
           num_rdma_bytes(num_rdma_bytes),
           low_latency_mode(low_latency_mode),
           explicitly_destroy(explicitly_destroy),
-          comm_stream(c10::xpu::getStreamFromPool(true)) {
+          comm_stream(c10::xpu::getStreamFromPool(true, device_id)) {
         TORCH_CHECK(rank >= 0 && rank < num_ranks, "rank must be in [0, num_ranks)");
         TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
         TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS || num_ranks % NUM_MAX_NVL_PEERS == 0,
