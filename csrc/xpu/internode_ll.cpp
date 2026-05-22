@@ -541,9 +541,13 @@ void combine_bf16(void* combined_x,
             });
             queue.wait();
         }
-        for (int i = 0; i < 16; ++i) {
-            internode::barrier();
-        }
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.single_task<LowLatencyCombineQuietKernel>([=]() {
+                ishmem_quiet();
+            });
+        });
+        queue.wait();
+        internode::barrier();
     }
 
     queue.submit([&](sycl::handler& cgh) {
