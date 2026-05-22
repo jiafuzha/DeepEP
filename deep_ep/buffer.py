@@ -762,7 +762,7 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
-        if self.is_xpu_runtime:
+        if self.is_xpu_runtime and os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
             return self._xpu_internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                                 num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                                 async_finish)
@@ -814,7 +814,7 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
-        if self.is_xpu_runtime:
+        if self.is_xpu_runtime and os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
             return self._xpu_internode_combine(x, handle, topk_weights, bias, async_finish)
 
         # Unpack handle and bias
@@ -987,24 +987,18 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         if self.is_xpu_runtime:
-            if not use_fp8 and not use_ue8m0:
-                packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
-                    self.runtime.low_latency_dispatch(x, topk_idx,
-                                                      cumulative_local_expert_recv_stats,
-                                                      dispatch_wait_recv_cost_stats,
-                                                      num_max_dispatch_tokens_per_rank, num_experts,
-                                                      use_fp8, round_scale, use_ue8m0,
-                                                      async_finish, return_recv_hook)
-                handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
-                tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range,
-                                     cumulative_local_expert_recv_stats)
-                return packed_recv_x, packed_recv_count, handle, \
-                    EventOverlap(event, tensors_to_record if async_finish else None), hook
-            packed_recv_x, packed_recv_count, handle, event, hook = self._xpu_low_latency_dispatch(
-                x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, cumulative_local_expert_recv_stats, use_fp8, async_finish,
-                return_recv_hook)
-            tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_count, cumulative_local_expert_recv_stats)
-            return packed_recv_x, packed_recv_count, handle, EventOverlap(event.event, tensors_to_record if async_finish else None), hook
+            packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+                self.runtime.low_latency_dispatch(x, topk_idx,
+                                                  cumulative_local_expert_recv_stats,
+                                                  dispatch_wait_recv_cost_stats,
+                                                  num_max_dispatch_tokens_per_rank, num_experts,
+                                                  use_fp8, round_scale, use_ue8m0,
+                                                  async_finish, return_recv_hook)
+            handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+            tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
+                                 packed_recv_layout_range, cumulative_local_expert_recv_stats)
+            return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
+                EventOverlap(event, tensors_to_record if async_finish else None), hook
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
