@@ -1342,6 +1342,7 @@ struct Buffer {
                             num_topk,
                             num_scales,
                             num_channels,
+                            config.num_max_rdma_chunked_send_tokens,
                             config.num_max_rdma_chunked_recv_tokens,
                             rank,
                             num_ranks,
@@ -1491,6 +1492,7 @@ struct Buffer {
                            num_combined_tokens,
                            hidden,
                            num_topk,
+                           config.num_max_rdma_chunked_send_tokens,
                            config.num_max_rdma_chunked_recv_tokens,
                            rank,
                            num_ranks,
@@ -1766,6 +1768,18 @@ struct Buffer {
             false,
             "XPU get_next_low_latency_combine_buffer zero-copy path is not implemented; call low_latency_combine with zero_copy=False");
     }
+
+    torch::Tensor debug_ishmem_channel_put(int row_ints, int num_channels, int queue_stride) {
+        TORCH_CHECK(is_available(), "XPU Buffer must be synced before debug_ishmem_channel_put");
+        TORCH_CHECK(!low_latency_mode, "debug_ishmem_channel_put requires a high-throughput RDMA buffer");
+        TORCH_CHECK(rdma_buffer_ptr != nullptr && num_rdma_bytes > 0, "debug_ishmem_channel_put requires an iSHMEM RDMA buffer");
+        auto options = torch::TensorOptions().device(torch::kXPU, device_id).dtype(torch::kInt32);
+        auto output = torch::empty({num_channels, 8}, options);
+        internode::debug_channel_put(
+            output.data_ptr<int>(), rdma_buffer_ptr, row_ints, num_channels, queue_stride, rank, num_ranks, comm_stream.queue());
+        comm_stream.queue().wait_and_throw();
+        return output;
+    }
 };
 
 bool is_sm90_compiled() {
@@ -1816,7 +1830,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer);
+        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer)
+        .def("debug_ishmem_channel_put", &Buffer::debug_ishmem_channel_put);
 
     m.def("is_sm90_compiled", is_sm90_compiled);
     m.attr("topk_idx_t") = py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<topk_idx_t>::value));

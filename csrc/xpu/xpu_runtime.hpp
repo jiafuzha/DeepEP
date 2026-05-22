@@ -157,6 +157,7 @@ void dispatch(void* recv_x,
               int num_topk,
               int num_scales,
               int num_channels,
+              int num_max_rdma_chunked_send_tokens,
               int num_max_rdma_chunked_recv_tokens,
               int rank,
               int num_ranks,
@@ -181,10 +182,14 @@ void combine(DataType type,
              int num_combined_tokens,
              int hidden,
              int num_topk,
+             int num_max_rdma_chunked_send_tokens,
              int num_max_rdma_chunked_recv_tokens,
              int rank,
              int num_ranks,
              sycl::queue& queue);
+
+void debug_channel_put(
+    int* output, void* rdma_buffer_ptr, int row_ints, int num_channels, int queue_stride, int rank, int num_ranks, sycl::queue& queue);
 
 }  // namespace internode
 

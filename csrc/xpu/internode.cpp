@@ -18,8 +18,13 @@ class DispatchPackKernel;
 class DispatchOffsetComputeKernel;
 class DispatchPayloadKernel;
 class DispatchPayloadQuietKernel;
+class DispatchQueueResetKernel;
 class DispatchQueueCopyKernel;
 class DispatchCopyKernel;
+class DebugChannelPutInitKernel;
+class DebugChannelPutResetKernel;
+class DebugChannelPutKernel;
+class DebugChannelPutValidateKernel;
 
 template <typename dtype_t>
 class CombineInitKernel;
@@ -32,6 +37,9 @@ class CombinePayloadKernel;
 
 template <typename dtype_t>
 class CombinePayloadQuietKernel;
+
+template <typename dtype_t>
+class CombineQueueResetKernel;
 
 template <typename dtype_t>
 class CombineQueueCopyKernel;
@@ -72,6 +80,7 @@ void dispatch(void* recv_x,
               int num_topk,
               int num_scales,
               int num_channels,
+              int num_max_rdma_chunked_send_tokens,
               int num_max_rdma_chunked_recv_tokens,
               int rank,
               int num_ranks,
@@ -81,9 +90,10 @@ void dispatch(void* recv_x,
     TORCH_CHECK(rdma_buffer_ptr != nullptr, "XPU internode dispatch requires a symmetric iSHMEM RDMA buffer");
     TORCH_CHECK(is_token_in_rank != nullptr, "XPU internode dispatch requires is_token_in_rank");
     TORCH_CHECK(num_channels > 0, "XPU internode dispatch requires a positive channel count");
+    TORCH_CHECK(num_max_rdma_chunked_send_tokens > 0, "XPU internode dispatch requires a positive RDMA send window");
     TORCH_CHECK(num_max_rdma_chunked_recv_tokens > 0, "XPU internode dispatch requires a positive RDMA queue window");
-    TORCH_CHECK(num_tokens <= num_max_rdma_chunked_recv_tokens,
-                "XPU internode dispatch validation path requires the per-channel RDMA queue window to cover the local token count");
+    TORCH_CHECK(num_max_rdma_chunked_send_tokens <= num_max_rdma_chunked_recv_tokens,
+                "XPU internode dispatch send window must fit in the RDMA receive queue window");
     TORCH_CHECK(element_size > 0, "XPU internode dispatch element size must be positive");
     TORCH_CHECK((x_scales == nullptr) == (recv_x_scales == nullptr), "XPU internode dispatch scale tensors must be paired");
     TORCH_CHECK((num_scales == 0) == (x_scales == nullptr), "XPU internode dispatch scale shape mismatch");
@@ -104,7 +114,7 @@ void dispatch(void* recv_x,
     offset = align_offset(offset, alignof(int));
     auto* rdma_channel_count_matrix = reinterpret_cast<int*>(rdma_base + offset);
     offset += static_cast<size_t>(num_ranks) * num_ranks * num_channels * sizeof(int);
-    offset = align_offset(offset, std::max({alignof(SourceMeta), alignof(topk_idx_t), alignof(float)}));
+    offset = align_offset(offset, 128);
     auto* rdma_x = rdma_base + offset;
     offset += static_cast<size_t>(num_recv_tokens) * row_bytes;
     offset = align_offset(offset, alignof(SourceMeta));
@@ -119,6 +129,7 @@ void dispatch(void* recv_x,
     offset = align_offset(offset, alignof(float));
     auto* rdma_x_scales = reinterpret_cast<float*>(rdma_base + offset);
     offset += static_cast<size_t>(num_recv_tokens) * num_scales * sizeof(float);
+    offset = align_offset(offset, 128);
     auto* rdma_send_x = rdma_base + offset;
     const size_t num_send_slots = static_cast<size_t>(num_recv_tokens) * num_ranks;
     offset += num_send_slots * row_bytes;
@@ -138,7 +149,9 @@ void dispatch(void* recv_x,
     auto* rdma_send_dst_token = reinterpret_cast<int*>(rdma_base + offset);
     offset += num_send_slots * sizeof(int);
     const int queue_window = num_max_rdma_chunked_recv_tokens;
-    const size_t num_queue_slots = static_cast<size_t>(num_ranks) * num_channels * queue_window;
+    const int queue_stride = std::max(queue_window, 64);
+    const size_t num_queue_slots = static_cast<size_t>(num_ranks) * num_channels * queue_stride;
+    offset = align_offset(offset, 128);
     auto* rdma_queue_x = rdma_base + offset;
     offset += num_queue_slots * row_bytes;
     offset = align_offset(offset, alignof(SourceMeta));
@@ -155,6 +168,12 @@ void dispatch(void* recv_x,
     offset += num_queue_slots * num_scales * sizeof(float);
     offset = align_offset(offset, alignof(int));
     auto* rdma_queue_dst_token = reinterpret_cast<int*>(rdma_base + offset);
+    offset += num_queue_slots * sizeof(int);
+    offset = align_offset(offset, alignof(int));
+    auto* rdma_queue_head = reinterpret_cast<int*>(rdma_base + offset);
+    const size_t num_queue_pairs = static_cast<size_t>(num_ranks) * num_channels;
+    offset += num_queue_pairs * sizeof(int);
+    auto* rdma_queue_tail = reinterpret_cast<int*>(rdma_base + offset);
     const size_t total_recv_elements = static_cast<size_t>(num_recv_tokens) * row_bytes;
     const size_t total_send_elements = num_send_slots * row_bytes;
     const size_t total_queue_elements = num_queue_slots * row_bytes;
@@ -180,6 +199,7 @@ void dispatch(void* recv_x,
                                         total_queue_scale_elements,
                                         total_channel_count_elements,
                                         static_cast<size_t>(num_tokens) * num_ranks,
+                                        num_queue_pairs,
                                         static_cast<size_t>(num_recv_tokens) * NUM_MAX_NVL_PEERS});
 
     queue.submit([&](sycl::handler& cgh) {
@@ -212,6 +232,10 @@ void dispatch(void* recv_x,
                 rdma_queue_meta[linear].src_rdma_rank = -1;
                 rdma_queue_meta[linear].is_token_in_nvl_rank_bits = -1;
                 rdma_queue_dst_token[linear] = -1;
+            }
+            if (linear < num_queue_pairs) {
+                rdma_queue_head[linear] = 0;
+                rdma_queue_tail[linear] = 0;
             }
             if (linear < total_topk_elements) {
                 if (recv_topk_idx != nullptr) {
@@ -398,118 +422,163 @@ void dispatch(void* recv_x,
     });
     queue.wait();
     internode::barrier();
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<DispatchPayloadKernel>(sycl::range<1>(static_cast<size_t>(num_ranks) * num_tokens), [=](sycl::id<1> id) {
-            const int linear = static_cast<int>(id[0]);
-            const int dst_rank = linear / num_tokens;
-            const int token = linear - dst_rank * num_tokens;
-            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
-                return;
+    for (int channel = 0; channel < num_channels; ++channel) {
+        const int channel_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
+        const int channel_end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
+        const int channel_tokens = channel_end - channel_start;
+        for (int window_offset = 0; window_offset < channel_tokens; window_offset += queue_window) {
+            if (window_offset > 0) {
+                queue.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for<DispatchQueueResetKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
+                        const size_t linear = static_cast<size_t>(id[0]);
+                        if (linear < total_queue_elements) {
+                            rdma_queue_x[linear] = 0;
+                        }
+                        if (linear < num_queue_slots) {
+                            rdma_queue_meta[linear].src_rdma_rank = -1;
+                            rdma_queue_meta[linear].is_token_in_nvl_rank_bits = -1;
+                            rdma_queue_dst_token[linear] = -1;
+                        }
+                        if (linear < total_queue_topk_elements) {
+                            rdma_queue_topk_idx[linear] = -1;
+                            rdma_queue_topk_weights[linear] = 0.0f;
+                        }
+                        if (linear < total_queue_scale_elements) {
+                            rdma_queue_x_scales[linear] = 0.0f;
+                        }
+                        if (linear < num_queue_pairs) {
+                            rdma_queue_head[linear] = 0;
+                            rdma_queue_tail[linear] = 0;
+                        }
+                    });
+                });
+                queue.wait();
+                internode::barrier();
             }
 
-            int dst_token = 0;
-            for (int src_rank = 0; src_rank < rank; ++src_rank) {
-                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
-            }
-            for (int prior_token = 0; prior_token < token; ++prior_token) {
-                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-            }
-            if (dst_token >= num_recv_tokens) {
-                return;
-            }
+            queue.submit([&](sycl::handler& cgh) {
+                cgh.single_task<DispatchPayloadKernel>([=]() {
+                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                        for (int token = channel_start; token < channel_end; ++token) {
+                            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
+                                continue;
+                            }
 
-            SourceMeta token_meta{rank, token};
-            int channel = static_cast<int>((static_cast<int64_t>(token) * num_channels) / num_tokens);
-            if (channel >= num_channels) {
-                channel = num_channels - 1;
-            }
-            const int channel_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
-            int queue_ordinal = 0;
-            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
-                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-            }
-            if (queue_ordinal >= queue_window) {
-                return;
-            }
-            const size_t queue_slot = (static_cast<size_t>(rank) * num_channels + channel) * queue_window + queue_ordinal;
-            auto* dst_x = rdma_queue_x + queue_slot * row_bytes;
-            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
-            auto* src_x = rdma_send_x + send_slot * row_bytes;
-            auto* dst_meta = rdma_queue_meta + queue_slot;
-            auto* src_meta = rdma_send_meta + send_slot;
-            auto* dst_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
-            auto* dst_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
-            auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
-            auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
-            auto* dst_scales = rdma_queue_x_scales + queue_slot * num_scales;
-            auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
-            auto* src_dst_token = rdma_send_dst_token + send_slot;
-            if (dst_rank == rank) {
-                for (size_t h = 0; h < row_bytes; ++h) {
-                    dst_x[h] = src_x[h];
-                }
-                *dst_meta = *src_meta;
-                for (int k = 0; k < num_topk; ++k) {
-                    dst_topk_idx[k] = src_topk_idx[k];
-                    dst_topk_weights[k] = src_topk_weights[k];
-                }
-                for (int k = 0; k < num_scales; ++k) {
-                    dst_scales[k] = src_scales[k];
-                }
-                rdma_queue_dst_token[queue_slot] = dst_token;
-            } else {
-                ishmem_putmem(dst_x, src_x, row_bytes, dst_rank);
-                ishmem_putmem(dst_meta, src_meta, sizeof(SourceMeta), dst_rank);
-                if (num_topk > 0) {
-                    ishmem_putmem(dst_topk_idx, src_topk_idx, static_cast<size_t>(num_topk) * sizeof(topk_idx_t), dst_rank);
-                    ishmem_putmem(dst_topk_weights, src_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), dst_rank);
-                }
-                if (num_scales > 0) {
-                    ishmem_putmem(dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank);
-                }
-                ishmem_putmem(rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank);
-            }
-        });
-    });
-    queue.wait();
-    internode::barrier();
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<DispatchQueueCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-            const size_t linear = static_cast<size_t>(id[0]);
-            if (linear < total_queue_elements) {
-                const size_t queue_slot = linear / row_bytes;
-                const size_t byte_idx = linear - queue_slot * row_bytes;
-                const int dst_token = rdma_queue_dst_token[queue_slot];
-                if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
-                    rdma_x[static_cast<size_t>(dst_token) * row_bytes + byte_idx] = rdma_queue_x[linear];
-                }
-            }
-            if (linear < num_queue_slots) {
-                const int dst_token = rdma_queue_dst_token[linear];
-                if (rdma_queue_meta[linear].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
-                    rdma_meta[dst_token] = rdma_queue_meta[linear];
-                }
-            }
-            if (linear < total_queue_topk_elements) {
-                const size_t queue_slot = linear / num_topk;
-                const size_t topk_idx = linear - queue_slot * num_topk;
-                const int dst_token = rdma_queue_dst_token[queue_slot];
-                if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
-                    rdma_topk_idx[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_idx[linear];
-                    rdma_topk_weights[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_weights[linear];
-                }
-            }
-            if (linear < total_queue_scale_elements) {
-                const size_t queue_slot = linear / num_scales;
-                const size_t scale_idx = linear - queue_slot * num_scales;
-                const int dst_token = rdma_queue_dst_token[queue_slot];
-                if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
-                    rdma_x_scales[static_cast<size_t>(dst_token) * num_scales + scale_idx] = rdma_queue_x_scales[linear];
-                }
-            }
-        });
-    });
-    queue.wait();
+                            int dst_token = 0;
+                            for (int src_rank = 0; src_rank < rank; ++src_rank) {
+                                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
+                            }
+                            for (int prior_token = 0; prior_token < token; ++prior_token) {
+                                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                            }
+                            if (dst_token >= num_recv_tokens) {
+                                continue;
+                            }
+
+                            int queue_ordinal = 0;
+                            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
+                                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                            }
+                            const int queue_offset = queue_ordinal - window_offset;
+                            if (queue_offset < 0 || queue_offset >= queue_window) {
+                                continue;
+                            }
+                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
+                            const size_t queue_slot = queue_pair * queue_stride + queue_offset;
+                            auto* dst_x = rdma_queue_x + queue_slot * row_bytes;
+                            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
+                            auto* src_x = rdma_send_x + send_slot * row_bytes;
+                            auto* dst_meta = rdma_queue_meta + queue_slot;
+                            auto* src_meta = rdma_send_meta + send_slot;
+                            auto* dst_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
+                            auto* dst_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
+                            auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
+                            auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
+                            auto* dst_scales = rdma_queue_x_scales + queue_slot * num_scales;
+                            auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
+                            auto* src_dst_token = rdma_send_dst_token + send_slot;
+                            if (dst_rank == rank) {
+                                for (size_t h = 0; h < row_bytes; ++h) {
+                                    dst_x[h] = src_x[h];
+                                }
+                                for (int k = 0; k < num_topk; ++k) {
+                                    dst_topk_idx[k] = src_topk_idx[k];
+                                    dst_topk_weights[k] = src_topk_weights[k];
+                                }
+                                for (int k = 0; k < num_scales; ++k) {
+                                    dst_scales[k] = src_scales[k];
+                                }
+                                rdma_queue_dst_token[queue_slot] = dst_token;
+                                *dst_meta = *src_meta;
+                            } else {
+                                ishmem_putmem(dst_x, src_x, row_bytes, dst_rank);
+                                if (num_topk > 0) {
+                                    ishmem_putmem(dst_topk_idx, src_topk_idx, static_cast<size_t>(num_topk) * sizeof(topk_idx_t), dst_rank);
+                                    ishmem_putmem(
+                                        dst_topk_weights, src_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), dst_rank);
+                                }
+                                if (num_scales > 0) {
+                                    ishmem_putmem(dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank);
+                                }
+                                ishmem_putmem(rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank);
+                                ishmem_putmem(dst_meta, src_meta, sizeof(SourceMeta), dst_rank);
+                            }
+                        }
+                    }
+                });
+            });
+            queue.wait();
+            internode::barrier();
+
+            queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for<DispatchQueueCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
+                    const size_t linear = static_cast<size_t>(id[0]);
+                    if (linear < total_queue_elements) {
+                        const size_t queue_slot = linear / row_bytes;
+                        const size_t byte_idx = linear - queue_slot * row_bytes;
+                        const int dst_token = rdma_queue_dst_token[queue_slot];
+                        if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
+                            rdma_x[static_cast<size_t>(dst_token) * row_bytes + byte_idx] = rdma_queue_x[linear];
+                        }
+                    }
+                    if (linear < num_queue_slots) {
+                        const int dst_token = rdma_queue_dst_token[linear];
+                        if (rdma_queue_meta[linear].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
+                            rdma_meta[dst_token] = rdma_queue_meta[linear];
+                        }
+                    }
+                    if (linear < total_queue_topk_elements) {
+                        const size_t queue_slot = linear / num_topk;
+                        const size_t topk_idx = linear - queue_slot * num_topk;
+                        const int dst_token = rdma_queue_dst_token[queue_slot];
+                        if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
+                            rdma_topk_idx[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_idx[linear];
+                            rdma_topk_weights[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_weights[linear];
+                        }
+                    }
+                    if (linear < total_queue_scale_elements) {
+                        const size_t queue_slot = linear / num_scales;
+                        const size_t scale_idx = linear - queue_slot * num_scales;
+                        const int dst_token = rdma_queue_dst_token[queue_slot];
+                        if (rdma_queue_meta[queue_slot].src_rdma_rank >= 0 && dst_token >= 0 && dst_token < num_recv_tokens) {
+                            rdma_x_scales[static_cast<size_t>(dst_token) * num_scales + scale_idx] = rdma_queue_x_scales[linear];
+                        }
+                    }
+                    if (linear < num_queue_pairs) {
+                        int tail = 0;
+                        for (int queue_offset = 0; queue_offset < queue_window; ++queue_offset) {
+                            if (rdma_queue_meta[linear * queue_stride + queue_offset].src_rdma_rank >= 0) {
+                                tail = queue_offset + 1;
+                            }
+                        }
+                        rdma_queue_tail[linear] = tail;
+                        rdma_queue_head[linear] = tail;
+                    }
+                });
+            });
+            queue.wait();
+        }
+    }
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<DispatchCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
             const size_t linear = static_cast<size_t>(id[0]);
@@ -556,16 +625,19 @@ void launch_combine_copy(void* combined_x,
                          int num_combined_tokens,
                          int hidden,
                          int num_topk,
+                         int num_max_rdma_chunked_send_tokens,
                          int num_max_rdma_chunked_recv_tokens,
                          int rank,
                          int num_ranks,
                          sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(rdma_buffer_ptr != nullptr, "XPU internode combine requires a symmetric iSHMEM RDMA buffer");
+    TORCH_CHECK(num_max_rdma_chunked_send_tokens > 0, "XPU internode combine requires a positive RDMA send window");
     TORCH_CHECK(num_max_rdma_chunked_recv_tokens > 0, "XPU internode combine requires a positive RDMA queue window");
-    TORCH_CHECK(num_combined_tokens <= num_max_rdma_chunked_recv_tokens,
-                "XPU internode combine validation path requires the RDMA queue window to cover the combined token count");
+    TORCH_CHECK(num_max_rdma_chunked_send_tokens <= num_max_rdma_chunked_recv_tokens,
+                "XPU internode combine send window must fit in the RDMA receive queue window");
     const int queue_window = num_max_rdma_chunked_recv_tokens;
+    const int queue_stride = std::max(queue_window, 64);
     auto dst = static_cast<dtype_t*>(combined_x);
     auto src = static_cast<const dtype_t*>(x);
     auto b0 = static_cast<const dtype_t*>(bias_0);
@@ -576,14 +648,17 @@ void launch_combine_copy(void* combined_x,
     auto* rdma_send_x = reinterpret_cast<dtype_t*>(rdma_recv_topk_weights + static_cast<int64_t>(num_combined_tokens) * num_topk);
     auto* rdma_send_topk_weights = reinterpret_cast<float*>(rdma_send_x + static_cast<int64_t>(num_tokens) * hidden);
     auto* rdma_queue_x = reinterpret_cast<dtype_t*>(rdma_send_topk_weights + static_cast<int64_t>(num_tokens) * num_topk);
-    auto* rdma_queue_topk_weights = reinterpret_cast<float*>(rdma_queue_x + static_cast<int64_t>(num_ranks) * queue_window * hidden);
+    auto* rdma_queue_topk_weights = reinterpret_cast<float*>(rdma_queue_x + static_cast<int64_t>(num_ranks) * queue_stride * hidden);
+    auto* rdma_queue_head = reinterpret_cast<int*>(rdma_queue_topk_weights + static_cast<int64_t>(num_ranks) * queue_stride * num_topk);
+    auto* rdma_queue_tail = rdma_queue_head + num_ranks;
     const int64_t total_combined = static_cast<int64_t>(num_combined_tokens) * hidden;
     const int64_t total_recv = static_cast<int64_t>(num_tokens) * hidden;
     const int64_t total_combined_topk = static_cast<int64_t>(num_combined_tokens) * num_topk;
     const int64_t total_recv_topk = static_cast<int64_t>(num_tokens) * num_topk;
-    const int64_t total_queue = static_cast<int64_t>(num_ranks) * queue_window * hidden;
-    const int64_t total_queue_topk = static_cast<int64_t>(num_ranks) * queue_window * num_topk;
-    const int64_t init_range = std::max({total_combined, total_combined_topk, total_queue, total_queue_topk});
+    const int64_t total_queue = static_cast<int64_t>(num_ranks) * queue_stride * hidden;
+    const int64_t total_queue_topk = static_cast<int64_t>(num_ranks) * queue_stride * num_topk;
+    const int64_t init_range =
+        std::max({total_combined, total_combined_topk, total_queue, total_queue_topk, static_cast<int64_t>(num_ranks)});
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -601,6 +676,10 @@ void launch_combine_copy(void* combined_x,
             }
             if (i < total_queue_topk) {
                 rdma_queue_topk_weights[i] = 0.0f;
+            }
+            if (i < num_ranks) {
+                rdma_queue_head[i] = 0;
+                rdma_queue_tail[i] = 0;
             }
         });
     });
@@ -624,59 +703,92 @@ void launch_combine_copy(void* combined_x,
     queue.wait();
     internode::barrier();
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinePayloadKernel<dtype_t>>(sycl::range<1>(num_tokens), [=](sycl::id<1> id) {
-            const int recv_token = static_cast<int>(id[0]);
-            const SourceMeta token_meta = meta[recv_token];
-            const int src_rank = token_meta.src_rdma_rank;
-            const int src_token = token_meta.is_token_in_nvl_rank_bits;
-            if (src_rank < 0 || src_rank >= num_ranks || src_token < 0 || src_token >= num_combined_tokens) {
-                return;
-            }
-
-            auto* remote_dst = rdma_queue_x + (static_cast<int64_t>(rank) * queue_window + src_token) * hidden;
-            auto* local_src = rdma_send_x + static_cast<int64_t>(recv_token) * hidden;
-            auto* remote_topk_weights = rdma_queue_topk_weights + (static_cast<int64_t>(rank) * queue_window + src_token) * num_topk;
-            auto* local_topk_weights = rdma_send_topk_weights + static_cast<int64_t>(recv_token) * num_topk;
-            if (src_rank == rank) {
-                for (int h = 0; h < hidden; ++h) {
-                    remote_dst[h] = local_src[h];
-                }
-                for (int k = 0; k < num_topk; ++k) {
-                    remote_topk_weights[k] = local_topk_weights[k];
-                }
-            } else {
-                ishmem_putmem(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank);
-                if (num_topk > 0) {
-                    ishmem_putmem(remote_topk_weights, local_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), src_rank);
-                }
-            }
-        });
-    });
-    queue.wait();
-    internode::barrier();
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombineQueueCopyKernel<dtype_t>>(
-            sycl::range<1>(std::max(total_combined, total_combined_topk)), [=](sycl::id<1> id) {
+    for (int window_offset = 0; window_offset < num_combined_tokens; window_offset += queue_window) {
+        const int window_tokens = std::min(queue_window, num_combined_tokens - window_offset);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<CombineQueueResetKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
                 const int64_t i = static_cast<int64_t>(id[0]);
-                if (i < total_combined) {
-                    dtype_t value{};
-                    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                        value += rdma_queue_x[(static_cast<int64_t>(src_rank) * queue_window * hidden) + i];
-                    }
-                    rdma_recv_x[i] = value;
+                if (i < total_queue) {
+                    rdma_queue_x[i] = dtype_t{};
                 }
-                if (i < total_combined_topk) {
-                    float value = 0.0f;
-                    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                        value += rdma_queue_topk_weights[(static_cast<int64_t>(src_rank) * queue_window * num_topk) + i];
-                    }
-                    rdma_recv_topk_weights[i] = value;
+                if (i < total_queue_topk) {
+                    rdma_queue_topk_weights[i] = 0.0f;
+                }
+                if (i < num_ranks) {
+                    rdma_queue_head[i] = 0;
+                    rdma_queue_tail[i] = 0;
                 }
             });
-    });
-    queue.wait();
+        });
+        queue.wait();
+        internode::barrier();
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.single_task<CombinePayloadKernel<dtype_t>>([=]() {
+                for (int recv_token = 0; recv_token < num_tokens; ++recv_token) {
+                    const SourceMeta token_meta = meta[recv_token];
+                    const int src_rank = token_meta.src_rdma_rank;
+                    const int src_token = token_meta.is_token_in_nvl_rank_bits;
+                    if (src_rank < 0 || src_rank >= num_ranks || src_token < window_offset || src_token >= window_offset + window_tokens) {
+                        continue;
+                    }
+
+                    const int queue_token = src_token - window_offset;
+                    auto* remote_dst = rdma_queue_x + (static_cast<int64_t>(rank) * queue_stride + queue_token) * hidden;
+                    auto* local_src = rdma_send_x + static_cast<int64_t>(recv_token) * hidden;
+                    auto* remote_topk_weights =
+                        rdma_queue_topk_weights + (static_cast<int64_t>(rank) * queue_stride + queue_token) * num_topk;
+                    auto* local_topk_weights = rdma_send_topk_weights + static_cast<int64_t>(recv_token) * num_topk;
+                    if (src_rank == rank) {
+                        for (int h = 0; h < hidden; ++h) {
+                            remote_dst[h] = local_src[h];
+                        }
+                        for (int k = 0; k < num_topk; ++k) {
+                            remote_topk_weights[k] = local_topk_weights[k];
+                        }
+                    } else {
+                        ishmem_putmem(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank);
+                        if (num_topk > 0) {
+                            ishmem_putmem(remote_topk_weights, local_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), src_rank);
+                        }
+                    }
+                }
+            });
+        });
+        queue.wait();
+        internode::barrier();
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<CombineQueueCopyKernel<dtype_t>>(
+                sycl::range<1>(std::max(static_cast<int64_t>(window_tokens) * hidden, static_cast<int64_t>(window_tokens) * num_topk)),
+                [=](sycl::id<1> id) {
+                    const int64_t i = static_cast<int64_t>(id[0]);
+                    if (i < static_cast<int64_t>(window_tokens) * hidden) {
+                        const int token_offset = static_cast<int>(i / hidden);
+                        const int h = static_cast<int>(i - static_cast<int64_t>(token_offset) * hidden);
+                        dtype_t value{};
+                        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                            value += rdma_queue_x[(static_cast<int64_t>(src_rank) * queue_stride + token_offset) * hidden + h];
+                        }
+                        rdma_recv_x[static_cast<int64_t>(window_offset + token_offset) * hidden + h] = value;
+                    }
+                    if (i < static_cast<int64_t>(window_tokens) * num_topk) {
+                        const int token_offset = static_cast<int>(i / num_topk);
+                        const int k = static_cast<int>(i - static_cast<int64_t>(token_offset) * num_topk);
+                        float value = 0.0f;
+                        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                            value += rdma_queue_topk_weights[(static_cast<int64_t>(src_rank) * queue_stride + token_offset) * num_topk + k];
+                        }
+                        rdma_recv_topk_weights[static_cast<int64_t>(window_offset + token_offset) * num_topk + k] = value;
+                    }
+                    if (i < num_ranks) {
+                        rdma_queue_tail[i] = window_tokens;
+                        rdma_queue_head[i] = window_tokens;
+                    }
+                });
+        });
+        queue.wait();
+    }
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombineBiasKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -720,6 +832,7 @@ void combine(DataType type,
              int num_combined_tokens,
              int hidden,
              int num_topk,
+             int num_max_rdma_chunked_send_tokens,
              int num_max_rdma_chunked_recv_tokens,
              int rank,
              int num_ranks,
@@ -737,6 +850,7 @@ void combine(DataType type,
                                                          num_combined_tokens,
                                                          hidden,
                                                          num_topk,
+                                                         num_max_rdma_chunked_send_tokens,
                                                          num_max_rdma_chunked_recv_tokens,
                                                          rank,
                                                          num_ranks,
@@ -754,11 +868,127 @@ void combine(DataType type,
                                      num_combined_tokens,
                                      hidden,
                                      num_topk,
+                                     num_max_rdma_chunked_send_tokens,
                                      num_max_rdma_chunked_recv_tokens,
                                      rank,
                                      num_ranks,
                                      queue);
     }
+}
+
+void debug_channel_put(
+    int* output, void* rdma_buffer_ptr, int row_ints, int num_channels, int queue_stride, int rank, int num_ranks, sycl::queue& queue) {
+#ifdef DEEP_EP_ENABLE_ISHMEM
+    TORCH_CHECK(output != nullptr, "debug_channel_put requires an output tensor");
+    TORCH_CHECK(rdma_buffer_ptr != nullptr, "debug_channel_put requires a symmetric iSHMEM RDMA buffer");
+    TORCH_CHECK(num_ranks == 2, "debug_channel_put currently expects exactly 2 ranks");
+    TORCH_CHECK(row_ints > 0 && num_channels > 0 && queue_stride >= num_channels,
+                "debug_channel_put received invalid row/channel/stride parameters");
+
+    auto* base = static_cast<int*>(rdma_buffer_ptr);
+    const int num_queue_slots = num_ranks * num_channels * queue_stride;
+    auto* recv_payload = base;
+    auto* recv_meta = recv_payload + static_cast<int64_t>(num_queue_slots) * row_ints;
+    auto* recv_dst_token = recv_meta + num_queue_slots;
+    auto* send_payload = recv_dst_token + num_queue_slots;
+    auto* send_meta = send_payload + static_cast<int64_t>(num_channels) * row_ints;
+    auto* send_dst_token = send_meta + num_channels;
+    const int output_cols = 8;
+    const int init_range =
+        std::max({num_queue_slots * row_ints, num_queue_slots, num_channels * row_ints, num_channels, num_channels * output_cols});
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<DebugChannelPutInitKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
+            const int i = static_cast<int>(id[0]);
+            if (i < num_queue_slots * row_ints) {
+                recv_payload[i] = -1;
+            }
+            if (i < num_queue_slots) {
+                recv_meta[i] = -1;
+                recv_dst_token[i] = -1;
+            }
+            if (i < num_channels * row_ints) {
+                const int channel = i / row_ints;
+                const int lane = i - channel * row_ints;
+                send_payload[i] = (rank + 1) * 100000 + channel * 1000 + lane;
+            }
+            if (i < num_channels) {
+                send_meta[i] = rank * 100 + i;
+                send_dst_token[i] = i;
+            }
+            if (i < num_channels * output_cols) {
+                output[i] = -999;
+            }
+        });
+    });
+    queue.wait();
+    internode::barrier();
+
+    for (int channel = 0; channel < num_channels; ++channel) {
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<DebugChannelPutResetKernel>(sycl::range<1>(std::max(num_queue_slots * row_ints, num_queue_slots)),
+                                                         [=](sycl::id<1> id) {
+                                                             const int i = static_cast<int>(id[0]);
+                                                             if (i < num_queue_slots * row_ints) {
+                                                                 recv_payload[i] = -1;
+                                                             }
+                                                             if (i < num_queue_slots) {
+                                                                 recv_meta[i] = -1;
+                                                                 recv_dst_token[i] = -1;
+                                                             }
+                                                         });
+        });
+        queue.wait();
+        internode::barrier();
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.single_task<DebugChannelPutKernel>([=]() {
+                const int peer = 1 - rank;
+                const int queue_slot = (rank * num_channels + channel) * queue_stride;
+                auto* dst_payload = recv_payload + queue_slot * row_ints;
+                auto* dst_meta = recv_meta + queue_slot;
+                auto* dst_token = recv_dst_token + queue_slot;
+                auto* src_payload = send_payload + channel * row_ints;
+                auto* src_meta = send_meta + channel;
+                auto* src_token = send_dst_token + channel;
+                ishmem_putmem(dst_payload, src_payload, static_cast<size_t>(row_ints) * sizeof(int), peer);
+                ishmem_putmem(dst_token, src_token, sizeof(int), peer);
+                ishmem_putmem(dst_meta, src_meta, sizeof(int), peer);
+            });
+        });
+        queue.wait();
+        internode::barrier();
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.single_task<DebugChannelPutValidateKernel>([=]() {
+                const int peer = 1 - rank;
+                const int queue_slot = (peer * num_channels + channel) * queue_stride;
+                const int expected_meta = peer * 100 + channel;
+                const int expected_first = (peer + 1) * 100000 + channel * 1000;
+                const int actual_meta = recv_meta[queue_slot];
+                const int actual_token = recv_dst_token[queue_slot];
+                const int actual_first = recv_payload[queue_slot * row_ints];
+                const int actual_last = recv_payload[queue_slot * row_ints + row_ints - 1];
+                auto* row = output + channel * output_cols;
+                row[0] = actual_meta;
+                row[1] = actual_token;
+                row[2] = actual_first;
+                row[3] = actual_last;
+                row[4] = expected_meta;
+                row[5] = channel;
+                row[6] = expected_first;
+                row[7] = (actual_meta == expected_meta && actual_token == channel && actual_first == expected_first &&
+                          actual_last == expected_first + row_ints - 1)
+                    ? 0
+                    : 1;
+            });
+        });
+        queue.wait();
+        internode::barrier();
+    }
+#else
+    TORCH_CHECK(false, "debug_channel_put requires iSHMEM support");
+#endif
 }
 
 }  // namespace internode
