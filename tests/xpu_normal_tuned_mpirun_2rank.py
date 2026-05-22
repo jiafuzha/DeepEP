@@ -228,6 +228,40 @@ def main():
                 ]
                 expected_weights = torch.tensor([token + src_rank + 0.25, token + src_rank + 0.75], dtype=torch.float32, device=device)
                 assert torch.allclose(recv_fp8_topk_weights[row], expected_weights)
+
+        print(f"[rank {rank}] starting normal all-rank reduction", flush=True)
+        all_rank_mask = torch.ones((num_tokens, world), dtype=torch.bool, device=device)
+        all_rank_counts = all_rank_mask.sum(dim=0).to(torch.int32).contiguous()
+        recv_all_x, recv_all_topk_idx, recv_all_topk_weights, _, all_handle, event = buffer.dispatch(
+            x,
+            num_tokens_per_rank=all_rank_counts,
+            num_tokens_per_rdma_rank=all_rank_counts.clone(),
+            is_token_in_rank=all_rank_mask,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_worst_tokens=num_worst_tokens,
+            config=config,
+            async_finish=False,
+        )
+        if event.event is not None:
+            event.current_stream_wait()
+        torch.xpu.synchronize()
+        assert recv_all_topk_idx is not None and recv_all_topk_weights is not None
+        combined_all_x, combined_all_topk_weights, event = buffer.combine(recv_all_x,
+                                                                          all_handle,
+                                                                          topk_weights=recv_all_topk_weights,
+                                                                          config=config,
+                                                                          async_finish=False)
+        if event.event is not None:
+            event.current_stream_wait()
+        torch.xpu.synchronize()
+        assert combined_all_topk_weights is not None
+        all_reduce_max_abs = (combined_all_x - x * world).abs().max().item()
+        all_reduce_weight_max_abs = (combined_all_topk_weights - topk_weights * world).abs().max().item()
+        print(f"[rank {rank}] all-rank combine max_abs={all_reduce_max_abs}", flush=True)
+        assert all_reduce_max_abs == 0.0
+        assert all_reduce_weight_max_abs == 0.0
         print(f"[rank {rank}] PASS normal internode compact BF16/cached/FP8 validation", flush=True)
     finally:
         buffer.destroy()

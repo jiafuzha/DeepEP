@@ -1342,6 +1342,7 @@ struct Buffer {
                             num_topk,
                             num_scales,
                             num_channels,
+                            config.num_max_rdma_chunked_recv_tokens,
                             rank,
                             num_ranks,
                             comm_stream.queue());
@@ -1490,6 +1491,7 @@ struct Buffer {
                            num_combined_tokens,
                            hidden,
                            num_topk,
+                           config.num_max_rdma_chunked_recv_tokens,
                            rank,
                            num_ranks,
                            comm_stream.queue());
