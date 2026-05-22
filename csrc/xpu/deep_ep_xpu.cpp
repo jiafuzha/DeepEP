@@ -59,8 +59,7 @@ bool try_parse_env_int(const char* name, int* value) {
     char* end = nullptr;
     errno = 0;
     const long parsed = std::strtol(env, &end, 10);
-    if (errno != 0 || end == env || *end != '\0' || parsed < std::numeric_limits<int>::min() ||
-        parsed > std::numeric_limits<int>::max()) {
+    if (errno != 0 || end == env || *end != '\0' || parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
         return false;
     }
 
@@ -73,8 +72,8 @@ int resolve_xpu_device_index() {
     const int current = static_cast<int>(c10::xpu::current_device());
 
     int local_rank = -1;
-    for (const char* key : {"LOCAL_RANK", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID",
-                            "PMI_LOCAL_RANK", "PALS_LOCAL_RANKID"}) {
+    for (const char* key :
+         {"LOCAL_RANK", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID", "PMI_LOCAL_RANK", "PALS_LOCAL_RANKID"}) {
         if (try_parse_env_int(key, &local_rank)) {
             if (local_rank < 0) {
                 continue;
@@ -340,6 +339,7 @@ struct Buffer {
     int num_ranks;
     int rdma_rank;
     int nvl_rank;
+    bool global_rdma_mode;
     int num_rdma_ranks;
     int num_nvl_ranks;
     int device_id;
@@ -388,7 +388,8 @@ struct Buffer {
           num_ranks(num_ranks),
           rdma_rank(rank / NUM_MAX_NVL_PEERS),
           nvl_rank(rank % NUM_MAX_NVL_PEERS),
-          num_rdma_ranks(low_latency_mode ? num_ranks : std::max(1, num_ranks / NUM_MAX_NVL_PEERS)),
+          global_rdma_mode(!low_latency_mode && num_rdma_bytes > 0 && num_nvl_bytes == 0 && num_ranks <= NUM_MAX_NVL_PEERS),
+          num_rdma_ranks((low_latency_mode || global_rdma_mode) ? num_ranks : std::max(1, num_ranks / NUM_MAX_NVL_PEERS)),
           num_nvl_ranks(std::min(num_ranks, NUM_MAX_NVL_PEERS)),
           device_id(resolve_xpu_device_index()),
           num_nvl_bytes(num_nvl_bytes),
@@ -401,7 +402,7 @@ struct Buffer {
         TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS || num_ranks % NUM_MAX_NVL_PEERS == 0,
                     "XPU internode ranks must be divisible by ",
                     NUM_MAX_NVL_PEERS);
-        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS || low_latency_mode,
+        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS || low_latency_mode || global_rdma_mode,
                     "XPU RDMA buffer is only valid for internode or low-latency ranks");
         TORCH_CHECK(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_nvl_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
         TORCH_CHECK(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_rdma_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
@@ -468,9 +469,9 @@ struct Buffer {
 
     int get_num_rdma_ranks() const { return num_rdma_ranks; }
 
-    int get_rdma_rank() const { return rdma_rank; }
+    int get_rdma_rank() const { return global_rdma_mode ? rank : rdma_rank; }
 
-    int get_root_rdma_rank(bool global) const { return global ? nvl_rank : 0; }
+    int get_root_rdma_rank(bool global) const { return global_rdma_mode ? 0 : (global ? nvl_rank : 0); }
 
     int get_local_device_id() const { return device_id; }
 
@@ -509,7 +510,7 @@ struct Buffer {
     }
 
     pybind11::bytearray get_local_nvshmem_unique_id() const {
-        TORCH_CHECK(rdma_rank == 0, "Only XPU RDMA rank 0 can get an iSHMEM unique ID");
+        TORCH_CHECK(get_rdma_rank() == 0, "Only XPU RDMA rank 0 can get an iSHMEM unique ID");
 #ifdef DEEP_EP_ENABLE_ISHMEM
         const char* port_env = std::getenv("I_MPI_MPCP_SERVER_PORT");
         int base_port = port_env == nullptr || port_env[0] == '\0' ? 35555 : std::stoi(port_env);
@@ -617,8 +618,8 @@ struct Buffer {
             auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
             std::vector<uint8_t> root_unique_id(root_unique_id_str.size());
             std::memcpy(root_unique_id.data(), root_unique_id_str.data(), root_unique_id.size());
-            const int ishmem_rank = low_latency_mode ? rank : rdma_rank;
-            const int num_ishmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+            const int ishmem_rank = (low_latency_mode || global_rdma_mode) ? rank : rdma_rank;
+            const int num_ishmem_ranks = (low_latency_mode || global_rdma_mode) ? num_ranks : num_rdma_ranks;
             TORCH_CHECK(internode::init(root_unique_id, ishmem_rank, num_ishmem_ranks, low_latency_mode) == ishmem_rank,
                         "XPU iSHMEM initialized with an unexpected rank");
             internode::barrier();
@@ -1219,11 +1220,29 @@ struct Buffer {
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
         TORCH_CHECK(!low_latency_mode, "XPU internode_dispatch requires a high-throughput buffer, not a low-latency buffer");
         TORCH_CHECK(num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr, "XPU internode_dispatch requires an iSHMEM RDMA buffer");
-        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_dispatch currently supports BF16 tensors only");
-        TORCH_CHECK(!x_scales.has_value(), "XPU internode_dispatch FP8/x_scales path is not migrated yet");
-        TORCH_CHECK(!topk_idx.has_value() && !topk_weights.has_value(), "XPU internode_dispatch top-k return path is not migrated yet");
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat8_e4m3fn,
+                    "XPU internode_dispatch currently supports BF16 and FP8 tensors only");
+        TORCH_CHECK(x_scales.has_value() == (x.scalar_type() == torch::kFloat8_e4m3fn),
+                    "XPU internode_dispatch FP8 tensors require scales and BF16 tensors must not pass scales");
+        TORCH_CHECK(topk_idx.has_value() == topk_weights.has_value(), "XPU internode_dispatch top-k tensors must be paired");
         check_xpu_tensor(x, "x");
+        int num_scales = 0;
+        if (x_scales.has_value()) {
+            check_xpu_tensor(*x_scales, "x_scales");
+            TORCH_CHECK(x_scales->scalar_type() == torch::kFloat32, "XPU internode_dispatch currently supports float32 scales only");
+            TORCH_CHECK(x_scales->dim() == 2 && x_scales->size(0) == x.size(0), "x_scales shape mismatch");
+            num_scales = static_cast<int>(x_scales->size(1));
+        }
         check_xpu_tensor(is_token_in_rank, "is_token_in_rank");
+        if (topk_idx.has_value()) {
+            check_xpu_tensor(*topk_idx, "topk_idx");
+            check_xpu_tensor(*topk_weights, "topk_weights");
+            TORCH_CHECK(topk_idx->scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value, "topk_idx has an unexpected dtype");
+            TORCH_CHECK(topk_weights->scalar_type() == torch::kFloat32, "topk_weights must be float32");
+            TORCH_CHECK(topk_idx->dim() == 2 && topk_weights->dim() == 2 && topk_idx->sizes() == topk_weights->sizes(),
+                        "topk_idx and topk_weights shape mismatch");
+            TORCH_CHECK(topk_idx->size(0) == x.size(0), "topk_idx token dimension mismatch");
+        }
         TORCH_CHECK(config.num_sms % 2 == 0, "config.num_sms must be even");
         bool cached_mode = cached_rdma_channel_prefix_matrix.has_value();
         if (cached_mode) {
@@ -1251,6 +1270,7 @@ struct Buffer {
 
         const int num_tokens = static_cast<int>(x.size(0));
         const int hidden = static_cast<int>(x.size(1));
+        const int num_topk = topk_idx.has_value() ? static_cast<int>(topk_idx->size(1)) : 0;
         const int num_channels = config.num_sms / 2;
         const int num_recv_tokens = cached_mode ? cached_num_recv_tokens : num_worst_tokens;
         const int num_rdma_recv_tokens = cached_mode ? cached_num_rdma_recv_tokens : num_worst_tokens;
@@ -1267,6 +1287,15 @@ struct Buffer {
             cached_mode ? cached_recv_gbl_rank_prefix_sum.value() : torch::zeros({num_ranks}, int_options);
 
         auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+        auto recv_x_scales = x_scales.has_value()
+            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_scales}, x_scales->options()))
+            : std::optional<torch::Tensor>();
+        auto recv_topk_idx = topk_idx.has_value()
+            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, topk_idx->options()))
+            : std::optional<torch::Tensor>();
+        auto recv_topk_weights = topk_weights.has_value()
+            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, topk_weights->options()))
+            : std::optional<torch::Tensor>();
         auto recv_src_meta = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty({num_recv_tokens, internode::get_source_meta_bytes()}, byte_options));
@@ -1287,14 +1316,15 @@ struct Buffer {
             comm_stream.queue().memcpy(recv_x.data_ptr(), x.data_ptr(), copy_rows * hidden * x.element_size());
         }
         internode::dispatch(recv_x.data_ptr(),
-                            nullptr,
-                            nullptr,
-                            nullptr,
+                            recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
+                            recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                            recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
                             cached_mode ? nullptr : recv_src_meta->data_ptr(),
+                            rdma_buffer_ptr,
                             x.data_ptr(),
-                            nullptr,
-                            nullptr,
-                            nullptr,
+                            x_scales.has_value() ? x_scales->data_ptr<float>() : nullptr,
+                            topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                            topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
                             cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
                             cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
                             cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
@@ -1307,7 +1337,9 @@ struct Buffer {
                             num_tokens,
                             num_recv_tokens,
                             hidden,
-                            0,
+                            static_cast<int>(x.element_size()),
+                            num_topk,
+                            num_scales,
                             rank,
                             num_ranks,
                             comm_stream.queue());
@@ -1336,7 +1368,10 @@ struct Buffer {
                              recv_gbl_channel_prefix_matrix,
                              send_rdma_head,
                              send_nvl_head,
-                             recv_src_meta}) {
+                             recv_src_meta,
+                             recv_x_scales,
+                             recv_topk_idx,
+                             recv_topk_weights}) {
                 if (to.has_value()) {
                     to->record_stream(stream);
                 }
@@ -1349,9 +1384,9 @@ struct Buffer {
         }
 
         return {recv_x,
-                std::nullopt,
-                std::nullopt,
-                std::nullopt,
+                recv_x_scales,
+                recv_topk_idx,
+                recv_topk_weights,
                 {},
                 rdma_channel_prefix_matrix,
                 gbl_channel_prefix_matrix,
@@ -1438,6 +1473,7 @@ struct Buffer {
                            combined_x.data_ptr(),
                            combined_topk_weights_ptr,
                            is_combined_token_in_rank.data_ptr<bool>(),
+                           rdma_buffer_ptr,
                            x.data_ptr(),
                            topk_weights_ptr,
                            bias_ptrs[0],
@@ -1545,13 +1581,13 @@ struct Buffer {
                          int num_max_dispatch_tokens_per_rank,
                          int num_experts,
                          bool use_fp8,
-                         bool,
+                         bool round_scale,
                          bool use_ue8m0,
                          bool async_finish,
                          bool return_recv_hook) {
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before low_latency_dispatch");
         TORCH_CHECK(low_latency_mode, "low_latency_dispatch requires a low-latency buffer");
-        TORCH_CHECK(!use_fp8 && !use_ue8m0, "XPU kernel-backed low_latency_dispatch currently supports BF16 output only");
+        TORCH_CHECK(!use_ue8m0 || (use_fp8 && round_scale), "UE8M0 scales require use_fp8=True and round_scale=True");
         TORCH_CHECK(!(async_finish && return_recv_hook), "async_finish and return_recv_hook cannot both be true");
         check_xpu_tensor(x, "x");
         check_xpu_tensor(topk_idx, "topk_idx");
@@ -1576,7 +1612,22 @@ struct Buffer {
         if (comm_stream != compute_stream) {
             stream_wait(comm_stream, compute_stream);
         }
-        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden}, x.options());
+        const int num_recv_slots = num_ranks * num_max_dispatch_tokens_per_rank;
+        auto packed_recv_bf16 = use_fp8 ? torch::empty({num_local_experts, num_recv_slots, hidden}, x.options()) : torch::Tensor();
+        auto packed_recv_x = use_fp8 ? torch::empty({num_local_experts, num_recv_slots, hidden}, x.options().dtype(torch::kFloat8_e4m3fn))
+                                     : torch::empty({num_local_experts, num_recv_slots, hidden}, x.options());
+        std::optional<torch::Tensor> packed_recv_x_scales;
+        if (use_fp8) {
+            TORCH_CHECK(hidden % 128 == 0, "FP8 low-latency dispatch requires hidden to be divisible by 128");
+            const int num_scales = hidden / 128;
+            if (use_ue8m0) {
+                packed_recv_x_scales =
+                    torch::empty({num_local_experts, num_recv_slots, (num_scales + 3) / 4}, x.options().dtype(torch::kInt32));
+                packed_recv_x_scales->zero_();
+            } else {
+                packed_recv_x_scales = torch::empty({num_local_experts, num_recv_slots, num_scales}, x.options().dtype(torch::kFloat32));
+            }
+        }
         auto int_options = x.options().dtype(torch::kInt32);
         auto long_options = x.options().dtype(torch::kInt64);
         auto packed_recv_count = torch::empty({num_local_experts}, int_options);
@@ -1584,7 +1635,7 @@ struct Buffer {
         auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, long_options);
 
         internode_ll::dispatch_bf16(
-            packed_recv_x.data_ptr(),
+            use_fp8 ? packed_recv_bf16.data_ptr() : packed_recv_x.data_ptr(),
             packed_recv_src_info.data_ptr<int>(),
             packed_recv_layout_range.data_ptr<int64_t>(),
             packed_recv_count.data_ptr<int>(),
@@ -1603,6 +1654,17 @@ struct Buffer {
             num_ranks,
             comm_stream.queue());
 
+        if (use_fp8) {
+            internode_ll::cast_bf16_to_fp8(packed_recv_x.data_ptr(),
+                                           packed_recv_x_scales->data_ptr(),
+                                           packed_recv_bf16.data_ptr(),
+                                           num_local_experts * num_recv_slots,
+                                           hidden,
+                                           round_scale,
+                                           use_ue8m0,
+                                           comm_stream.queue());
+        }
+
         EventHandle event(comm_stream);
         if (!async_finish && comm_stream != compute_stream) {
             stream_wait(compute_stream, comm_stream);
@@ -1611,7 +1673,7 @@ struct Buffer {
         if (return_recv_hook) {
             hook = pybind11::cpp_function([]() {});
         }
-        return {packed_recv_x, std::nullopt, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook};
+        return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook};
     }
 
     std::tuple<torch::Tensor, EventHandle, pybind11::object> low_latency_combine(

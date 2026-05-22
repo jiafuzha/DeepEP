@@ -1,3 +1,5 @@
+#include <c10/util/Float8_e4m3fn.h>
+
 #include "xpu_kernels.hpp"
 
 #ifdef DEEP_EP_ENABLE_ISHMEM
@@ -23,6 +25,7 @@ class LowLatencyDispatchSrcQuietKernel;
 class LowLatencyDispatchQuietKernel;
 class LowLatencyDispatchNormalizeRecvKernel;
 class LowLatencyDispatchPackKernel;
+class LowLatencyCastFp8Kernel;
 class LowLatencyCombineClearKernel;
 class LowLatencyCombineStageKernel;
 class LowLatencyCombinePutKernel;
@@ -107,6 +110,11 @@ inline bool ll_rank_masked(int* mask_buffer_ptr, int rank) {
 
 inline sycl::ext::oneapi::bfloat16 bf16_from_float(float value) {
     return sycl::ext::oneapi::bfloat16(value);
+}
+
+inline uint8_t ue8m0_from_float(float value) {
+    const uint32_t bits = sycl::bit_cast<uint32_t>(value);
+    return static_cast<uint8_t>(bits >> 23);
 }
 
 }  // namespace
@@ -294,19 +302,19 @@ void dispatch_bf16(void* packed_recv_x,
     queue.wait();
 
     queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<LowLatencyDispatchCountsPutKernel>(
-            sycl::range<1>(static_cast<size_t>(num_ranks) * num_local_experts), [=](sycl::id<1> id) {
-                const int linear = static_cast<int>(id[0]);
-                const int local_expert = linear % num_local_experts;
-                const int dst_rank = linear / num_local_experts;
-                auto* dst = dispatch_count + local_expert * num_ranks + rank;
-                auto* src = send_count + dst_rank * num_local_experts + local_expert;
-                if (dst_rank == rank) {
-                    *dst = *src;
-                } else {
-                    ishmem_int_put_nbi(dst, src, 1, dst_rank);
-                }
-            });
+        cgh.parallel_for<LowLatencyDispatchCountsPutKernel>(sycl::range<1>(static_cast<size_t>(num_ranks) * num_local_experts),
+                                                            [=](sycl::id<1> id) {
+                                                                const int linear = static_cast<int>(id[0]);
+                                                                const int local_expert = linear % num_local_experts;
+                                                                const int dst_rank = linear / num_local_experts;
+                                                                auto* dst = dispatch_count + local_expert * num_ranks + rank;
+                                                                auto* src = send_count + dst_rank * num_local_experts + local_expert;
+                                                                if (dst_rank == rank) {
+                                                                    *dst = *src;
+                                                                } else {
+                                                                    ishmem_int_put_nbi(dst, src, 1, dst_rank);
+                                                                }
+                                                            });
     });
     queue.wait();
 
@@ -328,7 +336,7 @@ void dispatch_bf16(void* packed_recv_x,
                 } else {
                     ishmem_putmem(dst, src, static_cast<size_t>(num_max_dispatch_tokens_per_rank) * sizeof(int), dst_rank);
                 }
-        });
+            });
     });
     queue.wait();
     queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyDispatchSrcQuietKernel>([=]() { ishmem_quiet(); }); });
@@ -432,6 +440,65 @@ void dispatch_bf16(void* packed_recv_x,
 #endif
 }
 
+void cast_bf16_to_fp8(void* packed_recv_x,
+                      void* packed_recv_x_scales,
+                      const void* packed_recv_bf16,
+                      int num_rows,
+                      int hidden,
+                      bool round_scale,
+                      bool use_ue8m0,
+                      sycl::queue& queue) {
+    TORCH_CHECK(hidden % 128 == 0, "FP8 low-latency dispatch requires hidden to be divisible by 128");
+    const int num_scales = hidden / 128;
+    const int scale_packs = use_ue8m0 ? (num_scales + 3) / 4 : num_scales;
+    auto* dst_fp8 = static_cast<uint8_t*>(packed_recv_x);
+    auto* src_bf16 = static_cast<const sycl::ext::oneapi::bfloat16*>(packed_recv_bf16);
+    auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
+    auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyCastFp8Kernel>(sycl::range<1>(static_cast<size_t>(num_rows) * num_scales), [=](sycl::id<1> id) {
+            const int linear = static_cast<int>(id[0]);
+            const int row = linear / num_scales;
+            const int scale_idx = linear - row * num_scales;
+            const int base_h = scale_idx * 128;
+            float amax = 1.0e-4f;
+            for (int i = 0; i < 128; ++i) {
+                const float value = static_cast<float>(src_bf16[static_cast<size_t>(row) * hidden + base_h + i]);
+                amax = sycl::fmax(amax, sycl::fabs(value));
+            }
+
+            float scale;
+            float scale_inv;
+            if (round_scale) {
+                const float exp_scale_inv = sycl::ceil(sycl::log2(amax / 448.0f));
+                scale = sycl::exp2(-exp_scale_inv);
+                scale_inv = sycl::exp2(exp_scale_inv);
+            } else {
+                scale_inv = amax / 448.0f;
+                scale = 448.0f / amax;
+            }
+
+            for (int i = 0; i < 128; ++i) {
+                const float value = static_cast<float>(src_bf16[static_cast<size_t>(row) * hidden + base_h + i]) * scale;
+                dst_fp8[static_cast<size_t>(row) * hidden + base_h + i] = c10::Float8_e4m3fn(value).x;
+            }
+
+            if (use_ue8m0) {
+                const int pack_idx = scale_idx / 4;
+                const int pack_shift = (scale_idx % 4) * 8;
+                const int32_t scale_byte = static_cast<int32_t>(ue8m0_from_float(scale_inv)) << pack_shift;
+                sycl::
+                    atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>
+                        scale_pack(dst_scale_int[static_cast<size_t>(row) * scale_packs + pack_idx]);
+                scale_pack.fetch_or(scale_byte);
+            } else {
+                dst_scale_float[static_cast<size_t>(row) * num_scales + scale_idx] = scale_inv;
+            }
+        });
+    });
+}
+
 void combine_bf16(void* combined_x,
                   void* rdma_buffer,
                   int* mask_buffer_ptr,
@@ -527,7 +594,8 @@ void combine_bf16(void* combined_x,
                     const int dst_rank = linear / num_local_experts;
                     const int global_expert = rank * num_local_experts + local_expert;
                     auto* src = send_data +
-                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank) * hidden_bytes;
+                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank) *
+                            hidden_bytes;
                     auto* dst = combine_data + static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank * hidden_bytes;
                     const size_t bytes = static_cast<size_t>(num_max_dispatch_tokens_per_rank) * hidden_bytes;
                     if (dst_rank == rank) {
@@ -541,11 +609,7 @@ void combine_bf16(void* combined_x,
             });
             queue.wait();
         }
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.single_task<LowLatencyCombineQuietKernel>([=]() {
-                ishmem_quiet();
-            });
-        });
+        queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyCombineQuietKernel>([=]() { ishmem_quiet(); }); });
         queue.wait();
         internode::barrier();
     }
