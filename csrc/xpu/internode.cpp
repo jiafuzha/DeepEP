@@ -47,6 +47,129 @@ class CombineQueueCopyKernel;
 template <typename dtype_t>
 class CombineBiasKernel;
 
+#ifdef DEEP_EP_ENABLE_ISHMEM
+struct DebugChannelPutInit {
+    int* output;
+    int* recv_payload;
+    int* recv_meta;
+    int* recv_dst_token;
+    int* send_payload;
+    int* send_meta;
+    int* send_dst_token;
+    int num_queue_slots;
+    int row_ints;
+    int num_channels;
+    int output_cols;
+    int rank;
+
+    void operator()(sycl::id<1> id) const {
+        const int i = static_cast<int>(id[0]);
+        if (i < num_queue_slots * row_ints) {
+            recv_payload[i] = -1;
+        }
+        if (i < num_queue_slots) {
+            recv_meta[i] = -1;
+            recv_dst_token[i] = -1;
+        }
+        if (i < num_channels * row_ints) {
+            const int channel = i / row_ints;
+            const int lane = i - channel * row_ints;
+            send_payload[i] = (rank + 1) * 100000 + channel * 1000 + lane;
+        }
+        if (i < num_channels) {
+            send_meta[i] = rank * 100 + i;
+            send_dst_token[i] = i;
+        }
+        if (i < num_channels * output_cols) {
+            output[i] = -999;
+        }
+    }
+};
+
+struct DebugChannelPutReset {
+    int* recv_payload;
+    int* recv_meta;
+    int* recv_dst_token;
+    int num_queue_slots;
+    int row_ints;
+
+    void operator()(sycl::id<1> id) const {
+        const int i = static_cast<int>(id[0]);
+        if (i < num_queue_slots * row_ints) {
+            recv_payload[i] = -1;
+        }
+        if (i < num_queue_slots) {
+            recv_meta[i] = -1;
+            recv_dst_token[i] = -1;
+        }
+    }
+};
+
+struct DebugChannelPutPost {
+    int* recv_payload;
+    int* recv_meta;
+    int* recv_dst_token;
+    int* send_payload;
+    int* send_meta;
+    int* send_dst_token;
+    int row_ints;
+    int num_channels;
+    int queue_stride;
+    int rank;
+    int channel;
+
+    void operator()() const {
+        const int peer = 1 - rank;
+        const int queue_slot = (rank * num_channels + channel) * queue_stride;
+        auto* dst_payload = recv_payload + queue_slot * row_ints;
+        auto* dst_meta = recv_meta + queue_slot;
+        auto* dst_token = recv_dst_token + queue_slot;
+        auto* src_payload = send_payload + channel * row_ints;
+        auto* src_meta = send_meta + channel;
+        auto* src_token = send_dst_token + channel;
+        ishmem_putmem(dst_payload, src_payload, static_cast<size_t>(row_ints) * sizeof(int), peer);
+        ishmem_putmem(dst_token, src_token, sizeof(int), peer);
+        ishmem_putmem(dst_meta, src_meta, sizeof(int), peer);
+    }
+};
+
+struct DebugChannelPutValidate {
+    int* output;
+    int* recv_payload;
+    int* recv_meta;
+    int* recv_dst_token;
+    int row_ints;
+    int num_channels;
+    int queue_stride;
+    int output_cols;
+    int rank;
+    int channel;
+
+    void operator()() const {
+        const int peer = 1 - rank;
+        const int queue_slot = (peer * num_channels + channel) * queue_stride;
+        const int expected_meta = peer * 100 + channel;
+        const int expected_first = (peer + 1) * 100000 + channel * 1000;
+        const int actual_meta = recv_meta[queue_slot];
+        const int actual_token = recv_dst_token[queue_slot];
+        const int actual_first = recv_payload[queue_slot * row_ints];
+        const int actual_last = recv_payload[queue_slot * row_ints + row_ints - 1];
+        auto* row = output + channel * output_cols;
+        row[0] = actual_meta;
+        row[1] = actual_token;
+        row[2] = actual_first;
+        row[3] = actual_last;
+        row[4] = expected_meta;
+        row[5] = channel;
+        row[6] = expected_first;
+        row[7] = (actual_meta == expected_meta && actual_token == channel && actual_first == expected_first &&
+                  actual_last == expected_first + row_ints - 1)
+            ? 0
+            : 1;
+    }
+};
+#endif
+
 }  // namespace
 
 size_t align_offset(size_t offset, size_t alignment) {
@@ -897,92 +1020,47 @@ void debug_channel_put(
     const int init_range =
         std::max({num_queue_slots * row_ints, num_queue_slots, num_channels * row_ints, num_channels, num_channels * output_cols});
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<DebugChannelPutInitKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-            const int i = static_cast<int>(id[0]);
-            if (i < num_queue_slots * row_ints) {
-                recv_payload[i] = -1;
-            }
-            if (i < num_queue_slots) {
-                recv_meta[i] = -1;
-                recv_dst_token[i] = -1;
-            }
-            if (i < num_channels * row_ints) {
-                const int channel = i / row_ints;
-                const int lane = i - channel * row_ints;
-                send_payload[i] = (rank + 1) * 100000 + channel * 1000 + lane;
-            }
-            if (i < num_channels) {
-                send_meta[i] = rank * 100 + i;
-                send_dst_token[i] = i;
-            }
-            if (i < num_channels * output_cols) {
-                output[i] = -999;
-            }
-        });
-    });
+    DebugChannelPutInit init_kernel{output,
+                                    recv_payload,
+                                    recv_meta,
+                                    recv_dst_token,
+                                    send_payload,
+                                    send_meta,
+                                    send_dst_token,
+                                    num_queue_slots,
+                                    row_ints,
+                                    num_channels,
+                                    output_cols,
+                                    rank};
+    queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutInitKernel>(sycl::range<1>(init_range), init_kernel); });
     queue.wait();
     internode::barrier();
 
     for (int channel = 0; channel < num_channels; ++channel) {
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<DebugChannelPutResetKernel>(sycl::range<1>(std::max(num_queue_slots * row_ints, num_queue_slots)),
-                                                         [=](sycl::id<1> id) {
-                                                             const int i = static_cast<int>(id[0]);
-                                                             if (i < num_queue_slots * row_ints) {
-                                                                 recv_payload[i] = -1;
-                                                             }
-                                                             if (i < num_queue_slots) {
-                                                                 recv_meta[i] = -1;
-                                                                 recv_dst_token[i] = -1;
-                                                             }
-                                                         });
-        });
+        const int reset_range = std::max(num_queue_slots * row_ints, num_queue_slots);
+        DebugChannelPutReset reset_kernel{recv_payload, recv_meta, recv_dst_token, num_queue_slots, row_ints};
+        queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutResetKernel>(sycl::range<1>(reset_range), reset_kernel); });
         queue.wait();
         internode::barrier();
 
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.single_task<DebugChannelPutKernel>([=]() {
-                const int peer = 1 - rank;
-                const int queue_slot = (rank * num_channels + channel) * queue_stride;
-                auto* dst_payload = recv_payload + queue_slot * row_ints;
-                auto* dst_meta = recv_meta + queue_slot;
-                auto* dst_token = recv_dst_token + queue_slot;
-                auto* src_payload = send_payload + channel * row_ints;
-                auto* src_meta = send_meta + channel;
-                auto* src_token = send_dst_token + channel;
-                ishmem_putmem(dst_payload, src_payload, static_cast<size_t>(row_ints) * sizeof(int), peer);
-                ishmem_putmem(dst_token, src_token, sizeof(int), peer);
-                ishmem_putmem(dst_meta, src_meta, sizeof(int), peer);
-            });
-        });
+        DebugChannelPutPost post_kernel{recv_payload,
+                                        recv_meta,
+                                        recv_dst_token,
+                                        send_payload,
+                                        send_meta,
+                                        send_dst_token,
+                                        row_ints,
+                                        num_channels,
+                                        queue_stride,
+                                        rank,
+                                        channel};
+        queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutKernel>(post_kernel); });
         queue.wait();
         internode::barrier();
 
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.single_task<DebugChannelPutValidateKernel>([=]() {
-                const int peer = 1 - rank;
-                const int queue_slot = (peer * num_channels + channel) * queue_stride;
-                const int expected_meta = peer * 100 + channel;
-                const int expected_first = (peer + 1) * 100000 + channel * 1000;
-                const int actual_meta = recv_meta[queue_slot];
-                const int actual_token = recv_dst_token[queue_slot];
-                const int actual_first = recv_payload[queue_slot * row_ints];
-                const int actual_last = recv_payload[queue_slot * row_ints + row_ints - 1];
-                auto* row = output + channel * output_cols;
-                row[0] = actual_meta;
-                row[1] = actual_token;
-                row[2] = actual_first;
-                row[3] = actual_last;
-                row[4] = expected_meta;
-                row[5] = channel;
-                row[6] = expected_first;
-                row[7] = (actual_meta == expected_meta && actual_token == channel && actual_first == expected_first &&
-                          actual_last == expected_first + row_ints - 1)
-                    ? 0
-                    : 1;
-            });
-        });
+        DebugChannelPutValidate validate_kernel{
+            output, recv_payload, recv_meta, recv_dst_token, row_ints, num_channels, queue_stride, output_cols, rank, channel};
+        queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutValidateKernel>(validate_kernel); });
         queue.wait();
         internode::barrier();
     }

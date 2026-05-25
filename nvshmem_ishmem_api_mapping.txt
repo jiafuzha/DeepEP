@@ -1,0 +1,149 @@
+NVSHMEM/IBGDA to iSHMEM/IBGDA API mapping for CUDA kernel migration
+=====================================================================
+
+Scope checked
+-------------
+
+CUDA kernel sources under:
+
+  csrc/kernels/**/*.{cu,cuh,hpp,h}
+
+Files containing NVSHMEM/IBGDA symbols:
+
+  csrc/kernels/configs.cuh
+  csrc/kernels/ibgda_device.cuh
+  csrc/kernels/internode.cu
+  csrc/kernels/internode_ll.cu
+  csrc/kernels/runtime.cu
+
+Host/runtime APIs
+-----------------
+
+CUDA/NVSHMEM API                              iSHMEM mapping / migration note
+--------------------------------------------------------------------------------
+<nvshmem.h>                                  <ishmem.h>
+<nvshmemx.h>                                 <ishmemx.h>
+nvshmemx_uniqueid_t                          ishmemx_uniqueid_t
+nvshmemx_get_uniqueid                        ishmemx_get_uniqueid
+nvshmemx_init_attr_t                         ishmemx_attr_t
+nvshmemx_set_attr_uniqueid_args              No direct current XPU use; current path uses
+                                              ishmemx_attr_t with ISHMEMX_RUNTIME_MPI.
+nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, ...)
+                                              ishmemx_init_attr(&attr)
+NVSHMEMX_INIT_WITH_UNIQUEID                  Not used in current iSHMEM MPI init path.
+nvshmem_my_pe                                ishmem_my_pe
+nvshmem_barrier_all                          ishmem_barrier_all
+nvshmem_align                                ishmem_align
+nvshmem_free                                 ishmem_free
+nvshmem_finalize                             ishmem_finalize
+nvshmem_team_t                               ishmem_team_t
+nvshmem_team_config_t                        iSHMEM team config equivalent if needed
+NVSHMEM_TEAM_WORLD                           ISHMEM_TEAM_WORLD
+NVSHMEM_TEAM_INVALID                         ISHMEM_TEAM_INVALID
+nvshmem_team_split_strided                   ishmem_team_split_strided
+nvshmem_team_destroy                         ishmem_team_destroy
+
+Device/kernel public and semi-public APIs
+-----------------------------------------
+
+CUDA/NVSHMEM/IBGDA API                       iSHMEM mapping / migration note
+--------------------------------------------------------------------------------
+nvshmem_sync                                 ishmem_team_sync
+nvshmem_sync_all                             ishmem_sync_all
+nvshmemx_barrier_all_block                   No exact block-scoped 1:1 mapping confirmed.
+                                              Use device ishmem_barrier_all carefully or
+                                              keep explicit SYCL/kernel synchronization.
+nvshmemi_ibgda_put_nbi_warp                  ishmem_putmem_nbi for nonblocking payload puts,
+                                              or correctness-first ishmem_putmem.
+nvshmemi_ibgda_rma_p                         ishmem_int_put, ishmem_int_put_nbi, or
+                                              ishmem_putmem for scalar remote write.
+nvshmemi_ibgda_amo_nonfetch_add              ishmem_int_atomic_add / ishmem_atomic_add.
+                                              Treat as suspect until validated on the
+                                              target iSHMEM/IBGDA stack.
+nvshmemi_ibgda_quiet                         ishmem_quiet. Known caveat in this migration:
+                                              dispatch-side quiet worked, but combine-side
+                                              quiet previously hung.
+nvshmemi_get_p2p_ptr                         ishmem_ptr if available and GPU IPC is enabled.
+                                              Otherwise replace with symmetric-offset logic
+                                              or Level Zero IPC for NVL/P2P topology.
+
+Private NVSHMEM IBGDA internals
+-------------------------------
+
+The following symbols are NVSHMEM internal IBGDA/QP/WQE implementation details.
+They have no public iSHMEM equivalent and should not be carried into the SYCL
+path. Replace their usage with iSHMEM symmetric-memory RMA operations, explicit
+validated synchronization, and runtime-provided topology/configuration.
+
+Internal symbol                               Migration note
+--------------------------------------------------------------------------------
+ibgda_get_state                               No public iSHMEM equivalent. Remove dependency
+                                              on QP-count internals or pass required
+                                              topology/config explicitly.
+ibgda_get_rc                                  No public iSHMEM equivalent.
+ibgda_get_rc_impl                             No public iSHMEM equivalent.
+ibgda_get_lkey_and_rkey                       No public iSHMEM equivalent. iSHMEM manages
+                                              memory keys internally.
+ibgda_get_rkey                                No public iSHMEM equivalent. iSHMEM manages
+                                              memory keys internally.
+ibgda_reserve_wqe_slots                       No public iSHMEM equivalent.
+ibgda_get_wqe_ptr                             No public iSHMEM equivalent.
+ibgda_submit_requests                         No public iSHMEM equivalent.
+ibgda_poll_cq                                 No public iSHMEM equivalent.
+ibgda_write_rdma_write_wqe                    Replace direct WQE construction with
+                                              ishmem_putmem / ishmem_putmem_nbi.
+ibgda_write_rdma_write_inl_wqe                Replace direct inline WQE construction with
+                                              scalar put or putmem.
+ibgda_write_amo_add_wqe                       Replace direct atomic WQE construction with
+                                              ishmem atomic API after validation.
+ibgda_write_empty_recv_wqe                    No public iSHMEM equivalent.
+ibgda_ring_db                                 No public iSHMEM equivalent.
+ibgda_update_dbr                              No public iSHMEM equivalent.
+ibgda_post_send                               No public iSHMEM equivalent.
+ibgda_lock_acquire                            Internal helper; replace with SYCL/device
+                                              synchronization only if still needed.
+ibgda_lock_release                            Internal helper; replace with SYCL/device
+                                              synchronization only if still needed.
+ibgda_ctrl_seg_t                              Internal mlx5 WQE control segment type.
+ibgda_atomic_32_masked_fa_seg_t               Internal mlx5 atomic WQE segment type.
+nvshmemi_device_state_d                       No public iSHMEM equivalent.
+nvshmemi_ibgda_device_state_d                 No public iSHMEM equivalent.
+nvshmemi_ibgda_device_state_t                 No public iSHMEM equivalent.
+nvshmemi_ibgda_device_state_v1                No public iSHMEM equivalent.
+nvshmemi_ibgda_device_qp_t                    No public iSHMEM equivalent.
+nvshmemi_ibgda_device_qp_management_t         No public iSHMEM equivalent.
+nvshmemi_ibgda_device_cq_t                    No public iSHMEM equivalent.
+nvshmemi_ibgda_device_key_t                   No public iSHMEM equivalent.
+
+Include/header migration
+------------------------
+
+CUDA/NVSHMEM header                           iSHMEM migration note
+--------------------------------------------------------------------------------
+device_host_transport/nvshmem_common_ibgda.h  Remove from XPU/iSHMEM path.
+non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh
+                                              Remove from XPU/iSHMEM path.
+
+Current migration guidance
+--------------------------
+
+1. Use iSHMEM public APIs over symmetric iSHMEM allocations:
+     - ishmem_align / ishmem_free for symmetric buffers
+     - ishmem_putmem or ishmem_putmem_nbi for payload movement
+     - ishmem_barrier_all / ishmem_sync only where validated
+
+2. Avoid private IBGDA state and WQE manipulation in SYCL:
+     - no direct QP lookup
+     - no rkey/lkey lookup
+     - no mlx5 WQE construction
+     - no doorbell or CQ polling code
+
+3. Treat the following as validation-sensitive on the current iSHMEM/IBGDA stack:
+     - ishmem_quiet, especially in combine paths
+     - iSHMEM atomics
+     - P2P pointer mapping / GPU IPC paths
+     - concurrent device work-items issuing many iSHMEM puts
+
+4. The current correctness-first normal-mode XPU path should prefer blocking
+   ishmem_putmem and explicit phased queue visibility until iSHMEM/IBGDA
+   concurrency and completion behavior is characterized by focused tests.
