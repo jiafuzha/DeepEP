@@ -1,0 +1,61 @@
+conda activate jiafuzha_deepep
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+
+export ISHMEM_DIR=/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim
+export PKG_CONFIG_PATH=$ISHMEM_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}
+export ZE_AFFINITY_MASK=4,5
+
+# 1. build and run UTs
+cd <your local deepep dir>
+
+bash tests/ut/build_xpu_ishmem_mapped_api_ut.sh
+bash tests/ut/run_xpu_ishmem_mapped_api_ut.sh
+
+
+# 2. reproduce known UT failures
+timeout 120 mpirun -n 2 \
+     -genv ISHMEM_IB_ENABLE_IBGDA 1 \
+     -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
+     -genv ISHMEM_ENABLE_GPU_IPC 0 \
+     -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 1 \
+     -genv ISHMEM_SYMMETRIC_SIZE 67108864 \
+     -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
+     -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
+     -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+     -genv ISHMEM_IBGDA_BAR_BACKEND igub \
+     -genv I_MPI_FABRICS shm \
+     -genv ISHMEM_DEBUG 0 \
+     ./build/tests/ut/xpu_ishmem_mapped_api_ut --case <case-name>
+
+  Known-failure cases are:
+
+   ll_putmem_nbi_atomic_flag
+   atomic_add_all_pes
+
+  Example:
+
+   ./build/tests/ut/xpu_ishmem_mapped_api_ut --case normal_putmem_blocking
+
+
+# 3. run integration tests
+timeout 120 mpirun -n 2 \
+     -genv ISHMEM_IB_ENABLE_IBGDA 1 \
+     -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
+     -genv ISHMEM_ENABLE_GPU_IPC 0 \
+     -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 1 \
+     -genv ISHMEM_SYMMETRIC_SIZE 67108864 \
+     -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
+     -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
+     -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+     -genv ISHMEM_IBGDA_BAR_BACKEND igub \
+     -genv I_MPI_FABRICS shm \
+     -genv ISHMEM_DEBUG 0 \
+     python tests/xpu_....py
+
+  Known-failure cases are:
+
+   xpu_ll_tuned_mpirun_2rank.py
+
+  Example:
+   
+   python tests/xpu_ll_ishmem_payload_repro_2rank.py

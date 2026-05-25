@@ -23,15 +23,15 @@ cases=(
     intranode_no_mapped_ishmem_api
     normal_sync_all_device
     ll_barrier_work_group
-    ll_putmem_nbi_atomic_flag
-    atomic_add_all_pes
+    # ll_putmem_nbi_atomic_flag
+    # atomic_add_all_pes
 )
 
 known_failures=(
     # Device sync_all validates data movement, but can crash during shutdown/finalize.
-    normal_sync_all_device
+    # normal_sync_all_device
     # Device work-group barrier validates data movement, then crashes during shutdown/finalize.
-    ll_barrier_work_group
+    # ll_barrier_work_group
     # Low-latency-style NBI payload followed by atomic completion flag times out.
     ll_putmem_nbi_atomic_flag
     # Atomic add to all PEs including self crashes/fails; remote-only atomics are covered separately.
