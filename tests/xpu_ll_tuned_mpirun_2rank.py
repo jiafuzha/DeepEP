@@ -150,6 +150,8 @@ def main():
 
     dist.init_process_group(backend="xccl")
     group = dist.new_group(list(range(world)))
+    
+    # os.environ["ZE_AFFINITY_MASK"] = os.environ["DEVICE_MASK"]
 
     hidden, num_experts = 512, 4
     num_tokens, num_topk = 4, 2

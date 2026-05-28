@@ -23,8 +23,8 @@ cases=(
     intranode_no_mapped_ishmem_api
     normal_sync_all_device
     ll_barrier_work_group
-    # ll_putmem_nbi_atomic_flag
-    # atomic_add_all_pes
+    ll_putmem_nbi_atomic_flag
+    atomic_add_all_pes
 )
 
 known_failures=(
@@ -64,7 +64,22 @@ run_case() {
         -genv I_MPI_FABRICS shm \
         -genv MASTER_ADDR 127.0.0.1 \
         -genv ISHMEM_DEBUG 0 \
-        "$BIN" --case "$case_name"
+        -genv BIN $BIN \
+        -genv case_name $case_name \
+        bash -c '
+       if [ "$PMI_RANK" = "0" ]; then
+         export ZE_AFFINITY_MASK=5
+         export ISHMEM_IBGDA_NIC=mlx5_5
+       elif [ "$PMI_RANK" = "1" ]; then
+         export ZE_AFFINITY_MASK=6
+         export ISHMEM_IBGDA_NIC=mlx5_6
+       else
+         echo "unknow PMI rank: $PMI_RANK"
+         exit 1
+       fi
+       "$BIN" --case "$case_name"
+       '
+        
 }
 
 unexpected=0
