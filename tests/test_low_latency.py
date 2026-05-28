@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 import torch
 import torch.distributed as dist
@@ -7,6 +8,11 @@ from typing import Literal, Set
 
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, get_accelerator_device_type, hash_tensor, per_token_cast_back
+
+
+def debug_print(rank: int, message: str):
+    if os.getenv('DEEP_EP_TEST_DEBUG', '0') == '1':
+        print(f'[rank {rank}] {message}', flush=True)
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -75,8 +81,10 @@ def test_main(num_tokens: int,
     for _ in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
+    debug_print(rank, 'before topk all_gather')
     all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device=device_type)
     dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
+    debug_print(rank, 'after topk all_gather')
 
     # For failure simulation and shrink testing
     mask_status = torch.zeros((num_ranks, ), dtype=torch.int, device=device_type)
@@ -95,16 +103,21 @@ def test_main(num_tokens: int,
                         num_times += 1
                         for _ in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device=device_type)
+                            debug_print(rank,
+                                        f'before low_latency_dispatch use_fp8={dispatch_use_fp8} round_scale={round_scale} use_ue8m0={use_ue8m0}')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
+                            debug_print(rank, 'after low_latency_dispatch call')
                             hook() if return_recv_hook else event.current_stream_wait()
+                            debug_print(rank, 'after low_latency_dispatch wait')
                         if shrink_test:
                             query_mask_buffer_and_check("dispatch", buffer, mask_status, expected_masked_ranks)
                         packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
-                        simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
+                        simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden),
+                                                               packed_recv_x[1].view(-1, packed_recv_x[1].size(-1))).view(packed_recv_x[0].shape) \
                             if dispatch_use_fp8 else packed_recv_x.clone()
                         for i in range(num_local_experts if do_check else 0):
                             expert_id = rank * num_local_experts + i
@@ -228,6 +241,8 @@ def test_main(num_tokens: int,
         f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
         f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
         flush=True)
+    if get_accelerator_device_type() == 'xpu':
+        return hash_value
 
     # Separate profiling
     for return_recv_hook in (False, True):
@@ -329,3 +344,4 @@ if __name__ == '__main__':
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    # test_loop(num_processes, args)
