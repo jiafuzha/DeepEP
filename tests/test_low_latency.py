@@ -341,6 +341,7 @@ if __name__ == '__main__':
     parser.add_argument("--pressure-test", action='store_true', help='Whether to do pressure test')
     parser.add_argument("--shrink-test", action='store_true', help='Whether to simulate failure and test shrink mode')
     args = parser.parse_args()
+    # print(args.pressure_test)
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)

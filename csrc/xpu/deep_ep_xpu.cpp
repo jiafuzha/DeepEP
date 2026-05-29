@@ -114,7 +114,7 @@ LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens
     add(num_send_slots * sizeof(int));
     add(static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int));
     add(num_combine_slots * hidden_bytes);
-    add(static_cast<size_t>(num_experts) * sizeof(int));
+    add(static_cast<size_t>(num_experts) * sizeof(uint64_t));
     LowLatencyBufferLayout layout;
     layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
     layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
@@ -1664,6 +1664,7 @@ struct Buffer {
             internode_ll::cast_bf16_to_fp8(packed_recv_x.data_ptr(),
                                            packed_recv_x_scales->data_ptr(),
                                            packed_recv_bf16.data_ptr(),
+                                           packed_recv_src_info.data_ptr<int>(),
                                            num_local_experts * num_recv_slots,
                                            hidden,
                                            round_scale,
