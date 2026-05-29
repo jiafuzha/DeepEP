@@ -19,6 +19,7 @@ void usage(const char* argv0) {
               << "  normal_putmem_blocking\n"
               << "  normal_putmem_nbi_quiet\n"
               << "  normal_putmem_parallel_work_items\n"
+              << "  combine_payload_work_group_putmem_atomic_tail\n"
               << "  work_group_sideband_putmem_nbi_atomic_tail_repeat\n"
               << "  work_group_sideband_putmem_nbi_split_atomic_tail_repeat\n"
               << "  ll_int_put_nbi_quiet\n"
@@ -148,7 +149,10 @@ int main(int argc, char** argv) {
 
     const int peer = 1 - rank;
     const int flag_idx = num_elems;
-    const int alloc_elems = num_elems + 1;
+    const int queue_elems = num_elems * world;
+    const int combine_tail_base = queue_elems;
+    const int warmup_tail_base = combine_tail_base + world;
+    const int alloc_elems = warmup_tail_base + world;
     int* recv = static_cast<int*>(ishmem_align(128, static_cast<size_t>(alloc_elems) * sizeof(int)));
     int* src = static_cast<int*>(ishmem_align(128, static_cast<size_t>(alloc_elems) * sizeof(int)));
     if (recv == nullptr || src == nullptr) {
@@ -228,6 +232,81 @@ int main(int argc, char** argv) {
             .wait_and_throw();
         ishmem_barrier_all();
         errors = count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+    } else if (test_case == "combine_payload_work_group_putmem_atomic_tail") {
+        queue
+            .parallel_for(sycl::range<1>(alloc_elems),
+                          [=](sycl::id<1> id) {
+                              const int i = static_cast<int>(id[0]);
+                              recv[i] = i >= combine_tail_base ? 0 : kSentinel;
+                              src[i] = (rank + 1) * 100000 + i;
+                          })
+            .wait_and_throw();
+        queue
+            .single_task([=]() {
+                for (int i = 0; i < world; ++i) {
+                    recv[combine_tail_base + i] = 0;
+                    recv[warmup_tail_base + i] = 0;
+                }
+            })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        queue.submit([&](sycl::handler& h) { h.single_task([=]() { ishmem_int_atomic_add(recv + warmup_tail_base + rank, 1, peer); }); })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        queue
+            .submit([&](sycl::handler& h) {
+                h.parallel_for(sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(world) * 32), sycl::range<1>(32)),
+                               [=](sycl::nd_item<1> it) {
+                                   auto group = it.get_group();
+                                   const int src_rank = static_cast<int>(it.get_group(0));
+                                   const int local_id = static_cast<int>(it.get_local_id(0));
+                                   const int local_size = static_cast<int>(it.get_local_range(0));
+                                   int* dst = recv + rank * num_elems;
+                                   if (src_rank == rank) {
+                                       for (int i = local_id; i < num_elems; i += local_size) {
+                                           dst[i] = src[i];
+                                       }
+                                   } else {
+                                       ishmemx_putmem_work_group(dst, src, static_cast<size_t>(num_elems) * sizeof(int), src_rank, group);
+                                   }
+                                   sycl::group_barrier(group);
+                               });
+            })
+            .wait_and_throw();
+        queue
+            .submit([&](sycl::handler& h) {
+                h.single_task([=]() {
+                    for (int src_rank = 0; src_rank < world; ++src_rank) {
+                        if (src_rank == rank) {
+                            recv[combine_tail_base + rank] += 1;
+                        } else {
+                            ishmem_int_atomic_add(recv + combine_tail_base + rank, 1, src_rank);
+                        }
+                    }
+                });
+            })
+            .wait_and_throw();
+        ishmem_barrier_all();
+        std::vector<int> host(alloc_elems);
+        queue.memcpy(host.data(), recv, static_cast<size_t>(alloc_elems) * sizeof(int)).wait_and_throw();
+        for (int src_rank = 0; src_rank < world; ++src_rank) {
+            for (int i = 0; i < num_elems; ++i) {
+                const int index = src_rank * num_elems + i;
+                const int expected = (src_rank + 1) * 100000 + i;
+                if (host[index] != expected) {
+                    if (errors < 8) {
+                        std::cout << "  combine queue mismatch src_rank=" << src_rank << " index=" << i << " expected=" << expected
+                                  << " got=" << host[index] << "\n";
+                    }
+                    ++errors;
+                }
+            }
+            if (host[combine_tail_base + src_rank] != 1) {
+                std::cout << "  combine tail mismatch src_rank=" << src_rank << " expected=1 got=" << host[combine_tail_base + src_rank]
+                          << "\n";
+                ++errors;
+            }
+        }
     } else if (test_case == "work_group_sideband_putmem_nbi_atomic_tail_repeat" ||
                test_case == "work_group_sideband_putmem_nbi_split_atomic_tail_repeat") {
         const bool split = test_case == "work_group_sideband_putmem_nbi_split_atomic_tail_repeat";
