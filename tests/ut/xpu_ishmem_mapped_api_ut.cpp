@@ -19,6 +19,8 @@ void usage(const char* argv0) {
               << "  normal_putmem_blocking\n"
               << "  normal_putmem_nbi_quiet\n"
               << "  normal_putmem_parallel_work_items\n"
+              << "  work_group_sideband_putmem_nbi_atomic_tail_repeat\n"
+              << "  work_group_sideband_putmem_nbi_split_atomic_tail_repeat\n"
               << "  ll_int_put_nbi_quiet\n"
               << "  ll_putmem_nbi_atomic_flag\n"
               << "  atomic_add_remote\n"
@@ -226,6 +228,52 @@ int main(int argc, char** argv) {
             .wait_and_throw();
         ishmem_barrier_all();
         errors = count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+    } else if (test_case == "work_group_sideband_putmem_nbi_atomic_tail_repeat" ||
+               test_case == "work_group_sideband_putmem_nbi_split_atomic_tail_repeat") {
+        const bool split = test_case == "work_group_sideband_putmem_nbi_split_atomic_tail_repeat";
+        constexpr int repeats = 1;
+        for (int iter = 0; iter < repeats; ++iter) {
+            init_buffers(queue, recv, src, num_elems, rank, false);
+            queue
+                .single_task([=]() {
+                    recv[flag_idx] = 0;
+                    src[flag_idx] = 0;
+                })
+                .wait_and_throw();
+            ishmem_barrier_all();
+            queue
+                .submit([&](sycl::handler& h) {
+                    h.parallel_for(sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
+                                   [=](sycl::nd_item<1> it) {
+                                       auto group = it.get_group();
+                                       if (split) {
+                                           const int first = num_elems / 2;
+                                           ishmemx_putmem_nbi_work_group(
+                                               recv, src, static_cast<size_t>(first) * sizeof(int), peer, group);
+                                           ishmemx_quiet_work_group(group);
+                                           ishmemx_putmem_nbi_work_group(
+                                               recv + first, src + first,
+                                               static_cast<size_t>(num_elems - first) * sizeof(int), peer, group);
+                                       } else {
+                                           ishmemx_putmem_nbi_work_group(
+                                               recv, src, static_cast<size_t>(num_elems) * sizeof(int), peer, group);
+                                       }
+                                       sycl::group_barrier(group);
+                                       if (group.leader()) {
+                                           ishmem_int_atomic_add(recv + flag_idx, 1, peer);
+                                       }
+                                   });
+                })
+                .wait_and_throw();
+            ishmem_barrier_all();
+            errors += count_errors(queue, recv, num_elems, (peer + 1) * 100000);
+            std::vector<int> flag_host(1);
+            queue.memcpy(flag_host.data(), recv + flag_idx, sizeof(int)).wait_and_throw();
+            if (flag_host[0] != 1) {
+                std::cout << "  iter=" << iter << " flag mismatch expected=1 got=" << flag_host[0] << "\n";
+                ++errors;
+            }
+        }
     } else if (test_case == "ll_int_put_nbi_quiet") {
         init_buffers(queue, recv, src, num_elems, rank, false);
         queue
