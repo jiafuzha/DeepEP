@@ -451,6 +451,7 @@ void dispatch_bf16(void* packed_recv_x,
 void cast_bf16_to_fp8(void* packed_recv_x,
                       void* packed_recv_x_scales,
                       const void* packed_recv_bf16,
+                      const int* packed_recv_src_info,
                       int num_rows,
                       int hidden,
                       bool round_scale,
@@ -469,6 +470,9 @@ void cast_bf16_to_fp8(void* packed_recv_x,
             const int linear = static_cast<int>(id[0]);
             const int row = linear / num_scales;
             const int scale_idx = linear - row * num_scales;
+            if (packed_recv_src_info[row] < 0) {
+                return;
+            }
             const int base_h = scale_idx * 128;
             float amax = 1.0e-4f;
             for (int i = 0; i < 128; ++i) {
@@ -592,35 +596,46 @@ void combine_bf16(void* combined_x,
     });
     queue.wait();
 
-    for (int owner_turn = 0; owner_turn < num_ranks; ++owner_turn) {
-        if (rank == owner_turn) {
-            const size_t combine_put_work = static_cast<size_t>(num_ranks) * num_local_experts;
-            queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for<LowLatencyCombinePutKernel>(sycl::range<1>(combine_put_work), [=](sycl::id<1> id) {
-                    const int linear = static_cast<int>(id[0]);
-                    const int local_expert = linear % num_local_experts;
-                    const int dst_rank = linear / num_local_experts;
-                    const int global_expert = rank * num_local_experts + local_expert;
-                    auto* src = send_data +
-                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank) *
-                            hidden_bytes;
-                    auto* dst = combine_data + static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank * hidden_bytes;
-                    const size_t bytes = static_cast<size_t>(num_max_dispatch_tokens_per_rank) * hidden_bytes;
-                    if (dst_rank == rank) {
-                        for (size_t b = 0; b < bytes; ++b) {
-                            dst[b] = src[b];
-                        }
-                    } else {
-                        ishmem_putmem_nbi(dst, src, bytes, dst_rank);
-                    }
-                });
-            });
-            queue.wait();
-        }
-        queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyCombineQuietKernel>([=]() { ishmem_quiet(); }); });
-        queue.wait();
-        internode::barrier();
-    }
+    const size_t combine_put_work = static_cast<size_t>(num_ranks) * num_local_experts;
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyCombinePutKernel>(sycl::range<1>(combine_put_work), [=](sycl::id<1> id) {
+            const int linear = static_cast<int>(id[0]);
+            const int local_expert = linear % num_local_experts;
+            const int dst_rank = linear / num_local_experts;
+            const int global_expert = rank * num_local_experts + local_expert;
+            int count = 0, begin = 0;
+            unpack_range(layout_range[local_expert * num_ranks + dst_rank], count, begin);
+            int min_token = num_max_dispatch_tokens_per_rank;
+            int max_token = -1;
+            for (int slot = 0; slot < count; ++slot) {
+                const int original_token =
+                    src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
+                if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                    min_token = sycl::min(min_token, original_token);
+                    max_token = sycl::max(max_token, original_token);
+                }
+            }
+            if (max_token < min_token) {
+                return;
+            }
+            auto* src = send_data +
+                (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank + min_token) *
+                    hidden_bytes;
+            auto* dst = combine_data + (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
+            const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
+            if (dst_rank == rank) {
+                for (size_t b = 0; b < bytes; ++b) {
+                    dst[b] = src[b];
+                }
+            } else {
+                ishmem_putmem_nbi(dst, src, bytes, dst_rank);
+            }
+        });
+    });
+    queue.wait();
+    queue.submit([&](sycl::handler& cgh) { cgh.single_task<LowLatencyCombineQuietKernel>([=]() { ishmem_quiet(); }); });
+    queue.wait();
+    internode::barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<LowLatencyCombineRecvKernel>(
