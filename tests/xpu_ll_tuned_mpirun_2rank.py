@@ -1,15 +1,27 @@
 import os
 import sys
 import argparse
+import ctypes
 
 import torch
 import torch.distributed as dist
 
-REPO = "/root/jiafuzha/code-repo/zjf2012/DeepEP"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 import deep_ep  # noqa: E402
-from utils import per_token_cast_back  # noqa: E402
+from utils import per_token_cast_back, per_token_cast_to_fp8  # noqa: E402
+
+
+def finalize_mpi_and_exit():
+    libmpi = ctypes.CDLL("libmpi.so")
+    initialized = ctypes.c_int()
+    finalized = ctypes.c_int()
+    libmpi.MPI_Initialized(ctypes.byref(initialized))
+    libmpi.MPI_Finalized(ctypes.byref(finalized))
+    if initialized.value and not finalized.value:
+        libmpi.MPI_Finalize()
+    os._exit(0)
 
 
 def make_inputs(rank, device, num_tokens, hidden, num_experts, num_topk):
@@ -35,7 +47,7 @@ def validate_dispatch_payload(rank, mode, device, x, packed_x, recv_count, handl
     src_info, layout_range, _, hidden, _ = handle
     num_local_experts = num_experts // world
     if isinstance(packed_x, tuple):
-        decoded_x = per_token_cast_back(packed_x[0].view(-1, hidden), packed_x[1].view(-1, hidden // 128)).view(packed_x[0].shape)
+        decoded_x = per_token_cast_back(packed_x[0].view(-1, hidden), packed_x[1].view(-1, packed_x[1].size(-1))).view(packed_x[0].shape)
     else:
         decoded_x = packed_x
 
@@ -54,6 +66,8 @@ def validate_dispatch_payload(rank, mode, device, x, packed_x, recv_count, handl
             tokens = src_info[local_expert, begin:begin + count].to(torch.long)
             expected_x = torch.ones((count, hidden), dtype=torch.bfloat16, device=device) * (src_rank + 1)
             expected_x[:, -1] = tokens.to(torch.bfloat16)
+            if mode in ("fp8", "ue8m0"):
+                expected_x = per_token_cast_back(*per_token_cast_to_fp8(expected_x))
             actual_x = decoded_x[local_expert, begin:begin + count]
             max_abs = (actual_x - expected_x).abs().max().item()
             tolerance = 0.5 if mode == "ue8m0" else 0.05 if mode == "fp8" else 0.0
@@ -104,7 +118,7 @@ def run_case(rank, world, group, buffer, mode, skip_combine):
     if skip_combine:
         return
 
-    combine_x = per_token_cast_back(packed_x[0].view(-1, hidden), packed_x[1].view(-1, hidden // 128)).view(
+    combine_x = per_token_cast_back(packed_x[0].view(-1, hidden), packed_x[1].view(-1, packed_x[1].size(-1))).view(
         packed_x[0].shape) if isinstance(packed_x, tuple) else packed_x
     print(f"[rank {rank}] starting {mode} combine", flush=True)
     combined_x, event, hook = buffer.low_latency_combine(
@@ -122,12 +136,16 @@ def run_case(rank, world, group, buffer, mode, skip_combine):
     torch.xpu.synchronize()
     print(f"[rank {rank}] {mode} combine synchronized", flush=True)
 
-    expected_x = (x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1)).to(torch.bfloat16)
-    if not torch.allclose(combined_x, expected_x, rtol=0, atol=0):
+    expected_x = x
+    if mode in ("fp8", "ue8m0"):
+        expected_x = per_token_cast_back(*per_token_cast_to_fp8(expected_x))
+    expected_x = (expected_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1)).to(torch.bfloat16)
+    tolerance = 0.5 if mode == "ue8m0" else 0.05 if mode == "fp8" else 0.0
+    if not torch.allclose(combined_x, expected_x, rtol=0, atol=tolerance):
         print(f"[rank {rank}] {mode} combined first={combined_x[:, 0].cpu().tolist()} last={combined_x[:, -1].cpu().tolist()}", flush=True)
         print(f"[rank {rank}] {mode} expected first={expected_x[:, 0].cpu().tolist()} last={expected_x[:, -1].cpu().tolist()}", flush=True)
     assert torch.allclose(combined_x, expected_x, rtol=0,
-                          atol=0), (f"rank {rank} {mode}: combine mismatch max_abs={(combined_x - expected_x).abs().max().item()}")
+                          atol=tolerance), (f"rank {rank} {mode}: combine mismatch max_abs={(combined_x - expected_x).abs().max().item()}")
     print(f"[rank {rank}] PASS {mode} low-latency dispatch+combine", flush=True)
 
 
@@ -150,7 +168,7 @@ def main():
 
     dist.init_process_group(backend="xccl")
     group = dist.new_group(list(range(world)))
-    
+
     # os.environ["ZE_AFFINITY_MASK"] = os.environ["DEVICE_MASK"]
 
     hidden, num_experts = 512, 4
@@ -158,13 +176,16 @@ def main():
     num_max_dispatch_tokens_per_rank = num_tokens * num_topk
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, world, num_experts)
     buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=1, explicitly_destroy=True)
+    completed = False
     try:
         for mode in args.cases:
             run_case(rank, world, group, buffer, mode, args.skip_combine)
         print(f"[rank {rank}] PASS tuned low-latency cases={args.cases} skip_combine={args.skip_combine}", flush=True)
+        completed = True
     finally:
+        if completed:
+            finalize_mpi_and_exit()
         buffer.destroy()
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

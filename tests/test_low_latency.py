@@ -1,6 +1,9 @@
 import argparse
+import ctypes
 import os
 import random
+import subprocess
+import sys
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -13,6 +16,89 @@ from utils import init_dist, bench, bench_kineto, calc_diff, get_accelerator_dev
 def debug_print(rank: int, message: str):
     if os.getenv('DEEP_EP_TEST_DEBUG', '0') == '1':
         print(f'[rank {rank}] {message}', flush=True)
+
+
+def get_launcher_rank_env():
+    for name in ('PMI_RANK', 'PMIX_RANK', 'OMPI_COMM_WORLD_RANK'):
+        if name in os.environ:
+            rank_name = name
+            break
+    else:
+        return None
+
+    for name in ('PMI_SIZE', 'PMIX_SIZE', 'OMPI_COMM_WORLD_SIZE'):
+        if name in os.environ:
+            return int(os.environ[rank_name]), int(os.environ[name])
+    return None
+
+
+def is_xpu_direct_doorbell_run() -> bool:
+    return get_accelerator_device_type() == 'xpu' and os.getenv('ISHMEM_IBGDA_DIRECT_DOORBELL', '0') == '1'
+
+
+def finalize_mpi_and_exit():
+    libmpi = ctypes.CDLL("libmpi.so")
+    initialized = ctypes.c_int()
+    finalized = ctypes.c_int()
+    libmpi.MPI_Initialized(ctypes.byref(initialized))
+    libmpi.MPI_Finalized(ctypes.byref(finalized))
+    if initialized.value and not finalized.value:
+        libmpi.MPI_Finalize()
+    os._exit(0)
+
+
+def configure_xpu_rank_affinity(local_rank: int):
+    if not is_xpu_direct_doorbell_run():
+        return
+
+    device_ids = os.getenv('DEEP_EP_XPU_DEVICE_IDS')
+    if device_ids is None:
+        device_ids = os.getenv('ZE_AFFINITY_MASK', '5,6')
+        os.environ.setdefault('DEEP_EP_XPU_DEVICE_IDS', device_ids)
+    os.environ.setdefault('ZE_AFFINITY_MASK', device_ids)
+
+    physical_devices = [device.strip() for device in device_ids.split(',') if device.strip()]
+    if local_rank < len(physical_devices):
+        os.environ.setdefault('ISHMEM_IBGDA_NIC', f'mlx5_{physical_devices[local_rank]}')
+
+
+def maybe_launch_xpu_direct_doorbell_with_mpirun(args: argparse.Namespace):
+    if not is_xpu_direct_doorbell_run() or get_launcher_rank_env() is not None:
+        return False
+    if os.getenv('DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN', '0') == '1':
+        return False
+
+    device_ids = os.getenv('DEEP_EP_XPU_DEVICE_IDS', os.getenv('ZE_AFFINITY_MASK', '5,6'))
+    os.environ.setdefault('DEEP_EP_XPU_DEVICE_IDS', device_ids)
+    os.environ.setdefault('ZE_AFFINITY_MASK', device_ids)
+
+    command = ['mpirun', '-n', str(args.num_processes)]
+    for name in (
+            'ISHMEM_IB_ENABLE_IBGDA',
+            'ISHMEM_IBGDA_DIRECT_DOORBELL',
+            'ISHMEM_ENABLE_GPU_IPC',
+            'ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP',
+            'ISHMEM_SYMMETRIC_SIZE',
+            'ZE_ENABLE_PCI_ID_DEVICE_ORDER',
+            'ZE_AFFINITY_MASK',
+            'DEEP_EP_XPU_DEVICE_IDS',
+            'ISHMEM_IBGDA_QPS_PER_PE',
+            'ISHMEM_IBGDA_DB_BATCH_SIZE',
+            'ISHMEM_IBGDA_BAR_BACKEND',
+            'I_MPI_FABRICS',
+            'ISHMEM_DEBUG',
+            'PYTHONPATH',
+            'MASTER_ADDR',
+            'MASTER_PORT',
+            'I_MPI_MPCP_SERVER_PORT',
+            'PYTHONUNBUFFERED',
+            'DEEP_EP_TEST_DEBUG',
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            command.extend(['-genv', name, value])
+    command.extend([sys.executable, '-u', __file__, *sys.argv[1:]])
+    return subprocess.run(command, check=False).returncode
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -103,8 +189,9 @@ def test_main(num_tokens: int,
                         num_times += 1
                         for _ in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device=device_type)
-                            debug_print(rank,
-                                        f'before low_latency_dispatch use_fp8={dispatch_use_fp8} round_scale={round_scale} use_ue8m0={use_ue8m0}')
+                            debug_print(
+                                rank,
+                                f'before low_latency_dispatch use_fp8={dispatch_use_fp8} round_scale={round_scale} use_ue8m0={use_ue8m0}')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
@@ -267,6 +354,7 @@ def test_main(num_tokens: int,
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    configure_xpu_rank_affinity(local_rank)
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
@@ -282,48 +370,54 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             explicitly_destroy=True,
                             allow_mnnvl=args.allow_mnnvl,
                             enable_shrink=args.shrink_test)
-    test_main(num_tokens,
-              hidden,
-              num_experts,
-              num_topk,
-              rank,
-              num_ranks,
-              group,
-              buffer,
-              use_logfmt=args.use_logfmt,
-              shrink_test=args.shrink_test,
-              seed=1)
+    completed = False
+    try:
+        test_main(num_tokens,
+                  hidden,
+                  num_experts,
+                  num_topk,
+                  rank,
+                  num_ranks,
+                  group,
+                  buffer,
+                  use_logfmt=args.use_logfmt,
+                  shrink_test=args.shrink_test,
+                  seed=1)
 
-    do_pressure_test = args.pressure_test
-    for seed in range(int(1e9) if do_pressure_test else 0):
-        if local_rank == 0:
-            print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens,
-                             hidden,
-                             num_experts,
-                             num_topk,
-                             rank,
-                             num_ranks,
-                             group,
-                             buffer,
-                             use_logfmt=args.use_logfmt,
-                             seed=seed)
-        for _ in range(20):
-            assert test_main(num_tokens,
-                             hidden,
-                             num_experts,
-                             num_topk,
-                             rank,
-                             num_ranks,
-                             group,
-                             buffer,
-                             use_logfmt=args.use_logfmt,
-                             seed=seed) == ref_hash, f'Error: seed={seed}'
+        do_pressure_test = args.pressure_test
+        for seed in range(int(1e9) if do_pressure_test else 0):
+            if local_rank == 0:
+                print(f'Testing with seed {seed} ...', flush=True)
+            ref_hash = test_main(num_tokens,
+                                 hidden,
+                                 num_experts,
+                                 num_topk,
+                                 rank,
+                                 num_ranks,
+                                 group,
+                                 buffer,
+                                 use_logfmt=args.use_logfmt,
+                                 seed=seed)
+            for _ in range(20):
+                assert test_main(num_tokens,
+                                 hidden,
+                                 num_experts,
+                                 num_topk,
+                                 rank,
+                                 num_ranks,
+                                 group,
+                                 buffer,
+                                 use_logfmt=args.use_logfmt,
+                                 seed=seed) == ref_hash, f'Error: seed={seed}'
+        completed = True
+    finally:
+        if completed and is_xpu_direct_doorbell_run():
+            finalize_mpi_and_exit()
 
-    # Destroy the buffer runtime and communication group
-    buffer.destroy()
-    dist.barrier()
-    dist.destroy_process_group()
+        # Destroy the buffer runtime and communication group
+        buffer.destroy()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -344,5 +438,14 @@ if __name__ == '__main__':
     # print(args.pressure_test)
 
     num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    mpirun_returncode = maybe_launch_xpu_direct_doorbell_with_mpirun(args)
+    if mpirun_returncode is not False:
+        sys.exit(mpirun_returncode)
+
+    launcher_env = get_launcher_rank_env()
+    if launcher_env is not None:
+        rank, world_size = launcher_env
+        test_loop(rank, world_size, args)
+    else:
+        torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
     # test_loop(num_processes, args)

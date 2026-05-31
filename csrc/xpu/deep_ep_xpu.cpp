@@ -223,7 +223,6 @@ void finalize() {
     int initialized = 0;
     ishmemx_query_initialized(&initialized);
     if (initialized) {
-        ishmem_barrier_all();
         ishmem_finalize();
     }
 }
@@ -650,7 +649,6 @@ struct Buffer {
         }
         if (rdma_buffer_ptr != nullptr) {
             queue.wait();
-            internode::barrier();
             internode::free(rdma_buffer_ptr);
             rdma_buffer_ptr = nullptr;
             internode::finalize();
