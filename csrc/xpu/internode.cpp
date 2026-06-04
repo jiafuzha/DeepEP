@@ -18,7 +18,6 @@ class DispatchCountExchangeKernel;
 class DispatchPackKernel;
 class DispatchOffsetComputeKernel;
 class DispatchPayloadKernel;
-class DispatchPayloadTailKernel;
 class DispatchQueueResetKernel;
 class DispatchQueueCopyKernel;
 class DispatchCopyKernel;
@@ -35,9 +34,6 @@ class CombinePackKernel;
 
 template <typename dtype_t>
 class CombinePayloadKernel;
-
-template <typename dtype_t>
-class CombinePayloadTailKernel;
 
 template <typename dtype_t>
 class CombinePayloadQuietKernel;
@@ -231,6 +227,7 @@ void dispatch(void* recv_x,
                 "XPU internode dispatch correctness path requires num_worst_tokens >= num_tokens * num_ranks");
 
     const size_t row_bytes = static_cast<size_t>(hidden) * element_size;
+    const bool debug_dispatch = (std::getenv("DEEP_EP_DEBUG_DISPATCH") != nullptr);
     auto* src = static_cast<const uint8_t*>(x);
     auto* dst = static_cast<uint8_t*>(recv_x);
     auto* meta = static_cast<SourceMeta*>(recv_src_meta);
@@ -407,7 +404,10 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    if (debug_dispatch) {
+        std::cerr << "[rank " << rank << "] dispatch: DispatchInitKernel done" << std::endl;
+    }
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchCountExchangeKernel>([=]() {
@@ -454,7 +454,10 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    if (debug_dispatch) {
+        std::cerr << "[rank " << rank << "] dispatch: DispatchCountExchangeKernel done" << std::endl;
+    }
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchOffsetComputeKernel>([=]() {
@@ -548,217 +551,239 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    if (debug_dispatch) {
+        std::cerr << "[rank " << rank << "] dispatch: DispatchPackKernel done" << std::endl;
+    }
+    internode::mpi_barrier();
+    // Compute max window phases across all channels
+    int max_windows = 0;
     for (int channel = 0; channel < num_channels; ++channel) {
         const int channel_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
         const int channel_end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
         const int channel_tokens = channel_end - channel_start;
-        for (int window_offset = 0; window_offset < channel_tokens; window_offset += queue_window) {
-            if (window_offset > 0) {
-                queue.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for<DispatchQueueResetKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-                        const size_t linear = static_cast<size_t>(id[0]);
-                        if (linear < total_queue_elements) {
-                            rdma_queue_x[linear] = 0;
-                        }
-                        if (linear < num_queue_slots) {
-                            rdma_queue_meta[linear].src_rdma_rank = -1;
-                            rdma_queue_meta[linear].is_token_in_nvl_rank_bits = -1;
-                            rdma_queue_dst_token[linear] = -1;
-                        }
-                        if (linear < total_queue_topk_elements) {
-                            rdma_queue_topk_idx[linear] = -1;
-                            rdma_queue_topk_weights[linear] = 0.0f;
-                        }
-                        if (linear < total_queue_scale_elements) {
-                            rdma_queue_x_scales[linear] = 0.0f;
-                        }
-                        if (linear < num_queue_pairs) {
-                            rdma_queue_head[linear] = 0;
-                            rdma_queue_tail[linear] = 0;
-                        }
-                    });
-                });
-                queue.wait();
-                internode::barrier();
-            }
+        const int windows = (channel_tokens + queue_window - 1) / queue_window;
+        max_windows = std::max(max_windows, windows);
+    }
 
-            queue.submit([&](sycl::handler& cgh) {
-                constexpr int kQueueGroupSize = 32;
-                cgh.parallel_for<DispatchPayloadKernel>(
-                    sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_ranks) * kQueueGroupSize), sycl::range<1>(kQueueGroupSize)),
-                    [=](sycl::nd_item<1> item) {
-                        auto group = item.get_group();
-                        const int local_id = static_cast<int>(item.get_local_id(0));
-                        const int local_size = static_cast<int>(item.get_local_range(0));
-                        const int dst_rank = static_cast<int>(item.get_group(0));
-                        int window_count = 0;
-                        for (int token = channel_start; token < channel_end; ++token) {
-                            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
-                                continue;
-                            }
-                            int queue_ordinal = 0;
-                            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
-                                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            const int queue_offset = queue_ordinal - window_offset;
-                            if (queue_offset < 0 || queue_offset >= queue_window) {
-                                continue;
-                            }
+    // Single mega-kernel: ALL iSHMEM dispatch work across ALL channels and ALL
+    // windows in ONE kernel submission. This avoids the cross-kernel stale UAR
+    // BAR hang where ring_doorbell's system fence leaves stale NIC UAR entries
+    // in the GPU coherency tracker, causing subsequent iSHMEM kernels to hang.
+    // Device-side ishmem_barrier_all() replaces host-side internode::barrier()
+    // for inter-phase synchronization.
+    queue.submit([&](sycl::handler& cgh) {
+        constexpr int kQueueGroupSize = 32;
+        cgh.parallel_for<DispatchPayloadKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kQueueGroupSize), sycl::range<1>(kQueueGroupSize)),
+            [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                const int local_size = static_cast<int>(item.get_local_range(0));
 
-                            int dst_token = 0;
-                            for (int src_rank = 0; src_rank < rank; ++src_rank) {
-                                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
-                            }
-                            for (int prior_token = 0; prior_token < token; ++prior_token) {
-                                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            if (dst_token >= num_recv_tokens) {
-                                continue;
-                            }
+                for (int window_phase = 0; window_phase < max_windows; ++window_phase) {
+                    // Phase 1: Reset queue slots (needed after first phase)
+                    if (window_phase > 0) {
+                        for (size_t i = local_id; i < total_queue_elements; i += local_size) {
+                            rdma_queue_x[i] = 0;
+                        }
+                        for (size_t i = local_id; i < num_queue_slots; i += local_size) {
+                            rdma_queue_meta[i].src_rdma_rank = -1;
+                            rdma_queue_meta[i].is_token_in_nvl_rank_bits = -1;
+                            rdma_queue_dst_token[i] = -1;
+                        }
+                        for (size_t i = local_id; i < total_queue_topk_elements; i += local_size) {
+                            rdma_queue_topk_idx[i] = -1;
+                            rdma_queue_topk_weights[i] = 0.0f;
+                        }
+                        for (size_t i = local_id; i < total_queue_scale_elements; i += local_size) {
+                            rdma_queue_x_scales[i] = 0.0f;
+                        }
+                        for (size_t i = local_id; i < num_queue_pairs; i += local_size) {
+                            rdma_queue_head[i] = 0;
+                            rdma_queue_tail[i] = 0;
+                        }
+                        sycl::group_barrier(group);
+                        if (local_id == 0) {
+                            ishmem_barrier_all();
+                        }
+                        sycl::group_barrier(group);
+                    }
 
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            const size_t queue_slot = queue_pair * queue_stride + queue_offset;
-                            auto* dst_x = rdma_queue_x + queue_slot * row_bytes;
-                            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
-                            auto* src_x = rdma_send_x + send_slot * row_bytes;
-                            auto* dst_meta = rdma_queue_meta + queue_slot;
-                            auto* src_meta = rdma_send_meta + send_slot;
-                            auto* dst_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
-                            auto* dst_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
-                            auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
-                            auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
-                            auto* dst_scales = rdma_queue_x_scales + queue_slot * num_scales;
-                            auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
-                            auto* src_dst_token = rdma_send_dst_token + send_slot;
-                            if (dst_rank == rank) {
-                                for (size_t h = local_id; h < row_bytes; h += local_size) {
-                                    dst_x[h] = src_x[h];
-                                }
-                                for (int k = local_id; k < num_topk; k += local_size) {
-                                    dst_topk_idx[k] = src_topk_idx[k];
-                                    dst_topk_weights[k] = src_topk_weights[k];
-                                }
-                                for (int k = local_id; k < num_scales; k += local_size) {
-                                    dst_scales[k] = src_scales[k];
-                                }
-                                if (local_id == 0) {
-                                    rdma_queue_dst_token[queue_slot] = dst_token;
-                                    *dst_meta = *src_meta;
-                                }
-                            } else {
-                                ishmemx_putmem_nbi_work_group(dst_x, src_x, row_bytes, dst_rank, group);
-                                if (num_topk > 0) {
-                                    ishmemx_putmem_nbi_work_group(
-                                        dst_topk_idx, src_topk_idx, static_cast<size_t>(num_topk) * sizeof(topk_idx_t), dst_rank, group);
-                                    ishmemx_putmem_nbi_work_group(
-                                        dst_topk_weights, src_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), dst_rank, group);
-                                }
-                                if (num_scales > 0) {
-                                    ishmemx_putmem_nbi_work_group(
-                                        dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank, group);
-                                }
-                                ishmemx_putmem_nbi_work_group(
-                                    rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank, group);
-                                ishmemx_putmem_nbi_work_group(dst_meta, src_meta, sizeof(SourceMeta), dst_rank, group);
-                            }
-                            sycl::group_barrier(group);
-                            if (local_id == 0) {
-                                ++window_count;
-                            }
-                        }
-                        if (local_id == 0 && window_count > 0) {
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            if (dst_rank == rank) {
-                                rdma_queue_tail[queue_pair] += window_count;
-                            }
-                        }
-                    });
-            });
-            queue.wait();
-            queue.submit([&](sycl::handler& cgh) {
-                cgh.single_task<DispatchPayloadTailKernel>([=]() {
-                    ishmem_quiet();
-                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) {
+                    // Phase 2: NBI puts for ALL channels in this window phase
+                    int window_counts[8 * 8] = {};  // [channel][dst_rank]
+                    for (int channel = 0; channel < num_channels; ++channel) {
+                        const int ch_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
+                        const int ch_end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
+                        const int ch_tokens = ch_end - ch_start;
+                        const int window_offset = window_phase * queue_window;
+                        if (window_offset >= ch_tokens) {
                             continue;
                         }
-                        int window_count = 0;
-                        for (int token = channel_start; token < channel_end; ++token) {
-                            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
-                                continue;
-                            }
-                            int queue_ordinal = 0;
-                            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
-                                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            const int queue_offset = queue_ordinal - window_offset;
-                            window_count += queue_offset >= 0 && queue_offset < queue_window ? 1 : 0;
-                        }
-                        if (window_count > 0) {
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            ishmem_int_atomic_add(rdma_queue_tail + queue_pair, window_count, dst_rank);
-                        }
-                    }
-                });
-            });
-            queue.wait();
-            internode::barrier();
 
-            queue.submit([&](sycl::handler& cgh) {
-                cgh.parallel_for<DispatchQueueCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-                    const size_t linear = static_cast<size_t>(id[0]);
-                    if (linear < total_queue_elements) {
-                        const size_t queue_slot = linear / row_bytes;
-                        const size_t byte_idx = linear - queue_slot * row_bytes;
-                        const int dst_token = rdma_queue_dst_token[queue_slot];
-                        const size_t queue_pair = queue_slot / queue_stride;
-                        const int queue_offset = static_cast<int>(queue_slot - queue_pair * queue_stride);
-                        if (queue_offset < rdma_queue_tail[queue_pair] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
-                            dst_token >= 0 && dst_token < num_recv_tokens) {
-                            rdma_x[static_cast<size_t>(dst_token) * row_bytes + byte_idx] = rdma_queue_x[linear];
+                        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                            int wcount = 0;
+                            for (int token = ch_start; token < ch_end; ++token) {
+                                if (!is_token_in_rank[token * num_ranks + dst_rank]) {
+                                    continue;
+                                }
+                                int queue_ordinal = 0;
+                                for (int prior_token = ch_start; prior_token < token; ++prior_token) {
+                                    queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                                }
+                                const int queue_offset = queue_ordinal - window_offset;
+                                if (queue_offset < 0 || queue_offset >= queue_window) {
+                                    continue;
+                                }
+
+                                int dst_token = 0;
+                                for (int src_rank = 0; src_rank < rank; ++src_rank) {
+                                    dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
+                                }
+                                for (int prior_token = 0; prior_token < token; ++prior_token) {
+                                    dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                                }
+                                if (dst_token >= num_recv_tokens) {
+                                    continue;
+                                }
+
+                                const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
+                                const size_t queue_slot = queue_pair * queue_stride + queue_offset;
+                                auto* d_x = rdma_queue_x + queue_slot * row_bytes;
+                                const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
+                                auto* s_x = rdma_send_x + send_slot * row_bytes;
+                                auto* d_meta = rdma_queue_meta + queue_slot;
+                                auto* s_meta = rdma_send_meta + send_slot;
+                                auto* d_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
+                                auto* d_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
+                                auto* s_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
+                                auto* s_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
+                                auto* d_scales = rdma_queue_x_scales + queue_slot * num_scales;
+                                auto* s_scales = rdma_send_x_scales + send_slot * num_scales;
+                                auto* s_dst_token = rdma_send_dst_token + send_slot;
+                                if (dst_rank == rank) {
+                                    for (size_t h = local_id; h < row_bytes; h += local_size) {
+                                        d_x[h] = s_x[h];
+                                    }
+                                    for (int k = local_id; k < num_topk; k += local_size) {
+                                        d_topk_idx[k] = s_topk_idx[k];
+                                        d_topk_weights[k] = s_topk_weights[k];
+                                    }
+                                    for (int k = local_id; k < num_scales; k += local_size) {
+                                        d_scales[k] = s_scales[k];
+                                    }
+                                    if (local_id == 0) {
+                                        rdma_queue_dst_token[queue_slot] = dst_token;
+                                        *d_meta = *s_meta;
+                                    }
+                                } else {
+                                    ishmemx_putmem_nbi_work_group(d_x, s_x, row_bytes, dst_rank, group);
+                                    if (num_topk > 0) {
+                                        ishmemx_putmem_nbi_work_group(
+                                            d_topk_idx, s_topk_idx, static_cast<size_t>(num_topk) * sizeof(topk_idx_t), dst_rank, group);
+                                        ishmemx_putmem_nbi_work_group(
+                                            d_topk_weights, s_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), dst_rank, group);
+                                    }
+                                    if (num_scales > 0) {
+                                        ishmemx_putmem_nbi_work_group(
+                                            d_scales, s_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank, group);
+                                    }
+                                    ishmemx_putmem_nbi_work_group(
+                                        rdma_queue_dst_token + queue_slot, s_dst_token, sizeof(int), dst_rank, group);
+                                    ishmemx_putmem_nbi_work_group(d_meta, s_meta, sizeof(SourceMeta), dst_rank, group);
+                                }
+                                sycl::group_barrier(group);
+                                if (local_id == 0) {
+                                    ++wcount;
+                                }
+                            }
+                            if (local_id == 0) {
+                                window_counts[channel * 8 + dst_rank] = wcount;
+                                if (dst_rank == rank && wcount > 0) {
+                                    const size_t qp = static_cast<size_t>(rank) * num_channels + channel;
+                                    rdma_queue_tail[qp] += wcount;
+                                }
+                            }
                         }
                     }
-                    if (linear < num_queue_slots) {
-                        const int dst_token = rdma_queue_dst_token[linear];
-                        const size_t queue_pair = linear / queue_stride;
-                        const int queue_offset = static_cast<int>(linear - queue_pair * queue_stride);
-                        if (queue_offset < rdma_queue_tail[queue_pair] && rdma_queue_meta[linear].src_rdma_rank >= 0 && dst_token >= 0 &&
-                            dst_token < num_recv_tokens) {
-                            rdma_meta[dst_token] = rdma_queue_meta[linear];
+
+                    // Phase 3: Quiet + atomic tail (leader only, same kernel context)
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        ishmem_quiet();
+                        for (int channel = 0; channel < num_channels; ++channel) {
+                            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                                if (dst_rank != rank && window_counts[channel * 8 + dst_rank] > 0) {
+                                    const size_t qp = static_cast<size_t>(rank) * num_channels + channel;
+                                    ishmem_int_atomic_add(
+                                        rdma_queue_tail + qp, window_counts[channel * 8 + dst_rank], dst_rank);
+                                }
+                            }
                         }
                     }
-                    if (linear < total_queue_topk_elements) {
-                        const size_t queue_slot = linear / num_topk;
-                        const size_t topk_idx = linear - queue_slot * num_topk;
-                        const int dst_token = rdma_queue_dst_token[queue_slot];
-                        const size_t queue_pair = queue_slot / queue_stride;
-                        const int queue_offset = static_cast<int>(queue_slot - queue_pair * queue_stride);
-                        if (queue_offset < rdma_queue_tail[queue_pair] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
-                            dst_token >= 0 && dst_token < num_recv_tokens) {
-                            rdma_topk_idx[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_idx[linear];
-                            rdma_topk_weights[static_cast<size_t>(dst_token) * num_topk + topk_idx] = rdma_queue_topk_weights[linear];
+
+                    // Phase 4: Device barrier (all PEs sync before queue copy)
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        ishmem_barrier_all();
+                    }
+                    sycl::group_barrier(group);
+
+                    // Phase 5: Queue copy to final positions (all items participate)
+                    for (size_t i = local_id; i < total_queue_elements; i += local_size) {
+                        const size_t queue_slot = i / row_bytes;
+                        const size_t byte_idx = i - queue_slot * row_bytes;
+                        const int d_token = rdma_queue_dst_token[queue_slot];
+                        const size_t qp = queue_slot / queue_stride;
+                        const int qoff = static_cast<int>(queue_slot - qp * queue_stride);
+                        if (qoff < rdma_queue_tail[qp] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
+                            d_token >= 0 && d_token < num_recv_tokens) {
+                            rdma_x[static_cast<size_t>(d_token) * row_bytes + byte_idx] = rdma_queue_x[i];
                         }
                     }
-                    if (linear < total_queue_scale_elements) {
-                        const size_t queue_slot = linear / num_scales;
-                        const size_t scale_idx = linear - queue_slot * num_scales;
-                        const int dst_token = rdma_queue_dst_token[queue_slot];
-                        const size_t queue_pair = queue_slot / queue_stride;
-                        const int queue_offset = static_cast<int>(queue_slot - queue_pair * queue_stride);
-                        if (queue_offset < rdma_queue_tail[queue_pair] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
-                            dst_token >= 0 && dst_token < num_recv_tokens) {
-                            rdma_x_scales[static_cast<size_t>(dst_token) * num_scales + scale_idx] = rdma_queue_x_scales[linear];
+                    for (size_t i = local_id; i < num_queue_slots; i += local_size) {
+                        const int d_token = rdma_queue_dst_token[i];
+                        const size_t qp = i / queue_stride;
+                        const int qoff = static_cast<int>(i - qp * queue_stride);
+                        if (qoff < rdma_queue_tail[qp] && rdma_queue_meta[i].src_rdma_rank >= 0 &&
+                            d_token >= 0 && d_token < num_recv_tokens) {
+                            rdma_meta[d_token] = rdma_queue_meta[i];
                         }
                     }
-                    if (linear < num_queue_pairs) {
-                        rdma_queue_head[linear] = rdma_queue_tail[linear];
+                    if (num_topk > 0) {
+                        for (size_t i = local_id; i < total_queue_topk_elements; i += local_size) {
+                            const size_t queue_slot = i / num_topk;
+                            const size_t tk = i - queue_slot * num_topk;
+                            const int d_token = rdma_queue_dst_token[queue_slot];
+                            const size_t qp = queue_slot / queue_stride;
+                            const int qoff = static_cast<int>(queue_slot - qp * queue_stride);
+                            if (qoff < rdma_queue_tail[qp] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
+                                d_token >= 0 && d_token < num_recv_tokens) {
+                                rdma_topk_idx[static_cast<size_t>(d_token) * num_topk + tk] = rdma_queue_topk_idx[i];
+                                rdma_topk_weights[static_cast<size_t>(d_token) * num_topk + tk] = rdma_queue_topk_weights[i];
+                            }
+                        }
                     }
-                });
+                    if (num_scales > 0) {
+                        for (size_t i = local_id; i < total_queue_scale_elements; i += local_size) {
+                            const size_t queue_slot = i / num_scales;
+                            const size_t sk = i - queue_slot * num_scales;
+                            const int d_token = rdma_queue_dst_token[queue_slot];
+                            const size_t qp = queue_slot / queue_stride;
+                            const int qoff = static_cast<int>(queue_slot - qp * queue_stride);
+                            if (qoff < rdma_queue_tail[qp] && rdma_queue_meta[queue_slot].src_rdma_rank >= 0 &&
+                                d_token >= 0 && d_token < num_recv_tokens) {
+                                rdma_x_scales[static_cast<size_t>(d_token) * num_scales + sk] = rdma_queue_x_scales[i];
+                            }
+                        }
+                    }
+                    for (size_t i = local_id; i < num_queue_pairs; i += local_size) {
+                        rdma_queue_head[i] = rdma_queue_tail[i];
+                    }
+                    sycl::group_barrier(group);
+                }
             });
-            queue.wait();
-        }
-    }
+    });
+    queue.wait();
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<DispatchCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
             const size_t linear = static_cast<size_t>(id[0]);
@@ -865,7 +890,7 @@ void launch_combine_copy(void* combined_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinePackKernel<dtype_t>>(sycl::range<1>(total_recv), [=](sycl::id<1> id) {
@@ -882,142 +907,138 @@ void launch_combine_copy(void* combined_x,
         });
     }
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
-    for (int window_offset = 0; window_offset < num_combined_tokens; window_offset += queue_window) {
-        const int window_tokens = std::min(queue_window, num_combined_tokens - window_offset);
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<CombineQueueResetKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-                const int64_t i = static_cast<int64_t>(id[0]);
-                if (i < total_queue) {
-                    rdma_queue_x[i] = dtype_t{};
-                }
-                if (i < total_queue_topk) {
-                    rdma_queue_topk_weights[i] = 0.0f;
-                }
-                if (i < num_ranks) {
-                    rdma_queue_head[i] = 0;
-                    rdma_queue_tail[i] = 0;
-                }
-            });
-        });
-        queue.wait();
-        internode::barrier();
+    // Compute max combine windows
+    const int max_combine_windows = (num_combined_tokens + queue_window - 1) / queue_window;
 
-        queue.submit([&](sycl::handler& cgh) {
-            constexpr int kQueueGroupSize = 32;
-            cgh.parallel_for<CombinePayloadKernel<dtype_t>>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_ranks) * kQueueGroupSize), sycl::range<1>(kQueueGroupSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto group = item.get_group();
-                    const int local_id = static_cast<int>(item.get_local_id(0));
-                    const int local_size = static_cast<int>(item.get_local_range(0));
-                    const int src_rank = static_cast<int>(item.get_group(0));
-                    int window_count = 0;
-                    for (int recv_token = 0; recv_token < num_tokens; ++recv_token) {
-                        const SourceMeta token_meta = meta[recv_token];
-                        const int src_token = token_meta.is_token_in_nvl_rank_bits;
-                        if (token_meta.src_rdma_rank != src_rank || src_token < window_offset ||
-                            src_token >= window_offset + window_tokens) {
-                            continue;
+    // Single mega-kernel: ALL iSHMEM combine work across ALL windows in ONE
+    // kernel submission. Avoids cross-kernel stale UAR BAR hang.
+    queue.submit([&](sycl::handler& cgh) {
+        constexpr int kQueueGroupSize = 32;
+        cgh.parallel_for<CombinePayloadKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(kQueueGroupSize), sycl::range<1>(kQueueGroupSize)),
+            [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                const int local_size = static_cast<int>(item.get_local_range(0));
+
+                for (int window_phase = 0; window_phase < max_combine_windows; ++window_phase) {
+                    const int window_offset = window_phase * queue_window;
+                    const int window_tokens = (window_offset + queue_window <= num_combined_tokens)
+                        ? queue_window
+                        : (num_combined_tokens - window_offset);
+
+                    // Phase 1: Reset queue
+                    for (int64_t i = local_id; i < total_queue; i += local_size) {
+                        rdma_queue_x[i] = dtype_t{};
+                    }
+                    for (int64_t i = local_id; i < total_queue_topk; i += local_size) {
+                        rdma_queue_topk_weights[i] = 0.0f;
+                    }
+                    for (int64_t i = local_id; i < num_ranks; i += local_size) {
+                        rdma_queue_head[i] = 0;
+                        rdma_queue_tail[i] = 0;
+                    }
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        ishmem_barrier_all();
+                    }
+                    sycl::group_barrier(group);
+
+                    // Phase 2: NBI puts for all src_ranks
+                    int window_counts[8] = {};
+                    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                        int wcount = 0;
+                        for (int recv_token = 0; recv_token < num_tokens; ++recv_token) {
+                            const SourceMeta token_meta = meta[recv_token];
+                            const int src_token = token_meta.is_token_in_nvl_rank_bits;
+                            if (token_meta.src_rdma_rank != src_rank || src_token < window_offset ||
+                                src_token >= window_offset + window_tokens) {
+                                continue;
+                            }
+
+                            const int queue_token = src_token - window_offset;
+                            auto* remote_dst = rdma_queue_x + (static_cast<int64_t>(rank) * queue_stride + queue_token) * hidden;
+                            auto* local_src = rdma_send_x + static_cast<int64_t>(recv_token) * hidden;
+                            auto* remote_topk_w =
+                                rdma_queue_topk_weights + (static_cast<int64_t>(rank) * queue_stride + queue_token) * num_topk;
+                            auto* local_topk_w = rdma_send_topk_weights + static_cast<int64_t>(recv_token) * num_topk;
+                            if (src_rank == rank) {
+                                for (int h = local_id; h < hidden; h += local_size) {
+                                    remote_dst[h] = local_src[h];
+                                }
+                                for (int k = local_id; k < num_topk; k += local_size) {
+                                    remote_topk_w[k] = local_topk_w[k];
+                                }
+                            } else {
+                                ishmemx_putmem_nbi_work_group(
+                                    remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
+                                if (num_topk > 0) {
+                                    ishmemx_putmem_nbi_work_group(
+                                        remote_topk_w, local_topk_w, static_cast<size_t>(num_topk) * sizeof(float), src_rank, group);
+                                }
+                            }
+                            sycl::group_barrier(group);
+                            if (local_id == 0) {
+                                ++wcount;
+                            }
                         }
-
-                        const int queue_token = src_token - window_offset;
-                        auto* remote_dst = rdma_queue_x + (static_cast<int64_t>(rank) * queue_stride + queue_token) * hidden;
-                        auto* local_src = rdma_send_x + static_cast<int64_t>(recv_token) * hidden;
-                        auto* remote_topk_weights =
-                            rdma_queue_topk_weights + (static_cast<int64_t>(rank) * queue_stride + queue_token) * num_topk;
-                        auto* local_topk_weights = rdma_send_topk_weights + static_cast<int64_t>(recv_token) * num_topk;
-                        if (src_rank == rank) {
-                            for (int h = local_id; h < hidden; h += local_size) {
-                                remote_dst[h] = local_src[h];
-                            }
-                            for (int k = local_id; k < num_topk; k += local_size) {
-                                remote_topk_weights[k] = local_topk_weights[k];
-                            }
-                        } else {
-                            ishmemx_putmem_work_group(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
-                            if (num_topk > 0) {
-                                ishmemx_putmem_work_group(
-                                    remote_topk_weights, local_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), src_rank, group);
-                            }
-                        }
-                        sycl::group_barrier(group);
                         if (local_id == 0) {
-                            ++window_count;
+                            window_counts[src_rank] = wcount;
+                            if (src_rank == rank && wcount > 0) {
+                                rdma_queue_tail[rank] += wcount;
+                            }
                         }
                     }
-                    if (local_id == 0 && window_count > 0) {
-                        if (src_rank == rank) {
-                            rdma_queue_tail[rank] += window_count;
-                        }
-                    }
-                });
-        });
-        queue.wait();
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " payload done" << std::endl;
-        }
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " submit tail" << std::endl;
-        }
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.single_task<CombinePayloadTailKernel<dtype_t>>([=]() {
-                for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                    if (src_rank == rank) {
-                        continue;
-                    }
-                    int window_count = 0;
-                    for (int recv_token = 0; recv_token < num_tokens; ++recv_token) {
-                        const SourceMeta token_meta = meta[recv_token];
-                        const int src_token = token_meta.is_token_in_nvl_rank_bits;
-                        if (token_meta.src_rdma_rank == src_rank && src_token >= window_offset &&
-                            src_token < window_offset + window_tokens) {
-                            ++window_count;
-                        }
-                    }
-                    if (window_count > 0) {
-                        ishmem_int_atomic_add(rdma_queue_tail + rank, window_count, src_rank);
-                    }
-                }
-            });
-        });
-        queue.wait();
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " tail done" << std::endl;
-        }
-        internode::barrier();
 
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<CombineQueueCopyKernel<dtype_t>>(
-                sycl::range<1>(std::max(static_cast<int64_t>(window_tokens) * hidden, static_cast<int64_t>(window_tokens) * num_topk)),
-                [=](sycl::id<1> id) {
-                    const int64_t i = static_cast<int64_t>(id[0]);
-                    if (i < static_cast<int64_t>(window_tokens) * hidden) {
+                    // Phase 3: Quiet + atomic tail (leader only)
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        ishmem_quiet();
+                        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                            if (src_rank != rank && window_counts[src_rank] > 0) {
+                                ishmem_int_atomic_add(rdma_queue_tail + rank, window_counts[src_rank], src_rank);
+                            }
+                        }
+                    }
+
+                    // Phase 4: Device barrier (all PEs sync before queue reduction)
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        ishmem_barrier_all();
+                    }
+                    sycl::group_barrier(group);
+
+                    // Phase 5: Queue reduction to final positions (all items participate)
+                    for (int64_t i = local_id; i < static_cast<int64_t>(window_tokens) * hidden; i += local_size) {
                         const int token_offset = static_cast<int>(i / hidden);
                         const int h = static_cast<int>(i - static_cast<int64_t>(token_offset) * hidden);
                         dtype_t value{};
-                        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                            value += rdma_queue_x[(static_cast<int64_t>(src_rank) * queue_stride + token_offset) * hidden + h];
+                        for (int sr = 0; sr < num_ranks; ++sr) {
+                            value += rdma_queue_x[(static_cast<int64_t>(sr) * queue_stride + token_offset) * hidden + h];
                         }
                         rdma_recv_x[static_cast<int64_t>(window_offset + token_offset) * hidden + h] = value;
                     }
-                    if (i < static_cast<int64_t>(window_tokens) * num_topk) {
-                        const int token_offset = static_cast<int>(i / num_topk);
-                        const int k = static_cast<int>(i - static_cast<int64_t>(token_offset) * num_topk);
-                        float value = 0.0f;
-                        for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                            value += rdma_queue_topk_weights[(static_cast<int64_t>(src_rank) * queue_stride + token_offset) * num_topk + k];
+                    if (num_topk > 0) {
+                        for (int64_t i = local_id; i < static_cast<int64_t>(window_tokens) * num_topk; i += local_size) {
+                            const int token_offset = static_cast<int>(i / num_topk);
+                            const int k = static_cast<int>(i - static_cast<int64_t>(token_offset) * num_topk);
+                            float value = 0.0f;
+                            for (int sr = 0; sr < num_ranks; ++sr) {
+                                value += rdma_queue_topk_weights[(static_cast<int64_t>(sr) * queue_stride + token_offset) * num_topk + k];
+                            }
+                            rdma_recv_topk_weights[static_cast<int64_t>(window_offset + token_offset) * num_topk + k] = value;
                         }
-                        rdma_recv_topk_weights[static_cast<int64_t>(window_offset + token_offset) * num_topk + k] = value;
                     }
-                    if (i < num_ranks) {
+                    for (int64_t i = local_id; i < num_ranks; i += local_size) {
                         rdma_queue_head[i] = rdma_queue_tail[i];
                     }
-                });
-        });
-        queue.wait();
-    }
+                    sycl::group_barrier(group);
+                }
+            });
+    });
+    queue.wait();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombineBiasKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
