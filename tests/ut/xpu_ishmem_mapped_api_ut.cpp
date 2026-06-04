@@ -2,10 +2,12 @@
 #include <ishmemx.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <sycl/sycl.hpp>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -151,8 +153,7 @@ int main(int argc, char** argv) {
     const int flag_idx = num_elems;
     const int queue_elems = num_elems * world;
     const int combine_tail_base = queue_elems;
-    const int warmup_tail_base = combine_tail_base + world;
-    const int alloc_elems = warmup_tail_base + world;
+    const int alloc_elems = combine_tail_base + world;
     int* recv = static_cast<int*>(ishmem_align(128, static_cast<size_t>(alloc_elems) * sizeof(int)));
     int* src = static_cast<int*>(ishmem_align(128, static_cast<size_t>(alloc_elems) * sizeof(int)));
     if (recv == nullptr || src == nullptr) {
@@ -233,6 +234,20 @@ int main(int argc, char** argv) {
         ishmem_barrier_all();
         errors = count_errors(queue, recv, num_elems, (peer + 1) * 100000);
     } else if (test_case == "combine_payload_work_group_putmem_atomic_tail") {
+        /* Merged-kernel test: work-group payload NBI puts followed by an
+         * atomic completion tail, all within a SINGLE nd_range kernel.
+         * This matches the production DeepEP combine kernel pattern where
+         * WG NBI payload puts and atomic_add tail are in the same kernel.
+         *
+         * Layout:
+         *   recv[0 .. num_elems*world-1] : payload (rank * num_elems slots each)
+         *   recv[combine_tail_base + r]  : atomic completion counter for rank r
+         *
+         * Each work-group i represents source rank i sending payload to this rank.
+         * After all WG puts complete (via work-group barrier + device quiet),
+         * work-item 0 of each WG issues ishmem_int_atomic_add on the combine
+         * tail counter, signalling that source rank i's contribution is complete. */
+        int peer = (rank + 1) % world;
         queue
             .parallel_for(sycl::range<1>(alloc_elems),
                           [=](sycl::id<1> id) {
@@ -245,14 +260,14 @@ int main(int argc, char** argv) {
             .single_task([=]() {
                 for (int i = 0; i < world; ++i) {
                     recv[combine_tail_base + i] = 0;
-                    recv[warmup_tail_base + i] = 0;
                 }
             })
             .wait_and_throw();
+        std::cout << "[rank " << rank << "] step1: before warmup barrier\n" << std::flush;
         ishmem_barrier_all();
-        queue.submit([&](sycl::handler& h) { h.single_task([=]() { ishmem_int_atomic_add(recv + warmup_tail_base + rank, 1, peer); }); })
-            .wait_and_throw();
-        ishmem_barrier_all();
+
+        /* step2: merged WG-put + atomic-tail kernel */
+        std::cout << "[rank " << rank << "] step2: before merged WG put + atomic kernel\n" << std::flush;
         queue
             .submit([&](sycl::handler& h) {
                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(world) * 32), sycl::range<1>(32)),
@@ -262,31 +277,27 @@ int main(int argc, char** argv) {
                                    const int local_id = static_cast<int>(it.get_local_id(0));
                                    const int local_size = static_cast<int>(it.get_local_range(0));
                                    int* dst = recv + rank * num_elems;
+                                   /* Phase 1: WG payload put */
                                    if (src_rank == rank) {
                                        for (int i = local_id; i < num_elems; i += local_size) {
                                            dst[i] = src[i];
                                        }
                                    } else {
-                                       ishmemx_putmem_work_group(dst, src, static_cast<size_t>(num_elems) * sizeof(int), src_rank, group);
+                                       ishmemx_putmem_nbi_work_group(dst, src, static_cast<size_t>(num_elems) * sizeof(int), src_rank, group);
                                    }
+                                   /* WG barrier ensures all work-items finish WG NBI put */
                                    sycl::group_barrier(group);
+                                   /* Phase 2: leader issues atomic tail after device quiet */
+                                   if (local_id == 0 && src_rank != rank) {
+                                       ishmem_quiet();
+                                       ishmem_int_atomic_add(recv + combine_tail_base + rank, 1, src_rank);
+                                   }
                                });
             })
             .wait_and_throw();
-        queue
-            .submit([&](sycl::handler& h) {
-                h.single_task([=]() {
-                    for (int src_rank = 0; src_rank < world; ++src_rank) {
-                        if (src_rank == rank) {
-                            recv[combine_tail_base + rank] += 1;
-                        } else {
-                            ishmem_int_atomic_add(recv + combine_tail_base + rank, 1, src_rank);
-                        }
-                    }
-                });
-            })
-            .wait_and_throw();
+        std::cout << "[rank " << rank << "] step3: merged kernel done\n" << std::flush;
         ishmem_barrier_all();
+        std::cout << "[rank " << rank << "] step4: after barrier\n" << std::flush;
         std::vector<int> host(alloc_elems);
         queue.memcpy(host.data(), recv, static_cast<size_t>(alloc_elems) * sizeof(int)).wait_and_throw();
         for (int src_rank = 0; src_rank < world; ++src_rank) {
@@ -301,9 +312,14 @@ int main(int argc, char** argv) {
                     ++errors;
                 }
             }
-            if (host[combine_tail_base + src_rank] != 1) {
-                std::cout << "  combine tail mismatch src_rank=" << src_rank << " expected=1 got=" << host[combine_tail_base + src_rank]
-                          << "\n";
+            /* Each non-self rank does atomic_add(1) to this PE's tail
+             * at position combine_tail_base + sender_rank.  So
+             * tail[src_rank] == 1 iff src_rank != rank (remote sender). */
+            int expected_tail = (src_rank != rank) ? 1 : 0;
+            if (host[combine_tail_base + src_rank] != expected_tail) {
+                std::cout << "  combine tail mismatch src_rank=" << src_rank
+                          << " expected=" << expected_tail
+                          << " got=" << host[combine_tail_base + src_rank] << "\n";
                 ++errors;
             }
         }

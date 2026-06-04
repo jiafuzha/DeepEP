@@ -25,17 +25,10 @@ cases=(
     ll_barrier_work_group
     ll_putmem_nbi_atomic_flag
     atomic_add_all_pes
+    combine_payload_work_group_putmem_atomic_tail
 )
 
 known_failures=(
-    # Device sync_all validates data movement, but can crash during shutdown/finalize.
-    # normal_sync_all_device
-    # Device work-group barrier validates data movement, then crashes during shutdown/finalize.
-    # ll_barrier_work_group
-    # Low-latency-style NBI payload followed by atomic completion flag times out.
-    ll_putmem_nbi_atomic_flag
-    # Atomic add to all PEs including self crashes/fails; remote-only atomics are covered separately.
-    atomic_add_all_pes
 )
 
 is_known_failure() {
@@ -68,11 +61,11 @@ run_case() {
         -genv case_name $case_name \
         bash -c '
        if [ "$PMI_RANK" = "0" ]; then
+         export ZE_AFFINITY_MASK=4
+         export ISHMEM_IBGDA_NIC=mlx5_4
+       elif [ "$PMI_RANK" = "1" ]; then
          export ZE_AFFINITY_MASK=5
          export ISHMEM_IBGDA_NIC=mlx5_5
-       elif [ "$PMI_RANK" = "1" ]; then
-         export ZE_AFFINITY_MASK=6
-         export ISHMEM_IBGDA_NIC=mlx5_6
        else
          echo "unknow PMI rank: $PMI_RANK"
          exit 1

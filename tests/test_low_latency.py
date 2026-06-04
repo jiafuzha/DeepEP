@@ -98,6 +98,7 @@ def maybe_launch_xpu_direct_doorbell_with_mpirun(args: argparse.Namespace):
         if value is not None:
             command.extend(['-genv', name, value])
     command.extend([sys.executable, '-u', __file__, *sys.argv[1:]])
+    print("command is: ", command, flush=True)
     return subprocess.run(command, check=False).returncode
 
 
