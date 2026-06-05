@@ -482,7 +482,7 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.runtime.get_num_rdma_ranks() > 1 or (self.num_nvl_bytes > 0 and self.runtime.get_num_rdma_ranks() == 1 and self.group_size > 1):
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                            previous_event, async_finish, allocate_on_comm_stream)
@@ -544,7 +544,7 @@ class Buffer:
         config = self.get_combine_config(self.group_size) if config is None else config
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.runtime.get_num_rdma_ranks() > 1 or (self.num_nvl_bytes > 0 and self.runtime.get_num_rdma_ranks() == 1 and self.group_size > 1):
             return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
