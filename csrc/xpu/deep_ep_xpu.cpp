@@ -13,6 +13,8 @@
 #include <string>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
+#include <mpi.h>
+
 #ifdef DEEP_EP_ENABLE_ISHMEM
 #include <ishmem.h>
 #include <ishmemx.h>
@@ -217,6 +219,10 @@ void free(void* ptr) {
 
 void barrier() {
     ishmem_barrier_all();
+}
+
+void mpi_barrier() {
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 void finalize() {
