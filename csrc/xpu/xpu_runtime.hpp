@@ -126,6 +126,11 @@ void free(void* ptr);
 
 void barrier();
 
+// Lightweight MPI-only barrier (no L0 sync, no Win_flush_all).
+// Use between non-iSHMEM kernels where full ishmem_barrier_all() overhead
+// is unnecessary and its MPI_Win_flush_all may hang on pending device RMA.
+void mpi_barrier();
+
 void finalize();
 
 int get_source_meta_bytes();

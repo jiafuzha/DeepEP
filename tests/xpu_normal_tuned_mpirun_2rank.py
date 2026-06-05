@@ -5,7 +5,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-REPO = "/root/jiafuzha/code-repo/zjf2012/DeepEP"
+REPO = "/data/jiafuzha/code-repo/zjf2012/DeepEP"
 sys.path.insert(0, REPO)
 
 import deep_ep  # noqa: E402

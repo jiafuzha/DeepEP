@@ -407,7 +407,7 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchCountExchangeKernel>([=]() {
@@ -426,7 +426,7 @@ void dispatch(void* recv_x,
             for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                 auto* remote_count_row = rdma_count_matrix + rank * num_ranks;
                 if (dst_rank != rank) {
-                    ishmem_putmem(remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank);
+                    ishmem_putmem_nbi(remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank);
                 }
             }
 
@@ -447,14 +447,16 @@ void dispatch(void* recv_x,
             for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                 auto* remote_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
                 if (dst_rank != rank) {
-                    ishmem_putmem(
+                    ishmem_putmem_nbi(
                         remote_channel_row, local_channel_row, static_cast<size_t>(num_ranks) * num_channels * sizeof(int), dst_rank);
                 }
             }
+            // Drain all NBI puts
+            ishmem_quiet();
         });
     });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchOffsetComputeKernel>([=]() {
@@ -548,7 +550,7 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
     for (int channel = 0; channel < num_channels; ++channel) {
         const int channel_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
         const int channel_end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
@@ -580,7 +582,7 @@ void dispatch(void* recv_x,
                     });
                 });
                 queue.wait();
-                internode::barrier();
+                internode::mpi_barrier();
             }
 
             queue.submit([&](sycl::handler& cgh) {
@@ -671,39 +673,25 @@ void dispatch(void* recv_x,
                             const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
                             if (dst_rank == rank) {
                                 rdma_queue_tail[queue_pair] += window_count;
+                            } else {
+                                // NBI put the tail to remote — stage in rdma_queue_head to avoid
+                                // clobbering the self-send tail already in rdma_queue_tail.
+                                rdma_queue_head[queue_pair] = window_count;
+                                ishmem_putmem_nbi(rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair,
+                                                  sizeof(int), dst_rank);
                             }
                         }
                     });
             });
             queue.wait();
+            // Quiet drains all outstanding NBI puts (payload data + tail values)
             queue.submit([&](sycl::handler& cgh) {
                 cgh.single_task<DispatchPayloadTailKernel>([=]() {
                     ishmem_quiet();
-                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) {
-                            continue;
-                        }
-                        int window_count = 0;
-                        for (int token = channel_start; token < channel_end; ++token) {
-                            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
-                                continue;
-                            }
-                            int queue_ordinal = 0;
-                            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
-                                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            const int queue_offset = queue_ordinal - window_offset;
-                            window_count += queue_offset >= 0 && queue_offset < queue_window ? 1 : 0;
-                        }
-                        if (window_count > 0) {
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            ishmem_int_atomic_add(rdma_queue_tail + queue_pair, window_count, dst_rank);
-                        }
-                    }
                 });
             });
             queue.wait();
-            internode::barrier();
+            internode::mpi_barrier();
 
             queue.submit([&](sycl::handler& cgh) {
                 cgh.parallel_for<DispatchQueueCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -839,7 +827,6 @@ void launch_combine_copy(void* combined_x,
     const int64_t total_queue_topk = static_cast<int64_t>(num_ranks) * queue_stride * num_topk;
     const int64_t init_range =
         std::max({total_combined, total_combined_topk, total_queue, total_queue_topk, static_cast<int64_t>(num_ranks)});
-    const bool debug_combine = std::getenv("DEEP_EP_XPU_DEBUG_COMBINE") != nullptr;
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -865,7 +852,7 @@ void launch_combine_copy(void* combined_x,
         });
     });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinePackKernel<dtype_t>>(sycl::range<1>(total_recv), [=](sycl::id<1> id) {
@@ -882,7 +869,7 @@ void launch_combine_copy(void* combined_x,
         });
     }
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     for (int window_offset = 0; window_offset < num_combined_tokens; window_offset += queue_window) {
         const int window_tokens = std::min(queue_window, num_combined_tokens - window_offset);
@@ -902,7 +889,7 @@ void launch_combine_copy(void* combined_x,
             });
         });
         queue.wait();
-        internode::barrier();
+        internode::mpi_barrier();
 
         queue.submit([&](sycl::handler& cgh) {
             constexpr int kQueueGroupSize = 32;
@@ -936,9 +923,9 @@ void launch_combine_copy(void* combined_x,
                                 remote_topk_weights[k] = local_topk_weights[k];
                             }
                         } else {
-                            ishmemx_putmem_work_group(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
+                            ishmemx_putmem_nbi_work_group(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
                             if (num_topk > 0) {
-                                ishmemx_putmem_work_group(
+                                ishmemx_putmem_nbi_work_group(
                                     remote_topk_weights, local_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), src_rank, group);
                             }
                         }
@@ -955,14 +942,10 @@ void launch_combine_copy(void* combined_x,
                 });
         });
         queue.wait();
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " payload done" << std::endl;
-        }
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " submit tail" << std::endl;
-        }
         queue.submit([&](sycl::handler& cgh) {
             cgh.single_task<CombinePayloadTailKernel<dtype_t>>([=]() {
+                // NBI put tail values instead of RDMA atomics.
+                // Each sender writes to queue_pair = rank (single-writer).
                 for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
                     if (src_rank == rank) {
                         continue;
@@ -977,16 +960,17 @@ void launch_combine_copy(void* combined_x,
                         }
                     }
                     if (window_count > 0) {
-                        ishmem_int_atomic_add(rdma_queue_tail + rank, window_count, src_rank);
+                        // Stage in rdma_queue_head to avoid clobbering self-send tail
+                        rdma_queue_head[rank] = window_count;
+                        ishmem_putmem_nbi(rdma_queue_tail + rank, rdma_queue_head + rank,
+                                          sizeof(int), src_rank);
                     }
                 }
+                ishmem_quiet();
             });
         });
         queue.wait();
-        if (debug_combine) {
-            std::cout << "[rank " << rank << "] combine window " << window_offset << " tail done" << std::endl;
-        }
-        internode::barrier();
+        internode::mpi_barrier();
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<CombineQueueCopyKernel<dtype_t>>(
@@ -1140,14 +1124,14 @@ void debug_channel_put(
                                     rank};
     queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutInitKernel>(sycl::range<1>(init_range), init_kernel); });
     queue.wait();
-    internode::barrier();
+    internode::mpi_barrier();
 
     for (int channel = 0; channel < num_channels; ++channel) {
         const int reset_range = std::max(num_queue_slots * row_ints, num_queue_slots);
         DebugChannelPutReset reset_kernel{recv_payload, recv_meta, recv_dst_token, num_queue_slots, row_ints};
         queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutResetKernel>(sycl::range<1>(reset_range), reset_kernel); });
         queue.wait();
-        internode::barrier();
+        internode::mpi_barrier();
 
         DebugChannelPutPost post_kernel{recv_payload,
                                         recv_meta,
@@ -1162,13 +1146,13 @@ void debug_channel_put(
                                         channel};
         queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutKernel>(post_kernel); });
         queue.wait();
-        internode::barrier();
+        internode::mpi_barrier();
 
         DebugChannelPutValidate validate_kernel{
             output, recv_payload, recv_meta, recv_dst_token, row_ints, num_channels, queue_stride, output_cols, rank, channel};
         queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutValidateKernel>(validate_kernel); });
         queue.wait();
-        internode::barrier();
+        internode::mpi_barrier();
     }
 #else
     TORCH_CHECK(false, "debug_channel_put requires iSHMEM support");
