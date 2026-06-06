@@ -2,6 +2,7 @@
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
 #include <level_zero/ze_api.h>
+#include <mpi.h>
 #include <torch/python.h>
 #include <unistd.h>
 
@@ -12,8 +13,6 @@
 #include <mutex>
 #include <string>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
-
-#include <mpi.h>
 
 #ifdef DEEP_EP_ENABLE_ISHMEM
 #include <ishmem.h>
@@ -1224,8 +1223,9 @@ struct Buffer {
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
         TORCH_CHECK(!low_latency_mode, "XPU internode_dispatch requires a high-throughput buffer, not a low-latency buffer");
         const bool nvl_only_mode = num_nvl_bytes > 0 && num_rdma_ranks == 1;
-        TORCH_CHECK(nvl_only_mode || (num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr),
-                    "XPU internode_dispatch requires an iSHMEM RDMA buffer or NVL-only mode");
+        const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
+        TORCH_CHECK(nvl_only_mode || combined_nvl_rdma_mode || (num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr),
+                    "XPU internode_dispatch requires an iSHMEM RDMA buffer, NVL-only, or combined NVL+RDMA mode");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat8_e4m3fn,
                     "XPU internode_dispatch currently supports BF16 and FP8 tensors only");
         TORCH_CHECK(x_scales.has_value() == (x.scalar_type() == torch::kFloat8_e4m3fn),
@@ -1311,9 +1311,9 @@ struct Buffer {
         auto recv_gbl_channel_prefix_matrix = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty({num_ranks, num_channels}, int_options));
-        auto send_rdma_head = cached_mode ? std::optional<torch::Tensor>()
-                                          : std::optional<torch::Tensor>(torch::empty(
-                                                {num_tokens, nvl_only_mode ? num_ranks : num_rdma_ranks}, int_options));
+        auto send_rdma_head = cached_mode
+            ? std::optional<torch::Tensor>()
+            : std::optional<torch::Tensor>(torch::empty({num_tokens, nvl_only_mode ? num_ranks : num_rdma_ranks}, int_options));
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, int_options));
@@ -1359,6 +1359,44 @@ struct Buffer {
                                     rank,
                                     num_ranks,
                                     comm_stream.queue());
+        } else if (combined_nvl_rdma_mode) {
+            internode::dispatch_nvl_rdma(recv_x.data_ptr(),
+                                         recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
+                                         recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                                         recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
+                                         cached_mode ? nullptr : recv_src_meta->data_ptr(),
+                                         rdma_buffer_ptr,
+                                         x.data_ptr(),
+                                         x_scales.has_value() ? x_scales->data_ptr<float>() : nullptr,
+                                         topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                                         topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
+                                         cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
+                                         cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
+                                         cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
+                                         cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
+                                         rdma_channel_prefix_matrix.data_ptr<int>(),
+                                         recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                         gbl_channel_prefix_matrix.data_ptr<int>(),
+                                         recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                                         cached_mode ? nullptr : num_tokens_per_rank->data_ptr<int>(),
+                                         is_token_in_rank.data_ptr<bool>(),
+                                         num_tokens,
+                                         num_recv_tokens,
+                                         hidden,
+                                         static_cast<int>(x.element_size()),
+                                         num_topk,
+                                         num_scales,
+                                         num_channels,
+                                         config.num_max_rdma_chunked_send_tokens,
+                                         config.num_max_rdma_chunked_recv_tokens,
+                                         buffer_ptrs_gpu,
+                                         barrier_signal_ptrs_gpu,
+                                         nvl_rank,
+                                         num_nvl_ranks,
+                                         reserve_barrier_signals(2),
+                                         rank,
+                                         num_ranks,
+                                         comm_stream.queue());
         } else {
             internode::dispatch(recv_x.data_ptr(),
                                 recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
@@ -1520,6 +1558,7 @@ struct Buffer {
 
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
         const bool nvl_only_mode = num_nvl_bytes > 0 && num_rdma_ranks == 1;
+        const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
 
         if (nvl_only_mode) {
             internode::combine_nvl(scalar_type_to_data_type(x.scalar_type()),
@@ -1548,6 +1587,36 @@ struct Buffer {
                                    rank,
                                    num_ranks,
                                    comm_stream.queue());
+        } else if (combined_nvl_rdma_mode) {
+            internode::combine_nvl_rdma(scalar_type_to_data_type(x.scalar_type()),
+                                        combined_x.data_ptr(),
+                                        combined_topk_weights_ptr,
+                                        is_combined_token_in_rank.data_ptr<bool>(),
+                                        rdma_buffer_ptr,
+                                        x.data_ptr(),
+                                        topk_weights_ptr,
+                                        bias_ptrs[0],
+                                        bias_ptrs[1],
+                                        combined_rdma_head.data_ptr<int>(),
+                                        combined_nvl_head.data_ptr<int>(),
+                                        src_meta.data_ptr(),
+                                        rdma_channel_prefix_matrix.data_ptr<int>(),
+                                        rdma_rank_prefix_sum.data_ptr<int>(),
+                                        gbl_channel_prefix_matrix.data_ptr<int>(),
+                                        num_tokens,
+                                        num_combined_tokens,
+                                        hidden,
+                                        num_topk,
+                                        config.num_max_rdma_chunked_send_tokens,
+                                        config.num_max_rdma_chunked_recv_tokens,
+                                        buffer_ptrs_gpu,
+                                        barrier_signal_ptrs_gpu,
+                                        nvl_rank,
+                                        num_nvl_ranks,
+                                        reserve_barrier_signals(1),
+                                        rank,
+                                        num_ranks,
+                                        comm_stream.queue());
         } else {
             internode::combine(scalar_type_to_data_type(x.scalar_type()),
                                combined_x.data_ptr(),
