@@ -701,19 +701,14 @@ void dispatch(void* recv_x,
                                 // NBI put the tail to remote — stage in rdma_queue_head to avoid
                                 // clobbering the self-send tail already in rdma_queue_tail.
                                 rdma_queue_head[queue_pair] = window_count;
-                                ishmem_putmem_nbi(rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair,
-                                                  sizeof(int), dst_rank);
+                                ishmem_putmem_nbi(rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair, sizeof(int), dst_rank);
                             }
                         }
                     });
             });
             queue.wait();
             // Quiet drains all outstanding NBI puts (payload data + tail values)
-            queue.submit([&](sycl::handler& cgh) {
-                cgh.single_task<DispatchPayloadTailKernel>([=]() {
-                    ishmem_quiet();
-                });
-            });
+            queue.submit([&](sycl::handler& cgh) { cgh.single_task<DispatchPayloadTailKernel>([=]() { ishmem_quiet(); }); });
             queue.wait();
             internode::mpi_barrier();
 
@@ -947,10 +942,14 @@ void launch_combine_copy(void* combined_x,
                                 remote_topk_weights[k] = local_topk_weights[k];
                             }
                         } else {
-                            ishmemx_putmem_nbi_work_group(remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
+                            ishmemx_putmem_nbi_work_group(
+                                remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
                             if (num_topk > 0) {
-                                ishmemx_putmem_nbi_work_group(
-                                    remote_topk_weights, local_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), src_rank, group);
+                                ishmemx_putmem_nbi_work_group(remote_topk_weights,
+                                                              local_topk_weights,
+                                                              static_cast<size_t>(num_topk) * sizeof(float),
+                                                              src_rank,
+                                                              group);
                             }
                         }
                         sycl::group_barrier(group);
@@ -986,8 +985,7 @@ void launch_combine_copy(void* combined_x,
                     if (window_count > 0) {
                         // Stage in rdma_queue_head to avoid clobbering self-send tail
                         rdma_queue_head[rank] = window_count;
-                        ishmem_putmem_nbi(rdma_queue_tail + rank, rdma_queue_head + rank,
-                                          sizeof(int), src_rank);
+                        ishmem_putmem_nbi(rdma_queue_tail + rank, rdma_queue_head + rank, sizeof(int), src_rank);
                     }
                 }
                 ishmem_quiet();
@@ -1192,29 +1190,46 @@ void debug_channel_put(
 // Runtime-dispatched NVL barrier: routes to barrier_block<N> for the actual peer count.
 SYCL_EXTERNAL inline void nvl_barrier(int** barrier_signal_ptrs, int rank, int signal, int num_peers, sycl::nd_item<1> item) {
     switch (num_peers) {
-    case 1: barrier_block<1>(barrier_signal_ptrs, rank, signal, item); break;
-    case 2: barrier_block<2>(barrier_signal_ptrs, rank, signal, item); break;
-    case 3: barrier_block<3>(barrier_signal_ptrs, rank, signal, item); break;
-    case 4: barrier_block<4>(barrier_signal_ptrs, rank, signal, item); break;
-    case 5: barrier_block<5>(barrier_signal_ptrs, rank, signal, item); break;
-    case 6: barrier_block<6>(barrier_signal_ptrs, rank, signal, item); break;
-    case 7: barrier_block<7>(barrier_signal_ptrs, rank, signal, item); break;
-    case 8: barrier_block<8>(barrier_signal_ptrs, rank, signal, item); break;
-    default: break;
+        case 1:
+            barrier_block<1>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 2:
+            barrier_block<2>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 3:
+            barrier_block<3>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 4:
+            barrier_block<4>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 5:
+            barrier_block<5>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 6:
+            barrier_block<6>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 7:
+            barrier_block<7>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        case 8:
+            barrier_block<8>(barrier_signal_ptrs, rank, signal, item);
+            break;
+        default:
+            break;
     }
 }
 
 struct NvlBufferLayout {
     // Offsets within each rank's NVL buffer (buffer_ptrs[nvl_rank])
-    size_t count_offset = 0;        // int[num_ranks]: per-destination token counts
-    size_t channel_count_offset = 0; // int[num_ranks * num_channels]
-    size_t send_x_offset = 0;       // uint8[num_tokens * row_bytes]: token payload
-    size_t send_meta_offset = 0;    // SourceMeta[num_tokens]
+    size_t count_offset = 0;          // int[num_ranks]: per-destination token counts
+    size_t channel_count_offset = 0;  // int[num_ranks * num_channels]
+    size_t send_x_offset = 0;         // uint8[num_tokens * row_bytes]: token payload
+    size_t send_meta_offset = 0;      // SourceMeta[num_tokens]
     size_t send_topk_idx_offset = 0;
     size_t send_topk_weights_offset = 0;
     size_t send_x_scales_offset = 0;
-    size_t send_dst_token_offset = 0; // int[num_tokens]: compact destination row
-    size_t send_routing_bits_offset = 0; // int[num_tokens]: per-token NVL destination bitmask
+    size_t send_dst_token_offset = 0;     // int[num_tokens]: compact destination row
+    size_t send_routing_bits_offset = 0;  // int[num_tokens]: per-token NVL destination bitmask
     size_t total_bytes = 0;
 
     NvlBufferLayout(int num_tokens, int num_ranks, int num_channels, size_t row_bytes, int num_topk, int num_scales) {
@@ -1289,13 +1304,11 @@ void dispatch_nvl(void* recv_x,
 
     // Phase 1: Initialize receive buffers
     const size_t total_recv = static_cast<size_t>(num_recv_tokens);
-    const size_t init_range = std::max({
-        total_recv * (row_bytes / sizeof(uint8_t)),
-        total_recv * sizeof(SourceMeta),
-        static_cast<size_t>(num_ranks) * num_channels,
-        static_cast<size_t>(num_tokens) * num_ranks,
-        static_cast<size_t>(1)
-    });
+    const size_t init_range = std::max({total_recv * (row_bytes / sizeof(uint8_t)),
+                                        total_recv * sizeof(SourceMeta),
+                                        static_cast<size_t>(num_ranks) * num_channels,
+                                        static_cast<size_t>(num_tokens) * num_ranks,
+                                        static_cast<size_t>(1)});
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<NvlDispatchInitKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
             const size_t linear = id[0];
@@ -1360,9 +1373,7 @@ void dispatch_nvl(void* recv_x,
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<NvlDispatchCountBarrierKernel>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) {
-                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_count, num_nvl_ranks, item);
-            });
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_count, num_nvl_ranks, item); });
     });
     queue.wait();
 
@@ -1441,7 +1452,8 @@ void dispatch_nvl(void* recv_x,
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<NvlDispatchPackKernel>(sycl::range<1>(std::max(num_tokens, 1)), [=](sycl::id<1> id) {
             const int token = static_cast<int>(id[0]);
-            if (token >= num_tokens) return;
+            if (token >= num_tokens)
+                return;
 
             auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
             auto* my_send_x = my_buf + layout.send_x_offset;
@@ -1492,9 +1504,7 @@ void dispatch_nvl(void* recv_x,
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<NvlDispatchPackBarrierKernel>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) {
-                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_pack, num_nvl_ranks, item);
-            });
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_pack, num_nvl_ranks, item); });
     });
     queue.wait();
 
@@ -1517,7 +1527,8 @@ void dispatch_nvl(void* recv_x,
                 // Scan source tokens using the routing bitmask
                 for (int t = 0; t < num_tokens; ++t) {
                     bool is_for_me = (src_routing_bits[t] >> nvl_rank) & 1;
-                    if (!is_for_me) continue;
+                    if (!is_for_me)
+                        continue;
 
                     // Copy to recv position
                     const int recv_idx = recv_offset;
@@ -1578,7 +1589,8 @@ void dispatch_nvl(void* recv_x,
                 // Iterate our own tokens, compute ordinal for those going to dst
                 int ordinal = 0;
                 for (int t = 0; t < num_tokens; ++t) {
-                    if (!is_token_in_rank[t * num_ranks + dst]) continue;
+                    if (!is_token_in_rank[t * num_ranks + dst])
+                        continue;
                     if (send_rdma_head) {
                         send_rdma_head[t * num_ranks + dst] = prefix + ordinal;
                     }
@@ -1624,7 +1636,8 @@ struct NvlCombinePackFunctor {
 
     void operator()(sycl::id<1> id) const {
         const int token = static_cast<int>(id[0]);
-        if (token >= num_tokens) return;
+        if (token >= num_tokens)
+            return;
 
         auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
         auto* combine_x = reinterpret_cast<dtype_t*>(my_buf + combine_x_offset);
@@ -1687,7 +1700,8 @@ struct NvlCombineReduceFunctor {
                 int peer_num_tokens = *peer_combine_count;
 
                 const int peer_recv_pos = combined_rdma_head[ct * num_ranks + peer];
-                if (peer_recv_pos < 0 || peer_recv_pos >= peer_num_tokens) continue;
+                if (peer_recv_pos < 0 || peer_recv_pos >= peer_num_tokens)
+                    continue;
 
                 for (int h = 0; h < hidden; ++h) {
                     float val = static_cast<float>(dst[ct * hidden + h]);
@@ -1714,11 +1728,14 @@ struct NvlCombineBiasFunctor {
 
     void operator()(sycl::id<1> id) const {
         const int ct = static_cast<int>(id[0]);
-        if (ct >= num_combined_tokens) return;
+        if (ct >= num_combined_tokens)
+            return;
         for (int h = 0; h < hidden; ++h) {
             float val = static_cast<float>(dst[ct * hidden + h]);
-            if (b0) val += static_cast<float>(b0[ct * hidden + h]);
-            if (b1) val += static_cast<float>(b1[ct * hidden + h]);
+            if (b0)
+                val += static_cast<float>(b0[ct * hidden + h]);
+            if (b1)
+                val += static_cast<float>(b1[ct * hidden + h]);
             dst[ct * hidden + h] = static_cast<dtype_t>(val);
         }
     }
@@ -1755,12 +1772,12 @@ void launch_combine_nvl(void* combined_x,
 
     const size_t combine_base_offset = 4096;
     const size_t combine_x_offset = combine_base_offset;
-    const size_t combine_topk_offset = align_offset(
-        combine_x_offset + static_cast<size_t>(num_tokens) * hidden * sizeof(dtype_t), alignof(float));
-    const size_t combine_src_token_offset = align_offset(
-        combine_topk_offset + static_cast<size_t>(num_tokens) * num_topk * sizeof(float), alignof(int));
-    const size_t combine_count_offset = align_offset(
-        combine_src_token_offset + static_cast<size_t>(num_tokens) * sizeof(int), alignof(int));
+    const size_t combine_topk_offset =
+        align_offset(combine_x_offset + static_cast<size_t>(num_tokens) * hidden * sizeof(dtype_t), alignof(float));
+    const size_t combine_src_token_offset =
+        align_offset(combine_topk_offset + static_cast<size_t>(num_tokens) * num_topk * sizeof(float), alignof(int));
+    const size_t combine_count_offset =
+        align_offset(combine_src_token_offset + static_cast<size_t>(num_tokens) * sizeof(int), alignof(int));
 
     // Phase 1: Initialize combined output
     const size_t total_combined = static_cast<size_t>(num_combined_tokens) * hidden;
@@ -1775,9 +1792,16 @@ void launch_combine_nvl(void* combined_x,
 
     // Phase 2: Each rank packs its combine contributions into its NVL buffer
     queue.submit([&](sycl::handler& cgh) {
-        NvlCombinePackFunctor<dtype_t> fn{buffer_ptrs_gpu, src, topk_weights,
-                                          nvl_rank, num_tokens, hidden, num_topk,
-                                          combine_x_offset, combine_topk_offset, combine_src_token_offset};
+        NvlCombinePackFunctor<dtype_t> fn{buffer_ptrs_gpu,
+                                          src,
+                                          topk_weights,
+                                          nvl_rank,
+                                          num_tokens,
+                                          hidden,
+                                          num_topk,
+                                          combine_x_offset,
+                                          combine_topk_offset,
+                                          combine_src_token_offset};
         cgh.parallel_for<NvlCombinePackKernel<dtype_t>>(sycl::range<1>(std::max(num_tokens, 1)), fn);
     });
     queue.wait();
@@ -1794,18 +1818,25 @@ void launch_combine_nvl(void* combined_x,
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<NvlCombinePackBarrierKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) {
-                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_combine, num_nvl_ranks, item);
-            });
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_combine, num_nvl_ranks, item); });
     });
     queue.wait();
 
     // Phase 3: Each rank reads combine contributions from all peers and reduces
     queue.submit([&](sycl::handler& cgh) {
-        NvlCombineReduceFunctor<dtype_t> fn{dst, combined_topk_weights, is_combined_token_in_rank,
-                                            combined_rdma_head, buffer_ptrs_gpu,
-                                            num_tokens, num_combined_tokens, hidden, num_topk, num_ranks,
-                                            combine_x_offset, combine_topk_offset, combine_count_offset};
+        NvlCombineReduceFunctor<dtype_t> fn{dst,
+                                            combined_topk_weights,
+                                            is_combined_token_in_rank,
+                                            combined_rdma_head,
+                                            buffer_ptrs_gpu,
+                                            num_tokens,
+                                            num_combined_tokens,
+                                            hidden,
+                                            num_topk,
+                                            num_ranks,
+                                            combine_x_offset,
+                                            combine_topk_offset,
+                                            combine_count_offset};
         cgh.single_task<NvlCombineReduceKernel<dtype_t>>(fn);
     });
     queue.wait();
@@ -1853,17 +1884,247 @@ void combine_nvl(DataType type,
     TORCH_CHECK(barrier_signal_ptrs_gpu != nullptr, "NVL combine requires barrier signal pointers");
 
     if (type == DataType::kBFloat16) {
-        launch_combine_nvl<sycl::ext::oneapi::bfloat16>(
-            combined_x, combined_topk_weights, is_combined_token_in_rank,
-            x, topk_weights, bias_0, bias_1,
-            combined_rdma_head, combined_nvl_head, src_meta,
-            rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
-            num_tokens, num_combined_tokens, hidden, num_topk,
-            buffer_ptrs_gpu, barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks,
-            barrier_signal_base, rank, num_ranks, queue);
+        launch_combine_nvl<sycl::ext::oneapi::bfloat16>(combined_x,
+                                                        combined_topk_weights,
+                                                        is_combined_token_in_rank,
+                                                        x,
+                                                        topk_weights,
+                                                        bias_0,
+                                                        bias_1,
+                                                        combined_rdma_head,
+                                                        combined_nvl_head,
+                                                        src_meta,
+                                                        rdma_channel_prefix_matrix,
+                                                        rdma_rank_prefix_sum,
+                                                        gbl_channel_prefix_matrix,
+                                                        num_tokens,
+                                                        num_combined_tokens,
+                                                        hidden,
+                                                        num_topk,
+                                                        buffer_ptrs_gpu,
+                                                        barrier_signal_ptrs_gpu,
+                                                        nvl_rank,
+                                                        num_nvl_ranks,
+                                                        barrier_signal_base,
+                                                        rank,
+                                                        num_ranks,
+                                                        queue);
     } else {
         TORCH_CHECK(false, "NVL combine only supports BFloat16 for now");
     }
+}
+
+// ======================================================================
+// Combined NVL + RDMA internode dispatch
+// ======================================================================
+//
+// Topology: num_ranks = num_rdma_ranks * num_nvl_ranks
+//   rdma_rank = rank / NUM_MAX_NVL_PEERS
+//   nvl_rank  = rank % NUM_MAX_NVL_PEERS
+//
+// Data flow for a token going from (src_rdma_rank, src_nvl_rank) to
+// (dst_rdma_rank, dst_nvl_rank) where dst_rdma_rank != src_rdma_rank:
+//   1. Source packs token into its NVL buffer with routing info
+//   2. Source's RDMA peer (nvl_rank=src_nvl_rank on src node) packs into
+//      iSHMEM buffer and sends to its peer on the destination node
+//   3. Destination RDMA peer receives, forwards to local NVL peers
+//   4. Destination NVL peer reads from its forwarding buffer
+//
+// For same-node tokens (dst_rdma_rank == src_rdma_rank):
+//   Delivered via NVL IPC directly.
+
+// NVL forwarding buffer layout: used for RDMA→NVL forwarding on the receive side.
+// Each rank's NVL buffer (buffer_ptrs[nvl_rank]) is split into two regions:
+//   Region A: NVL-local tokens (same NvlBufferLayout as NVL-only dispatch)
+//   Region B: RDMA-forwarded tokens
+struct NvlForwardLayout {
+    size_t fwd_x_offset = 0;     // uint8[max_fwd_tokens * row_bytes]
+    size_t fwd_meta_offset = 0;  // SourceMeta[max_fwd_tokens]
+    size_t fwd_topk_idx_offset = 0;
+    size_t fwd_topk_weights_offset = 0;
+    size_t fwd_x_scales_offset = 0;
+    size_t fwd_count_offset = 0;  // int[num_rdma_ranks]: per-source-rdma-rank count
+    size_t total_bytes = 0;
+
+    NvlForwardLayout(int max_fwd_tokens, size_t row_bytes, int num_topk, int num_scales, int num_rdma_ranks) {
+        size_t off = 0;
+        auto add_aligned = [&](size_t bytes, size_t align = 128) {
+            off = align_offset(off, align);
+            size_t result = off;
+            off += bytes;
+            return result;
+        };
+        fwd_x_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * row_bytes, 128);
+        fwd_meta_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * sizeof(SourceMeta), alignof(SourceMeta));
+        fwd_topk_idx_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_topk * sizeof(topk_idx_t), alignof(topk_idx_t));
+        fwd_topk_weights_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_topk * sizeof(float), alignof(float));
+        fwd_x_scales_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_scales * sizeof(float), alignof(float));
+        fwd_count_offset = add_aligned(static_cast<size_t>(num_rdma_ranks) * sizeof(int), alignof(int));
+        total_bytes = align_offset(off, 128);
+    }
+};
+
+void dispatch_nvl_rdma(void* recv_x,
+                       float* recv_x_scales,
+                       topk_idx_t* recv_topk_idx,
+                       float* recv_topk_weights,
+                       void* recv_src_meta,
+                       void* rdma_buffer_ptr,
+                       const void* x,
+                       const float* x_scales,
+                       const topk_idx_t* topk_idx,
+                       const float* topk_weights,
+                       int* send_rdma_head,
+                       int* send_nvl_head,
+                       int* recv_rdma_channel_prefix_matrix,
+                       int* recv_gbl_channel_prefix_matrix,
+                       int* rdma_channel_prefix_matrix,
+                       int* recv_rdma_rank_prefix_sum,
+                       int* gbl_channel_prefix_matrix,
+                       int* recv_gbl_rank_prefix_sum,
+                       const int* num_tokens_per_rank,
+                       const bool* is_token_in_rank,
+                       int num_tokens,
+                       int num_recv_tokens,
+                       int hidden,
+                       int element_size,
+                       int num_topk,
+                       int num_scales,
+                       int num_channels,
+                       int num_max_rdma_chunked_send_tokens,
+                       int num_max_rdma_chunked_recv_tokens,
+                       void** buffer_ptrs_gpu,
+                       int** barrier_signal_ptrs_gpu,
+                       int nvl_rank,
+                       int num_nvl_ranks,
+                       int barrier_signal_base,
+                       int rank,
+                       int num_ranks,
+                       sycl::queue& queue) {
+#ifdef DEEP_EP_ENABLE_ISHMEM
+    TORCH_CHECK(recv_x != nullptr && x != nullptr, "dispatch_nvl_rdma requires input and output tensors");
+    TORCH_CHECK(rdma_buffer_ptr != nullptr, "dispatch_nvl_rdma requires a symmetric iSHMEM RDMA buffer");
+    TORCH_CHECK(is_token_in_rank != nullptr, "dispatch_nvl_rdma requires is_token_in_rank");
+
+    // When num_nvl_ranks == 1, each rank is its own RDMA rank with no NVL peers.
+    // This degenerates to the pure RDMA-only dispatch path.
+    if (num_nvl_ranks <= 1) {
+        internode::dispatch(recv_x,
+                            recv_x_scales,
+                            recv_topk_idx,
+                            recv_topk_weights,
+                            recv_src_meta,
+                            rdma_buffer_ptr,
+                            x,
+                            x_scales,
+                            topk_idx,
+                            topk_weights,
+                            send_rdma_head,
+                            send_nvl_head,
+                            recv_rdma_channel_prefix_matrix,
+                            recv_gbl_channel_prefix_matrix,
+                            rdma_channel_prefix_matrix,
+                            recv_rdma_rank_prefix_sum,
+                            gbl_channel_prefix_matrix,
+                            recv_gbl_rank_prefix_sum,
+                            num_tokens_per_rank,
+                            is_token_in_rank,
+                            num_tokens,
+                            num_recv_tokens,
+                            hidden,
+                            element_size,
+                            num_topk,
+                            num_scales,
+                            num_channels,
+                            num_max_rdma_chunked_send_tokens,
+                            num_max_rdma_chunked_recv_tokens,
+                            rank,
+                            num_ranks,
+                            queue);
+        return;
+    }
+
+    // Multi-NVL-peer combined NVL+RDMA dispatch:
+    // Same-node tokens go via NVL IPC buffers. Cross-node tokens go via RDMA
+    // to the corresponding device on the remote node, then NVL-forwarded.
+    // This path requires num_nvl_ranks > 1 and cannot be tested with only 2 devices.
+    TORCH_CHECK(false,
+                "dispatch_nvl_rdma with num_nvl_ranks > 1 is not yet implemented; "
+                "requires multi-device per-node validation");
+#else
+    TORCH_CHECK(false, "dispatch_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
+#endif
+}
+
+// Combined NVL+RDMA combine
+void combine_nvl_rdma(DataType type,
+                      void* combined_x,
+                      float* combined_topk_weights,
+                      const bool* is_combined_token_in_rank,
+                      void* rdma_buffer_ptr,
+                      const void* x,
+                      const float* topk_weights,
+                      const void* bias_0,
+                      const void* bias_1,
+                      const int* combined_rdma_head,
+                      const int* combined_nvl_head,
+                      const void* src_meta,
+                      const int* rdma_channel_prefix_matrix,
+                      const int* rdma_rank_prefix_sum,
+                      const int* gbl_channel_prefix_matrix,
+                      int num_tokens,
+                      int num_combined_tokens,
+                      int hidden,
+                      int num_topk,
+                      int num_max_rdma_chunked_send_tokens,
+                      int num_max_rdma_chunked_recv_tokens,
+                      void** buffer_ptrs_gpu,
+                      int** barrier_signal_ptrs_gpu,
+                      int nvl_rank,
+                      int num_nvl_ranks,
+                      int barrier_signal_base,
+                      int rank,
+                      int num_ranks,
+                      sycl::queue& queue) {
+#ifdef DEEP_EP_ENABLE_ISHMEM
+    // When num_nvl_ranks == 1, each rank is its own RDMA rank with no NVL peers.
+    // This degenerates to the pure RDMA-only combine path.
+    if (num_nvl_ranks <= 1) {
+        internode::combine(type,
+                           combined_x,
+                           combined_topk_weights,
+                           is_combined_token_in_rank,
+                           rdma_buffer_ptr,
+                           x,
+                           topk_weights,
+                           bias_0,
+                           bias_1,
+                           combined_rdma_head,
+                           combined_nvl_head,
+                           src_meta,
+                           rdma_channel_prefix_matrix,
+                           rdma_rank_prefix_sum,
+                           gbl_channel_prefix_matrix,
+                           num_tokens,
+                           num_combined_tokens,
+                           hidden,
+                           num_topk,
+                           num_max_rdma_chunked_send_tokens,
+                           num_max_rdma_chunked_recv_tokens,
+                           rank,
+                           num_ranks,
+                           queue);
+        return;
+    }
+
+    // Multi-NVL-peer combined NVL+RDMA combine:
+    // Reverse of dispatch_nvl_rdma's forwarding path.
+    TORCH_CHECK(false,
+                "combine_nvl_rdma with num_nvl_ranks > 1 is not yet implemented; "
+                "requires multi-device per-node validation");
+#else
+    TORCH_CHECK(false, "combine_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
+#endif
 }
 
 }  // namespace internode
