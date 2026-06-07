@@ -3,6 +3,7 @@ import os
 import sys
 
 import torch
+import torch.distributed as dist
 
 REPO = "/data/jiafuzha/code-repo/zjf2012/DeepEP"
 sys.path.insert(0, REPO)
@@ -62,18 +63,22 @@ def main():
     world = int(os.environ.get("PMI_SIZE", os.environ.get("PMIX_SIZE", "2")))
     assert world == 2, f"expected 2 ranks, got {world}"
 
-    from mpi4py import MPI
-    comm = MPI.COMM_WORLD
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29513")
+
+    dist.init_process_group(backend="xccl")
+    group = dist.new_group(list(range(world)))
 
     num_tokens, hidden = args.num_tokens, 128
     num_worst_tokens = num_tokens * world
-    buffer = deep_ep.Buffer(group=None,
+    buffer = deep_ep.Buffer(group,
                             num_nvl_bytes=0,
                             num_rdma_bytes=16 * 1024 * 1024,
                             low_latency_mode=False,
                             num_qps_per_rank=1,
-                            explicitly_destroy=True,
-                            comm=comm)
+                            explicitly_destroy=True)
     try:
         device = torch.device(f"xpu:{buffer.runtime.get_local_device_id()}")
         x = make_input(rank, num_tokens, hidden, device)
@@ -267,7 +272,7 @@ def main():
         print(f"[rank {rank}] PASS normal internode compact BF16/cached/FP8 validation", flush=True)
     finally:
         buffer.destroy()
-        MPI.Finalize()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
