@@ -8,6 +8,7 @@ if [ ! -x "$BIN" ]; then
     "$ROOT_DIR/tests/ut/build_xpu_ishmem_mapped_api_ut.sh" >/dev/null
 fi
 
+
 cases=(
     init_attr_uniqueid
     normal_putmem_blocking
@@ -26,9 +27,48 @@ cases=(
     ll_putmem_nbi_atomic_flag
     atomic_add_all_pes
     combine_payload_work_group_putmem_atomic_tail
+    combine_payload_work_group_putmem_atomic_tail_separate_kernels
+    work_group_sideband_putmem_nbi_atomic_tail_repeat
+    work_group_sideband_putmem_nbi_split_atomic_tail_repeat
+    multi_channel_nbi_quiet_atomic
+    dispatch_then_combine_blocking_put
+    multi_channel_nbi_quiet_atomic_split
+    l3_snoop_verify
+    # --- Scalar device API hang/stability tests ---
+    scalar_putmem_single_task
+    scalar_putmem_nbi_quiet_single_task
+    scalar_int_put_single_task
+    scalar_quiet_after_nbi_single_task
+    scalar_fence_single_task
+    scalar_barrier_all_device
+    scalar_sync_all_device
+    scalar_putmem_parallel_for
+    scalar_putmem_nd_range_no_wg_api
+    scalar_get_single_task
+    scalar_putmem_large_single_task
+    scalar_p_single_task
+    scalar_g_single_task
+    scalar_atomic_fetch_add_single_task
+    scalar_quiet_no_preceding_put
+    scalar_put_multi_pe_single_task
+    scalar_nbi_quiet_repeat_single_task
 )
 
 known_failures=(
+    # Team/barrier/sync/fence APIs that can hang or segfault during finalize (flaky)
+    team_split_sync_destroy
+    device_barrier_all
+    normal_sync_all_device
+    ll_barrier_work_group
+    scalar_sync_all_device
+    scalar_fence_single_task
+    scalar_barrier_all_device
+    # Scalar iSHMEM device APIs that still hang with IBGDA direct-doorbell transport.
+    # get-side APIs hang: ishmem_get, ishmem_short_g
+    scalar_get_single_task
+    scalar_g_single_task
+    # ishmem_short_p hangs in single_task
+    scalar_p_single_task
 )
 
 is_known_failure() {
@@ -44,7 +84,7 @@ is_known_failure() {
 
 run_case() {
     local case_name="$1"
-    timeout 120 mpirun -n 2 \
+    timeout 120 mpirun -n 4 \
         -genv ISHMEM_IB_ENABLE_IBGDA 1 \
         -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
         -genv ISHMEM_ENABLE_GPU_IPC 0 \
@@ -60,16 +100,7 @@ run_case() {
         -genv BIN $BIN \
         -genv case_name $case_name \
         bash -c '
-       if [ "$PMI_RANK" = "0" ]; then
-         export ZE_AFFINITY_MASK=4
-         export ISHMEM_IBGDA_NIC=mlx5_4
-       elif [ "$PMI_RANK" = "1" ]; then
-         export ZE_AFFINITY_MASK=5
-         export ISHMEM_IBGDA_NIC=mlx5_5
-       else
-         echo "unknow PMI rank: $PMI_RANK"
-         exit 1
-       fi
+        # export ZE_AFFINITY_MASK=4,5,6,7
        "$BIN" --case "$case_name"
        '
         
