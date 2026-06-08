@@ -207,18 +207,16 @@ void dispatch_bf16(void* packed_recv_x,
                 auto group = item.get_group();
                 const int local_id = static_cast<int>(item.get_local_id(0));
                 const int local_size = static_cast<int>(item.get_local_range(0));
-                const size_t recv_count_elems = static_cast<size_t>(num_local_experts) * num_ranks;
                 const size_t send_count_elems = static_cast<size_t>(num_ranks) * num_local_experts;
-                const size_t slot_elems = recv_count_elems * num_max_dispatch_tokens_per_rank;
+                const size_t slot_elems = send_count_elems * num_max_dispatch_tokens_per_rank;
 
-                for (size_t i = local_id; i < recv_count_elems; i += local_size) {
-                    dispatch_count[i] = 0;
-                }
+                // Zero only LOCAL staging and output tensors.
+                // Symmetric buffer regions (dispatch_count, dispatch_src, dispatch_data)
+                // are already zeroed by clean_low_latency_buffer with cross-PE barriers.
                 for (size_t i = local_id; i < send_count_elems; i += local_size) {
                     send_count[i] = 0;
                 }
                 for (size_t i = local_id; i < slot_elems; i += local_size) {
-                    dispatch_src[i] = -1;
                     send_src[i] = -1;
                     packed_recv_src_info[i] = -1;
                 }
@@ -227,8 +225,10 @@ void dispatch_bf16(void* packed_recv_x,
                 }
                 sycl::group_barrier(group);
 
-                ishmemx_barrier_all_work_group(group);
+                // No barrier_all needed here — clean_low_latency_buffer guarantees
+                // all PEs have zeroed the symmetric receive buffers before dispatch.
 
+                // Route tokens into local send staging
                 for (int token_idx = local_id; token_idx < num_tokens; token_idx += local_size) {
                     for (int k = 0; k < num_topk; ++k) {
                         const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
@@ -261,54 +261,62 @@ void dispatch_bf16(void* packed_recv_x,
                 }
                 sycl::group_barrier(group);
 
+                // Phase 1: Issue data + src puts (NBI) to all remote PEs.
+                // Local copies go directly into dispatch buffers.
+                // Slots are contiguous in both send and dispatch layouts, so we
+                // batch all slots per channel into a single large put.
                 for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                     for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
                         const size_t src_slot =
                             (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
                         const size_t dst_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        auto* dst_count = dispatch_count + local_expert * num_ranks + rank;
                         auto* src_count = send_count + dst_rank * num_local_experts + local_expert;
                         auto* dst_src = dispatch_src + dst_slot;
                         auto* src_src = send_src + src_slot;
 
                         if (dst_rank == rank) {
+                            const int count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
                             if (local_id == 0) {
-                                *dst_count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
+                                dispatch_count[local_expert * num_ranks + rank] = count;
                             }
                             for (int slot = local_id; slot < num_max_dispatch_tokens_per_rank; slot += local_size) {
                                 dst_src[slot] = src_src[slot];
                             }
-                            const int count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
-                            for (int slot = 0; slot < count; ++slot) {
-                                auto* dst = dispatch_data + (dst_slot + slot) * hidden_bytes;
-                                auto* src = send_data + (src_slot + slot) * hidden_bytes;
-                                for (size_t b = local_id; b < hidden_bytes; b += local_size) {
-                                    dst[b] = src[b];
-                                }
-                                sycl::group_barrier(group);
+                            auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
+                            auto* src_ptr = send_data + src_slot * hidden_bytes;
+                            const size_t bytes = static_cast<size_t>(count) * hidden_bytes;
+                            for (size_t b = local_id; b < bytes; b += local_size) {
+                                dst_ptr[b] = src_ptr[b];
                             }
                         } else {
                             if (local_id == 0) {
                                 *src_count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
                             }
                             sycl::group_barrier(group);
-                            ishmemx_int_put_nbi_work_group(dst_count, src_count, 1, dst_rank, group);
-                            ishmemx_putmem_nbi_work_group(
-                                dst_src, src_src, static_cast<size_t>(num_max_dispatch_tokens_per_rank) * sizeof(int), dst_rank, group);
                             const int count = *src_count;
-                            for (int slot = 0; slot < count; ++slot) {
-                                auto* dst = dispatch_data + (dst_slot + slot) * hidden_bytes;
-                                auto* src = send_data + (src_slot + slot) * hidden_bytes;
-                                ishmemx_putmem_nbi_work_group(dst, src, hidden_bytes, dst_rank, group);
+                            // Put count to remote
+                            auto* dst_count = dispatch_count + local_expert * num_ranks + rank;
+                            ishmemx_int_put_nbi_work_group(dst_count, src_count, 1, dst_rank, group);
+                            if (count > 0) {
+                                // Batch src info into one put
+                                ishmemx_putmem_nbi_work_group(
+                                    dst_src, src_src, static_cast<size_t>(count) * sizeof(int), dst_rank, group);
+                                // Batch all data slots into one put
+                                auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
+                                auto* src_ptr = send_data + src_slot * hidden_bytes;
+                                ishmemx_putmem_nbi_work_group(
+                                    dst_ptr, src_ptr, static_cast<size_t>(count) * hidden_bytes, dst_rank, group);
                             }
                         }
                         sycl::group_barrier(group);
                     }
                 }
 
-                ishmemx_quiet_work_group(group);
+                // Phase 2: Barrier ensures all PEs have completed their puts
+                // (barrier_all internally does quiet + cross-PE synchronization)
                 ishmemx_barrier_all_work_group(group);
 
+                // Phase 3: Pack received data — batch contiguous ranges per channel
                 for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
                     int begin = 0;
                     for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
@@ -325,21 +333,24 @@ void dispatch_bf16(void* packed_recv_x,
                                 dispatch_wait_recv_cost_stats[src_rank] += 0;
                             }
                         }
-                        for (int slot = 0; slot < clamped_count; ++slot) {
-                            const size_t src_idx =
-                                (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank + slot;
-                            const size_t dst_idx =
-                                static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot;
-                            auto* src = dispatch_data + src_idx * hidden_bytes;
-                            auto* dst = static_cast<uint8_t*>(packed_recv_x) + dst_idx * hidden_bytes;
-                            for (size_t b = local_id; b < hidden_bytes; b += local_size) {
+                        if (clamped_count > 0) {
+                            // Batch copy all data for this channel
+                            const size_t src_base =
+                                (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
+                            const size_t dst_base =
+                                static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
+                            auto* src = dispatch_data + src_base * hidden_bytes;
+                            auto* dst = static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes;
+                            const size_t total_bytes = static_cast<size_t>(clamped_count) * hidden_bytes;
+                            for (size_t b = local_id; b < total_bytes; b += local_size) {
                                 dst[b] = src[b];
                             }
-                            if (local_id == 0) {
-                                packed_recv_src_info[dst_idx] = dispatch_src[src_idx];
+                            // Copy src_info for this channel
+                            for (int slot = local_id; slot < clamped_count; slot += local_size) {
+                                packed_recv_src_info[dst_base + slot] = dispatch_src[src_base + slot];
                             }
-                            sycl::group_barrier(group);
                         }
+                        sycl::group_barrier(group);
                         begin += clamped_count;
                     }
                 }
@@ -440,7 +451,7 @@ void combine_bf16(void* combined_x,
     auto* base = static_cast<uint8_t*>(rdma_buffer);
     auto* send_data = base + layout.send_data_offset;
     auto* combine_data = base + layout.combine_data_offset;
-    auto* combine_flag = reinterpret_cast<uint64_t*>(base + layout.combine_flag_offset);
+    (void)layout.combine_flag_offset;  // combine_flag zeroed by clean_low_latency_buffer
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<LowLatencyCombineMergedKernel>(
@@ -449,23 +460,18 @@ void combine_bf16(void* combined_x,
                 auto group = item.get_group();
                 const int local_id = static_cast<int>(item.get_local_id(0));
                 const int local_size = static_cast<int>(item.get_local_range(0));
-                const size_t combine_elems = static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank;
                 const size_t send_elems = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
-                auto* combine_bf16 = reinterpret_cast<sycl::ext::oneapi::bfloat16*>(combine_data);
                 auto* send_bf16 = reinterpret_cast<sycl::ext::oneapi::bfloat16*>(send_data);
 
-                for (size_t i = local_id; i < combine_elems * hidden; i += local_size) {
-                    combine_bf16[i] = sycl::ext::oneapi::bfloat16(0.0f);
-                }
+                // Zero only local send staging. combine_data and combine_flag are
+                // already zeroed by clean_low_latency_buffer with cross-PE barriers.
                 for (size_t i = local_id; i < send_elems * hidden; i += local_size) {
                     send_bf16[i] = sycl::ext::oneapi::bfloat16(0.0f);
                 }
-                for (int i = local_id; i < num_experts; i += local_size) {
-                    combine_flag[i] = 0;
-                }
                 sycl::group_barrier(group);
 
-                ishmemx_barrier_all_work_group(group);
+                // No barrier_all needed here — clean_low_latency_buffer guarantees
+                // all PEs have zeroed combine_data/combine_flag before dispatch+combine.
 
                 for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
                     for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
@@ -491,10 +497,10 @@ void combine_bf16(void* combined_x,
                             for (size_t b = local_id; b < hidden_bytes; b += local_size) {
                                 staged_dst[b] = src[b];
                             }
-                            sycl::group_barrier(group);
                         }
                     }
                 }
+                sycl::group_barrier(group);
 
                 for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                     for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
@@ -533,7 +539,6 @@ void combine_bf16(void* combined_x,
                     }
                 }
 
-                ishmemx_quiet_work_group(group);
                 ishmemx_barrier_all_work_group(group);
 
                 auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
