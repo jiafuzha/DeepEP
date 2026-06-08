@@ -261,56 +261,66 @@ void dispatch_bf16(void* packed_recv_x,
                 }
                 sycl::group_barrier(group);
 
-                // Phase 1: Issue data + src puts (NBI) to all remote PEs.
-                // Local copies go directly into dispatch buffers.
-                // Slots are contiguous in both send and dispatch layouts, so we
-                // batch all slots per channel into a single large put.
-                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                        const size_t src_slot =
-                            (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
-                        const size_t dst_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        auto* src_count = send_count + dst_rank * num_local_experts + local_expert;
-                        auto* dst_src = dispatch_src + dst_slot;
-                        auto* src_src = send_src + src_slot;
-
-                        if (dst_rank == rank) {
-                            const int count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
-                            if (local_id == 0) {
-                                dispatch_count[local_expert * num_ranks + rank] = count;
-                            }
-                            for (int slot = local_id; slot < num_max_dispatch_tokens_per_rank; slot += local_size) {
-                                dst_src[slot] = src_src[slot];
-                            }
-                            auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
-                            auto* src_ptr = send_data + src_slot * hidden_bytes;
-                            const size_t bytes = static_cast<size_t>(count) * hidden_bytes;
-                            for (size_t b = local_id; b < bytes; b += local_size) {
-                                dst_ptr[b] = src_ptr[b];
-                            }
-                        } else {
-                            if (local_id == 0) {
-                                *src_count = sycl::min(*src_count, num_max_dispatch_tokens_per_rank);
-                            }
-                            sycl::group_barrier(group);
-                            const int count = *src_count;
-                            // Put count to remote
-                            auto* dst_count = dispatch_count + local_expert * num_ranks + rank;
-                            ishmemx_int_put_nbi_work_group(dst_count, src_count, 1, dst_rank, group);
-                            if (count > 0) {
-                                // Batch src info into one put
-                                ishmemx_putmem_nbi_work_group(
-                                    dst_src, src_src, static_cast<size_t>(count) * sizeof(int), dst_rank, group);
-                                // Batch all data slots into one put
-                                auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
-                                auto* src_ptr = send_data + src_slot * hidden_bytes;
-                                ishmemx_putmem_nbi_work_group(
-                                    dst_ptr, src_ptr, static_cast<size_t>(count) * hidden_bytes, dst_rank, group);
-                            }
-                        }
-                        sycl::group_barrier(group);
+                // Phase 1a: Local copies (all WIs cooperate for data parallelism)
+                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                    const size_t src_slot =
+                        (static_cast<size_t>(rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
+                    const size_t dst_slot =
+                        (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                    const int count = sycl::min(send_count[rank * num_local_experts + local_expert],
+                                                num_max_dispatch_tokens_per_rank);
+                    if (local_id == 0) {
+                        dispatch_count[local_expert * num_ranks + rank] = count;
+                    }
+                    auto* dst_src_ptr = dispatch_src + dst_slot;
+                    auto* src_src_ptr = send_src + src_slot;
+                    for (int slot = local_id; slot < num_max_dispatch_tokens_per_rank; slot += local_size) {
+                        dst_src_ptr[slot] = src_src_ptr[slot];
+                    }
+                    auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
+                    auto* src_ptr = send_data + src_slot * hidden_bytes;
+                    const size_t bytes = static_cast<size_t>(count) * hidden_bytes;
+                    for (size_t b = local_id; b < bytes; b += local_size) {
+                        dst_ptr[b] = src_ptr[b];
                     }
                 }
+                sycl::group_barrier(group);
+
+                // Phase 1b: Remote RDMA puts using scalar NBI APIs.
+                // Each work-item independently handles assigned channels,
+                // eliminating the serialized WG put loop.
+                {
+                    int ch = 0;
+                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                        if (dst_rank == rank) continue;
+                        for (int le = 0; le < num_local_experts; ++le) {
+                            if (ch % local_size == local_id) {
+                                const int sc_idx = dst_rank * num_local_experts + le;
+                                send_count[sc_idx] = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
+                                const int count = send_count[sc_idx];
+                                const size_t src_slot =
+                                    static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
+                                const size_t dst_slot =
+                                    (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+
+                                // Put count to remote
+                                ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank,
+                                                  send_count + sc_idx, sizeof(int), dst_rank);
+                                if (count > 0) {
+                                    // Put src info
+                                    ishmem_putmem_nbi(dispatch_src + dst_slot, send_src + src_slot,
+                                                      static_cast<size_t>(count) * sizeof(int), dst_rank);
+                                    // Put data
+                                    ishmem_putmem_nbi(dispatch_data + dst_slot * hidden_bytes,
+                                                      send_data + src_slot * hidden_bytes,
+                                                      static_cast<size_t>(count) * hidden_bytes, dst_rank);
+                                }
+                            }
+                            ch++;
+                        }
+                    }
+                }
+                sycl::group_barrier(group);
 
                 // Phase 2: Barrier ensures all PEs have completed their puts
                 // (barrier_all internally does quiet + cross-PE synchronization)
@@ -502,42 +512,78 @@ void combine_bf16(void* combined_x,
                 }
                 sycl::group_barrier(group);
 
-                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                        const int global_expert = rank * num_local_experts + local_expert;
-                        int count = 0, begin = 0;
-                        unpack_range(layout_range[local_expert * num_ranks + dst_rank], count, begin);
-                        const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                        int min_token = num_max_dispatch_tokens_per_rank;
-                        int max_token = -1;
-                        for (int slot = 0; slot < clamped_count; ++slot) {
-                            const int original_token =
-                                src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                            if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                                min_token = sycl::min(min_token, original_token);
-                                max_token = sycl::max(max_token, original_token);
-                            }
+                // Combine put phase: local copies + parallel remote scalar NBI puts
+                // Step 1: Local copies (all WIs cooperate on data copy)
+                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                    const int global_expert = rank * num_local_experts + local_expert;
+                    int count = 0, begin = 0;
+                    unpack_range(layout_range[local_expert * num_ranks + rank], count, begin);
+                    const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
+                    int min_token = num_max_dispatch_tokens_per_rank;
+                    int max_token = -1;
+                    for (int slot = 0; slot < clamped_count; ++slot) {
+                        const int original_token =
+                            src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
+                        if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                            min_token = sycl::min(min_token, original_token);
+                            max_token = sycl::max(max_token, original_token);
                         }
-                        if (max_token < min_token) {
-                            continue;
-                        }
-                        auto* src = send_data +
-                            (static_cast<size_t>(dst_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
+                    }
+                    if (max_token >= min_token) {
+                        auto* src_ptr = send_data +
+                            (static_cast<size_t>(rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
                              min_token) *
                                 hidden_bytes;
-                        auto* dst = combine_data +
+                        auto* dst_ptr = combine_data +
                             (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
                         const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                        if (dst_rank == rank) {
-                            for (size_t b = local_id; b < bytes; b += local_size) {
-                                dst[b] = src[b];
-                            }
-                        } else {
-                            ishmemx_putmem_nbi_work_group(dst, src, bytes, dst_rank, group);
+                        for (size_t b = local_id; b < bytes; b += local_size) {
+                            dst_ptr[b] = src_ptr[b];
                         }
-                        sycl::group_barrier(group);
                     }
                 }
+                sycl::group_barrier(group);
+
+                // Step 2: Remote scalar NBI puts (parallel across work-items)
+                {
+                    int ch = 0;
+                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                        if (dst_rank == rank) continue;
+                        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                            if (ch % local_size == local_id) {
+                                const int global_expert = rank * num_local_experts + local_expert;
+                                int count = 0, begin = 0;
+                                unpack_range(layout_range[local_expert * num_ranks + dst_rank], count, begin);
+                                const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
+                                int min_token = num_max_dispatch_tokens_per_rank;
+                                int max_token = -1;
+                                for (int slot = 0; slot < clamped_count; ++slot) {
+                                    const int original_token =
+                                        src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank +
+                                                 begin + slot];
+                                    if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                                        min_token = sycl::min(min_token, original_token);
+                                        max_token = sycl::max(max_token, original_token);
+                                    }
+                                }
+                                if (max_token >= min_token) {
+                                    auto* src_ptr = send_data +
+                                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) *
+                                             num_max_dispatch_tokens_per_rank +
+                                         min_token) *
+                                            hidden_bytes;
+                                    auto* dst_ptr = combine_data +
+                                        (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) *
+                                            hidden_bytes;
+                                    const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
+                                    ishmem_putmem_nbi(dst_ptr, src_ptr, bytes, dst_rank);
+                                }
+                            }
+                            ch++;
+                        }
+                    }
+                }
+                sycl::group_barrier(group);
 
                 ishmemx_barrier_all_work_group(group);
 
