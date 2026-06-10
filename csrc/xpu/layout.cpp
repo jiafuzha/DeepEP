@@ -26,6 +26,7 @@ void launch_get_dispatch_layout(const topk_idx_t* topk_idx,
                                 int num_topk,
                                 int num_ranks,
                                 int num_experts,
+                                int num_rdma_ranks_arg,
                                 sycl::queue& queue) {
     TORCH_CHECK(num_tokens >= 0, "num_tokens must be non-negative");
     TORCH_CHECK(num_topk > 0, "num_topk must be positive");
@@ -34,7 +35,8 @@ void launch_get_dispatch_layout(const topk_idx_t* topk_idx,
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
 
     const int num_experts_per_rank = num_experts / num_ranks;
-    const int num_rdma_ranks = num_tokens_per_rdma_rank == nullptr ? 0 : std::max(1, num_ranks / NUM_MAX_NVL_PEERS);
+    const int num_rdma_ranks = num_tokens_per_rdma_rank == nullptr ? 0 : num_rdma_ranks_arg;
+    const int num_nvl_ranks = num_rdma_ranks > 0 ? num_ranks / num_rdma_ranks : num_ranks;
 
     auto zero_rank_event = queue.memset(num_tokens_per_rank, 0, sizeof(int) * num_ranks);
     auto zero_expert_event = queue.memset(num_tokens_per_expert, 0, sizeof(int) * num_experts);
@@ -121,8 +123,8 @@ void launch_get_dispatch_layout(const topk_idx_t* topk_idx,
 
                         const int token_idx = static_cast<int>(linear_idx / num_rdma_ranks);
                         const int rdma_rank_idx = static_cast<int>(linear_idx % num_rdma_ranks);
-                        const int expert_begin = rdma_rank_idx * NUM_MAX_NVL_PEERS * num_experts_per_rank;
-                        const int expert_end = std::min(expert_begin + NUM_MAX_NVL_PEERS * num_experts_per_rank, num_experts);
+                        const int expert_begin = rdma_rank_idx * num_nvl_ranks * num_experts_per_rank;
+                        const int expert_end = std::min(expert_begin + num_nvl_ranks * num_experts_per_rank, num_experts);
                         bool in_rdma_rank = false;
 
                         for (int topk = 0; topk < num_topk; ++topk) {

@@ -38,13 +38,14 @@ def init_dist(local_rank: int, num_local_ranks: int):
     accelerator = get_accelerator_module()
 
     sig = inspect.signature(dist.init_process_group)
+    backend = get_dist_backend()
     params = {
-        'backend': get_dist_backend(),
+        'backend': backend,
         'init_method': f'tcp://{ip}:{port}',
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
-    if 'device_id' in sig.parameters:
+    if 'device_id' in sig.parameters and backend not in ('gloo',):
         # noinspection PyTypeChecker
         params['device_id'] = torch.device(f'{device_type}:{local_rank}')
     dist.init_process_group(**params)

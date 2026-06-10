@@ -341,11 +341,11 @@ size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int 
 struct Buffer {
     int rank;
     int num_ranks;
+    int num_nvl_ranks;
     int rdma_rank;
     int nvl_rank;
     bool global_rdma_mode;
     int num_rdma_ranks;
-    int num_nvl_ranks;
     int device_id;
     int64_t num_nvl_bytes;
     int64_t num_rdma_bytes;
@@ -386,15 +386,25 @@ struct Buffer {
     volatile int* moe_recv_expert_counter = nullptr;
     int* moe_recv_expert_counter_mapped = nullptr;
 
+    static int resolve_num_nvl_ranks(int num_ranks) {
+        const char* env = std::getenv("DEEP_EP_NVL_RANKS");
+        if (env) {
+            int val = std::atoi(env);
+            if (val > 0 && val <= NUM_MAX_NVL_PEERS && num_ranks % val == 0)
+                return val;
+        }
+        return std::min(num_ranks, NUM_MAX_NVL_PEERS);
+    }
+
     Buffer(
         int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode, bool explicitly_destroy, bool, bool)
         : rank(rank),
           num_ranks(num_ranks),
-          rdma_rank(rank / NUM_MAX_NVL_PEERS),
-          nvl_rank(rank % NUM_MAX_NVL_PEERS),
-          global_rdma_mode(!low_latency_mode && num_rdma_bytes > 0 && num_nvl_bytes == 0 && num_ranks <= NUM_MAX_NVL_PEERS),
-          num_rdma_ranks((low_latency_mode || global_rdma_mode) ? num_ranks : std::max(1, num_ranks / NUM_MAX_NVL_PEERS)),
-          num_nvl_ranks(std::min(num_ranks, NUM_MAX_NVL_PEERS)),
+          num_nvl_ranks(resolve_num_nvl_ranks(num_ranks)),
+          rdma_rank(rank / resolve_num_nvl_ranks(num_ranks)),
+          nvl_rank(rank % resolve_num_nvl_ranks(num_ranks)),
+          global_rdma_mode(!low_latency_mode && num_rdma_bytes > 0 && num_nvl_bytes == 0 && num_ranks <= num_nvl_ranks),
+          num_rdma_ranks((low_latency_mode || global_rdma_mode) ? num_ranks : std::max(1, num_ranks / num_nvl_ranks)),
           device_id(resolve_xpu_device_index()),
           num_nvl_bytes(num_nvl_bytes),
           num_rdma_bytes(num_rdma_bytes),
@@ -403,11 +413,10 @@ struct Buffer {
           comm_stream(c10::xpu::getStreamFromPool(true, device_id)) {
         TORCH_CHECK(rank >= 0 && rank < num_ranks, "rank must be in [0, num_ranks)");
         TORCH_CHECK(num_ranks > 0, "num_ranks must be positive");
-        TORCH_CHECK(num_ranks <= NUM_MAX_NVL_PEERS || num_ranks % NUM_MAX_NVL_PEERS == 0,
-                    "XPU internode ranks must be divisible by ",
-                    NUM_MAX_NVL_PEERS);
-        TORCH_CHECK(num_rdma_bytes == 0 || num_ranks > NUM_MAX_NVL_PEERS || low_latency_mode || global_rdma_mode,
-                    "XPU RDMA buffer is only valid for internode or low-latency ranks");
+        TORCH_CHECK(num_ranks % num_nvl_ranks == 0,
+                    "XPU internode ranks must be divisible by num_nvl_ranks=", num_nvl_ranks);
+        TORCH_CHECK(num_rdma_bytes == 0 || num_rdma_ranks > 1 || low_latency_mode || global_rdma_mode,
+                    "XPU RDMA buffer requires multi-node topology (num_rdma_ranks > 1), low-latency, or global RDMA mode");
         TORCH_CHECK(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_nvl_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
         TORCH_CHECK(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0, "num_rdma_bytes must be aligned to ", NUM_BUFFER_ALIGNMENT_BYTES);
         TORCH_CHECK(num_rdma_ranks == 1 || num_rdma_bytes > 0, "XPU internode mode requires a non-empty RDMA buffer");
@@ -472,6 +481,8 @@ struct Buffer {
     bool is_available() const { return available; }
 
     int get_num_rdma_ranks() const { return num_rdma_ranks; }
+
+    int get_num_nvl_ranks() const { return num_nvl_ranks; }
 
     int get_rdma_rank() const { return global_rdma_mode ? rank : rdma_rank; }
 
@@ -622,8 +633,11 @@ struct Buffer {
             auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
             std::vector<uint8_t> root_unique_id(root_unique_id_str.size());
             std::memcpy(root_unique_id.data(), root_unique_id_str.data(), root_unique_id.size());
-            const int ishmem_rank = (low_latency_mode || global_rdma_mode) ? rank : rdma_rank;
-            const int num_ishmem_ranks = (low_latency_mode || global_rdma_mode) ? num_ranks : num_rdma_ranks;
+            // All ranks init iSHMEM (required by MPI runtime), but only nvl_rank=0
+            // participates in RDMA operations — matching CUDA's 1-NVSHMEM-PE-per-node pattern.
+            const bool all_ranks_ishmem = low_latency_mode || global_rdma_mode || (num_nvl_bytes > 0 && num_rdma_bytes > 0);
+            const int ishmem_rank = all_ranks_ishmem ? rank : rdma_rank;
+            const int num_ishmem_ranks = all_ranks_ishmem ? num_ranks : num_rdma_ranks;
             TORCH_CHECK(internode::init(root_unique_id, ishmem_rank, num_ishmem_ranks, low_latency_mode) == ishmem_rank,
                         "XPU iSHMEM initialized with an unexpected rank");
             internode::barrier();
@@ -754,6 +768,7 @@ struct Buffer {
                                    num_topk,
                                    num_ranks,
                                    num_experts,
+                                   num_rdma_ranks,
                                    comm_stream.queue());
 
         std::optional<EventHandle> event;
@@ -1316,7 +1331,10 @@ struct Buffer {
             : std::optional<torch::Tensor>(torch::empty({num_tokens, nvl_only_mode ? num_ranks : num_rdma_ranks}, int_options));
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
-            : std::optional<torch::Tensor>(torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, int_options));
+            : std::optional<torch::Tensor>(torch::empty(
+                  combined_nvl_rdma_mode ? std::vector<int64_t>{num_tokens, num_ranks}
+                                         : std::vector<int64_t>{num_rdma_recv_tokens, NUM_MAX_NVL_PEERS},
+                  int_options));
 
         const size_t copy_rows = static_cast<size_t>(std::min(num_tokens, num_recv_tokens));
         if (copy_rows > 0) {
@@ -1957,6 +1975,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &Buffer::is_available)
         .def("get_num_rdma_ranks", &Buffer::get_num_rdma_ranks)
+        .def("get_num_nvl_ranks", &Buffer::get_num_nvl_ranks)
         .def("get_rdma_rank", &Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &Buffer::get_root_rdma_rank)
         .def("get_local_device_id", &Buffer::get_local_device_id)

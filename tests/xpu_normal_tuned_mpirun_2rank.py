@@ -3,7 +3,6 @@ import os
 import sys
 
 import torch
-import torch.distributed as dist
 
 REPO = "/data/jiafuzha/code-repo/zjf2012/DeepEP"
 sys.path.insert(0, REPO)
@@ -63,22 +62,24 @@ def main():
     world = int(os.environ.get("PMI_SIZE", os.environ.get("PMIX_SIZE", "2")))
     assert world == 2, f"expected 2 ranks, got {world}"
 
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29513")
+    # Determine local device and set PyTorch default device to match
+    num_xpu = torch.xpu.device_count()
+    local_rank = int(os.environ.get("MPI_LOCALRANKID", rank))
+    local_device = local_rank % num_xpu
+    torch.xpu.set_device(local_device)
 
-    dist.init_process_group(backend="xccl")
-    group = dist.new_group(list(range(world)))
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
 
     num_tokens, hidden = args.num_tokens, 128
     num_worst_tokens = num_tokens * world
-    buffer = deep_ep.Buffer(group,
+    buffer = deep_ep.Buffer(group=None,
                             num_nvl_bytes=0,
                             num_rdma_bytes=16 * 1024 * 1024,
                             low_latency_mode=False,
                             num_qps_per_rank=1,
-                            explicitly_destroy=True)
+                            explicitly_destroy=True,
+                            comm=comm)
     try:
         device = torch.device(f"xpu:{buffer.runtime.get_local_device_id()}")
         x = make_input(rank, num_tokens, hidden, device)
@@ -134,7 +135,7 @@ def main():
         assert handle[5].cpu().tolist() == [
             recv_channel_offsets(src_rank, rank, world, num_tokens, num_channels) for src_rank in range(world)
         ]
-        recv_meta = handle[7].view(torch.int32).view(num_worst_tokens, 2)
+        recv_meta = handle[7].view(torch.int32).view(num_worst_tokens, 3)  # SourceMeta: src_rdma_rank, token, src_nvl_rank
         send_rdma_head = handle[8]
         send_nvl_head = handle[9]
         assert torch.all(send_nvl_head == -1).item()
@@ -155,7 +156,7 @@ def main():
                 actual_meta = recv_meta[row].cpu().tolist()
                 print(f"[rank {rank}] dispatch src={src_rank} token={token} row={row} "
                       f"meta={actual_meta} max_abs={max_abs}", flush=True)
-                assert actual_meta == [src_rank, token]
+                assert actual_meta == [src_rank, token, -1]
                 assert max_abs == 0.0
                 assert recv_topk_idx[row].cpu().tolist() == [
                     token,
@@ -219,7 +220,7 @@ def main():
             event.current_stream_wait()
         torch.xpu.synchronize()
         recv_fp8, recv_fp8_scales = recv_fp8_pair
-        recv_fp8_meta = fp8_handle[7].view(torch.int32).view(num_worst_tokens, 2)
+        recv_fp8_meta = fp8_handle[7].view(torch.int32).view(num_worst_tokens, 3)
         for src_rank in range(world):
             tokens = [token for token in range(num_tokens) if route(src_rank, token, world) == rank]
             for token in tokens:
@@ -228,7 +229,7 @@ def main():
                 expected_fp8[-1] = torch.tensor(token, dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
                 assert torch.equal(recv_fp8[row].cpu(), expected_fp8.cpu())
                 assert torch.allclose(recv_fp8_scales[row], torch.ones_like(recv_fp8_scales[row]))
-                assert recv_fp8_meta[row].cpu().tolist() == [src_rank, token]
+                assert recv_fp8_meta[row].cpu().tolist() == [src_rank, token, -1]
                 assert recv_fp8_topk_idx[row].cpu().tolist() == [
                     token,
                     token + 10 * (src_rank + 1),
@@ -272,7 +273,7 @@ def main():
         print(f"[rank {rank}] PASS normal internode compact BF16/cached/FP8 validation", flush=True)
     finally:
         buffer.destroy()
-        dist.destroy_process_group()
+        MPI.Finalize()
 
 
 if __name__ == "__main__":

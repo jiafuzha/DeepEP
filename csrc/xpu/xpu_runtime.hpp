@@ -105,6 +105,7 @@ void launch_get_dispatch_layout(const topk_idx_t* topk_idx,
                                 int num_topk,
                                 int num_ranks,
                                 int num_experts,
+                                int num_rdma_ranks,
                                 sycl::queue& queue);
 
 size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts);
@@ -114,6 +115,7 @@ namespace internode {
 struct SourceMeta {
     int src_rdma_rank;
     int is_token_in_nvl_rank_bits;
+    int src_nvl_rank;
 };
 
 std::vector<uint8_t> get_unique_id();
