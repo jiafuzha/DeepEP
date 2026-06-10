@@ -133,6 +133,8 @@ void barrier();
 // is unnecessary and its MPI_Win_flush_all may hang on pending device RMA.
 void mpi_barrier();
 
+void quiet();
+
 void finalize();
 
 int get_source_meta_bytes();

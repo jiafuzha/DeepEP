@@ -224,6 +224,10 @@ void mpi_barrier() {
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
+void quiet() {
+    ishmem_quiet();
+}
+
 void finalize() {
     int initialized = 0;
     ishmemx_query_initialized(&initialized);

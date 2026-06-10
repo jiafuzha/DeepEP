@@ -2128,7 +2128,14 @@ void dispatch_nvl_rdma(void* recv_x,
 
     NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
     NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks);
-    const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
+    // Dispatch and combine share the same NVL buffer regions. Their fwd_base_offset
+    // MUST match (across iterations and between dispatch/combine on the same rank,
+    // and across ranks for IPC writes). Use a shared anchor sized by the max possible
+    // local rows (= num_nvl_ranks * num_tokens, the upper bound on combine input which
+    // also covers dispatch).
+    const int max_local_tokens = num_nvl_ranks * num_tokens;
+    NvlBufferLayout fwd_anchor_layout(max_local_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
+    const size_t fwd_base_offset = align_offset(fwd_anchor_layout.total_bytes, 128);
 
     const size_t rdma_x_size = static_cast<size_t>(num_recv_tokens) * row_bytes;
     const size_t rdma_meta_size = static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
@@ -2216,6 +2223,12 @@ void dispatch_nvl_rdma(void* recv_x,
         });
     });
     queue.wait();
+    // Cross-PE barrier so every receiver completes the rdma_base zero-init
+    // before any sender starts an RDMA put. Without this, a fast sender's
+    // ishmem_putmem_nbi can land at a slow receiver's rdma_base before the
+    // receiver's Init kernel has zeroed it, and the Init zero subsequently
+    // clobbers the freshly delivered remote count/data.
+    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchPackKernel>([=]() {
@@ -2817,6 +2830,7 @@ void combine_nvl_rdma(DataType type,
 
     const int my_rdma_rank = rank / num_nvl_ranks;
     const int num_rdma_ranks = num_ranks / num_nvl_ranks;
+    const bool combine_debug = std::getenv("DEEP_EP_DBG_COMBINE") != nullptr;
     TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "combine_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
 
     const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(dtype_t);
@@ -2829,12 +2843,23 @@ void combine_nvl_rdma(DataType type,
 
     NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, 0);
     NvlForwardLayout fwd_layout(num_combined_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
-    const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
+    // fwd_base_offset must be IDENTICAL across all ranks, otherwise a rank
+    // writing into a peer's NVL buffer via IPC at its own offset will land at
+    // a different address than where the peer reads from. Use the global upper
+    // bound (max possible combine input rows = num_nvl_ranks *
+    // num_combined_tokens) so the offset is rank-invariant. Local layout above
+    // still uses num_tokens for correct local data sizing.
+    const int max_combine_tokens = num_nvl_ranks * num_combined_tokens;
+    NvlBufferLayout fwd_anchor_layout(max_combine_tokens, num_ranks, 1, row_bytes, num_topk, 0);
+    const size_t fwd_base_offset = align_offset(fwd_anchor_layout.total_bytes, 128);
 
-    // Each RDMA region must hold up to num_nvl_ranks * num_tokens tokens
-    // (all NVL peers' contributions to one RDMA destination), not just
-    // num_combined_tokens which is only the local token count.
-    const int max_rdma_tokens = num_nvl_ranks * num_tokens;
+    // Each RDMA region must hold up to num_nvl_ranks * num_combined_tokens
+    // tokens (the max number of tokens any source rdma_rank could have
+    // originally sent to this rdma_rank's NVL peers). Use num_combined_tokens
+    // (the original sender count, identical on all ranks) instead of num_tokens
+    // (per-rank receive count from dispatch, which DIFFERS across ranks and
+    // would yield mismatched rdma_region_bytes between sender/receiver).
+    const int max_rdma_tokens = num_nvl_ranks * num_combined_tokens;
     const size_t rdma_x_size = static_cast<size_t>(max_rdma_tokens) * row_bytes;
     const size_t rdma_topk_wt_size = static_cast<size_t>(max_rdma_tokens) * num_topk * sizeof(float);
     const size_t rdma_recv_pos_size = static_cast<size_t>(max_rdma_tokens) * sizeof(int);
@@ -3010,6 +3035,16 @@ void combine_nvl_rdma(DataType type,
                             }
                         }
                         *rdma_count = count;
+                        if (combine_debug) {
+                            sycl::ext::oneapi::experimental::printf(
+                                "[cmb-push rank=%d my_rdma=%d->dst_rdma=%d dst_pe=%d count=%d region_bytes=%lu]\n",
+                                rank, my_rdma_rank, dst_rdma, dst_rdma * num_nvl_ranks, count, (unsigned long)rdma_region_bytes);
+                            for (int dbg = 0; dbg < count && dbg < 8; ++dbg) {
+                                sycl::ext::oneapi::experimental::printf(
+                                    "  [cmb-push rank=%d dst_rdma=%d i=%d recv_pos=%d src_nvl=%d]\n",
+                                    rank, dst_rdma, dbg, rdma_recv_pos[dbg], rdma_src_nvl[dbg]);
+                            }
+                        }
                     }
                     sycl::group_barrier(group);
 
@@ -3061,6 +3096,11 @@ void combine_nvl_rdma(DataType type,
                 auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
                 auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
                 const int count = *rdma_count;
+                if (combine_debug) {
+                    sycl::ext::oneapi::experimental::printf(
+                        "[cmb-fwd rank=%d my_rdma=%d reads src_rdma=%d count=%d]\n",
+                        rank, my_rdma_rank, src_rdma, count);
+                }
                 for (int i = 0; i < count; ++i) {
                     const int target_nvl = rdma_src_nvl[i];
                     if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
@@ -3081,6 +3121,11 @@ void combine_nvl_rdma(DataType type,
                         }
                     }
                     fwd_meta[dst_idx] = SourceMeta{src_rdma, rdma_recv_pos[i], target_nvl};
+                    if (combine_debug && i < 8) {
+                        sycl::ext::oneapi::experimental::printf(
+                            "  [cmb-fwd rank=%d src_rdma=%d i=%d target_nvl=%d dst_idx=%d recv_pos=%d]\n",
+                            rank, src_rdma, i, target_nvl, dst_idx, rdma_recv_pos[i]);
+                    }
                 }
 
                 for (int peer = 0; peer < num_nvl_ranks; ++peer) {
@@ -3112,13 +3157,20 @@ void combine_nvl_rdma(DataType type,
             int fwd_offset = 0;
             for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                 const int count = fwd_counts[src_rdma];
+                if (combine_debug) {
+                    sycl::ext::oneapi::experimental::printf(
+                        "[cmb-red rank=%d nvl=%d src_rdma=%d fwd_count=%d fwd_offset=%d]\n",
+                        rank, nvl_rank, src_rdma, count, fwd_offset);
+                }
                 for (int i = 0; i < count; ++i) {
                     const int idx = fwd_offset + i;
                     const int recv_pos = fwd_meta[idx].is_token_in_nvl_rank_bits;
+                    int matched_ct = -1;
                     for (int ct = 0; ct < num_combined_tokens; ++ct) {
                         if (combined_rdma_head[ct * num_rdma_ranks + src_rdma] != recv_pos) {
                             continue;
                         }
+                        matched_ct = ct;
                         for (int h = 0; h < hidden; ++h) {
                             float value = static_cast<float>(dst[ct * hidden + h]);
                             value += static_cast<float>(fwd_x[idx * hidden + h]);
@@ -3130,6 +3182,11 @@ void combine_nvl_rdma(DataType type,
                             }
                         }
                         break;
+                    }
+                    if (combine_debug && i < 8) {
+                        sycl::ext::oneapi::experimental::printf(
+                            "  [cmb-red rank=%d src_rdma=%d i=%d idx=%d recv_pos=%d matched_ct=%d]\n",
+                            rank, src_rdma, i, idx, recv_pos, matched_ct);
                     }
                 }
                 fwd_offset += count;
