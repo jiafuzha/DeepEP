@@ -1,0 +1,120 @@
+# ===========================================================================
+# Docker Compose: 2-Node DeepEP Internode Simulation
+#
+# Simulates 2 physical nodes, each with 2 GPUs + 2 NICs:
+#   deepep-node0: GPUs 4,5 + NICs mlx5_4,mlx5_5  (172.31.0.10)
+#   deepep-node1: GPUs 6,7 + NICs mlx5_6,mlx5_7  (172.31.0.11)
+#
+# Uses a private bridge network so each container has its own hostname and
+# IP - MPI then treats them as TWO real nodes (correct PPN, MPI_LOCALRANKID).
+# RDMA/verbs work via bind-mounted /dev/infiniband and /sys (privileged).
+# ===========================================================================
+
+x-common: &common
+  image: jiafuzha-ishmem-ibgda:latest
+  privileged: true
+  ipc: host
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  volumes:
+    # --- Shared environments ---
+    - /opt/intel/oneapi:/opt/intel/oneapi:ro
+    - /root/miniforge3:/root/miniforge3:ro
+    - /root/.conda:/root/.conda:ro
+
+    # --- Code repos (read-write) ---
+    - /data/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
+    - /data/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/code-repo/zjf2012/DeepEP:/root/jiafuzha/code-repo/zjf2012/DeepEP:rw
+    - /data/jiafuzha/code-repo/zjf2012/DeepEP:/data/jiafuzha/code-repo/zjf2012/DeepEP:rw
+    - /root/jiafuzha/code-repo/pytorch:/root/jiafuzha/code-repo/pytorch:rw
+    - /root/jiafuzha/code-repo/intel_gpu_uar_bridge:/root/jiafuzha/code-repo/intel_gpu_uar_bridge:rw
+
+    # --- iSHMEM 2026 shim (used by DeepEP at link/runtime) ---
+    - /root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:ro
+
+    # --- System (RDMA, GPU sysfs) ---
+    - /sys:/sys:ro
+    - /etc/libibverbs.d:/etc/libibverbs.d:ro
+    - /dev:/dev
+    - /usr/bin/kmod:/usr/bin/kmod:ro
+    - /lib/modules:/lib/modules:ro
+
+    # --- Host RDMA/GPU libraries ---
+    - /lib/x86_64-linux-gnu:/host-libs:ro
+    - /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro
+
+    # --- SSH keys ---
+    - /tmp/deepep-docker-ssh:/tmp/ssh-keys:ro
+
+services:
+  node0:
+    <<: *common
+    container_name: deepep-node0
+    hostname: deepep-node0
+    networks:
+      deepep-net:
+        ipv4_address: 172.31.0.10
+    ports:
+      - "2300:22"
+    extra_hosts:
+      - "deepep-node0:172.31.0.10"
+      - "deepep-node1:172.31.0.11"
+    environment:
+      - ZE_AFFINITY_MASK=4,5
+      - NODE_ID=0
+      - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
+    command: >
+      bash -c "
+        ln -sf /usr/bin/kmod /usr/sbin/insmod 2>/dev/null;
+        ln -sf /usr/bin/kmod /usr/sbin/lsmod 2>/dev/null;
+        insmod /root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko 2>/dev/null || true;
+        mkdir -p /root/.ssh /var/run/sshd &&
+        cp /tmp/ssh-keys/id_rsa /root/.ssh/id_rsa &&
+        cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
+        cp /tmp/ssh-keys/config /root/.ssh/config &&
+        chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
+        /usr/sbin/sshd -p 22 &&
+        echo 'deepep-node0 ready (hostname=deepep-node0, IP=172.31.0.10, SSH 22)' &&
+        sleep infinity
+      "
+
+  node1:
+    <<: *common
+    container_name: deepep-node1
+    hostname: deepep-node1
+    networks:
+      deepep-net:
+        ipv4_address: 172.31.0.11
+    ports:
+      - "2301:22"
+    extra_hosts:
+      - "deepep-node0:172.31.0.10"
+      - "deepep-node1:172.31.0.11"
+    environment:
+      - ZE_AFFINITY_MASK=6,7
+      - NODE_ID=1
+      - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
+    command: >
+      bash -c "
+        ln -sf /usr/bin/kmod /usr/sbin/insmod 2>/dev/null;
+        ln -sf /usr/bin/kmod /usr/sbin/lsmod 2>/dev/null;
+        insmod /root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko 2>/dev/null || true;
+        mkdir -p /root/.ssh /var/run/sshd &&
+        cp /tmp/ssh-keys/id_rsa /root/.ssh/id_rsa &&
+        cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
+        cp /tmp/ssh-keys/config /root/.ssh/config &&
+        chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
+        /usr/sbin/sshd -p 22 &&
+        echo 'deepep-node1 ready (hostname=deepep-node1, IP=172.31.0.11, SSH 22)' &&
+        sleep infinity
+      "
+
+networks:
+  deepep-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
