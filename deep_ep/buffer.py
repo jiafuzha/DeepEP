@@ -107,15 +107,15 @@ class Buffer:
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
-        print(f'[rank: {self.rank}] local_device_id: {local_device_id}')
+        print(f'[rank: {self.rank}] local_device_id: {local_device_id}', flush=True)
         device_ids = all_gather_object(local_device_id)
-        print(f'[rank: {self.rank}] device_ids: {device_ids}')
+        print(f'[rank: {self.rank}] device_ids gathered: {device_ids}', flush=True)
 
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
-        print(f'[rank: {self.rank}] local_ipc_handle: {local_ipc_handle}')
+        print(f'[rank: {self.rank}] local_ipc_handle len={len(local_ipc_handle)}', flush=True)
         ipc_handles = all_gather_object(local_ipc_handle)
-        print(f'[rank: {self.rank}] ipc_handles: {ipc_handles}')
+        print(f'[rank: {self.rank}] ipc_handles gathered, count={len(ipc_handles)}', flush=True)
         if num_nvl_bytes > 0 and self.group_size > 1 and self.is_xpu_runtime:
             ipc_handles = self._exchange_xpu_ipc_fds(ipc_handles, all_gather_object)
 
@@ -124,8 +124,9 @@ class Buffer:
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
             if self.is_xpu_runtime:
                 os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-                if os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == os.environ.get('MASTER_PORT', ''):
-                    os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(os.environ['MASTER_PORT']) + 1)
+                master_port = os.environ.get('MASTER_PORT', '')
+                if master_port and os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == master_port:
+                    os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(master_port) + 1)
                 self.nvshmem_qp_depth = max(int(os.environ.get('ISHMEM_QP_DEPTH', '1024')), (num_qps_per_rank + 1) * 2)
             else:
                 # Enable IBGDA
@@ -150,11 +151,11 @@ class Buffer:
                     # Disable multi-node NVLink detection
                     os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
-            # Synchronize using the root ID
-            if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
+            # Synchronize using the root ID — only one rank obtains the unique ID
+            if self.rank == 0:
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             nvshmem_unique_ids = all_gather_object(root_unique_id)
-            root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
+            root_unique_id = nvshmem_unique_ids[0]
 
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
@@ -174,7 +175,7 @@ class Buffer:
         with suppress(FileNotFoundError):
             os.unlink(socket_path)
 
-        num_nvl_ranks = min(self.group_size, 8)
+        num_nvl_ranks = self.runtime.get_num_nvl_ranks() if hasattr(self.runtime, 'get_num_nvl_ranks') else min(self.group_size, 8)
         nvl_group_start = self.runtime.get_rdma_rank() * num_nvl_ranks
         nvl_group_end = nvl_group_start + num_nvl_ranks
         local_ipc_ranks = [rank for rank in range(nvl_group_start, nvl_group_end) if rank < self.group_size]

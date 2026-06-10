@@ -1,8 +1,12 @@
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
 
 #include "xpu_kernels.hpp"
+
+#include <sycl/ext/oneapi/experimental/builtins.hpp>
 
 #ifdef DEEP_EP_ENABLE_ISHMEM
 #include <ishmem.h>
@@ -13,12 +17,17 @@ namespace deep_ep {
 namespace internode {
 namespace {
 
+// Work-group size for iSHMEM collective kernels (putmem_nbi_work_group, quiet_work_group, etc.).
+// Scalar device iSHMEM APIs (ishmem_putmem, ishmem_quiet) hang with IBGDA direct-doorbell
+// on Intel XPU; work-group variants in nd_range parallel_for are stable.
+constexpr int kIshmemWGSize = 32;
+
 class DispatchInitKernel;
 class DispatchCountExchangeKernel;
 class DispatchPackKernel;
 class DispatchOffsetComputeKernel;
 class DispatchPayloadKernel;
-class DispatchPayloadTailKernel;
+
 class DispatchQueueResetKernel;
 class DispatchQueueCopyKernel;
 class DispatchCopyKernel;
@@ -37,6 +46,16 @@ class NvlDispatchPackBarrierKernel;
 class NvlDispatchReceiveKernel;
 class NvlDispatchCopyKernel;
 
+class CombinedDispatchInitKernel;
+class CombinedDispatchPackKernel;
+class CombinedDispatchPackBarrierKernel;
+class CombinedDispatchRdmaSendKernel;
+class CombinedDispatchRdmaPutKernel;
+class CombinedDispatchFwdWriteKernel;
+class CombinedDispatchFwdBarrierKernel;
+class CombinedDispatchAssembleKernel;
+class CombinedDispatchHeadKernel;
+
 // NVL-only internode combine kernels
 template <typename dtype_t>
 class NvlCombineInitKernel;
@@ -52,6 +71,23 @@ template <typename dtype_t>
 class NvlCombineBiasKernel;
 
 template <typename dtype_t>
+class CombinedCombinePackKernel;
+template <typename dtype_t>
+class CombinedCombinePackBarrierKernel;
+template <typename dtype_t>
+class CombinedCombineInitKernel;
+template <typename dtype_t>
+class CombinedCombineRdmaSendKernel;
+template <typename dtype_t>
+class CombinedCombineRdmaPushKernel;
+template <typename dtype_t>
+class CombinedCombineFwdWriteKernel;
+template <typename dtype_t>
+class CombinedCombineFwdBarrierKernel;
+template <typename dtype_t>
+class CombinedCombineReduceKernel;
+
+template <typename dtype_t>
 class CombineInitKernel;
 
 template <typename dtype_t>
@@ -59,9 +95,6 @@ class CombinePackKernel;
 
 template <typename dtype_t>
 class CombinePayloadKernel;
-
-template <typename dtype_t>
-class CombinePayloadTailKernel;
 
 template <typename dtype_t>
 class CombinePayloadQuietKernel;
@@ -370,18 +403,22 @@ void dispatch(void* recv_x,
                 if (meta != nullptr) {
                     meta[linear].src_rdma_rank = -1;
                     meta[linear].is_token_in_nvl_rank_bits = -1;
+                    meta[linear].src_nvl_rank = -1;
                 }
                 rdma_meta[linear].src_rdma_rank = -1;
                 rdma_meta[linear].is_token_in_nvl_rank_bits = -1;
+                rdma_meta[linear].src_nvl_rank = -1;
             }
             if (linear < num_send_slots) {
                 rdma_send_meta[linear].src_rdma_rank = -1;
                 rdma_send_meta[linear].is_token_in_nvl_rank_bits = -1;
+                rdma_send_meta[linear].src_nvl_rank = -1;
                 rdma_send_dst_token[linear] = -1;
             }
             if (linear < num_queue_slots) {
                 rdma_queue_meta[linear].src_rdma_rank = -1;
                 rdma_queue_meta[linear].is_token_in_nvl_rank_bits = -1;
+                rdma_queue_meta[linear].src_nvl_rank = -1;
                 rdma_queue_dst_token[linear] = -1;
             }
             if (linear < num_queue_pairs) {
@@ -434,50 +471,66 @@ void dispatch(void* recv_x,
     internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
-        cgh.single_task<DispatchCountExchangeKernel>([=]() {
-            auto* local_count_row = rdma_count_matrix + rank * num_ranks;
-            for (int i = 0; i < num_ranks; ++i) {
-                if (num_tokens_per_rank != nullptr) {
-                    local_count_row[i] = num_tokens_per_rank[i];
-                } else {
-                    int count = 0;
-                    for (int token = 0; token < num_tokens; ++token) {
-                        count += is_token_in_rank[token * num_ranks + i] ? 1 : 0;
+        cgh.parallel_for<DispatchCountExchangeKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                if (local_id == 0) {
+                    auto* local_count_row = rdma_count_matrix + rank * num_ranks;
+                    for (int i = 0; i < num_ranks; ++i) {
+                        if (num_tokens_per_rank != nullptr) {
+                            local_count_row[i] = num_tokens_per_rank[i];
+                        } else {
+                            int count = 0;
+                            for (int token = 0; token < num_tokens; ++token) {
+                                count += is_token_in_rank[token * num_ranks + i] ? 1 : 0;
+                            }
+                            local_count_row[i] = count;
+                        }
                     }
-                    local_count_row[i] = count;
                 }
-            }
-            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                auto* remote_count_row = rdma_count_matrix + rank * num_ranks;
-                if (dst_rank != rank) {
-                    ishmem_putmem_nbi(remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank);
+                sycl::group_barrier(group);
+                auto* local_count_row = rdma_count_matrix + rank * num_ranks;
+                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                    auto* remote_count_row = rdma_count_matrix + rank * num_ranks;
+                    if (dst_rank != rank) {
+                        ishmemx_putmem_nbi_work_group(
+                            remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank, group);
+                    }
+                    sycl::group_barrier(group);
                 }
-            }
 
-            auto* local_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
-            for (int dst = 0; dst < num_ranks; ++dst) {
-                int cumulative = 0;
-                for (int channel = 0; channel < num_channels; ++channel) {
-                    const int start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
-                    const int end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
-                    int count = 0;
-                    for (int token = start; token < end; ++token) {
-                        count += is_token_in_rank[token * num_ranks + dst] ? 1 : 0;
+                if (local_id == 0) {
+                    auto* local_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
+                    for (int dst = 0; dst < num_ranks; ++dst) {
+                        int cumulative = 0;
+                        for (int channel = 0; channel < num_channels; ++channel) {
+                            const int start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
+                            const int end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
+                            int count = 0;
+                            for (int token = start; token < end; ++token) {
+                                count += is_token_in_rank[token * num_ranks + dst] ? 1 : 0;
+                            }
+                            cumulative += count;
+                            local_channel_row[dst * num_channels + channel] = cumulative;
+                        }
                     }
-                    cumulative += count;
-                    local_channel_row[dst * num_channels + channel] = cumulative;
                 }
-            }
-            for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                auto* remote_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
-                if (dst_rank != rank) {
-                    ishmem_putmem_nbi(
-                        remote_channel_row, local_channel_row, static_cast<size_t>(num_ranks) * num_channels * sizeof(int), dst_rank);
+                sycl::group_barrier(group);
+                auto* local_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
+                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                    auto* remote_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
+                    if (dst_rank != rank) {
+                        ishmemx_putmem_nbi_work_group(remote_channel_row,
+                                                      local_channel_row,
+                                                      static_cast<size_t>(num_ranks) * num_channels * sizeof(int),
+                                                      dst_rank,
+                                                      group);
+                    }
+                    sycl::group_barrier(group);
                 }
-            }
-            // Drain all NBI puts
-            ishmem_quiet();
-        });
+                ishmemx_quiet_work_group(group);
+            });
     });
     queue.wait();
     internode::mpi_barrier();
@@ -552,7 +605,7 @@ void dispatch(void* recv_x,
             for (size_t h = 0; h < row_bytes; ++h) {
                 send_x[h] = src_x[h];
             }
-            rdma_send_meta[send_slot] = SourceMeta{rank, token};
+            rdma_send_meta[send_slot] = SourceMeta{rank, token, -1};
             rdma_send_dst_token[send_slot] = dst_token;
             if (x_scales != nullptr) {
                 auto* send_scales = rdma_send_x_scales + send_slot * num_scales;
@@ -590,6 +643,7 @@ void dispatch(void* recv_x,
                         if (linear < num_queue_slots) {
                             rdma_queue_meta[linear].src_rdma_rank = -1;
                             rdma_queue_meta[linear].is_token_in_nvl_rank_bits = -1;
+                            rdma_queue_meta[linear].src_nvl_rank = -1;
                             rdma_queue_dst_token[linear] = -1;
                         }
                         if (linear < total_queue_topk_elements) {
@@ -610,105 +664,117 @@ void dispatch(void* recv_x,
             }
 
             queue.submit([&](sycl::handler& cgh) {
-                constexpr int kQueueGroupSize = 32;
                 cgh.parallel_for<DispatchPayloadKernel>(
-                    sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_ranks) * kQueueGroupSize), sycl::range<1>(kQueueGroupSize)),
-                    [=](sycl::nd_item<1> item) {
+                    sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
                         auto group = item.get_group();
                         const int local_id = static_cast<int>(item.get_local_id(0));
                         const int local_size = static_cast<int>(item.get_local_range(0));
-                        const int dst_rank = static_cast<int>(item.get_group(0));
-                        int window_count = 0;
-                        for (int token = channel_start; token < channel_end; ++token) {
-                            if (!is_token_in_rank[token * num_ranks + dst_rank]) {
-                                continue;
-                            }
-                            int queue_ordinal = 0;
-                            for (int prior_token = channel_start; prior_token < token; ++prior_token) {
-                                queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            const int queue_offset = queue_ordinal - window_offset;
-                            if (queue_offset < 0 || queue_offset >= queue_window) {
-                                continue;
-                            }
+                        for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                            int window_count = 0;
+                            for (int token = channel_start; token < channel_end; ++token) {
+                                if (!is_token_in_rank[token * num_ranks + dst_rank]) {
+                                    continue;
+                                }
+                                int queue_ordinal = 0;
+                                for (int prior_token = channel_start; prior_token < token; ++prior_token) {
+                                    queue_ordinal += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                                }
+                                const int queue_offset = queue_ordinal - window_offset;
+                                if (queue_offset < 0 || queue_offset >= queue_window) {
+                                    continue;
+                                }
 
-                            int dst_token = 0;
-                            for (int src_rank = 0; src_rank < rank; ++src_rank) {
-                                dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
-                            }
-                            for (int prior_token = 0; prior_token < token; ++prior_token) {
-                                dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
-                            }
-                            if (dst_token >= num_recv_tokens) {
-                                continue;
-                            }
+                                int dst_token = 0;
+                                for (int src_rank = 0; src_rank < rank; ++src_rank) {
+                                    dst_token += rdma_count_matrix[src_rank * num_ranks + dst_rank];
+                                }
+                                for (int prior_token = 0; prior_token < token; ++prior_token) {
+                                    dst_token += is_token_in_rank[prior_token * num_ranks + dst_rank] ? 1 : 0;
+                                }
+                                if (dst_token >= num_recv_tokens) {
+                                    continue;
+                                }
 
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            const size_t queue_slot = queue_pair * queue_stride + queue_offset;
-                            auto* dst_x = rdma_queue_x + queue_slot * row_bytes;
-                            const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
-                            auto* src_x = rdma_send_x + send_slot * row_bytes;
-                            auto* dst_meta = rdma_queue_meta + queue_slot;
-                            auto* src_meta = rdma_send_meta + send_slot;
-                            auto* dst_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
-                            auto* dst_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
-                            auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
-                            auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
-                            auto* dst_scales = rdma_queue_x_scales + queue_slot * num_scales;
-                            auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
-                            auto* src_dst_token = rdma_send_dst_token + send_slot;
-                            if (dst_rank == rank) {
-                                for (size_t h = local_id; h < row_bytes; h += local_size) {
-                                    dst_x[h] = src_x[h];
+                                const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
+                                const size_t queue_slot = queue_pair * queue_stride + queue_offset;
+                                auto* dst_x = rdma_queue_x + queue_slot * row_bytes;
+                                const size_t send_slot = static_cast<size_t>(dst_rank) * num_recv_tokens + dst_token;
+                                auto* src_x = rdma_send_x + send_slot * row_bytes;
+                                auto* dst_meta = rdma_queue_meta + queue_slot;
+                                auto* src_meta = rdma_send_meta + send_slot;
+                                auto* dst_topk_idx = rdma_queue_topk_idx + queue_slot * num_topk;
+                                auto* dst_topk_weights = rdma_queue_topk_weights + queue_slot * num_topk;
+                                auto* src_topk_idx = rdma_send_topk_idx + send_slot * num_topk;
+                                auto* src_topk_weights = rdma_send_topk_weights + send_slot * num_topk;
+                                auto* dst_scales = rdma_queue_x_scales + queue_slot * num_scales;
+                                auto* src_scales = rdma_send_x_scales + send_slot * num_scales;
+                                auto* src_dst_token = rdma_send_dst_token + send_slot;
+                                if (dst_rank == rank) {
+                                    for (size_t h = local_id; h < row_bytes; h += local_size) {
+                                        dst_x[h] = src_x[h];
+                                    }
+                                    for (int k = local_id; k < num_topk; k += local_size) {
+                                        dst_topk_idx[k] = src_topk_idx[k];
+                                        dst_topk_weights[k] = src_topk_weights[k];
+                                    }
+                                    for (int k = local_id; k < num_scales; k += local_size) {
+                                        dst_scales[k] = src_scales[k];
+                                    }
+                                    if (local_id == 0) {
+                                        rdma_queue_dst_token[queue_slot] = dst_token;
+                                        *dst_meta = *src_meta;
+                                    }
+                                } else {
+                                    ishmemx_putmem_nbi_work_group(dst_x, src_x, row_bytes, dst_rank, group);
+                                    if (num_topk > 0) {
+                                        ishmemx_putmem_nbi_work_group(dst_topk_idx,
+                                                                      src_topk_idx,
+                                                                      static_cast<size_t>(num_topk) * sizeof(topk_idx_t),
+                                                                      dst_rank,
+                                                                      group);
+                                        ishmemx_putmem_nbi_work_group(dst_topk_weights,
+                                                                      src_topk_weights,
+                                                                      static_cast<size_t>(num_topk) * sizeof(float),
+                                                                      dst_rank,
+                                                                      group);
+                                    }
+                                    if (num_scales > 0) {
+                                        ishmemx_putmem_nbi_work_group(
+                                            dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank, group);
+                                    }
+                                    ishmemx_putmem_nbi_work_group(
+                                        rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank, group);
+                                    ishmemx_putmem_nbi_work_group(dst_meta, src_meta, sizeof(SourceMeta), dst_rank, group);
                                 }
-                                for (int k = local_id; k < num_topk; k += local_size) {
-                                    dst_topk_idx[k] = src_topk_idx[k];
-                                    dst_topk_weights[k] = src_topk_weights[k];
-                                }
-                                for (int k = local_id; k < num_scales; k += local_size) {
-                                    dst_scales[k] = src_scales[k];
-                                }
+                                sycl::group_barrier(group);
                                 if (local_id == 0) {
-                                    rdma_queue_dst_token[queue_slot] = dst_token;
-                                    *dst_meta = *src_meta;
+                                    ++window_count;
                                 }
-                            } else {
-                                ishmemx_putmem_nbi_work_group(dst_x, src_x, row_bytes, dst_rank, group);
-                                if (num_topk > 0) {
+                            }
+                            // Broadcast window_count from work-item 0 to all items via shared local var
+                            sycl::group_barrier(group);
+                            int wg_window_count = sycl::group_broadcast(group, window_count, 0);
+                            if (wg_window_count > 0) {
+                                const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
+                                if (dst_rank == rank) {
+                                    if (local_id == 0) {
+                                        rdma_queue_tail[queue_pair] += wg_window_count;
+                                    }
+                                } else {
+                                    // Stage tail in rdma_queue_head per (rank, channel) — unique per WG.
+                                    if (local_id == 0) {
+                                        rdma_queue_head[queue_pair] = wg_window_count;
+                                    }
+                                    sycl::group_barrier(group);
                                     ishmemx_putmem_nbi_work_group(
-                                        dst_topk_idx, src_topk_idx, static_cast<size_t>(num_topk) * sizeof(topk_idx_t), dst_rank, group);
-                                    ishmemx_putmem_nbi_work_group(
-                                        dst_topk_weights, src_topk_weights, static_cast<size_t>(num_topk) * sizeof(float), dst_rank, group);
+                                        rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair, sizeof(int), dst_rank, group);
                                 }
-                                if (num_scales > 0) {
-                                    ishmemx_putmem_nbi_work_group(
-                                        dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank, group);
-                                }
-                                ishmemx_putmem_nbi_work_group(
-                                    rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank, group);
-                                ishmemx_putmem_nbi_work_group(dst_meta, src_meta, sizeof(SourceMeta), dst_rank, group);
                             }
                             sycl::group_barrier(group);
-                            if (local_id == 0) {
-                                ++window_count;
-                            }
-                        }
-                        if (local_id == 0 && window_count > 0) {
-                            const size_t queue_pair = static_cast<size_t>(rank) * num_channels + channel;
-                            if (dst_rank == rank) {
-                                rdma_queue_tail[queue_pair] += window_count;
-                            } else {
-                                // NBI put the tail to remote — stage in rdma_queue_head to avoid
-                                // clobbering the self-send tail already in rdma_queue_tail.
-                                rdma_queue_head[queue_pair] = window_count;
-                                ishmem_putmem_nbi(rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair, sizeof(int), dst_rank);
-                            }
-                        }
+                            ishmemx_quiet_work_group(group);
+                        }  // end for dst_rank
                     });
             });
-            queue.wait();
-            // Quiet drains all outstanding NBI puts (payload data + tail values)
-            queue.submit([&](sycl::handler& cgh) { cgh.single_task<DispatchPayloadTailKernel>([=]() { ishmem_quiet(); }); });
             queue.wait();
             internode::mpi_barrier();
 
@@ -957,39 +1023,26 @@ void launch_combine_copy(void* combined_x,
                             ++window_count;
                         }
                     }
-                    if (local_id == 0 && window_count > 0) {
+                    sycl::group_barrier(group);
+                    int wg_window_count = sycl::group_broadcast(group, window_count, 0);
+                    if (wg_window_count > 0) {
                         if (src_rank == rank) {
-                            rdma_queue_tail[rank] += window_count;
+                            if (local_id == 0) {
+                                rdma_queue_tail[rank] += wg_window_count;
+                            }
+                        } else {
+                            // Stage in rdma_queue_head; unique per work-group since
+                            // only one (src_rank, channel) WG runs at a time.
+                            if (local_id == 0) {
+                                rdma_queue_head[rank] = wg_window_count;
+                            }
+                            sycl::group_barrier(group);
+                            ishmemx_putmem_nbi_work_group(rdma_queue_tail + rank, rdma_queue_head + rank, sizeof(int), src_rank, group);
+                            ishmemx_quiet_work_group(group);
                         }
                     }
+                    sycl::group_barrier(group);
                 });
-        });
-        queue.wait();
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.single_task<CombinePayloadTailKernel<dtype_t>>([=]() {
-                // NBI put tail values instead of RDMA atomics.
-                // Each sender writes to queue_pair = rank (single-writer).
-                for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                    if (src_rank == rank) {
-                        continue;
-                    }
-                    int window_count = 0;
-                    for (int recv_token = 0; recv_token < num_tokens; ++recv_token) {
-                        const SourceMeta token_meta = meta[recv_token];
-                        const int src_token = token_meta.is_token_in_nvl_rank_bits;
-                        if (token_meta.src_rdma_rank == src_rank && src_token >= window_offset &&
-                            src_token < window_offset + window_tokens) {
-                            ++window_count;
-                        }
-                    }
-                    if (window_count > 0) {
-                        // Stage in rdma_queue_head to avoid clobbering self-send tail
-                        rdma_queue_head[rank] = window_count;
-                        ishmem_putmem_nbi(rdma_queue_tail + rank, rdma_queue_head + rank, sizeof(int), src_rank);
-                    }
-                }
-                ishmem_quiet();
-            });
         });
         queue.wait();
         internode::mpi_barrier();
@@ -1230,6 +1283,8 @@ struct NvlBufferLayout {
     size_t send_x_scales_offset = 0;
     size_t send_dst_token_offset = 0;     // int[num_tokens]: compact destination row
     size_t send_routing_bits_offset = 0;  // int[num_tokens]: per-token NVL destination bitmask
+    size_t send_rdma_dest_bits_offset = 0;
+    size_t send_is_token_in_rank_offset = 0;  // bool[num_tokens * num_ranks]
     size_t total_bytes = 0;
 
     NvlBufferLayout(int num_tokens, int num_ranks, int num_channels, size_t row_bytes, int num_topk, int num_scales) {
@@ -1249,6 +1304,8 @@ struct NvlBufferLayout {
         send_x_scales_offset = add_aligned(static_cast<size_t>(num_tokens) * num_scales * sizeof(float), alignof(float));
         send_dst_token_offset = add_aligned(static_cast<size_t>(num_tokens) * sizeof(int), alignof(int));
         send_routing_bits_offset = add_aligned(static_cast<size_t>(num_tokens) * sizeof(int), alignof(int));
+        send_rdma_dest_bits_offset = add_aligned(static_cast<size_t>(num_tokens) * sizeof(int), alignof(int));
+        send_is_token_in_rank_offset = add_aligned(static_cast<size_t>(num_tokens) * num_ranks * sizeof(bool), alignof(bool));
         total_bytes = align_offset(off, 128);
     }
 };
@@ -1317,6 +1374,7 @@ void dispatch_nvl(void* recv_x,
                 if (meta_ptr) {
                     meta_ptr[linear].src_rdma_rank = -1;
                     meta_ptr[linear].is_token_in_nvl_rank_bits = 0;
+                    meta_ptr[linear].src_nvl_rank = -1;
                 }
             }
             if (linear < static_cast<size_t>(num_ranks) * num_channels && gbl_channel_prefix_matrix) {
@@ -1472,7 +1530,7 @@ void dispatch_nvl(void* recv_x,
             }
 
             // Write source metadata: {src_rank, src_token} — same format as RDMA dispatch
-            my_send_meta[token] = SourceMeta{rank, token};
+            my_send_meta[token] = SourceMeta{rank, token, nvl_rank};
 
             // Write per-token routing bitmask separately for the receive kernel
             int bits = 0;
@@ -2044,13 +2102,645 @@ void dispatch_nvl_rdma(void* recv_x,
         return;
     }
 
-    // Multi-NVL-peer combined NVL+RDMA dispatch:
-    // Same-node tokens go via NVL IPC buffers. Cross-node tokens go via RDMA
-    // to the corresponding device on the remote node, then NVL-forwarded.
-    // This path requires num_nvl_ranks > 1 and cannot be tested with only 2 devices.
-    TORCH_CHECK(false,
-                "dispatch_nvl_rdma with num_nvl_ranks > 1 is not yet implemented; "
-                "requires multi-device per-node validation");
+    TORCH_CHECK(buffer_ptrs_gpu != nullptr, "dispatch_nvl_rdma requires NVL buffer pointers");
+    TORCH_CHECK(barrier_signal_ptrs_gpu != nullptr, "dispatch_nvl_rdma requires barrier signal pointers");
+    TORCH_CHECK(num_nvl_ranks > 1 && num_nvl_ranks <= NUM_MAX_NVL_PEERS, "dispatch_nvl_rdma NVL peer count out of range");
+    TORCH_CHECK(num_ranks % num_nvl_ranks == 0, "dispatch_nvl_rdma requires num_ranks divisible by num_nvl_ranks");
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * element_size;
+    const int my_rdma_rank = rank / num_nvl_ranks;
+    const int my_global_rank = my_rdma_rank * num_nvl_ranks + nvl_rank;
+    const int num_rdma_ranks = num_ranks / num_nvl_ranks;
+    TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "dispatch_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
+
+    const auto* src = static_cast<const uint8_t*>(x);
+    auto* dst = static_cast<uint8_t*>(recv_x);
+    auto* meta = static_cast<SourceMeta*>(recv_src_meta);
+    auto* rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr);
+
+    const bool dispatch_debug = std::getenv("DEEP_EP_DBG_DISPATCH") != nullptr;
+    if (dispatch_debug) {
+        std::cerr << "[dbg dispatch_nvl_rdma rank=" << rank << " my_rdma_rank=" << my_rdma_rank
+                  << " nvl_rank=" << nvl_rank << "] num_tokens=" << num_tokens
+                  << " num_recv_tokens=" << num_recv_tokens << " num_rdma_ranks=" << num_rdma_ranks
+                  << " num_nvl_ranks=" << num_nvl_ranks << std::endl;
+    }
+
+    NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
+    NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks);
+    const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
+
+    const size_t rdma_x_size = static_cast<size_t>(num_recv_tokens) * row_bytes;
+    const size_t rdma_meta_size = static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
+    const size_t rdma_topk_idx_size = static_cast<size_t>(num_recv_tokens) * num_topk * sizeof(topk_idx_t);
+    const size_t rdma_topk_wt_size = static_cast<size_t>(num_recv_tokens) * num_topk * sizeof(float);
+    const size_t rdma_scales_size = static_cast<size_t>(num_recv_tokens) * num_scales * sizeof(float);
+    const size_t rdma_meta_offset = align_offset(rdma_x_size, alignof(SourceMeta));
+    const size_t rdma_topk_idx_offset = align_offset(rdma_meta_offset + rdma_meta_size, alignof(topk_idx_t));
+    const size_t rdma_topk_wt_offset = align_offset(rdma_topk_idx_offset + rdma_topk_idx_size, alignof(float));
+    const size_t rdma_scales_offset = align_offset(rdma_topk_wt_offset + rdma_topk_wt_size, alignof(float));
+    const size_t rdma_count_offset = align_offset(rdma_scales_offset + rdma_scales_size, alignof(int));
+    const size_t rdma_region_bytes = align_offset(rdma_count_offset + sizeof(int), 128);
+    const size_t rdma_send_base = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
+
+    const size_t total_recv_bytes = static_cast<size_t>(num_recv_tokens) * row_bytes;
+    const size_t total_recv_topk = static_cast<size_t>(num_recv_tokens) * num_topk;
+    const size_t total_recv_scales = static_cast<size_t>(num_recv_tokens) * num_scales;
+    const size_t total_send_rdma = static_cast<size_t>(num_tokens) * num_rdma_ranks;
+    const size_t total_send_nvl = static_cast<size_t>(num_tokens) * num_ranks;
+    const size_t total_recv_regions = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
+    const size_t init_range = std::max({total_recv_bytes,
+                                        total_recv_topk,
+                                        total_recv_scales,
+                                        static_cast<size_t>(num_recv_tokens),
+                                        total_send_rdma,
+                                        total_send_nvl,
+                                        static_cast<size_t>(num_ranks),
+                                        static_cast<size_t>(num_rdma_ranks),
+                                        static_cast<size_t>(num_ranks) * num_channels,
+                                        static_cast<size_t>(num_rdma_ranks) * num_channels,
+                                        total_recv_regions,
+                                        static_cast<size_t>(1)});
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedDispatchInitKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
+            const size_t linear = static_cast<size_t>(id[0]);
+            if (linear < total_recv_bytes) {
+                dst[linear] = 0;
+            }
+            if (linear < static_cast<size_t>(num_recv_tokens)) {
+                if (meta != nullptr) {
+                    meta[linear].src_rdma_rank = -1;
+                    meta[linear].is_token_in_nvl_rank_bits = 0;
+                    meta[linear].src_nvl_rank = -1;
+                }
+            }
+            if (linear < total_recv_topk && recv_topk_idx != nullptr) {
+                recv_topk_idx[linear] = -1;
+                recv_topk_weights[linear] = 0.0f;
+            }
+            if (linear < total_recv_scales && recv_x_scales != nullptr) {
+                recv_x_scales[linear] = 0.0f;
+            }
+            if (linear < total_send_rdma && send_rdma_head != nullptr) {
+                send_rdma_head[linear] = -1;
+            }
+            if (linear < total_send_nvl && send_nvl_head != nullptr) {
+                send_nvl_head[linear] = -1;
+            }
+            if (linear < static_cast<size_t>(num_ranks) && recv_gbl_rank_prefix_sum != nullptr) {
+                recv_gbl_rank_prefix_sum[linear] = 0;
+            }
+            if (linear < static_cast<size_t>(num_rdma_ranks) && recv_rdma_rank_prefix_sum != nullptr) {
+                recv_rdma_rank_prefix_sum[linear] = 0;
+            }
+            if (linear < static_cast<size_t>(num_ranks) * num_channels) {
+                if (gbl_channel_prefix_matrix != nullptr) {
+                    gbl_channel_prefix_matrix[linear] = 0;
+                }
+                if (recv_gbl_channel_prefix_matrix != nullptr) {
+                    recv_gbl_channel_prefix_matrix[linear] = 0;
+                }
+            }
+            if (linear < static_cast<size_t>(num_rdma_ranks) * num_channels) {
+                if (rdma_channel_prefix_matrix != nullptr) {
+                    rdma_channel_prefix_matrix[linear] = 0;
+                }
+                if (recv_rdma_channel_prefix_matrix != nullptr) {
+                    recv_rdma_channel_prefix_matrix[linear] = 0;
+                }
+            }
+            if (nvl_rank == 0 && linear < total_recv_regions) {
+                rdma_base[linear] = 0;
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedDispatchPackKernel>([=]() {
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* my_counts = reinterpret_cast<int*>(my_buf + layout.count_offset);
+            auto* my_channel_counts = reinterpret_cast<int*>(my_buf + layout.channel_count_offset);
+            auto* my_send_x = my_buf + layout.send_x_offset;
+            auto* my_send_meta = reinterpret_cast<SourceMeta*>(my_buf + layout.send_meta_offset);
+            auto* my_send_topk_idx = reinterpret_cast<topk_idx_t*>(my_buf + layout.send_topk_idx_offset);
+            auto* my_send_topk_weights = reinterpret_cast<float*>(my_buf + layout.send_topk_weights_offset);
+            auto* my_send_x_scales = reinterpret_cast<float*>(my_buf + layout.send_x_scales_offset);
+            auto* my_send_dst_token = reinterpret_cast<int*>(my_buf + layout.send_dst_token_offset);
+            auto* my_send_routing_bits = reinterpret_cast<int*>(my_buf + layout.send_routing_bits_offset);
+            auto* my_send_rdma_bits = reinterpret_cast<int*>(my_buf + layout.send_rdma_dest_bits_offset);
+            auto* my_send_is_in_rank = reinterpret_cast<bool*>(my_buf + layout.send_is_token_in_rank_offset);
+
+            for (int d = 0; d < num_ranks; ++d) {
+                my_counts[d] = 0;
+                for (int c = 0; c < num_channels; ++c) {
+                    my_channel_counts[d * num_channels + c] = 0;
+                }
+            }
+
+            for (int token = 0; token < num_tokens; ++token) {
+                int nvl_bits = 0;
+                int rdma_bits = 0;
+                for (int d = 0; d < num_ranks; ++d) {
+                    const bool in_rank = is_token_in_rank[token * num_ranks + d];
+                    my_send_is_in_rank[token * num_ranks + d] = in_rank;
+                    if (!in_rank) {
+                        continue;
+                    }
+                    my_counts[d] += 1;
+                    nvl_bits |= 1 << (d % num_nvl_ranks);
+                    rdma_bits |= 1 << (d / num_nvl_ranks);
+                }
+
+                const auto* src_row = src + static_cast<size_t>(token) * row_bytes;
+                auto* dst_row = my_send_x + static_cast<size_t>(token) * row_bytes;
+                for (size_t b = 0; b < row_bytes; ++b) {
+                    dst_row[b] = src_row[b];
+                }
+
+                my_send_meta[token] = SourceMeta{my_rdma_rank, nvl_bits, nvl_rank};
+                my_send_dst_token[token] = -1;
+                my_send_routing_bits[token] = nvl_bits;
+                my_send_rdma_bits[token] = rdma_bits;
+
+                if (topk_idx != nullptr) {
+                    for (int k = 0; k < num_topk; ++k) {
+                        my_send_topk_idx[token * num_topk + k] = topk_idx[token * num_topk + k];
+                        my_send_topk_weights[token * num_topk + k] = topk_weights[token * num_topk + k];
+                    }
+                }
+                if (x_scales != nullptr) {
+                    for (int s = 0; s < num_scales; ++s) {
+                        my_send_x_scales[token * num_scales + s] = x_scales[token * num_scales + s];
+                    }
+                }
+            }
+
+            for (int d = 0; d < num_ranks; ++d) {
+                int cumulative = 0;
+                for (int c = 0; c < num_channels; ++c) {
+                    const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
+                    const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
+                    int count = 0;
+                    for (int token = start; token < end; ++token) {
+                        count += my_send_is_in_rank[token * num_ranks + d] ? 1 : 0;
+                    }
+                    cumulative += count;
+                    my_channel_counts[d * num_channels + c] = cumulative;
+                }
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedDispatchPackBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item); });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedDispatchRdmaSendKernel>([=]() {
+            if (nvl_rank != 0) {
+                return;
+            }
+            for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                auto* rdma_x = region;
+                auto* rdma_m = reinterpret_cast<SourceMeta*>(region + rdma_meta_offset);
+                auto* rdma_idx = reinterpret_cast<topk_idx_t*>(region + rdma_topk_idx_offset);
+                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
+                auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
+                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
+                *rdma_count = 0;
+                if (dst_rdma == my_rdma_rank) {
+                    continue;
+                }
+
+                int count = 0;
+                for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
+                    auto* peer_x = peer_buf + layout.send_x_offset;
+                    auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
+                    auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
+                    auto* peer_wt = reinterpret_cast<float*>(peer_buf + layout.send_topk_weights_offset);
+                    auto* peer_scales = reinterpret_cast<float*>(peer_buf + layout.send_x_scales_offset);
+                    auto* peer_rdma_bits = reinterpret_cast<int*>(peer_buf + layout.send_rdma_dest_bits_offset);
+                    auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
+                    for (int t = 0; t < num_tokens; ++t) {
+                        if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) {
+                            continue;
+                        }
+                        auto* src_row = peer_x + static_cast<size_t>(t) * row_bytes;
+                        auto* dst_row = rdma_x + static_cast<size_t>(count) * row_bytes;
+                        for (size_t b = 0; b < row_bytes; ++b) {
+                            dst_row[b] = src_row[b];
+                        }
+                        int dst_nvl_bits = 0;
+                        for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                            const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
+                            if (peer_is_in_rank[t * num_ranks + dst_rank]) {
+                                dst_nvl_bits |= 1 << dst_nvl;
+                            }
+                        }
+                        SourceMeta sm = peer_m[t];
+                        sm.is_token_in_nvl_rank_bits = dst_nvl_bits;
+                        rdma_m[count] = sm;
+                        if (topk_idx != nullptr) {
+                            for (int k = 0; k < num_topk; ++k) {
+                                rdma_idx[count * num_topk + k] = peer_idx[t * num_topk + k];
+                                rdma_wt[count * num_topk + k] = peer_wt[t * num_topk + k];
+                            }
+                        }
+                        if (x_scales != nullptr) {
+                            for (int s = 0; s < num_scales; ++s) {
+                                rdma_scales[count * num_scales + s] = peer_scales[t * num_scales + s];
+                            }
+                        }
+                        ++count;
+                    }
+                }
+                *rdma_count = count;
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedDispatchRdmaPutKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                const int local_size = static_cast<int>(item.get_local_range(0));
+                if (nvl_rank == 0) {
+                    // Distribute puts across work-items the same way internode_ll does
+                    // (each WI owns disjoint channels). This pattern is known to work
+                    // reliably with iSHMEM+IBGDA on Intel XPU, unlike a single WI doing
+                    // all puts (which races with the post-put quiet completion).
+                    int ch = 0;
+                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                        if (dst_rdma == my_rdma_rank) continue;
+                        if (ch % local_size == local_id) {
+                            auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                            const int dst_pe = dst_rdma * num_nvl_ranks;
+                            auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                            ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
+                        }
+                        ch++;
+                    }
+                }
+                sycl::group_barrier(group);
+                // Explicit quiet to flush all pending nbi puts before barrier_all.
+                // barrier_all is supposed to imply quiet, but in some iSHMEM versions
+                // it only synchronizes participating WIs without guaranteeing all
+                // outstanding PE-level puts are drained first.
+                ishmemx_quiet_work_group(group);
+                ishmemx_barrier_all_work_group(group);
+            });
+    });
+    queue.wait();
+    // Hard host-side cross-PE sync: ishmemx_barrier_all_work_group has proven
+    // unreliable on the receiver side (assemble can read rdma_count before the
+    // remote NBI put lands), so add an MPI_Barrier here to guarantee that all
+    // RDMA puts are visible at every PE before the assemble kernel runs.
+    internode::mpi_barrier();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedDispatchFwdWriteKernel>([=]() {
+            if (nvl_rank != 0) {
+                return;
+            }
+            int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
+            for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                auto* fwd_base = peer_buf + fwd_base_offset;
+                auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+                for (int r = 0; r < num_rdma_ranks; ++r) {
+                    fwd_counts[r] = 0;
+                }
+            }
+
+            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                if (src_rdma == my_rdma_rank) {
+                    continue;
+                }
+                int before[NUM_MAX_NVL_PEERS] = {0};
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    before[peer] = peer_offsets[peer];
+                }
+
+                auto* region = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
+                auto* rdma_x = region;
+                auto* rdma_m = reinterpret_cast<SourceMeta*>(region + rdma_meta_offset);
+                auto* rdma_idx = reinterpret_cast<topk_idx_t*>(region + rdma_topk_idx_offset);
+                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
+                auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
+                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
+                const int count = *rdma_count;
+                for (int i = 0; i < count; ++i) {
+                    const SourceMeta sm = rdma_m[i];
+                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                        if (((sm.is_token_in_nvl_rank_bits >> peer) & 1) == 0) {
+                            continue;
+                        }
+                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                        auto* fwd_base = peer_buf + fwd_base_offset;
+                        auto* fwd_x = fwd_base + fwd_layout.fwd_x_offset;
+                        auto* fwd_m = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
+                        auto* fwd_idx = reinterpret_cast<topk_idx_t*>(fwd_base + fwd_layout.fwd_topk_idx_offset);
+                        auto* fwd_wt = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
+                        auto* fwd_scales = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_x_scales_offset);
+                        const int dst_idx = peer_offsets[peer]++;
+                        auto* src_row = rdma_x + static_cast<size_t>(i) * row_bytes;
+                        auto* dst_row = fwd_x + static_cast<size_t>(dst_idx) * row_bytes;
+                        for (size_t b = 0; b < row_bytes; ++b) {
+                            dst_row[b] = src_row[b];
+                        }
+                        SourceMeta fwd_sm = sm;
+                        fwd_sm.is_token_in_nvl_rank_bits = i;
+                        fwd_m[dst_idx] = fwd_sm;
+                        if (topk_idx != nullptr) {
+                            for (int k = 0; k < num_topk; ++k) {
+                                fwd_idx[dst_idx * num_topk + k] = rdma_idx[i * num_topk + k];
+                                fwd_wt[dst_idx * num_topk + k] = rdma_wt[i * num_topk + k];
+                            }
+                        }
+                        if (x_scales != nullptr) {
+                            for (int s = 0; s < num_scales; ++s) {
+                                fwd_scales[dst_idx * num_scales + s] = rdma_scales[i * num_scales + s];
+                            }
+                        }
+                    }
+                }
+
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                    auto* fwd_base = peer_buf + fwd_base_offset;
+                    auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+                    fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
+                }
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedDispatchFwdBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedDispatchAssembleKernel>([=]() {
+            int recv_offset = 0;
+            int intra_count = 0;  // dbg: tokens from same-RDMA-node NVL peers
+            int fwd_total = 0;    // dbg: tokens from remote-RDMA-node fwd buf
+            if (recv_gbl_rank_prefix_sum != nullptr) {
+                for (int src = 0; src < num_ranks; ++src) {
+                    recv_gbl_rank_prefix_sum[src] = 0;
+                }
+            }
+            if (recv_rdma_rank_prefix_sum != nullptr) {
+                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                    recv_rdma_rank_prefix_sum[src_rdma] = 0;
+                }
+            }
+            if (recv_gbl_channel_prefix_matrix != nullptr) {
+                for (int i = 0; i < num_ranks * num_channels; ++i) {
+                    recv_gbl_channel_prefix_matrix[i] = 0;
+                }
+            }
+            if (recv_rdma_channel_prefix_matrix != nullptr) {
+                for (int i = 0; i < num_rdma_ranks * num_channels; ++i) {
+                    recv_rdma_channel_prefix_matrix[i] = 0;
+                }
+            }
+
+            for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
+                const int src_rank = my_rdma_rank * num_nvl_ranks + src_nvl;
+                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
+                auto* peer_x = peer_buf + layout.send_x_offset;
+                auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
+                auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
+                auto* peer_wt = reinterpret_cast<float*>(peer_buf + layout.send_topk_weights_offset);
+                auto* peer_scales = reinterpret_cast<float*>(peer_buf + layout.send_x_scales_offset);
+                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
+                for (int t = 0; t < num_tokens; ++t) {
+                    if (!peer_is_in_rank[t * num_ranks + my_global_rank]) {
+                        continue;
+                    }
+                    auto* src_row = peer_x + static_cast<size_t>(t) * row_bytes;
+                    auto* dst_row = dst + static_cast<size_t>(recv_offset) * row_bytes;
+                    for (size_t b = 0; b < row_bytes; ++b) {
+                        dst_row[b] = src_row[b];
+                    }
+                    if (meta != nullptr) {
+                        meta[recv_offset] = peer_m[t];
+                    }
+                    if (recv_topk_idx != nullptr) {
+                        for (int k = 0; k < num_topk; ++k) {
+                            recv_topk_idx[recv_offset * num_topk + k] = peer_idx[t * num_topk + k];
+                            recv_topk_weights[recv_offset * num_topk + k] = peer_wt[t * num_topk + k];
+                        }
+                    }
+                    if (recv_x_scales != nullptr) {
+                        for (int s = 0; s < num_scales; ++s) {
+                            recv_x_scales[recv_offset * num_scales + s] = peer_scales[t * num_scales + s];
+                        }
+                    }
+                    if (recv_gbl_rank_prefix_sum != nullptr) {
+                        recv_gbl_rank_prefix_sum[src_rank] += 1;
+                    }
+                    if (recv_rdma_rank_prefix_sum != nullptr) {
+                        recv_rdma_rank_prefix_sum[my_rdma_rank] += 1;
+                    }
+                    ++recv_offset;
+                    ++intra_count;
+                }
+            }
+
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* my_fwd_base = my_buf + fwd_base_offset;
+            auto* my_fwd_x = my_fwd_base + fwd_layout.fwd_x_offset;
+            auto* my_fwd_m = reinterpret_cast<SourceMeta*>(my_fwd_base + fwd_layout.fwd_meta_offset);
+            auto* my_fwd_idx = reinterpret_cast<topk_idx_t*>(my_fwd_base + fwd_layout.fwd_topk_idx_offset);
+            auto* my_fwd_wt = reinterpret_cast<float*>(my_fwd_base + fwd_layout.fwd_topk_weights_offset);
+            auto* my_fwd_scales = reinterpret_cast<float*>(my_fwd_base + fwd_layout.fwd_x_scales_offset);
+            auto* my_fwd_counts = reinterpret_cast<int*>(my_fwd_base + fwd_layout.fwd_count_offset);
+            int fwd_offset = 0;
+            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                const int count = my_fwd_counts[src_rdma];
+                fwd_total += count;
+                for (int i = 0; i < count; ++i) {
+                    const int idx = fwd_offset + i;
+                    const SourceMeta sm = my_fwd_m[idx];
+                    const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
+                    auto* src_row = my_fwd_x + static_cast<size_t>(idx) * row_bytes;
+                    auto* dst_row = dst + static_cast<size_t>(recv_offset) * row_bytes;
+                    for (size_t b = 0; b < row_bytes; ++b) {
+                        dst_row[b] = src_row[b];
+                    }
+                    if (meta != nullptr) {
+                        meta[recv_offset] = sm;
+                    }
+                    if (recv_topk_idx != nullptr) {
+                        for (int k = 0; k < num_topk; ++k) {
+                            recv_topk_idx[recv_offset * num_topk + k] = my_fwd_idx[idx * num_topk + k];
+                            recv_topk_weights[recv_offset * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                        }
+                    }
+                    if (recv_x_scales != nullptr) {
+                        for (int s = 0; s < num_scales; ++s) {
+                            recv_x_scales[recv_offset * num_scales + s] = my_fwd_scales[idx * num_scales + s];
+                        }
+                    }
+                    if (recv_gbl_rank_prefix_sum != nullptr) {
+                        recv_gbl_rank_prefix_sum[src_rank] += 1;
+                    }
+                    if (recv_rdma_rank_prefix_sum != nullptr) {
+                        recv_rdma_rank_prefix_sum[sm.src_rdma_rank] += 1;
+                    }
+                    ++recv_offset;
+                }
+                fwd_offset += count;
+            }
+
+            for (int idx = recv_offset; idx < num_recv_tokens; ++idx) {
+                auto* dst_row = dst + static_cast<size_t>(idx) * row_bytes;
+                for (size_t b = 0; b < row_bytes; ++b) {
+                    dst_row[b] = 0;
+                }
+                if (meta != nullptr) {
+                    meta[idx].src_rdma_rank = -1;
+                    meta[idx].is_token_in_nvl_rank_bits = 0;
+                    meta[idx].src_nvl_rank = -1;
+                }
+                if (recv_topk_idx != nullptr) {
+                    for (int k = 0; k < num_topk; ++k) {
+                        recv_topk_idx[idx * num_topk + k] = -1;
+                        recv_topk_weights[idx * num_topk + k] = 0.0f;
+                    }
+                }
+                if (recv_x_scales != nullptr) {
+                    for (int s = 0; s < num_scales; ++s) {
+                        recv_x_scales[idx * num_scales + s] = 0.0f;
+                    }
+                }
+            }
+
+            if (recv_gbl_rank_prefix_sum != nullptr) {
+                int prefix = 0;
+                for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                    const int count = recv_gbl_rank_prefix_sum[src_rank];
+                    if (recv_gbl_channel_prefix_matrix != nullptr) {
+                        for (int c = 0; c < num_channels; ++c) {
+                            recv_gbl_channel_prefix_matrix[src_rank * num_channels + c] = prefix + ((count * (c + 1)) / num_channels);
+                        }
+                    }
+                    prefix += count;
+                    recv_gbl_rank_prefix_sum[src_rank] = prefix;
+                }
+            }
+            if (recv_rdma_rank_prefix_sum != nullptr) {
+                int prefix = 0;
+                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                    const int count = recv_rdma_rank_prefix_sum[src_rdma];
+                    if (recv_rdma_channel_prefix_matrix != nullptr) {
+                        for (int c = 0; c < num_channels; ++c) {
+                            recv_rdma_channel_prefix_matrix[src_rdma * num_channels + c] = prefix + ((count * (c + 1)) / num_channels);
+                        }
+                    }
+                    prefix += count;
+                    recv_rdma_rank_prefix_sum[src_rdma] = prefix;
+                }
+            }
+
+            if (dispatch_debug) {
+                // Per-source intake (counts already converted to prefix sums above).
+                sycl::ext::oneapi::experimental::printf(
+                    "[dbg-asm rank=%d my_rdma=%d nvl=%d] intra=%d fwd_total=%d recv_offset=%d num_recv_tokens=%d\n",
+                    rank, my_rdma_rank, nvl_rank, intra_count, fwd_total, recv_offset, num_recv_tokens);
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedDispatchHeadKernel>([=]() {
+            if (gbl_channel_prefix_matrix != nullptr) {
+                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                    int cumulative = 0;
+                    for (int c = 0; c < num_channels; ++c) {
+                        const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
+                        const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
+                        int count = 0;
+                        for (int token = start; token < end; ++token) {
+                            count += is_token_in_rank[token * num_ranks + dst_rank] ? 1 : 0;
+                        }
+                        cumulative += count;
+                        gbl_channel_prefix_matrix[dst_rank * num_channels + c] = cumulative;
+                    }
+                }
+            }
+            if (rdma_channel_prefix_matrix != nullptr) {
+                for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                    int cumulative = 0;
+                    for (int c = 0; c < num_channels; ++c) {
+                        const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
+                        const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
+                        int count = 0;
+                        for (int token = start; token < end; ++token) {
+                            bool hit = false;
+                            for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                                const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
+                                if (is_token_in_rank[token * num_ranks + dst_rank]) {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            count += hit ? 1 : 0;
+                        }
+                        cumulative += count;
+                        rdma_channel_prefix_matrix[dst_rdma * num_channels + c] = cumulative;
+                    }
+                }
+            }
+
+            int same_node_head[NUM_MAX_NVL_PEERS] = {0};
+            int rdma_head[NUM_MAX_NVL_PEERS] = {0};
+            for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
+                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
+                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
+                auto* peer_rdma_bits = reinterpret_cast<int*>(peer_buf + layout.send_rdma_dest_bits_offset);
+                for (int token = 0; token < num_tokens; ++token) {
+                    const bool is_my_token = src_nvl == nvl_rank;
+                    for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                        const int dst_rank = my_rdma_rank * num_nvl_ranks + dst_nvl;
+                        if (!peer_is_in_rank[token * num_ranks + dst_rank]) {
+                            continue;
+                        }
+                        if (is_my_token && send_nvl_head != nullptr) {
+                            send_nvl_head[token * num_ranks + dst_rank] = same_node_head[dst_nvl];
+                        }
+                        same_node_head[dst_nvl] += 1;
+                    }
+                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                        if (dst_rdma == my_rdma_rank || ((peer_rdma_bits[token] >> dst_rdma) & 1) == 0) {
+                            continue;
+                        }
+                        if (is_my_token && send_rdma_head != nullptr) {
+                            send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
+                        }
+                        rdma_head[dst_rdma] += 1;
+                    }
+                }
+            }
+        });
+    });
+    queue.wait();
 #else
     TORCH_CHECK(false, "dispatch_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
 #endif
@@ -2117,11 +2807,349 @@ void combine_nvl_rdma(DataType type,
         return;
     }
 
-    // Multi-NVL-peer combined NVL+RDMA combine:
-    // Reverse of dispatch_nvl_rdma's forwarding path.
-    TORCH_CHECK(false,
-                "combine_nvl_rdma with num_nvl_ranks > 1 is not yet implemented; "
-                "requires multi-device per-node validation");
+    TORCH_CHECK(buffer_ptrs_gpu != nullptr, "combine_nvl_rdma requires NVL buffer pointers");
+    TORCH_CHECK(barrier_signal_ptrs_gpu != nullptr, "combine_nvl_rdma requires barrier signal pointers");
+    TORCH_CHECK(rdma_buffer_ptr != nullptr, "combine_nvl_rdma requires a symmetric iSHMEM RDMA buffer");
+    TORCH_CHECK(num_nvl_ranks > 1 && num_nvl_ranks <= NUM_MAX_NVL_PEERS, "combine_nvl_rdma NVL peer count out of range");
+    TORCH_CHECK(num_ranks % num_nvl_ranks == 0, "combine_nvl_rdma requires num_ranks divisible by num_nvl_ranks");
+    TORCH_CHECK(type == DataType::kBFloat16, "Combined NVL+RDMA combine only supports BF16");
+    using dtype_t = sycl::ext::oneapi::bfloat16;
+
+    const int my_rdma_rank = rank / num_nvl_ranks;
+    const int num_rdma_ranks = num_ranks / num_nvl_ranks;
+    TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "combine_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
+
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(dtype_t);
+    auto* dst = static_cast<dtype_t*>(combined_x);
+    const auto* src = static_cast<const dtype_t*>(x);
+    const auto* b0 = static_cast<const dtype_t*>(bias_0);
+    const auto* b1 = static_cast<const dtype_t*>(bias_1);
+    const auto* sm = static_cast<const SourceMeta*>(src_meta);
+    auto* rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr);
+
+    NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, 0);
+    NvlForwardLayout fwd_layout(num_combined_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
+    const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
+
+    // Each RDMA region must hold up to num_nvl_ranks * num_tokens tokens
+    // (all NVL peers' contributions to one RDMA destination), not just
+    // num_combined_tokens which is only the local token count.
+    const int max_rdma_tokens = num_nvl_ranks * num_tokens;
+    const size_t rdma_x_size = static_cast<size_t>(max_rdma_tokens) * row_bytes;
+    const size_t rdma_topk_wt_size = static_cast<size_t>(max_rdma_tokens) * num_topk * sizeof(float);
+    const size_t rdma_recv_pos_size = static_cast<size_t>(max_rdma_tokens) * sizeof(int);
+    const size_t rdma_src_nvl_size = static_cast<size_t>(max_rdma_tokens) * sizeof(int);
+    const size_t rdma_topk_wt_offset = align_offset(rdma_x_size, alignof(float));
+    const size_t rdma_recv_pos_offset = align_offset(rdma_topk_wt_offset + rdma_topk_wt_size, alignof(int));
+    const size_t rdma_src_nvl_offset = align_offset(rdma_recv_pos_offset + rdma_recv_pos_size, alignof(int));
+    const size_t rdma_count_offset = align_offset(rdma_src_nvl_offset + rdma_src_nvl_size, alignof(int));
+    const size_t rdma_region_bytes = align_offset(rdma_count_offset + sizeof(int), 128);
+    const size_t rdma_send_base = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
+
+    const size_t total_combined = static_cast<size_t>(num_combined_tokens) * hidden;
+    const size_t total_topk = static_cast<size_t>(num_combined_tokens) * num_topk;
+    const size_t total_recv_regions = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
+    const size_t init_range = std::max({total_combined, total_topk, total_recv_regions, static_cast<size_t>(1)});
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedCombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
+            const size_t linear = static_cast<size_t>(id[0]);
+            if (linear < total_combined) {
+                dst[linear] = dtype_t{};
+            }
+            if (linear < total_topk && combined_topk_weights != nullptr) {
+                combined_topk_weights[linear] = 0.0f;
+            }
+            if (nvl_rank == 0 && linear < total_recv_regions) {
+                rdma_base[linear] = 0;
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedCombinePackKernel<dtype_t>>([=]() {
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* combine_count = reinterpret_cast<int*>(my_buf + layout.count_offset);
+            auto* combine_x = reinterpret_cast<dtype_t*>(my_buf + layout.send_x_offset);
+            auto* combine_meta = reinterpret_cast<SourceMeta*>(my_buf + layout.send_meta_offset);
+            auto* combine_topk = reinterpret_cast<float*>(my_buf + layout.send_topk_weights_offset);
+            *combine_count = num_tokens;
+            for (int t = 0; t < num_tokens; ++t) {
+                for (int h = 0; h < hidden; ++h) {
+                    combine_x[t * hidden + h] = src[t * hidden + h];
+                }
+                if (num_topk > 0) {
+                    for (int k = 0; k < num_topk; ++k) {
+                        combine_topk[t * num_topk + k] = topk_weights ? topk_weights[t * num_topk + k] : 0.0f;
+                    }
+                }
+                combine_meta[t] = sm[t];
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item); });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedCombineRdmaSendKernel<dtype_t>>([=]() {
+            // Compute per-peer topk_weights offset based on each peer's actual
+            // num_tokens. The NvlBufferLayout offsets after send_x_offset depend
+            // on num_tokens, so using this rank's layout to read from a peer with
+            // a different received count would access wrong memory.
+            auto peer_topk_offset = [=](int peer_n) -> size_t {
+                size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
+                off = (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
+                off += static_cast<size_t>(peer_n) * sizeof(SourceMeta);
+                off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
+                off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
+                off = (off + alignof(float) - 1) / alignof(float) * alignof(float);
+                return off;
+            };
+
+            for (int ct = 0; ct < num_combined_tokens; ++ct) {
+                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
+                    if (dst_rank / num_nvl_ranks != my_rdma_rank) {
+                        continue;
+                    }
+                    if (is_combined_token_in_rank != nullptr && !is_combined_token_in_rank[ct * num_ranks + dst_rank]) {
+                        continue;
+                    }
+                    const int peer_recv_pos = combined_nvl_head[ct * num_ranks + dst_rank];
+                    const int dst_nvl = dst_rank % num_nvl_ranks;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_nvl]);
+                    auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
+                    const int peer_count = *peer_count_ptr;
+                    if (peer_recv_pos < 0 || peer_recv_pos >= peer_count) {
+                        continue;
+                    }
+                    auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
+                    for (int h = 0; h < hidden; ++h) {
+                        float value = static_cast<float>(dst[ct * hidden + h]);
+                        value += static_cast<float>(peer_x[peer_recv_pos * hidden + h]);
+                        dst[ct * hidden + h] = static_cast<dtype_t>(value);
+                    }
+                    if (combined_topk_weights != nullptr) {
+                        auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_offset(peer_count));
+                        for (int k = 0; k < num_topk; ++k) {
+                            combined_topk_weights[ct * num_topk + k] += peer_topk[peer_recv_pos * num_topk + k];
+                        }
+                    }
+                }
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedCombineRdmaPushKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                // NOTE: do NOT early-return for nvl_rank != 0; every PE must reach
+                // ishmemx_barrier_all_work_group below (it is a cross-PE collective
+                // and would hang waiting for non-puter PEs otherwise).
+                const bool is_puter = (nvl_rank == 0);
+                // Per-peer offset helpers (same logic as NVL accumulate)
+                auto peer_meta_off = [=](int peer_n) -> size_t {
+                    size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
+                    return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
+                };
+                auto peer_topk_off = [=](int peer_n) -> size_t {
+                    size_t off = peer_meta_off(peer_n) + static_cast<size_t>(peer_n) * sizeof(SourceMeta);
+                    off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
+                    off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
+                    return (off + alignof(float) - 1) / alignof(float) * alignof(float);
+                };
+
+                if (is_puter) {
+                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    auto* rdma_x = reinterpret_cast<dtype_t*>(region);
+                    auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
+                    auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
+                    auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
+                    auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
+                    if (local_id == 0) {
+                        *rdma_count = 0;
+                    }
+                    if (dst_rdma == my_rdma_rank) {
+                        continue;
+                    }
+
+                    if (local_id == 0) {
+                        int count = 0;
+                        for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                            auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                            auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
+                            auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
+                            const int peer_count = *peer_count_ptr;
+                            auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
+                            auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
+                            for (int t = 0; t < peer_count; ++t) {
+                                if (peer_meta[t].src_rdma_rank != dst_rdma) {
+                                    continue;
+                                }
+                                for (int h = 0; h < hidden; ++h) {
+                                    rdma_x[count * hidden + h] = peer_x[t * hidden + h];
+                                }
+                                if (combined_topk_weights != nullptr) {
+                                    for (int k = 0; k < num_topk; ++k) {
+                                        rdma_wt[count * num_topk + k] = peer_topk[t * num_topk + k];
+                                    }
+                                }
+                                rdma_recv_pos[count] = peer_meta[t].is_token_in_nvl_rank_bits;
+                                rdma_src_nvl[count] = peer_meta[t].src_nvl_rank;
+                                ++count;
+                            }
+                        }
+                        *rdma_count = count;
+                    }
+                    sycl::group_barrier(group);
+
+                    const int dst_pe = dst_rdma * num_nvl_ranks;
+                    auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                    ishmemx_putmem_nbi_work_group(dst_region, region, rdma_region_bytes, dst_pe, group);
+                }
+                }  // end if (is_puter)
+                // Match dispatch_nvl_rdma pattern: explicit quiet + barrier_all to
+                // guarantee all outstanding RDMA puts are drained and visible at
+                // every PE before FWD WRITE reads from the receive regions.
+                // Every PE (including nvl_rank != 0) must reach these collectives.
+                ishmemx_quiet_work_group(group);
+                ishmemx_barrier_all_work_group(group);
+            });
+    });
+    queue.wait();
+    // Same hard host-side cross-PE sync as dispatch_nvl_rdma above.
+    internode::mpi_barrier();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedCombineFwdWriteKernel<dtype_t>>([=]() {
+            if (nvl_rank != 0) {
+                return;
+            }
+            int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
+            for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                auto* fwd_base = peer_buf + fwd_base_offset;
+                auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+                for (int r = 0; r < num_rdma_ranks; ++r) {
+                    fwd_counts[r] = 0;
+                }
+            }
+
+            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                if (src_rdma == my_rdma_rank) {
+                    continue;
+                }
+                int before[NUM_MAX_NVL_PEERS] = {0};
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    before[peer] = peer_offsets[peer];
+                }
+
+                auto* region = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
+                auto* rdma_x = reinterpret_cast<dtype_t*>(region);
+                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
+                auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
+                auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
+                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
+                const int count = *rdma_count;
+                for (int i = 0; i < count; ++i) {
+                    const int target_nvl = rdma_src_nvl[i];
+                    if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
+                        continue;
+                    }
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[target_nvl]);
+                    auto* fwd_base = peer_buf + fwd_base_offset;
+                    auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
+                    auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
+                    auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
+                    const int dst_idx = peer_offsets[target_nvl]++;
+                    for (int h = 0; h < hidden; ++h) {
+                        fwd_x[dst_idx * hidden + h] = rdma_x[i * hidden + h];
+                    }
+                    if (combined_topk_weights != nullptr) {
+                        for (int k = 0; k < num_topk; ++k) {
+                            fwd_topk[dst_idx * num_topk + k] = rdma_wt[i * num_topk + k];
+                        }
+                    }
+                    fwd_meta[dst_idx] = SourceMeta{src_rdma, rdma_recv_pos[i], target_nvl};
+                }
+
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                    auto* fwd_base = peer_buf + fwd_base_offset;
+                    auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+                    fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
+                }
+            }
+        });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedCombineFwdBarrierKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
+    });
+    queue.wait();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.single_task<CombinedCombineReduceKernel<dtype_t>>([=]() {
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* fwd_base = my_buf + fwd_base_offset;
+            auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
+            auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
+            auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
+            auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+            int fwd_offset = 0;
+            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                const int count = fwd_counts[src_rdma];
+                for (int i = 0; i < count; ++i) {
+                    const int idx = fwd_offset + i;
+                    const int recv_pos = fwd_meta[idx].is_token_in_nvl_rank_bits;
+                    for (int ct = 0; ct < num_combined_tokens; ++ct) {
+                        if (combined_rdma_head[ct * num_rdma_ranks + src_rdma] != recv_pos) {
+                            continue;
+                        }
+                        for (int h = 0; h < hidden; ++h) {
+                            float value = static_cast<float>(dst[ct * hidden + h]);
+                            value += static_cast<float>(fwd_x[idx * hidden + h]);
+                            dst[ct * hidden + h] = static_cast<dtype_t>(value);
+                        }
+                        if (combined_topk_weights != nullptr) {
+                            for (int k = 0; k < num_topk; ++k) {
+                                combined_topk_weights[ct * num_topk + k] += fwd_topk[idx * num_topk + k];
+                            }
+                        }
+                        break;
+                    }
+                }
+                fwd_offset += count;
+            }
+
+            for (int ct = 0; ct < num_combined_tokens; ++ct) {
+                for (int h = 0; h < hidden; ++h) {
+                    float value = static_cast<float>(dst[ct * hidden + h]);
+                    if (b0 != nullptr) {
+                        value += static_cast<float>(b0[ct * hidden + h]);
+                    }
+                    if (b1 != nullptr) {
+                        value += static_cast<float>(b1[ct * hidden + h]);
+                    }
+                    dst[ct * hidden + h] = static_cast<dtype_t>(value);
+                }
+            }
+        });
+    });
+    queue.wait();
 #else
     TORCH_CHECK(false, "combine_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
 #endif

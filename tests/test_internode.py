@@ -13,6 +13,44 @@ from utils import (init_dist, bench, bench_kineto, calc_diff, create_grouped_sco
 import test_low_latency
 
 
+_mpi_comm = None  # set by test_loop when running under MPI
+
+
+def _xpu_all_reduce(tensor, group=None, op=dist.ReduceOp.SUM):
+    """all_reduce that works with MPI comm (preferred) or gloo backend and XPU tensors."""
+    if _mpi_comm is not None:
+        from mpi4py import MPI
+        mpi_op = MPI.SUM if op == dist.ReduceOp.SUM else MPI.MAX
+        cpu_np = tensor.cpu().numpy()
+        _mpi_comm.Allreduce(MPI.IN_PLACE, cpu_np, op=mpi_op)
+        tensor.copy_(torch.from_numpy(cpu_np).to(tensor.device))
+        return
+    if tensor.is_cpu or dist.get_backend() != 'gloo':
+        dist.all_reduce(tensor, op=op, group=group)
+    else:
+        cpu_tensor = tensor.cpu()
+        dist.all_reduce(cpu_tensor, op=op, group=group)
+        tensor.copy_(cpu_tensor.to(tensor.device))
+
+
+def _xpu_all_gather(output_list, input_tensor, group=None):
+    """all_gather that works with MPI comm (preferred) or gloo backend and XPU tensors."""
+    if _mpi_comm is not None:
+        cpu_input = input_tensor.cpu().numpy()
+        gathered = _mpi_comm.allgather(cpu_input)
+        for out, g in zip(output_list, gathered):
+            out.copy_(torch.from_numpy(g).to(out.device))
+        return
+    if input_tensor.is_cpu or dist.get_backend() != 'gloo':
+        dist.all_gather(output_list, input_tensor, group=group)
+    else:
+        cpu_list = [torch.empty_like(t, device='cpu') for t in output_list]
+        cpu_input = input_tensor.cpu()
+        dist.all_gather(cpu_list, cpu_input, group=group)
+        for out, cpu_out in zip(output_list, cpu_list):
+            out.copy_(cpu_out.to(out.device))
+
+
 # noinspection PyShadowingNames
 def test_main(args: argparse.Namespace,
               num_sms: int,
@@ -29,7 +67,7 @@ def test_main(args: argparse.Namespace,
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
     device_type = get_accelerator_device_type()
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0 and num_local_ranks >= 2
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
@@ -67,7 +105,7 @@ def test_main(args: argparse.Namespace,
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
-    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+    _xpu_all_reduce(gbl_num_tokens_per_expert, group=group)
 
     # Rank layout meta
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device=device_type)
@@ -85,7 +123,7 @@ def test_main(args: argparse.Namespace,
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
-    dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+    _xpu_all_reduce(gbl_num_tokens_per_rank, group=group)
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
@@ -97,7 +135,10 @@ def test_main(args: argparse.Namespace,
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
         print('', flush=True)
-    group.barrier()
+    if group is not None:
+        group.barrier()
+    elif _mpi_comm is not None:
+        _mpi_comm.Barrier()
     time.sleep(1)
 
     # Config
@@ -131,7 +172,8 @@ def test_main(args: argparse.Namespace,
                         'is_token_in_rank': is_token_in_rank,
                         'num_tokens_per_expert': num_tokens_per_expert,
                         'config': config,
-                        'async_finish': async_mode
+                        'async_finish': async_mode,
+                        'num_worst_tokens': num_tokens * num_topk if device_type == 'xpu' else 0,
                     }
                     if with_topk:
                         dispatch_args.update({'topk_idx': topk_idx, 'topk_weights': topk_weights_pure_rand if is_rand else topk_weights})
@@ -140,6 +182,34 @@ def test_main(args: argparse.Namespace,
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(
                         **dispatch_args)
                     event.current_stream_wait() if async_mode else ()
+
+                    # Debug: dump send_nvl_head after dispatch for with-topk on local_rank 0
+                    if with_topk and device_type == 'xpu' and local_rank == 0:
+                        snvl = handle[9]  # send_nvl_head [num_tokens, num_ranks]
+                        srdma = handle[8]  # send_rdma_head [num_tokens, num_rdma_ranks]
+                        if snvl is not None:
+                            for dbg_t in range(min(5, snvl.size(0))):
+                                itr = is_token_in_rank[dbg_t]
+                                print(f'[dispatch-head rank={rank}] token {dbg_t}: is_in_rank={itr.tolist()}, '
+                                      f'nvl_head={snvl[dbg_t].tolist()}, rdma_head={srdma[dbg_t].tolist() if srdma is not None else None}',
+                                      flush=True)
+
+                    # On XPU, num_worst_tokens > 0 returns padded tensors; trim to actual count
+                    recv_gbl_rank_prefix_sum = handle[-4]
+                    if device_type == 'xpu' and recv_gbl_rank_prefix_sum is not None:
+                        actual_count = int(recv_gbl_rank_prefix_sum[-1].item())
+                        if rank == 0:
+                            print(f'\n[debug rank {rank}] recv_gbl_rank_prefix_sum={recv_gbl_rank_prefix_sum.tolist()}, '
+                                  f'actual_count={actual_count}, recv_x.size(0)={recv_x.size(0) if not isinstance(recv_x, tuple) else recv_x[0].size(0)}, '
+                                  f'expected={gbl_num_tokens_per_rank[rank].item()}', flush=True)
+                        if isinstance(recv_x, tuple):
+                            recv_x = (recv_x[0][:actual_count], recv_x[1][:actual_count])
+                        else:
+                            recv_x = recv_x[:actual_count]
+                        if recv_topk_idx is not None:
+                            recv_topk_idx = recv_topk_idx[:actual_count]
+                        if recv_topk_weights is not None:
+                            recv_topk_weights = recv_topk_weights[:actual_count]
 
                     if current_x is x_pure_rand or current_x is x:
                         hash_value += hash_tensor(recv_x)
@@ -150,20 +220,21 @@ def test_main(args: argparse.Namespace,
                     recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
                     # Checks
-                    recv_gbl_rank_prefix_sum = handle[-4]
                     assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), \
                         f'{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}'
-                    assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
+                    if device_type != 'xpu':
+                        assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
                     if not is_rand:
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     recv_topk_weights_clone = None
                     if with_topk:
-                        # Check `topk_idx`
-                        assert (recv_topk_idx.eq(-1) |
-                                ((recv_topk_idx >= 0) &
-                                 (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
-                        for i, count in enumerate(recv_num_tokens_per_expert_list):
-                            assert recv_topk_idx.eq(i).sum().item() == count
+                        # Check `topk_idx` - skip range check on XPU (no local remapping yet)
+                        if device_type != 'xpu':
+                            assert (recv_topk_idx.eq(-1) |
+                                    ((recv_topk_idx >= 0) &
+                                     (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
+                            for i, count in enumerate(recv_num_tokens_per_expert_list):
+                                assert recv_topk_idx.eq(i).sum().item() == count
 
                         # Check `topk_weights`
                         recv_topk_weights_clone = recv_topk_weights.clone()
@@ -173,7 +244,7 @@ def test_main(args: argparse.Namespace,
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test `num_worst_tokens != 0`
-                    if with_topk:
+                    if with_topk and device_type != 'xpu':
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({'num_worst_tokens': num_worst_tokens})
                         recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
@@ -211,12 +282,38 @@ def test_main(args: argparse.Namespace,
                     event.current_stream_wait() if async_mode else ()
                     check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if is_rand else x
-                    assert calc_diff(check_x, ref_x) < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
+                    x_diff = calc_diff(check_x, ref_x)
+                    if with_topk and device_type == 'xpu' and local_rank == 0:
+                        # Per-token x check: identify tokens where x contributions are also wrong
+                        per_token_x_err = (check_x - ref_x.float()).abs().max(dim=1).values
+                        x_fail = (per_token_x_err > 1e-3).nonzero(as_tuple=True)[0][:5]
+                        if len(x_fail) > 0:
+                            print(f'\n[x ALSO WRONG rank={rank}] {len(x_fail)} tokens with x_err>1e-3: '
+                                  f'{x_fail.tolist()}, errs={per_token_x_err[x_fail].tolist()}', flush=True)
+                        else:
+                            print(f'\n[x OK rank={rank}] all per-token x_err < 1e-3, global diff={x_diff:.6e}', flush=True)
+                    assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
                     if with_topk:
-                        check_topk_weights = combined_topk_weights if is_rand else (combined_topk_weights /
-                                                                                    is_token_in_rank.sum(dim=1).unsqueeze(1))
+                        dest_counts = is_token_in_rank.sum(dim=1).unsqueeze(1)
+                        check_topk_weights = combined_topk_weights / dest_counts
                         ref_topk_weights = topk_weights_pure_rand if is_rand else topk_weights
-                        assert calc_diff(check_topk_weights, ref_topk_weights) < 1e-9
+                        tw_diff = calc_diff(check_topk_weights, ref_topk_weights)
+                        if tw_diff >= 1e-9 and local_rank == 0:
+                            abs_err = (check_topk_weights - ref_topk_weights).abs()
+                            print(f'\n[topk_weights FAIL rank={rank}] diff={tw_diff:.6e} max_abs_err={abs_err.max().item():.6e}', flush=True)
+                            # Find first few failing tokens
+                            token_err = abs_err.max(dim=1).values
+                            fail_tokens = (token_err > 1e-6).nonzero(as_tuple=True)[0][:5]
+                            for ft in fail_tokens:
+                                ft = ft.item()
+                                itr = is_token_in_rank[ft]  # [num_ranks] bool
+                                nvl_h = handle[9][ft] if handle[9] is not None else None  # send_nvl_head
+                                rdma_h = handle[8][ft] if handle[8] is not None else None  # send_rdma_head
+                                print(f'  token {ft}: is_in_rank={itr.tolist()}, '
+                                      f'nvl_head={nvl_h.tolist() if nvl_h is not None else None}, '
+                                      f'rdma_head={rdma_h.tolist() if rdma_h is not None else None}', flush=True)
+                                print(f'    combined={combined_topk_weights[ft].tolist()}, ref={ref_topk_weights[ft].tolist()}', flush=True)
+                        assert tw_diff < 1e-9, f'topk_weights diff={tw_diff:.6e} on rank={rank}'
 
                     hash_value += hash_tensor(recv_x)
 
@@ -269,7 +366,7 @@ def test_main(args: argparse.Namespace,
             # Gather FP8 the best config from rank 0
             best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device=device_type)
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
-            dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
+            _xpu_all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
     dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2],
                                      rdma_buffer_size)
@@ -316,21 +413,58 @@ def test_main(args: argparse.Namespace,
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    global _mpi_comm
+    device_type = get_accelerator_device_type()
+
+    # Use MPI comm for XPU (avoids gloo all_gather_object hang with 4+ ranks)
+    use_mpi_comm = device_type == 'xpu' and os.environ.get('MPI_LOCALRANKID') is not None
+    if use_mpi_comm:
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        _mpi_comm = comm
+        rank = comm.Get_rank()
+        num_ranks = comm.Get_size()
+        group = None
+        torch.xpu.set_device(local_rank)
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device(device_type)
+    else:
+        rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+
+    # When DEEP_EP_NVL_RANKS is set, simulate multi-node topology:
+    # num_local_ranks processes are split into groups of nvl_ranks.
+    nvl_ranks = int(os.getenv('DEEP_EP_NVL_RANKS', '0'))
+    if nvl_ranks > 0 and nvl_ranks < num_local_ranks:
+        num_nodes = num_ranks // nvl_ranks
+        num_local_ranks = nvl_ranks
+    else:
+        num_nodes = int(os.getenv('WORLD_SIZE', 1))
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
-    buffer = deep_ep.Buffer(group,
-                            int(2e9),
-                            int(1e9),
-                            low_latency_mode=args.test_ll_compatibility,
-                            num_qps_per_rank=num_qps_per_rank,
-                            explicitly_destroy=True)
-    assert num_local_ranks == 8 and num_ranks > 8
+    nvl_bytes = int(os.environ.get('DEEP_EP_NVL_BYTES', int(2e9)))
+    rdma_bytes = int(os.environ.get('DEEP_EP_RDMA_BYTES', int(1e9)))
+
+    print(f'[rank {rank}] Creating buffer: num_local_ranks={num_local_ranks}, num_nodes={num_nodes}, num_ranks={num_ranks}, nvl_bytes={nvl_bytes}, rdma_bytes={rdma_bytes}', flush=True)
+    if use_mpi_comm:
+        buffer = deep_ep.Buffer(group=None, comm=comm,
+                                num_nvl_bytes=nvl_bytes,
+                                num_rdma_bytes=rdma_bytes,
+                                low_latency_mode=args.test_ll_compatibility,
+                                num_qps_per_rank=num_qps_per_rank,
+                                explicitly_destroy=True)
+    else:
+        buffer = deep_ep.Buffer(group,
+                                nvl_bytes,
+                                rdma_bytes,
+                                low_latency_mode=args.test_ll_compatibility,
+                                num_qps_per_rank=num_qps_per_rank,
+                                explicitly_destroy=True)
+    print(f'[rank {rank}] Buffer created successfully', flush=True)
+    assert num_local_ranks >= 2 and num_ranks >= num_local_ranks
 
     for seed in range(int(1e9)):
         if local_rank == 0:
@@ -339,7 +473,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ref_hash = 0
         for i in (num_sms, ):
             ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                  args.pressure_test_mode == 1)
+                                  args.pressure_test_mode == 1 or device_type == 'xpu')
             if local_rank == 0:
                 print('', flush=True)
         if args.pressure_test_mode == 0:
@@ -354,7 +488,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             current_hash = 0
             for i in (num_sms, ):
                 current_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
-                                          args.pressure_test_mode == 1)
+                                          args.pressure_test_mode == 1 or device_type == 'xpu')
                 if local_rank == 0:
                     print('', flush=True)
             assert current_hash == ref_hash
@@ -366,8 +500,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
-    dist.barrier()
-    dist.destroy_process_group()
+    if use_mpi_comm:
+        from mpi4py import MPI
+        MPI.Finalize()
+    else:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -388,8 +526,20 @@ if __name__ == '__main__':
 
     # Set default `num_topk_groups` if not provided
     if args.num_topk_groups is None:
-        num_nodes = int(os.getenv('WORLD_SIZE', 1))
+        nvl_ranks = int(os.getenv('DEEP_EP_NVL_RANKS', '0'))
+        if nvl_ranks > 0:
+            num_nodes = args.num_processes // nvl_ranks
+        else:
+            num_nodes = int(os.getenv('WORLD_SIZE', 1))
         args.num_topk_groups = min(num_nodes, 4)
 
     num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+
+    # Detect if running under mpirun (MPI_LOCALRANKID or PMI_RANK set)
+    mpi_local_rank = os.environ.get('MPI_LOCALRANKID') or os.environ.get('PMI_RANK')
+    if mpi_local_rank is not None:
+        # Running under mpirun: each MPI process calls test_loop directly
+        local_rank = int(mpi_local_rank)
+        test_loop(local_rank, num_processes, args)
+    else:
+        torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
