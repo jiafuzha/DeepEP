@@ -2360,22 +2360,13 @@ void dispatch_nvl_rdma(void* recv_x,
             sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
                 auto group = item.get_group();
                 const int local_id = static_cast<int>(item.get_local_id(0));
-                const int local_size = static_cast<int>(item.get_local_range(0));
-                if (nvl_rank == 0) {
-                    // Distribute puts across work-items the same way internode_ll does
-                    // (each WI owns disjoint channels). This pattern is known to work
-                    // reliably with iSHMEM+IBGDA on Intel XPU, unlike a single WI doing
-                    // all puts (which races with the post-put quiet completion).
-                    int ch = 0;
+                if (nvl_rank == 0 && local_id == 0) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;
-                        if (ch % local_size == local_id) {
-                            auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                            const int dst_pe = dst_rdma * num_nvl_ranks;
-                            auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                            ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
-                        }
-                        ch++;
+                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                        const int dst_pe = dst_rdma * num_nvl_ranks;
+                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                        ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
                     }
                 }
                 sycl::group_barrier(group);

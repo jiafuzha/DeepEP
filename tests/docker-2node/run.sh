@@ -32,7 +32,7 @@ SSH_DIR="/tmp/deepep-docker-ssh"
 # DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
 DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
 DEEP_EP_RDMA_BYTES="${DEEP_EP_RDMA_BYTES:-67108864}"  # 64 MiB
-ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-1073741824}"  # 1 GiB (xccl+iSHMEM coexist)
+ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"  # 256 MiB
 
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -229,8 +229,8 @@ run_test() {
                 -genv MASTER_ADDR deepep-node0 \
                 -genv MASTER_PORT $MASTER_PORT \
                 -genv WORLD_SIZE 2 \
-                -genv CCL_ZE_IPC_EXCHANGE sockets \
-                -genv CCL_OP_SYNC 1 \
+                \
+                \
                 -genv TORCH_DISTRIBUTED_DEBUG OFF \
                 -launcher ssh \
                 -bootstrap-exec-args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa' \
