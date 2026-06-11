@@ -18,8 +18,8 @@ namespace internode {
 namespace {
 
 // Work-group size for iSHMEM collective kernels (putmem_nbi_work_group, quiet_work_group, etc.).
-// Scalar device iSHMEM APIs (ishmem_putmem, ishmem_quiet) hang with IBGDA direct-doorbell
-// on Intel XPU; work-group variants in nd_range parallel_for are stable.
+// Matches NVSHMEM's `_block` API pattern: a whole WG cooperates on payload assembly and
+// posts one work request, amortizing doorbell overhead.
 constexpr int kIshmemWGSize = 32;
 
 class DispatchInitKernel;
@@ -468,7 +468,6 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<DispatchCountExchangeKernel>(
@@ -533,7 +532,6 @@ void dispatch(void* recv_x,
             });
     });
     queue.wait();
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<DispatchOffsetComputeKernel>([=]() {
@@ -627,7 +625,6 @@ void dispatch(void* recv_x,
         });
     });
     queue.wait();
-    internode::mpi_barrier();
     for (int channel = 0; channel < num_channels; ++channel) {
         const int channel_start = (static_cast<int64_t>(num_tokens) * channel) / num_channels;
         const int channel_end = (static_cast<int64_t>(num_tokens) * (channel + 1)) / num_channels;
@@ -660,7 +657,6 @@ void dispatch(void* recv_x,
                     });
                 });
                 queue.wait();
-                internode::mpi_barrier();
             }
 
             queue.submit([&](sycl::handler& cgh) {
@@ -776,7 +772,6 @@ void dispatch(void* recv_x,
                     });
             });
             queue.wait();
-            internode::mpi_barrier();
 
             queue.submit([&](sycl::handler& cgh) {
                 cgh.parallel_for<DispatchQueueCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -937,7 +932,6 @@ void launch_combine_copy(void* combined_x,
         });
     });
     queue.wait();
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinePackKernel<dtype_t>>(sycl::range<1>(total_recv), [=](sycl::id<1> id) {
@@ -954,7 +948,6 @@ void launch_combine_copy(void* combined_x,
         });
     }
     queue.wait();
-    internode::mpi_barrier();
 
     for (int window_offset = 0; window_offset < num_combined_tokens; window_offset += queue_window) {
         const int window_tokens = std::min(queue_window, num_combined_tokens - window_offset);
@@ -974,7 +967,6 @@ void launch_combine_copy(void* combined_x,
             });
         });
         queue.wait();
-        internode::mpi_barrier();
 
         queue.submit([&](sycl::handler& cgh) {
             constexpr int kQueueGroupSize = 32;
@@ -1045,7 +1037,6 @@ void launch_combine_copy(void* combined_x,
                 });
         });
         queue.wait();
-        internode::mpi_barrier();
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<CombineQueueCopyKernel<dtype_t>>(
@@ -1199,14 +1190,12 @@ void debug_channel_put(
                                     rank};
     queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutInitKernel>(sycl::range<1>(init_range), init_kernel); });
     queue.wait();
-    internode::mpi_barrier();
 
     for (int channel = 0; channel < num_channels; ++channel) {
         const int reset_range = std::max(num_queue_slots * row_ints, num_queue_slots);
         DebugChannelPutReset reset_kernel{recv_payload, recv_meta, recv_dst_token, num_queue_slots, row_ints};
         queue.submit([&](sycl::handler& cgh) { cgh.parallel_for<DebugChannelPutResetKernel>(sycl::range<1>(reset_range), reset_kernel); });
         queue.wait();
-        internode::mpi_barrier();
 
         DebugChannelPutPost post_kernel{recv_payload,
                                         recv_meta,
@@ -1221,13 +1210,11 @@ void debug_channel_put(
                                         channel};
         queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutKernel>(post_kernel); });
         queue.wait();
-        internode::mpi_barrier();
 
         DebugChannelPutValidate validate_kernel{
             output, recv_payload, recv_meta, recv_dst_token, row_ints, num_channels, queue_stride, output_cols, rank, channel};
         queue.submit([&](sycl::handler& cgh) { cgh.single_task<DebugChannelPutValidateKernel>(validate_kernel); });
         queue.wait();
-        internode::mpi_barrier();
     }
 #else
     TORCH_CHECK(false, "debug_channel_put requires iSHMEM support");
@@ -2208,12 +2195,6 @@ void dispatch_nvl_rdma(void* recv_x,
         });
     });
     queue.wait();
-    // Cross-PE barrier so every receiver completes the rdma_base zero-init
-    // before any sender starts an RDMA put. Without this, a fast sender's
-    // ishmem_putmem_nbi can land at a slow receiver's rdma_base before the
-    // receiver's Init kernel has zeroed it, and the Init zero subsequently
-    // clobbers the freshly delivered remote count/data.
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchPackKernel>([=]() {
@@ -2398,20 +2379,10 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
                 sycl::group_barrier(group);
-                // Explicit quiet to flush all pending nbi puts before barrier_all.
-                // barrier_all is supposed to imply quiet, but in some iSHMEM versions
-                // it only synchronizes participating WIs without guaranteeing all
-                // outstanding PE-level puts are drained first.
-                ishmemx_quiet_work_group(group);
                 ishmemx_barrier_all_work_group(group);
             });
     });
     queue.wait();
-    // Hard host-side cross-PE sync: ishmemx_barrier_all_work_group has proven
-    // unreliable on the receiver side (assemble can read rdma_count before the
-    // remote NBI put lands), so add an MPI_Barrier here to guarantee that all
-    // RDMA puts are visible at every PE before the assemble kernel runs.
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchFwdWriteKernel>([=]() {
@@ -3093,17 +3064,13 @@ void combine_nvl_rdma(DataType type,
                     ishmemx_putmem_nbi_work_group(dst_region, region, rdma_region_bytes, dst_pe, group);
                 }
                 }  // end if (is_puter)
-                // Match dispatch_nvl_rdma pattern: explicit quiet + barrier_all to
-                // guarantee all outstanding RDMA puts are drained and visible at
+                // Cross-PE sync to drain pending RDMA puts and make them visible at
                 // every PE before FWD WRITE reads from the receive regions.
-                // Every PE (including nvl_rank != 0) must reach these collectives.
-                ishmemx_quiet_work_group(group);
+                // Every PE (including nvl_rank != 0) must reach this collective.
                 ishmemx_barrier_all_work_group(group);
             });
     });
     queue.wait();
-    // Same hard host-side cross-PE sync as dispatch_nvl_rdma above.
-    internode::mpi_barrier();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineFwdWriteKernel<dtype_t>>([=]() {
