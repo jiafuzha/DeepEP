@@ -12,42 +12,33 @@ from utils import (init_dist, bench, bench_kineto, calc_diff, create_grouped_sco
 # Test compatibility with low latency functions
 import test_low_latency
 
-_mpi_comm = None  # set by test_loop when running under MPI
-
-
 def _xpu_all_reduce(tensor, group=None, op=dist.ReduceOp.SUM):
-    """all_reduce that works with MPI comm (preferred) or gloo backend and XPU tensors."""
-    if _mpi_comm is not None:
-        from mpi4py import MPI
-        mpi_op = MPI.SUM if op == dist.ReduceOp.SUM else MPI.MAX
-        cpu_np = tensor.cpu().numpy()
-        _mpi_comm.Allreduce(MPI.IN_PLACE, cpu_np, op=mpi_op)
-        tensor.copy_(torch.from_numpy(cpu_np).to(tensor.device))
-        return
-    if tensor.is_cpu or dist.get_backend() != 'gloo':
+    """all_reduce that routes through CPU to avoid xccl<->iSHMEM GPU resource contention.
+
+    Both xccl and iSHMEM/IBGDA allocate Level-Zero events/command-lists on the same
+    XPU; mixing them at scale causes UR_RESULT_ERROR_OUT_OF_RESOURCES (40) or
+    UR_RESULT_ERROR_DEVICE_LOST (20) during dispatch. The collective payloads here
+    are tiny (counters/per-rank token counts), so a CPU detour is negligible while
+    still using the xccl process group for rendezvous and barrier semantics.
+    """
+    if tensor.is_cpu:
         dist.all_reduce(tensor, op=op, group=group)
-    else:
-        cpu_tensor = tensor.cpu()
-        dist.all_reduce(cpu_tensor, op=op, group=group)
-        tensor.copy_(cpu_tensor.to(tensor.device))
+        return
+    cpu_tensor = tensor.detach().to('cpu')
+    dist.all_reduce(cpu_tensor, op=op, group=group)
+    tensor.copy_(cpu_tensor.to(tensor.device))
 
 
 def _xpu_all_gather(output_list, input_tensor, group=None):
-    """all_gather that works with MPI comm (preferred) or gloo backend and XPU tensors."""
-    if _mpi_comm is not None:
-        cpu_input = input_tensor.cpu().numpy()
-        gathered = _mpi_comm.allgather(cpu_input)
-        for out, g in zip(output_list, gathered):
-            out.copy_(torch.from_numpy(g).to(out.device))
-        return
-    if input_tensor.is_cpu or dist.get_backend() != 'gloo':
+    """all_gather that routes through CPU; same rationale as _xpu_all_reduce."""
+    if input_tensor.is_cpu:
         dist.all_gather(output_list, input_tensor, group=group)
-    else:
-        cpu_list = [torch.empty_like(t, device='cpu') for t in output_list]
-        cpu_input = input_tensor.cpu()
-        dist.all_gather(cpu_list, cpu_input, group=group)
-        for out, cpu_out in zip(output_list, cpu_list):
-            out.copy_(cpu_out.to(out.device))
+        return
+    cpu_list = [torch.empty_like(t, device='cpu') for t in output_list]
+    cpu_input = input_tensor.detach().to('cpu')
+    dist.all_gather(cpu_list, cpu_input, group=group)
+    for out, cpu_out in zip(output_list, cpu_list):
+        out.copy_(cpu_out.to(out.device))
 
 
 # noinspection PyShadowingNames
@@ -136,8 +127,6 @@ def test_main(args: argparse.Namespace,
         print('', flush=True)
     if group is not None:
         group.barrier()
-    elif _mpi_comm is not None:
-        _mpi_comm.Barrier()
     time.sleep(1)
 
     # Config
@@ -430,23 +419,10 @@ def test_main(args: argparse.Namespace,
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    global _mpi_comm
     device_type = get_accelerator_device_type()
 
-    # Use MPI comm for XPU (avoids gloo all_gather_object hang with 4+ ranks)
-    use_mpi_comm = device_type == 'xpu' and os.environ.get('MPI_LOCALRANKID') is not None
-    if use_mpi_comm:
-        from mpi4py import MPI
-        comm = MPI.COMM_WORLD
-        _mpi_comm = comm
-        rank = comm.Get_rank()
-        num_ranks = comm.Get_size()
-        group = None
-        torch.xpu.set_device(local_rank)
-        torch.set_default_dtype(torch.bfloat16)
-        torch.set_default_device(device_type)
-    else:
-        rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    # Use PyTorch distributed (xccl on XPU, nccl on CUDA) via init_dist.
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
     # When DEEP_EP_NVL_RANKS is set, simulate multi-node topology:
     # num_local_ranks processes are split into groups of nvl_ranks.
@@ -468,21 +444,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     print(
         f'[rank {rank}] Creating buffer: num_local_ranks={num_local_ranks}, num_nodes={num_nodes}, num_ranks={num_ranks}, nvl_bytes={nvl_bytes}, rdma_bytes={rdma_bytes}',
         flush=True)
-    if use_mpi_comm:
-        buffer = deep_ep.Buffer(group=None,
-                                comm=comm,
-                                num_nvl_bytes=nvl_bytes,
-                                num_rdma_bytes=rdma_bytes,
-                                low_latency_mode=args.test_ll_compatibility,
-                                num_qps_per_rank=num_qps_per_rank,
-                                explicitly_destroy=True)
-    else:
-        buffer = deep_ep.Buffer(group,
-                                nvl_bytes,
-                                rdma_bytes,
-                                low_latency_mode=args.test_ll_compatibility,
-                                num_qps_per_rank=num_qps_per_rank,
-                                explicitly_destroy=True)
+    buffer = deep_ep.Buffer(group,
+                            nvl_bytes,
+                            rdma_bytes,
+                            low_latency_mode=args.test_ll_compatibility,
+                            num_qps_per_rank=num_qps_per_rank,
+                            explicitly_destroy=True)
     print(f'[rank {rank}] Buffer created successfully', flush=True)
     assert num_local_ranks >= 2 and num_ranks >= num_local_ranks
 
@@ -520,17 +487,16 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Destroy the buffer runtime and communication group
     buffer.destroy()
-    if use_mpi_comm:
-        from mpi4py import MPI
-        MPI.Finalize()
-        # NOTE: bypass static destructors in the SYCL/iSHMEM stack that abort
-        # post-finalize on the XPU build. All validation has completed by here.
-        if local_rank == 0:
-            print('[teardown] all done, exiting cleanly', flush=True)
-        os._exit(0)
-    else:
-        dist.barrier()
-        dist.destroy_process_group()
+    try:
+        dist.barrier(group=group)
+    except Exception:
+        pass
+    dist.destroy_process_group()
+    # NOTE: bypass static destructors in the SYCL/iSHMEM stack that abort
+    # post-finalize on the XPU build. All validation has completed by here.
+    if local_rank == 0:
+        print('[teardown] all done, exiting cleanly', flush=True)
+    os._exit(0)
 
 
 if __name__ == '__main__':

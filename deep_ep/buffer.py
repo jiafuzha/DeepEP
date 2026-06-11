@@ -107,15 +107,11 @@ class Buffer:
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
-        print(f'[rank: {self.rank}] local_device_id: {local_device_id}', flush=True)
         device_ids = all_gather_object(local_device_id)
-        print(f'[rank: {self.rank}] device_ids gathered: {device_ids}', flush=True)
 
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
-        print(f'[rank: {self.rank}] local_ipc_handle len={len(local_ipc_handle)}', flush=True)
         ipc_handles = all_gather_object(local_ipc_handle)
-        print(f'[rank: {self.rank}] ipc_handles gathered, count={len(ipc_handles)}', flush=True)
         if num_nvl_bytes > 0 and self.group_size > 1 and self.is_xpu_runtime:
             ipc_handles = self._exchange_xpu_ipc_fds(ipc_handles, all_gather_object)
 
@@ -159,9 +155,6 @@ class Buffer:
 
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
-        print(f'[rank: {self.rank}] Synced iSHMEM runtime device_ids: ', device_ids)
-        print(f'[rank: {self.rank}] Synced iSHMEM runtime ipc_handles: ', ipc_handles)
-        print(f'[rank: {self.rank}] Synced iSHMEM runtime root_unique_id: ', root_unique_id)
         assert self.runtime.is_available()
 
     def _exchange_xpu_ipc_fds(self, ipc_handles, all_gather_object):
