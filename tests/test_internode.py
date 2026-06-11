@@ -148,11 +148,23 @@ def test_main(args: argparse.Namespace,
     # Test dispatch
     # noinspection PyShadowingNames
     def check_data(check_x, recv_gbl_rank_prefix_sum):
-        assert torch.allclose(check_x.amin(dim=1), check_x.amax(dim=1))
+        if not torch.allclose(check_x.amin(dim=1), check_x.amax(dim=1)):
+            bad = (check_x.amin(dim=1) != check_x.amax(dim=1)).nonzero(as_tuple=True)[0][:5]
+            print(f'[check_data FAIL rank={rank}] {len(bad)} bad rows (showing 5): {bad.tolist()}', flush=True)
+            for i in bad[:3]:
+                ii = int(i)
+                row = check_x[ii]
+                print(f'  row {ii}: min={row.amin().item()}, max={row.amax().item()}, first8={row[:8].tolist()}, last8={row[-8:].tolist()}', flush=True)
+            assert False, 'check_x rows not uniform'
         check_start = 0
         for i in range(num_ranks):
             check_end = recv_gbl_rank_prefix_sum[i].item()
-            assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
+            seg = check_x[check_start:check_end, :].int()
+            err = (seg - i).sum().item()
+            if err != 0:
+                vals = seg[:, 0].tolist() if seg.numel() else []
+                print(f'[check_data FAIL rank={rank}] segment for src_rank={i} rows [{check_start},{check_end}) err_sum={err} first_col_vals={vals[:10]}', flush=True)
+                assert False, f'segment src_rank={i} values mismatch'
             check_start = check_end
 
     for previous_mode in (False, True):
@@ -225,6 +237,7 @@ def test_main(args: argparse.Namespace,
                     if device_type != 'xpu':
                         assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
                     if not is_rand:
+                        print(f'[INITIAL dispatch check rank={rank}]', flush=True)
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     recv_topk_weights_clone = None
                     if with_topk:
@@ -268,6 +281,7 @@ def test_main(args: argparse.Namespace,
                         event.current_stream_wait() if async_mode else ()
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if not is_rand:
+                            print(f'[CACHED dispatch check rank={rank}]', flush=True)
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
