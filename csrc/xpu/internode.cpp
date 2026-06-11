@@ -2128,14 +2128,7 @@ void dispatch_nvl_rdma(void* recv_x,
 
     NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
     NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks);
-    // Dispatch and combine share the same NVL buffer regions. Their fwd_base_offset
-    // MUST match (across iterations and between dispatch/combine on the same rank,
-    // and across ranks for IPC writes). Use a shared anchor sized by the max possible
-    // local rows (= num_nvl_ranks * num_tokens, the upper bound on combine input which
-    // also covers dispatch).
-    const int max_local_tokens = num_nvl_ranks * num_tokens;
-    NvlBufferLayout fwd_anchor_layout(max_local_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
-    const size_t fwd_base_offset = align_offset(fwd_anchor_layout.total_bytes, 128);
+    const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
 
     const size_t rdma_x_size = static_cast<size_t>(num_recv_tokens) * row_bytes;
     const size_t rdma_meta_size = static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
@@ -2245,10 +2238,18 @@ void dispatch_nvl_rdma(void* recv_x,
             auto* my_send_rdma_bits = reinterpret_cast<int*>(my_buf + layout.send_rdma_dest_bits_offset);
             auto* my_send_is_in_rank = reinterpret_cast<bool*>(my_buf + layout.send_is_token_in_rank_offset);
 
+            // NvlBufferLayout above is constructed with num_channels=1 (combined-dispatch
+            // single_task uses a single conceptual channel for routing metadata).
+            // The kernel param num_channels may be larger (config-driven SM count); using
+            // it in the channel_count loops below would write 4*num_channels ints into a
+            // region only sized for 4 ints and overflow into send_x. Always use 1 here to
+            // match the layout.
+            constexpr int kPackNumChannels = 1;
+
             for (int d = 0; d < num_ranks; ++d) {
                 my_counts[d] = 0;
-                for (int c = 0; c < num_channels; ++c) {
-                    my_channel_counts[d * num_channels + c] = 0;
+                for (int c = 0; c < kPackNumChannels; ++c) {
+                    my_channel_counts[d * kPackNumChannels + c] = 0;
                 }
             }
 
@@ -2292,15 +2293,15 @@ void dispatch_nvl_rdma(void* recv_x,
 
             for (int d = 0; d < num_ranks; ++d) {
                 int cumulative = 0;
-                for (int c = 0; c < num_channels; ++c) {
-                    const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
-                    const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
+                for (int c = 0; c < kPackNumChannels; ++c) {
+                    const int start = (static_cast<int64_t>(num_tokens) * c) / kPackNumChannels;
+                    const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / kPackNumChannels;
                     int count = 0;
                     for (int token = start; token < end; ++token) {
                         count += my_send_is_in_rank[token * num_ranks + d] ? 1 : 0;
                     }
                     cumulative += count;
-                    my_channel_counts[d * num_channels + c] = cumulative;
+                    my_channel_counts[d * kPackNumChannels + c] = cumulative;
                 }
             }
         });
