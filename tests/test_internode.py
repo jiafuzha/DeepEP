@@ -12,7 +12,6 @@ from utils import (init_dist, bench, bench_kineto, calc_diff, create_grouped_sco
 # Test compatibility with low latency functions
 import test_low_latency
 
-
 _mpi_comm = None  # set by test_loop when running under MPI
 
 
@@ -154,8 +153,9 @@ def test_main(args: argparse.Namespace,
             for i in bad[:3]:
                 ii = int(i)
                 row = check_x[ii]
-                print(f'  row {ii}: min={row.amin().item()}, max={row.amax().item()}, first8={row[:8].tolist()}, last8={row[-8:].tolist()}', flush=True)
-            assert False, 'check_x rows not uniform'
+                print(f'  row {ii}: min={row.amin().item()}, max={row.amax().item()}, first8={row[:8].tolist()}, last8={row[-8:].tolist()}',
+                      flush=True)
+            assert False, 'check_x rows not uniform'  # noqa: B011
         check_start = 0
         for i in range(num_ranks):
             check_end = recv_gbl_rank_prefix_sum[i].item()
@@ -163,8 +163,10 @@ def test_main(args: argparse.Namespace,
             err = (seg - i).sum().item()
             if err != 0:
                 vals = seg[:, 0].tolist() if seg.numel() else []
-                print(f'[check_data FAIL rank={rank}] segment for src_rank={i} rows [{check_start},{check_end}) err_sum={err} first_col_vals={vals[:10]}', flush=True)
-                assert False, f'segment src_rank={i} values mismatch'
+                print(
+                    f'[check_data FAIL rank={rank}] segment for src_rank={i} rows [{check_start},{check_end}) err_sum={err} first_col_vals={vals[:10]}',
+                    flush=True)
+                assert False, f'segment src_rank={i} values mismatch'  # noqa: B011
             check_start = check_end
 
     for previous_mode in (False, True):
@@ -196,24 +198,22 @@ def test_main(args: argparse.Namespace,
                     event.current_stream_wait() if async_mode else ()
 
                     # Debug: dump send_nvl_head after dispatch for with-topk on local_rank 0
-                    if with_topk and device_type == 'xpu' and local_rank == 0:
-                        snvl = handle[9]  # send_nvl_head [num_tokens, num_ranks]
-                        srdma = handle[8]  # send_rdma_head [num_tokens, num_rdma_ranks]
-                        if snvl is not None:
-                            for dbg_t in range(min(5, snvl.size(0))):
-                                itr = is_token_in_rank[dbg_t]
-                                print(f'[dispatch-head rank={rank}] token {dbg_t}: is_in_rank={itr.tolist()}, '
-                                      f'nvl_head={snvl[dbg_t].tolist()}, rdma_head={srdma[dbg_t].tolist() if srdma is not None else None}',
-                                      flush=True)
+                    if False:  # noqa: SIM223 - kept for ad-hoc diagnostics
+                        if with_topk and device_type == 'xpu' and local_rank == 0:
+                            snvl = handle[9]
+                            srdma = handle[8]
+                            if snvl is not None:
+                                for dbg_t in range(min(5, snvl.size(0))):
+                                    itr = is_token_in_rank[dbg_t]
+                                    print(
+                                        f'[dispatch-head rank={rank}] token {dbg_t}: is_in_rank={itr.tolist()}, '
+                                        f'nvl_head={snvl[dbg_t].tolist()}, rdma_head={srdma[dbg_t].tolist() if srdma is not None else None}',
+                                        flush=True)
 
                     # On XPU, num_worst_tokens > 0 returns padded tensors; trim to actual count
                     recv_gbl_rank_prefix_sum = handle[-4]
                     if device_type == 'xpu' and recv_gbl_rank_prefix_sum is not None:
                         actual_count = int(recv_gbl_rank_prefix_sum[-1].item())
-                        if rank == 0:
-                            print(f'\n[debug rank {rank}] recv_gbl_rank_prefix_sum={recv_gbl_rank_prefix_sum.tolist()}, '
-                                  f'actual_count={actual_count}, recv_x.size(0)={recv_x.size(0) if not isinstance(recv_x, tuple) else recv_x[0].size(0)}, '
-                                  f'expected={gbl_num_tokens_per_rank[rank].item()}', flush=True)
                         if isinstance(recv_x, tuple):
                             recv_x = (recv_x[0][:actual_count], recv_x[1][:actual_count])
                         else:
@@ -237,7 +237,6 @@ def test_main(args: argparse.Namespace,
                     if device_type != 'xpu':
                         assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
                     if not is_rand:
-                        print(f'[INITIAL dispatch check rank={rank}]', flush=True)
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     recv_topk_weights_clone = None
                     if with_topk:
@@ -281,7 +280,6 @@ def test_main(args: argparse.Namespace,
                         event.current_stream_wait() if async_mode else ()
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if not is_rand:
-                            print(f'[CACHED dispatch check rank={rank}]', flush=True)
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
@@ -302,8 +300,10 @@ def test_main(args: argparse.Namespace,
                         per_token_x_err = (check_x - ref_x.float()).abs().max(dim=1).values
                         x_fail = (per_token_x_err > 1e-3).nonzero(as_tuple=True)[0][:5]
                         if len(x_fail) > 0:
-                            print(f'\n[x ALSO WRONG rank={rank}] {len(x_fail)} tokens with x_err>1e-3: '
-                                  f'{x_fail.tolist()}, errs={per_token_x_err[x_fail].tolist()}', flush=True)
+                            print(
+                                f'\n[x ALSO WRONG rank={rank}] {len(x_fail)} tokens with x_err>1e-3: '
+                                f'{x_fail.tolist()}, errs={per_token_x_err[x_fail].tolist()}',
+                                flush=True)
                         else:
                             print(f'\n[x OK rank={rank}] all per-token x_err < 1e-3, global diff={x_diff:.6e}', flush=True)
                     assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
@@ -314,7 +314,8 @@ def test_main(args: argparse.Namespace,
                         tw_diff = calc_diff(check_topk_weights, ref_topk_weights)
                         if tw_diff >= 1e-9 and local_rank == 0:
                             abs_err = (check_topk_weights - ref_topk_weights).abs()
-                            print(f'\n[topk_weights FAIL rank={rank}] diff={tw_diff:.6e} max_abs_err={abs_err.max().item():.6e}', flush=True)
+                            print(f'\n[topk_weights FAIL rank={rank}] diff={tw_diff:.6e} max_abs_err={abs_err.max().item():.6e}',
+                                  flush=True)
                             # Find first few failing tokens
                             token_err = abs_err.max(dim=1).values
                             fail_tokens = (token_err > 1e-6).nonzero(as_tuple=True)[0][:5]
@@ -323,9 +324,11 @@ def test_main(args: argparse.Namespace,
                                 itr = is_token_in_rank[ft]  # [num_ranks] bool
                                 nvl_h = handle[9][ft] if handle[9] is not None else None  # send_nvl_head
                                 rdma_h = handle[8][ft] if handle[8] is not None else None  # send_rdma_head
-                                print(f'  token {ft}: is_in_rank={itr.tolist()}, '
-                                      f'nvl_head={nvl_h.tolist() if nvl_h is not None else None}, '
-                                      f'rdma_head={rdma_h.tolist() if rdma_h is not None else None}', flush=True)
+                                print(
+                                    f'  token {ft}: is_in_rank={itr.tolist()}, '
+                                    f'nvl_head={nvl_h.tolist() if nvl_h is not None else None}, '
+                                    f'rdma_head={rdma_h.tolist() if rdma_h is not None else None}',
+                                    flush=True)
                                 print(f'    combined={combined_topk_weights[ft].tolist()}, ref={ref_topk_weights[ft].tolist()}', flush=True)
                         assert tw_diff < 1e-9, f'topk_weights diff={tw_diff:.6e} on rank={rank}'
 
@@ -462,9 +465,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     nvl_bytes = int(os.environ.get('DEEP_EP_NVL_BYTES', int(2e9)))
     rdma_bytes = int(os.environ.get('DEEP_EP_RDMA_BYTES', int(1e9)))
 
-    print(f'[rank {rank}] Creating buffer: num_local_ranks={num_local_ranks}, num_nodes={num_nodes}, num_ranks={num_ranks}, nvl_bytes={nvl_bytes}, rdma_bytes={rdma_bytes}', flush=True)
+    print(
+        f'[rank {rank}] Creating buffer: num_local_ranks={num_local_ranks}, num_nodes={num_nodes}, num_ranks={num_ranks}, nvl_bytes={nvl_bytes}, rdma_bytes={rdma_bytes}',
+        flush=True)
     if use_mpi_comm:
-        buffer = deep_ep.Buffer(group=None, comm=comm,
+        buffer = deep_ep.Buffer(group=None,
+                                comm=comm,
                                 num_nvl_bytes=nvl_bytes,
                                 num_rdma_bytes=rdma_bytes,
                                 low_latency_mode=args.test_ll_compatibility,
@@ -517,6 +523,11 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if use_mpi_comm:
         from mpi4py import MPI
         MPI.Finalize()
+        # NOTE: bypass static destructors in the SYCL/iSHMEM stack that abort
+        # post-finalize on the XPU build. All validation has completed by here.
+        if local_rank == 0:
+            print('[teardown] all done, exiting cleanly', flush=True)
+        os._exit(0)
     else:
         dist.barrier()
         dist.destroy_process_group()
