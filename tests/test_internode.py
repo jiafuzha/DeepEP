@@ -492,11 +492,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     except Exception:
         pass
     dist.destroy_process_group()
-    # NOTE: bypass static destructors in the SYCL/iSHMEM stack that abort
-    # post-finalize on the XPU build. All validation has completed by here.
     if local_rank == 0:
         print('[teardown] all done, exiting cleanly', flush=True)
-    os._exit(0)
 
 
 if __name__ == '__main__':
