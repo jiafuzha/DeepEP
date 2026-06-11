@@ -34,12 +34,18 @@ case "$HOSTNAME_VAL" in
     *node1*|*node-1*)
         IFACES=(ens5008f0np0 ens5008f1np1)
         export ZE_AFFINITY_MASK=6,7
+        NODE_RANK=1
         ;;
     *)
         IFACES=(ens4013f0np0 ens4013f1np1)
         export ZE_AFFINITY_MASK=4,5
+        NODE_RANK=0
         ;;
 esac
+
+# init_dist (tests/utils.py) reads RANK as the *node* rank (0..WORLD_SIZE-1).
+# WORLD_SIZE is set by run.sh to the number of nodes.
+export RANK=${RANK:-$NODE_RANK}
 
 # NOTE: ISHMEM_IBGDA_NIC is intentionally NOT set here. iSHMEM auto-selects the
 # NIC closest to the chosen GPU by PCIe topology, which is correct in this

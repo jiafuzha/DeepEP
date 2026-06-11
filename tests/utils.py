@@ -39,13 +39,19 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     sig = inspect.signature(dist.init_process_group)
     backend = get_dist_backend()
+    # For XPU, register a multi-backend mapping so CPU tensors use gloo and XPU
+    # tensors use xccl in the same process group. This is required by tests
+    # that route small control-plane collectives through CPU to avoid
+    # contention between xccl and iSHMEM/IBGDA on the Level-Zero device.
+    if device_type == 'xpu' and backend == 'xccl':
+        backend = 'cpu:gloo,xpu:xccl'
     params = {
         'backend': backend,
         'init_method': f'tcp://{ip}:{port}',
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
-    if 'device_id' in sig.parameters and backend not in ('gloo', ):
+    if 'device_id' in sig.parameters and 'gloo' not in backend.split(','):
         # noinspection PyTypeChecker
         params['device_id'] = torch.device(f'{device_type}:{local_rank}')
     dist.init_process_group(**params)

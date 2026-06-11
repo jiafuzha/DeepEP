@@ -32,7 +32,9 @@ SSH_DIR="/tmp/deepep-docker-ssh"
 # DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
 DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
 DEEP_EP_RDMA_BYTES="${DEEP_EP_RDMA_BYTES:-67108864}"  # 64 MiB
-ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"  # 256 MiB
+ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-1073741824}"  # 1 GiB (xccl+iSHMEM coexist)
+
+MASTER_PORT="${MASTER_PORT:-29500}"
 
 # Test parameters (small by default for fast iteration)
 NUM_PROCESSES="${NUM_PROCESSES:-2}"   # num local ranks (= ppn = nvl_ranks)
@@ -146,10 +148,43 @@ verify_rdma() {
     return 0
 }
 
+# --- Ensure MASTER_PORT is free on all nodes (xccl rendezvous). Kill only
+#     processes holding the specific port (don't blindly kill all python). ---
+ensure_port_free() {
+    local port="$MASTER_PORT"
+    echo "===== Ensuring MASTER_PORT $port free on both nodes ====="
+    for c in deepep-node0 deepep-node1; do
+        docker exec "$c" bash -lc "
+            port=$port
+            for attempt in 1 2 3; do
+                holders=\$( (ss -lntpH 2>/dev/null || netstat -lntp 2>/dev/null | tail -n +3) \
+                           | awk -v p=\":\$port\$\" '\$4 ~ p { print }' )
+                if [ -z \"\$holders\" ]; then
+                    echo \"[$c] port \$port is free\"
+                    exit 0
+                fi
+                echo \"[$c] port \$port held by:\"
+                echo \"\$holders\"
+                pids=\$(echo \"\$holders\" | grep -oE 'pid=[0-9]+|users:\\(\\(\"[^\"]+\",pid=[0-9]+|[0-9]+/' \
+                       | grep -oE '[0-9]+' | sort -u)
+                if [ -n \"\$pids\" ]; then
+                    echo \"[$c] killing pids holding port \$port: \$pids\"
+                    kill -9 \$pids 2>/dev/null || true
+                fi
+                sleep 2
+            done
+            echo \"[$c] FAIL: port \$port still in use after 3 attempts\" >&2
+            exit 1
+        " || return 1
+    done
+    return 0
+}
+
 # --- Run DeepEP internode test: launch mpirun INSIDE node0; spawn rank on node1 via SSH ---
 run_test() {
     ensure_up
     verify_rdma || { echo "RDMA accessibility check failed; aborting test." >&2; return 1; }
+    ensure_port_free || { echo "MASTER_PORT cleanup failed; aborting test." >&2; return 1; }
 
     echo "===== RUN $TEST_SCRIPT (2 nodes x ${NUM_PROCESSES} ranks = $((NUM_PROCESSES * 2)) total) ====="
 
@@ -192,8 +227,11 @@ run_test() {
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \
                 -genv MASTER_ADDR deepep-node0 \
-                -genv MASTER_PORT 29500 \
+                -genv MASTER_PORT $MASTER_PORT \
                 -genv WORLD_SIZE 2 \
+                -genv CCL_ZE_IPC_EXCHANGE sockets \
+                -genv CCL_OP_SYNC 1 \
+                -genv TORCH_DISTRIBUTED_DEBUG OFF \
                 -launcher ssh \
                 -bootstrap-exec-args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa' \
                 $WRAPPER_PATH \
