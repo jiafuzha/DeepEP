@@ -2360,16 +2360,27 @@ void dispatch_nvl_rdma(void* recv_x,
             sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
                 auto group = item.get_group();
                 const int local_id = static_cast<int>(item.get_local_id(0));
-                if (nvl_rank == 0 && local_id == 0) {
+                // Per-WI distributed RDMA puts: each work-item owns disjoint
+                // destination channels via `dst_rdma % local_size == local_id`
+                // so no two WIs target the same destination concurrently. This
+                // pairs reliably with ishmemx_barrier_all_work_group on this
+                // iSHMEM+IBGDA stack and avoids:
+                //   - the single-WI scalar put racing with WG-collective
+                //     barrier_all completion (token undercount).
+                //   - the WG-collective put accumulating CQ state across
+                //     dispatch cycles that surfaces as DEVICE_LOST after a
+                //     few sub-tests.
+                if (nvl_rank == 0) {
+                    const int local_size = static_cast<int>(item.get_local_range(0));
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;
+                        if ((dst_rdma % local_size) != local_id) continue;
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int dst_pe = dst_rdma * num_nvl_ranks;
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                         ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
                     }
                 }
-                sycl::group_barrier(group);
                 ishmemx_barrier_all_work_group(group);
             });
     });
