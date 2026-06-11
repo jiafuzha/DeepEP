@@ -212,7 +212,7 @@ run_test() {
                 -genv ISHMEM_IB_ENABLE_IBGDA 1 \
                 -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
                 -genv ISHMEM_ENABLE_GPU_IPC 0 \
-                -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 1 \
+                -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
                 -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
