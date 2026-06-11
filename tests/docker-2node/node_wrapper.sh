@@ -60,4 +60,5 @@ export MASTER_ADDR=${MASTER_ADDR:-deepep-node0}
 
 echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK IFACE=$FI_VERBS_IFACE" >&2
 
+ulimit -c unlimited
 exec "$@"
