@@ -229,6 +229,14 @@ void quiet() {
 }
 
 void finalize() {
+    // NOTE: ishmem_finalize() in the oneAPI-2026 iSHMEM-IBGDA stack can hang
+    // after a long workload (proxy/MPI window quiesce). DeepEP teardown is
+    // process-exit anyway, so skip the global finalize by default. Set
+    // DEEP_EP_XPU_ISHMEM_FINALIZE=1 to force calling it.
+    const char* env = std::getenv("DEEP_EP_XPU_ISHMEM_FINALIZE");
+    if (env == nullptr || env[0] == 0 || env[0] == '0') {
+        return;
+    }
     int initialized = 0;
     ishmemx_query_initialized(&initialized);
     if (initialized) {
@@ -1252,11 +1260,13 @@ struct Buffer {
         TORCH_CHECK(topk_idx.has_value() == topk_weights.has_value(), "XPU internode_dispatch top-k tensors must be paired");
         check_xpu_tensor(x, "x");
         int num_scales = 0;
+        std::optional<torch::Tensor> x_scales_contig;
         if (x_scales.has_value()) {
-            check_xpu_tensor(*x_scales, "x_scales");
-            TORCH_CHECK(x_scales->scalar_type() == torch::kFloat32, "XPU internode_dispatch currently supports float32 scales only");
-            TORCH_CHECK(x_scales->dim() == 2 && x_scales->size(0) == x.size(0), "x_scales shape mismatch");
-            num_scales = static_cast<int>(x_scales->size(1));
+            TORCH_CHECK(x_scales->device().type() == c10::DeviceType::XPU, "x_scales must be an XPU tensor");
+            x_scales_contig = x_scales->contiguous();
+            TORCH_CHECK(x_scales_contig->scalar_type() == torch::kFloat32, "XPU internode_dispatch currently supports float32 scales only");
+            TORCH_CHECK(x_scales_contig->dim() == 2 && x_scales_contig->size(0) == x.size(0), "x_scales shape mismatch");
+            num_scales = static_cast<int>(x_scales_contig->size(1));
         }
         check_xpu_tensor(is_token_in_rank, "is_token_in_rank");
         if (topk_idx.has_value()) {
@@ -1313,7 +1323,7 @@ struct Buffer {
 
         auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
         auto recv_x_scales = x_scales.has_value()
-            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_scales}, x_scales->options()))
+            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_scales}, (x_scales_contig.has_value() ? x_scales_contig->options() : x_scales->options())))
             : std::optional<torch::Tensor>();
         auto recv_topk_idx = topk_idx.has_value()
             ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, topk_idx->options()))
@@ -1353,7 +1363,7 @@ struct Buffer {
                                     recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
                                     recv_src_meta->data_ptr(),
                                     x.data_ptr(),
-                                    x_scales.has_value() ? x_scales->data_ptr<float>() : nullptr,
+                                    x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
                                     topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
                                     topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
                                     send_rdma_head->data_ptr<int>(),
@@ -1389,7 +1399,7 @@ struct Buffer {
                                          cached_mode ? nullptr : recv_src_meta->data_ptr(),
                                          rdma_buffer_ptr,
                                          x.data_ptr(),
-                                         x_scales.has_value() ? x_scales->data_ptr<float>() : nullptr,
+                                         x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
                                          topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
                                          topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
                                          cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
@@ -1427,7 +1437,7 @@ struct Buffer {
                                 cached_mode ? nullptr : recv_src_meta->data_ptr(),
                                 rdma_buffer_ptr,
                                 x.data_ptr(),
-                                x_scales.has_value() ? x_scales->data_ptr<float>() : nullptr,
+                                x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
                                 topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
                                 topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
                                 cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),

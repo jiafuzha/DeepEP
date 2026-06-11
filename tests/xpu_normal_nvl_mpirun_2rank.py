@@ -132,8 +132,7 @@ def main():
                 max_abs = (actual_x - expected_x).abs().max().item()
                 actual_meta = recv_meta[row].cpu().tolist()
                 print(f"[rank {rank}] dispatch src={src_rank} token={token} row={row} "
-                      f"meta={actual_meta} max_abs={max_abs}",
-                      flush=True)
+                      f"meta={actual_meta} max_abs={max_abs}", flush=True)
                 assert actual_meta == [src_rank, token], f"meta mismatch: {actual_meta} != [{src_rank}, {token}]"
                 assert max_abs == 0.0, f"dispatch payload mismatch: max_abs={max_abs}"
 
