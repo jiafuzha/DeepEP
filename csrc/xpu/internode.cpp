@@ -2359,29 +2359,19 @@ void dispatch_nvl_rdma(void* recv_x,
         cgh.parallel_for<CombinedDispatchRdmaPutKernel>(
             sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
                 auto group = item.get_group();
-                // WG-collective RDMA puts: all WIs in the group cooperate on
-                // each put. Pairs reliably with ishmemx_barrier_all_work_group
-                // because that barrier's WG-cooperative quiet (in iSHMEM, see
-                // src/collectives/barrier.cpp) drains exactly the WG-collective
-                // NBI puts issued by this group.
-                //
-                // We previously tried (a) single-WI scalar ishmem_putmem_nbi
-                // and (b) per-WI distributed scalar puts. Both led to RDMA-
-                // half token undercount: the scalar NBI put issued from a
-                // divergent control-flow lane does not pair with the WG-
-                // collective barrier_all in this iSHMEM+IBGDA stack (the
-                // barrier's leader-only quiet polls per-PE CQs but the scalar
-                // put's SND_DBR/UAR doorbell write from a non-leader lane
-                // races with the barrier completion). The WG-collective put
-                // is the architecturally correct choice and matches the
-                // combine path (lines ~3060).
-                if (nvl_rank == 0) {
+                // Mirror the original CUDA implementation: warp-collective
+                // nvshmemi_ibgda_put_nbi_warp.  iSHMEM has no warp variant,
+                // so use the SCALAR ishmem_putmem_nbi from a single WI
+                // (group leader).  The WG-collective NBI put exhibits an
+                // iter-0 RDMA-half delivery race; the scalar API matches
+                // CUDA's per-warp issue pattern and avoids that race.
+                if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int dst_pe = dst_rdma * num_nvl_ranks;
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        ishmemx_putmem_nbi_work_group(dst_region, region, rdma_region_bytes, dst_pe, group);
+                        ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
                     }
                 }
                 ishmemx_barrier_all_work_group(group);
@@ -3066,7 +3056,14 @@ void combine_nvl_rdma(DataType type,
 
                     const int dst_pe = dst_rdma * num_nvl_ranks;
                     auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                    ishmemx_putmem_nbi_work_group(dst_region, region, rdma_region_bytes, dst_pe, group);
+                    // Mirror original CUDA warp-collective put. iSHMEM lacks a
+                    // warp variant, so use scalar ishmem_putmem_nbi from the
+                    // group leader (matches CUDA's per-warp issue cadence and
+                    // avoids the WG-collective NBI delivery race).
+                    if (local_id == 0) {
+                        ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
+                    }
+                    sycl::group_barrier(group);
                 }
                 }  // end if (is_puter)
                 // Cross-PE sync to drain pending RDMA puts and make them visible at
