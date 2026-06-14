@@ -2277,6 +2277,10 @@ void dispatch_nvl_rdma(void* recv_x,
                     my_channel_counts[d * kPackNumChannels + c] = cumulative;
                 }
             }
+            // Release fence: flush this rank's packed send buffer (payload, meta,
+            // is_token_in_rank, counts) across PCIe so the other NVL peers'
+            // Assemble kernel reads the up-to-date data, not stale cache.
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     });
     queue.wait();
@@ -2293,6 +2297,9 @@ void dispatch_nvl_rdma(void* recv_x,
             if (nvl_rank != 0) {
                 return;
             }
+            // Acquire fence: order reads of the NVL peers' packed send buffers
+            // (IPC-mapped remote GPU memory) after their Pack release fence.
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                 auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                 auto* rdma_x = region;
@@ -2384,6 +2391,13 @@ void dispatch_nvl_rdma(void* recv_x,
             if (nvl_rank != 0) {
                 return;
             }
+            // Acquire fence: the RDMA receive regions (rdma_count / rdma_m /
+            // rdma_x at rdma_base + src_rdma*rdma_region_bytes) were written by
+            // the remote NIC into the local symmetric heap. Order all reads of
+            // that data after the iSHMEM barrier so this kernel observes the
+            // NIC-delivered bytes, not stale GPU L2 cache (the RDMA-half
+            // visibility race).
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
             for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                 auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
@@ -2447,6 +2461,11 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
 
+                // Flush all forwarded payload writes to the remote NVL peers
+                // (IPC-mapped GPU memory across PCIe) BEFORE publishing the
+                // per-source fwd_counts signal, mirroring CUDA's
+                // st_release_sys_global on the NVL channel tail.
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                     auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                     auto* fwd_base = peer_buf + fwd_base_offset;
@@ -2454,6 +2473,10 @@ void dispatch_nvl_rdma(void* recv_x,
                     fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
                 }
             }
+            // Final release fence: ensure every payload + count write issued by
+            // the NVL leader is flushed across PCIe to the remote peers before
+            // this kernel retires and the forward barrier runs.
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     });
     queue.wait();
@@ -2467,6 +2490,11 @@ void dispatch_nvl_rdma(void* recv_x,
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchAssembleKernel>([=]() {
+            // Acquire fence: invalidate any stale local cache and order all
+            // subsequent reads of the NVL peers' forwarded/send buffers
+            // (IPC-mapped remote GPU memory) after the leader's release fence,
+            // mirroring CUDA's ld_acquire_sys_global on the NVL channel tail.
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             constexpr int kMaxRanks = 64;
             int per_src_count[kMaxRanks] = {0};
             int cursors[kMaxRanks] = {0};
@@ -2927,6 +2955,9 @@ void combine_nvl_rdma(DataType type,
                 }
                 combine_meta[t] = sm[t];
             }
+            // Release fence: flush this rank's packed combine buffer across PCIe
+            // so peers' RdmaSend reduction reads up-to-date payload.
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     });
     queue.wait();
@@ -2940,6 +2971,9 @@ void combine_nvl_rdma(DataType type,
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineRdmaSendKernel<dtype_t>>([=]() {
+            // Acquire fence: order reads of the NVL peers' packed combine
+            // buffers (IPC-mapped remote GPU memory) after their release fence.
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             // Compute per-peer topk_weights offset based on each peer's actual
             // num_tokens. The NvlBufferLayout offsets after send_x_offset depend
             // on num_tokens, so using this rank's layout to read from a peer with
@@ -3079,6 +3113,9 @@ void combine_nvl_rdma(DataType type,
             if (nvl_rank != 0) {
                 return;
             }
+            // Acquire fence: order reads of the NIC-delivered RDMA receive
+            // regions after the iSHMEM barrier (RDMA-half visibility race).
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
             for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                 auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
@@ -3127,6 +3164,10 @@ void combine_nvl_rdma(DataType type,
                     fwd_meta[dst_idx] = SourceMeta{src_rdma, rdma_recv_pos[i], target_nvl};
                 }
 
+                // Flush forwarded payload writes to the remote NVL peers
+                // (IPC-mapped GPU memory across PCIe) BEFORE publishing the
+                // fwd_counts signal (CUDA st_release_sys_global equivalent).
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                     auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                     auto* fwd_base = peer_buf + fwd_base_offset;
@@ -3134,6 +3175,9 @@ void combine_nvl_rdma(DataType type,
                     fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
                 }
             }
+            // Final release fence so all payload + count writes are flushed
+            // across PCIe to the remote peers before the forward barrier runs.
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     });
     queue.wait();
@@ -3147,6 +3191,10 @@ void combine_nvl_rdma(DataType type,
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineReduceKernel<dtype_t>>([=]() {
+            // Acquire fence: order all subsequent reads of this rank's
+            // forwarded NVL buffer (written by the leader across PCIe) after
+            // the leader's release fence (CUDA ld_acquire_sys_global equivalent).
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
             auto* fwd_base = my_buf + fwd_base_offset;
             auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
