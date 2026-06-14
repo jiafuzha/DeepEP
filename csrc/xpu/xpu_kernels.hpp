@@ -29,6 +29,42 @@ SYCL_EXTERNAL inline void plain_store(T* ptr, T value) {
 
 SYCL_EXTERNAL inline void visa_spin_hint() {}
 
+// Uncacheable (UC) load that bypasses GPU L1/L2/L3 caches, mirroring iSHMEM's
+// ishmemi_ibgda_uc_load*. NIC RDMA DMA writes land in VRAM/host memory but the
+// GPU caches are NOT coherent with external PCIe-P2P writes; since the iSHMEM
+// symmetric heap addresses are reused every iteration, a plain (cached) load
+// can return stale lines (even the zero-init bytes) instead of the freshly
+// NIC-delivered data. Reading the RDMA receive region through this UC load
+// forces the GPU to fetch the current bytes from memory.
+template <typename T>
+SYCL_EXTERNAL inline T uc_load(const T* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    T out;
+    if constexpr (sizeof(T) == 1) {
+        uint8_t v = *reinterpret_cast<const volatile uint8_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint8_t*>(const_cast<T*>(ptr)), "sycl-cache-read-hint", 0x7));
+        __builtin_memcpy(&out, &v, 1);
+    } else if constexpr (sizeof(T) == 2) {
+        uint16_t v = *reinterpret_cast<const volatile uint16_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint16_t*>(const_cast<T*>(ptr)), "sycl-cache-read-hint", 0x7));
+        __builtin_memcpy(&out, &v, 2);
+    } else if constexpr (sizeof(T) == 4) {
+        uint32_t v = *reinterpret_cast<const volatile uint32_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint32_t*>(const_cast<T*>(ptr)), "sycl-cache-read-hint", 0x7));
+        __builtin_memcpy(&out, &v, 4);
+    } else if constexpr (sizeof(T) == 8) {
+        uint64_t v = *reinterpret_cast<const volatile uint64_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint64_t*>(const_cast<T*>(ptr)), "sycl-cache-read-hint", 0x7));
+        __builtin_memcpy(&out, &v, 8);
+    } else {
+        out = *ptr;
+    }
+    return out;
+#else
+    return *ptr;
+#endif
+}
+
 SYCL_EXTERNAL inline void get_channel_task_range(
     int num_tokens, int num_channels, int channel_id, int& token_start_idx, int& token_end_idx) {
     int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
