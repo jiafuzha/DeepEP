@@ -2367,18 +2367,45 @@ void dispatch_nvl_rdma(void* recv_x,
             sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
                 auto group = item.get_group();
                 // Mirror the original CUDA implementation: warp-collective
-                // nvshmemi_ibgda_put_nbi_warp.  iSHMEM has no warp variant,
-                // so use the SCALAR ishmem_putmem_nbi from a single WI
-                // (group leader).  The WG-collective NBI put exhibits an
-                // iter-0 RDMA-half delivery race; the scalar API matches
-                // CUDA's per-warp issue pattern and avoids that race.
+                // nvshmemi_ibgda_put_nbi_warp.  iSHMEM has no warp variant, so
+                // use the SCALAR BLOCKING ishmem_putmem from a single WI (group
+                // leader).  The blocking put polls the IBGDA CQ until the NIC
+                // confirms the remote write is ACK'd, guaranteeing the data has
+                // landed in the destination PE's symmetric heap before return.
+                //
+                // The non-blocking ishmem_putmem_nbi + barrier_all path relied
+                // on the barrier's device_quiet to drain the SQ, but that quiet
+                // can return early (it reads SND_DBR which may lag the just-
+                // issued doorbell), so FwdWrite on the remote PE could read
+                // rdma_count while the RDMA write was still in flight -> a
+                // non-deterministic RDMA-half/off-by-N token undercount. The
+                // blocking put removes that race at the source.
+                //
+                // Defence-in-depth for the RDMA-Write-to-GPU-VRAM visibility
+                // gap (a posted PCIe-P2P write may not have landed in the
+                // receiver's VRAM when the sender's RC ACK / barrier release
+                // fires, observed as an iter-0/QP-warmup race): stamp each of
+                // MY receive regions' count field with a sentinel BEFORE the
+                // exchange, so FwdWrite can spin (UC load) until the real
+                // count actually arrives instead of trusting the barrier.
+                constexpr int kRdmaCountSentinel = -424242;
+                if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
+                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                        if (src_rdma == my_rdma_rank) continue;
+                        auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
+                        *reinterpret_cast<int*>(rcv + rdma_count_offset) = kRdmaCountSentinel;
+                    }
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                }
+                ishmemx_barrier_all_work_group(group);
+
                 if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int dst_pe = dst_rdma * num_nvl_ranks;
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
+                        ishmem_putmem(dst_region, region, rdma_region_bytes, dst_pe);
                     }
                 }
                 ishmemx_barrier_all_work_group(group);
@@ -2424,9 +2451,30 @@ void dispatch_nvl_rdma(void* recv_x,
                 auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
                 auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
                 auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                const int count = *rdma_count;
+                // Bounded spin (UC load) to let the NIC-delivered count replace
+                // the pre-exchange sentinel, closing the RDMA-Write-to-VRAM
+                // landing race that the blocking put + barrier alone don't fully
+                // cover on the iter-0/QP-warmup path. Bounded so a genuinely
+                // dropped write degrades to an undercount (recoverable) instead
+                // of hanging the kernel. The real count is always >= 0.
+                constexpr int kRdmaCountSentinel = -424242;
+                constexpr unsigned long kRdmaSpinLimit = 2000000ul;
+                int count = uc_load(rdma_count);
+                for (unsigned long spins = 0; count == kRdmaCountSentinel && spins < kRdmaSpinLimit; ++spins) {
+                    if ((spins & 0x3FFF) == 0) {
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                    }
+                    count = uc_load(rdma_count);
+                }
+                if (count == kRdmaCountSentinel) {
+                    count = 0;  // dropped write: degrade to undercount, not a hang
+                }
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                 for (int i = 0; i < count; ++i) {
-                    const SourceMeta sm = rdma_m[i];
+                    SourceMeta sm;
+                    sm.src_rdma_rank = uc_load(&rdma_m[i].src_rdma_rank);
+                    sm.is_token_in_nvl_rank_bits = uc_load(&rdma_m[i].is_token_in_nvl_rank_bits);
+                    sm.src_nvl_rank = uc_load(&rdma_m[i].src_nvl_rank);
                     for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                         if (((sm.is_token_in_nvl_rank_bits >> peer) & 1) == 0) {
                             continue;
@@ -2442,20 +2490,20 @@ void dispatch_nvl_rdma(void* recv_x,
                         auto* src_row = rdma_x + static_cast<size_t>(i) * row_bytes;
                         auto* dst_row = fwd_x + static_cast<size_t>(dst_idx) * row_bytes;
                         for (size_t b = 0; b < row_bytes; ++b) {
-                            dst_row[b] = src_row[b];
+                            dst_row[b] = uc_load(&src_row[b]);
                         }
                         SourceMeta fwd_sm = sm;
                         fwd_sm.is_token_in_nvl_rank_bits = i;
                         fwd_m[dst_idx] = fwd_sm;
                         if (topk_idx != nullptr) {
                             for (int k = 0; k < num_topk; ++k) {
-                                fwd_idx[dst_idx * num_topk + k] = rdma_idx[i * num_topk + k];
-                                fwd_wt[dst_idx * num_topk + k] = rdma_wt[i * num_topk + k];
+                                fwd_idx[dst_idx * num_topk + k] = uc_load(&rdma_idx[i * num_topk + k]);
+                                fwd_wt[dst_idx * num_topk + k] = uc_load(&rdma_wt[i * num_topk + k]);
                             }
                         }
                         if (x_scales != nullptr) {
                             for (int s = 0; s < num_scales; ++s) {
-                                fwd_scales[dst_idx * num_scales + s] = rdma_scales[i * num_scales + s];
+                                fwd_scales[dst_idx * num_scales + s] = uc_load(&rdma_scales[i * num_scales + s]);
                             }
                         }
                     }
@@ -3043,6 +3091,21 @@ void combine_nvl_rdma(DataType type,
                     return (off + alignof(float) - 1) / alignof(float) * alignof(float);
                 };
 
+                // Stamp my receive regions' count with a sentinel BEFORE the
+                // exchange so CombineFwdWrite can spin until the real count
+                // lands (RDMA-Write-to-VRAM visibility defence-in-depth, same
+                // as the dispatch RdmaPut path).
+                constexpr int kRdmaCountSentinel = -424242;
+                if (is_puter && local_id == 0) {
+                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                        if (src_rdma == my_rdma_rank) continue;
+                        auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
+                        *reinterpret_cast<int*>(rcv + rdma_count_offset) = kRdmaCountSentinel;
+                    }
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                }
+                ishmemx_barrier_all_work_group(group);
+
                 if (is_puter) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                     auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
@@ -3091,11 +3154,13 @@ void combine_nvl_rdma(DataType type,
                     const int dst_pe = dst_rdma * num_nvl_ranks;
                     auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                     // Mirror original CUDA warp-collective put. iSHMEM lacks a
-                    // warp variant, so use scalar ishmem_putmem_nbi from the
-                    // group leader (matches CUDA's per-warp issue cadence and
-                    // avoids the WG-collective NBI delivery race).
+                    // warp variant, so use scalar BLOCKING ishmem_putmem from the
+                    // group leader. Blocking poll-to-CQE guarantees the combine
+                    // payload has landed in the destination PE's heap before
+                    // return, removing the early-quiet race that caused the
+                    // RDMA-half undercount (see dispatch RdmaPut for details).
                     if (local_id == 0) {
-                        ishmem_putmem_nbi(dst_region, region, rdma_region_bytes, dst_pe);
+                        ishmem_putmem(dst_region, region, rdma_region_bytes, dst_pe);
                     }
                     sycl::group_barrier(group);
                 }
@@ -3141,9 +3206,23 @@ void combine_nvl_rdma(DataType type,
                 auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
                 auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
                 auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                const int count = *rdma_count;
+                // Bounded UC spin until the NIC-delivered count replaces the
+                // sentinel (RDMA-Write-to-VRAM landing race; same as dispatch).
+                constexpr int kRdmaCountSentinel = -424242;
+                constexpr unsigned long kRdmaSpinLimit = 2000000ul;
+                int count = uc_load(rdma_count);
+                for (unsigned long spins = 0; count == kRdmaCountSentinel && spins < kRdmaSpinLimit; ++spins) {
+                    if ((spins & 0x3FFF) == 0) {
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                    }
+                    count = uc_load(rdma_count);
+                }
+                if (count == kRdmaCountSentinel) {
+                    count = 0;  // dropped write: degrade gracefully, no hang
+                }
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                 for (int i = 0; i < count; ++i) {
-                    const int target_nvl = rdma_src_nvl[i];
+                    const int target_nvl = uc_load(&rdma_src_nvl[i]);
                     if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
                         continue;
                     }
@@ -3154,14 +3233,14 @@ void combine_nvl_rdma(DataType type,
                     auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
                     const int dst_idx = peer_offsets[target_nvl]++;
                     for (int h = 0; h < hidden; ++h) {
-                        fwd_x[dst_idx * hidden + h] = rdma_x[i * hidden + h];
+                        fwd_x[dst_idx * hidden + h] = uc_load(&rdma_x[i * hidden + h]);
                     }
                     if (combined_topk_weights != nullptr) {
                         for (int k = 0; k < num_topk; ++k) {
-                            fwd_topk[dst_idx * num_topk + k] = rdma_wt[i * num_topk + k];
+                            fwd_topk[dst_idx * num_topk + k] = uc_load(&rdma_wt[i * num_topk + k]);
                         }
                     }
-                    fwd_meta[dst_idx] = SourceMeta{src_rdma, rdma_recv_pos[i], target_nvl};
+                    fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), target_nvl};
                 }
 
                 // Flush forwarded payload writes to the remote NVL peers
