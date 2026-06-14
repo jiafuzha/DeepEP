@@ -2393,7 +2393,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                         if (src_rdma == my_rdma_rank) continue;
                         auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                        *reinterpret_cast<int*>(rcv + rdma_count_offset) = kRdmaCountSentinel;
+                        uc_store(reinterpret_cast<int*>(rcv + rdma_count_offset), kRdmaCountSentinel);
                     }
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }
@@ -3100,7 +3100,7 @@ void combine_nvl_rdma(DataType type,
                     for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                         if (src_rdma == my_rdma_rank) continue;
                         auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                        *reinterpret_cast<int*>(rcv + rdma_count_offset) = kRdmaCountSentinel;
+                        uc_store(reinterpret_cast<int*>(rcv + rdma_count_offset), kRdmaCountSentinel);
                     }
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }

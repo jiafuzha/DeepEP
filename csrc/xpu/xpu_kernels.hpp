@@ -65,6 +65,26 @@ SYCL_EXTERNAL inline T uc_load(const T* ptr) {
 #endif
 }
 
+// Uncached (write-through) store, paired with uc_load. Writing the RDMA
+// receive-region sentinel through this (instead of a cached store) guarantees
+// the UC-load reader observes the sentinel, not a stale cached line from a
+// previous iteration's count value.
+template <typename T>
+SYCL_EXTERNAL inline void uc_store(T* ptr, T value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    if constexpr (sizeof(T) == 4) {
+        uint32_t v;
+        __builtin_memcpy(&v, &value, 4);
+        *reinterpret_cast<volatile uint32_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint32_t*>(ptr), "sycl-cache-write-hint", 0x7)) = v;
+    } else {
+        *ptr = value;
+    }
+#else
+    *ptr = value;
+#endif
+}
+
 SYCL_EXTERNAL inline void get_channel_task_range(
     int num_tokens, int num_channels, int channel_id, int& token_start_idx, int& token_end_idx) {
     int num_tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
