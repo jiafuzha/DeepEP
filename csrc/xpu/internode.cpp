@@ -237,6 +237,55 @@ size_t align_offset(size_t offset, size_t alignment) {
     return (offset + alignment - 1) / alignment * alignment;
 }
 
+namespace {
+class QpWarmupKernel;
+}  // namespace
+
+// Warm up the IBGDA QPs / RC connections to every other RDMA peer before the
+// first real dispatch.  On a cold QP the first device-issued RDMA write can be
+// dropped (no PCIe TLP reaches the NIC until the connection is established),
+// which surfaced as an iter-0 RDMA-half undercount / DEVICE_LOST.  Issuing a
+// few small blocking puts (poll-to-CQE) here establishes the connection state
+// so the first dispatch delivers reliably.
+void warmup_qps(void* rdma_buffer_ptr,
+                int my_rdma_rank,
+                int num_rdma_ranks,
+                int num_nvl_ranks,
+                int nvl_rank,
+                sycl::queue& queue) {
+    if (num_rdma_ranks <= 1 || rdma_buffer_ptr == nullptr) {
+        return;
+    }
+    constexpr int kWarmupRounds = 4;
+    auto* base = static_cast<uint8_t*>(rdma_buffer_ptr);
+    const int rdma_ranks = num_rdma_ranks;
+    const int nvl_ranks = num_nvl_ranks;
+    const int my_rdma = my_rdma_rank;
+    const int my_nvl = nvl_rank;
+    for (int round = 0; round < kWarmupRounds; ++round) {
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<QpWarmupKernel>(
+                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto group = item.get_group();
+                    if (my_nvl == 0 && group.get_local_linear_id() == 0) {
+                        // Use the tail of the RDMA buffer as scratch so the
+                        // warmup never collides with real dispatch regions.
+                        auto* src = base;
+                        auto* dst = base;
+                        for (int dst_rdma = 0; dst_rdma < rdma_ranks; ++dst_rdma) {
+                            if (dst_rdma == my_rdma) continue;
+                            const int dst_pe = dst_rdma * nvl_ranks;
+                            ishmem_putmem(dst, src, 128, dst_pe);
+                        }
+                    }
+                    ishmemx_barrier_all_work_group(group);
+                });
+        });
+        queue.wait();
+    }
+}
+
 void dispatch(void* recv_x,
               float* recv_x_scales,
               topk_idx_t* recv_topk_idx,

@@ -657,6 +657,12 @@ struct Buffer {
             auto& queue = comm_stream.queue();
             queue.memset(rdma_buffer_ptr, 0, num_rdma_bytes).wait();
             internode::barrier();
+            // Warm up the IBGDA RC connections so the first dispatch's RDMA
+            // writes are not dropped on a cold QP (iter-0 undercount/DEVICE_LOST).
+            if (num_rdma_ranks > 1) {
+                internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
+                internode::barrier();
+            }
         }
         available = true;
     }
