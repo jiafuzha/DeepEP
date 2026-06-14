@@ -13,7 +13,23 @@
 x-common: &common
   image: jiafuzha-ishmem-ibgda:latest
   privileged: true
-  ipc: host
+  # NOTE: do NOT use `ipc: host`. This is a 2-NODE SIMULATION on one physical
+  # host; `ipc: host` shares /dev/shm + SysV IPC across BOTH simulated nodes and
+  # the host, so the two "nodes" collide on shared-memory IPC objects (MPI shm:
+  # fabric, oneCCL/xccl intra-node shm, and PSM3 NIC-affinity shm/semaphores).
+  # Worse, a SIGKILL'd run (timeout/DEVICE_LOST) leaks PSM3's named semaphore
+  # (sem.psm3_nic_affinity_shm_rw_mutex) into the shared, persistent /dev/shm,
+  # and the next run blocks forever acquiring it -> intermittent bootstrap hang.
+  # A private per-container IPC namespace gives each simulated node its own
+  # /dev/shm (matching a real cluster) and is cleared on container restart.
+  # Within-node Level-Zero IPC uses dma-buf FD passing (SCM_RIGHTS over Unix
+  # sockets), which is IPC-namespace-independent, so this does not break it.
+  shm_size: '16gb'
+  # The blanket `/dev:/dev` mount below shares the host's /dev/shm into both
+  # containers; layer a private tmpfs over /dev/shm so each simulated node has
+  # its own POSIX-shm namespace (PSM3/oneCCL/MPI segments + named semaphores).
+  tmpfs:
+    - /dev/shm:exec,size=16g
   ulimits:
     memlock:
       soft: -1

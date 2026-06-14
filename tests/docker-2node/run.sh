@@ -148,6 +148,27 @@ verify_rdma() {
     return 0
 }
 
+# --- Clean leaked IPC state (PSM3/oneCCL/gloo named semaphores + shm) left in
+#     /dev/shm by a previously SIGKILL'd run. PSM3 locks a named POSIX semaphore
+#     (sem.psm3_nic_affinity_shm_rw_mutex.*) during init; if a process is killed
+#     while holding it (e.g. `timeout mpirun` on a hang/DEVICE_LOST), the next
+#     run blocks FOREVER acquiring the same named semaphore -> intermittent
+#     bootstrap/all_gather hang. With `ipc: host` the shared /dev/shm makes the
+#     leak persist across runs and poison BOTH nodes, so we must scrub it first.
+clean_ipc_state() {
+    echo "===== Cleaning leaked IPC state (/dev/shm PSM3/CCL sems) ====="
+    for c in deepep-node0 deepep-node1; do
+        docker exec "$c" bash -lc '
+            rm -f /dev/shm/sem.psm3* /dev/shm/psm3_* 2>/dev/null || true
+            rm -f /dev/shm/sem.ishmem* /dev/shm/ishmem* 2>/dev/null || true
+            rm -f /dev/shm/*oneccl* /dev/shm/*ccl_* /dev/shm/sem.*ccl* 2>/dev/null || true
+            rm -f /dev/shm/gloo* /dev/shm/sem.gloo* 2>/dev/null || true
+            rm -f /tmp/deep_ep_xpu_ipc_*.sock 2>/dev/null || true
+        ' 2>/dev/null || true
+    done
+    return 0
+}
+
 # --- Ensure MASTER_PORT is free on all nodes (xccl rendezvous). Kill only
 #     processes holding the specific port (don't blindly kill all python). ---
 ensure_port_free() {
@@ -184,6 +205,7 @@ ensure_port_free() {
 run_test() {
     ensure_up
     verify_rdma || { echo "RDMA accessibility check failed; aborting test." >&2; return 1; }
+    clean_ipc_state
     ensure_port_free || { echo "MASTER_PORT cleanup failed; aborting test." >&2; return 1; }
 
     echo "===== RUN $TEST_SCRIPT (2 nodes x ${NUM_PROCESSES} ranks = $((NUM_PROCESSES * 2)) total) ====="
