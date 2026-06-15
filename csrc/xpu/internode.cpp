@@ -2454,7 +2454,21 @@ void dispatch_nvl_rdma(void* recv_x,
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int dst_pe = dst_rdma * num_nvl_ranks;
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        ishmem_putmem(dst_region, region, rdma_region_bytes, dst_pe);
+                        // Split-put for landing-race elimination: write the
+                        // DATA portion (everything before the count field)
+                        // first, then write the COUNT word alone. Both are
+                        // blocking, on the same QP. RC + same-QP ordering
+                        // guarantees the second write's bytes only commit
+                        // to the destination memory AFTER the first write's
+                        // bytes are committed. Receiver's count!=sentinel
+                        // check then becomes a true "all data has landed"
+                        // flag instead of an "ACK seen" flag, eliminating
+                        // the RDMA-Write-to-VRAM byte-level landing race
+                        // that caused the residual ~1/6 dispatch undercount.
+                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                        ishmem_putmem(dst_region + rdma_count_offset,
+                                      region + rdma_count_offset,
+                                      sizeof(int), dst_pe);
                     }
                 }
                 ishmemx_barrier_all_work_group(group);
@@ -3202,14 +3216,18 @@ void combine_nvl_rdma(DataType type,
 
                     const int dst_pe = dst_rdma * num_nvl_ranks;
                     auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                    // Mirror original CUDA warp-collective put. iSHMEM lacks a
-                    // warp variant, so use scalar BLOCKING ishmem_putmem from the
-                    // group leader. Blocking poll-to-CQE guarantees the combine
-                    // payload has landed in the destination PE's heap before
-                    // return, removing the early-quiet race that caused the
-                    // RDMA-half undercount (see dispatch RdmaPut for details).
+                    // Split-put for landing-race elimination (see dispatch
+                    // RdmaPut for full rationale). Two sequential blocking
+                    // puts on the same QP: data first, then count alone.
+                    // RC ordering ensures the count word only commits AFTER
+                    // every data byte has been committed at the destination,
+                    // so the receiver's count!=sentinel check definitively
+                    // means all data has landed.
                     if (local_id == 0) {
-                        ishmem_putmem(dst_region, region, rdma_region_bytes, dst_pe);
+                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                        ishmem_putmem(dst_region + rdma_count_offset,
+                                      region + rdma_count_offset,
+                                      sizeof(int), dst_pe);
                     }
                     sycl::group_barrier(group);
                 }
