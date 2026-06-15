@@ -270,7 +270,9 @@ void warmup_qps(void* rdma_buffer_ptr,
     const int nvl_ranks = num_nvl_ranks;
     const int my_rdma = my_rdma_rank;
     const int my_nvl = nvl_rank;
-    const bool log = (my_rdma == 0 && my_nvl == 0) && (std::getenv("DEEP_EP_TIME_WARMUP") != nullptr);
+    const char* twenv = std::getenv("DEEP_EP_TIME_WARMUP");
+    const bool log = (my_rdma == 0 && my_nvl == 0) && (twenv != nullptr && twenv[0] != '\0');
+
     for (int round = 0; round < kWarmupRounds; ++round) {
         auto t0 = std::chrono::steady_clock::now();
         queue.submit([&](sycl::handler& cgh) {

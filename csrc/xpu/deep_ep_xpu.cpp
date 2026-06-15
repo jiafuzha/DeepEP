@@ -666,7 +666,8 @@ struct Buffer {
                 auto _wu_t1 = std::chrono::steady_clock::now();
                 internode::barrier();
                 auto _wu_t2 = std::chrono::steady_clock::now();
-                if (rdma_rank == 0 && nvl_rank == 0 && std::getenv("DEEP_EP_TIME_WARMUP") != nullptr) {
+                const char* twenv = std::getenv("DEEP_EP_TIME_WARMUP");
+                if (rdma_rank == 0 && nvl_rank == 0 && twenv != nullptr && twenv[0] != '\0') {
                     double wu_ms = std::chrono::duration<double, std::milli>(_wu_t1 - _wu_t0).count();
                     double br_ms = std::chrono::duration<double, std::milli>(_wu_t2 - _wu_t1).count();
                     std::fprintf(stderr,

@@ -221,6 +221,7 @@ run_test() {
         -e ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
+        -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
         deepep-node0 \
         bash -lc "
             source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
@@ -245,6 +246,7 @@ run_test() {
                 -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
+                -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \
