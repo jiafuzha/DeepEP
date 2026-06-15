@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -660,8 +661,18 @@ struct Buffer {
             // Warm up the IBGDA RC connections so the first dispatch's RDMA
             // writes are not dropped on a cold QP (iter-0 undercount/DEVICE_LOST).
             if (num_rdma_ranks > 1) {
+                auto _wu_t0 = std::chrono::steady_clock::now();
                 internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
+                auto _wu_t1 = std::chrono::steady_clock::now();
                 internode::barrier();
+                auto _wu_t2 = std::chrono::steady_clock::now();
+                if (rdma_rank == 0 && nvl_rank == 0 && std::getenv("DEEP_EP_TIME_WARMUP") != nullptr) {
+                    double wu_ms = std::chrono::duration<double, std::milli>(_wu_t1 - _wu_t0).count();
+                    double br_ms = std::chrono::duration<double, std::milli>(_wu_t2 - _wu_t1).count();
+                    std::fprintf(stderr,
+                                 "[warmup_qps timing] num_rdma_ranks=%d kernel+wait=%.3f ms barrier=%.3f ms total=%.3f ms\n",
+                                 num_rdma_ranks, wu_ms, br_ms, wu_ms + br_ms);
+                }
             }
         }
         available = true;

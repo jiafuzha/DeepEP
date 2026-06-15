@@ -1,6 +1,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 
@@ -256,13 +258,21 @@ void warmup_qps(void* rdma_buffer_ptr,
     if (num_rdma_ranks <= 1 || rdma_buffer_ptr == nullptr) {
         return;
     }
-    constexpr int kWarmupRounds = 4;
+    // ONE round is sufficient: round 0 establishes the IBGDA RC connection
+    // (the cold-QP handshake) and exchanges the first WQE/CQE so subsequent
+    // dispatch puts find a warm QP.  Empirically (see [warmup_qps round N]
+    // timings) round 0 takes ~5.6s on first init while rounds 1-3 each cost
+    // ~700ms purely on ishmemx_barrier_all_work_group + kernel launch
+    // overhead with no additional QP-warming benefit.
+    constexpr int kWarmupRounds = 1;
     auto* base = static_cast<uint8_t*>(rdma_buffer_ptr);
     const int rdma_ranks = num_rdma_ranks;
     const int nvl_ranks = num_nvl_ranks;
     const int my_rdma = my_rdma_rank;
     const int my_nvl = nvl_rank;
+    const bool log = (my_rdma == 0 && my_nvl == 0) && (std::getenv("DEEP_EP_TIME_WARMUP") != nullptr);
     for (int round = 0; round < kWarmupRounds; ++round) {
+        auto t0 = std::chrono::steady_clock::now();
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<QpWarmupKernel>(
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
@@ -283,6 +293,11 @@ void warmup_qps(void* rdma_buffer_ptr,
                 });
         });
         queue.wait();
+        auto t1 = std::chrono::steady_clock::now();
+        if (log) {
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::fprintf(stderr, "[warmup_qps round %d] %.3f ms\n", round, ms);
+        }
     }
 }
 
