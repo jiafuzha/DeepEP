@@ -658,23 +658,13 @@ struct Buffer {
             auto& queue = comm_stream.queue();
             queue.memset(rdma_buffer_ptr, 0, num_rdma_bytes).wait();
             internode::barrier();
-            // Warm up the IBGDA RC connections so the first dispatch's RDMA
-            // writes are not dropped on a cold QP (iter-0 undercount/DEVICE_LOST).
-            if (num_rdma_ranks > 1) {
-                auto _wu_t0 = std::chrono::steady_clock::now();
-                internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
-                auto _wu_t1 = std::chrono::steady_clock::now();
-                internode::barrier();
-                auto _wu_t2 = std::chrono::steady_clock::now();
-                const char* twenv = std::getenv("DEEP_EP_TIME_WARMUP");
-                if (rdma_rank == 0 && nvl_rank == 0 && twenv != nullptr && twenv[0] != '\0') {
-                    double wu_ms = std::chrono::duration<double, std::milli>(_wu_t1 - _wu_t0).count();
-                    double br_ms = std::chrono::duration<double, std::milli>(_wu_t2 - _wu_t1).count();
-                    std::fprintf(stderr,
-                                 "[warmup_qps timing] num_rdma_ranks=%d kernel+wait=%.3f ms barrier=%.3f ms total=%.3f ms\n",
-                                 num_rdma_ranks, wu_ms, br_ms, wu_ms + br_ms);
-                }
-            }
+            // Cold-QP warmup removed: upstream ishmem_ibgda_integration does
+            // not implement the IBGDA fixes (UNCACHED UAR mapping, SND_DBR
+            // readback, per-GPU release fence, fast RERING, safe RERING +
+            // device-quiet) that make a single-WI cold-QP ishmem_putmem
+            // succeed. NBI puts in dispatch/combine each get their own
+            // doorbell from a leader WI; the iSHMEM proxy / barrier_all
+            // device_quiet drains them before remote PEs proceed.
         }
         available = true;
     }

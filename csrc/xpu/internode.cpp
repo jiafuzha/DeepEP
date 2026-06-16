@@ -244,67 +244,26 @@ namespace {
 class QpWarmupKernel;
 }  // namespace
 
-// Warm up the IBGDA QPs / RC connections to every other RDMA peer before the
-// first real dispatch.  On a cold QP the first device-issued RDMA write can be
-// dropped (no PCIe TLP reaches the NIC until the connection is established),
-// which surfaced as an iter-0 RDMA-half undercount / DEVICE_LOST.  Issuing a
-// few small blocking puts (poll-to-CQE) here establishes the connection state
-// so the first dispatch delivers reliably.
-void warmup_qps(void* rdma_buffer_ptr,
-                int my_rdma_rank,
-                int num_rdma_ranks,
-                int num_nvl_ranks,
-                int nvl_rank,
-                sycl::queue& queue) {
-    if (num_rdma_ranks <= 1 || rdma_buffer_ptr == nullptr) {
-        return;
-    }
-    // ONE round is sufficient: round 0 establishes the IBGDA RC connection
-    // (the cold-QP handshake) and exchanges the first WQE/CQE so subsequent
-    // dispatch puts find a warm QP.  Empirically (see [warmup_qps round N]
-    // timings) round 0 takes ~5.6s on first init while rounds 1-3 each cost
-    // ~700ms purely on ishmemx_barrier_all_work_group + kernel launch
-    // overhead with no additional QP-warming benefit.
-    constexpr int kWarmupRounds = 1;
-    auto* base = static_cast<uint8_t*>(rdma_buffer_ptr);
-    const int rdma_ranks = num_rdma_ranks;
-    const int nvl_ranks = num_nvl_ranks;
-    const int my_rdma = my_rdma_rank;
-    const int my_nvl = nvl_rank;
-    const char* twenv = std::getenv("DEEP_EP_TIME_WARMUP");
-    const bool log = (my_rdma == 0 && my_nvl == 0) && (twenv != nullptr && twenv[0] != '\0');
-
-    for (int round = 0; round < kWarmupRounds; ++round) {
-        auto t0 = std::chrono::steady_clock::now();
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<QpWarmupKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto group = item.get_group();
-                    if (my_nvl == 0 && group.get_local_linear_id() == 0) {
-                        // Use the tail of the RDMA buffer as scratch so the
-                        // warmup never collides with real dispatch regions.
-                        auto* src = base;
-                        auto* dst = base;
-                        for (int dst_rdma = 0; dst_rdma < rdma_ranks; ++dst_rdma) {
-                            if (dst_rdma == my_rdma) continue;
-                            const int dst_pe = dst_rdma * nvl_ranks;
-                            ishmem_putmem(dst, src, 128, dst_pe);
-                        }
-                    }
-                    sycl::group_barrier(group);
-                    if (group.leader()) ishmem_barrier_all();
-                    sycl::group_barrier(group);
-                });
-        });
-        queue.wait();
-        auto t1 = std::chrono::steady_clock::now();
-        if (log) {
-            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::fprintf(stderr, "[warmup_qps round %d] %.3f ms\n", round, ms);
-        }
-    }
-}
+// Cold-QP warmup REMOVED. The original warmup_qps issued a single-WI
+// blocking ishmem_putmem(128B) from each rdma_rank leader to every other
+// peer to force the IBGDA RC connection establishment before the first
+// real dispatch. Upstream ishmem_ibgda_integration does not implement
+// the IBGDA fixes (UNCACHED UAR DMA-BUF, post-UAR SND_DBR readback,
+// per-GPU release fence, fast/safe RERING, host-pinned proxy ring) that
+// make a cold-QP put succeed reliably from a SYCL kernel; that warmup
+// is the exact path that causes UR_RESULT_ERROR_DEVICE_LOST in the
+// Buffer ctor on upstream. The dispatch/combine NBI puts each carry
+// their own doorbell from a leader WI; barrier_all (which calls
+// ishmemi_ibgda_device_quiet on the internode path) drains them before
+// any cross-PE BARRIER. The runtime's own first-WQE handshake then
+// happens during the first real dispatch's NBI put without needing an
+// explicit warmup kernel.
+inline void warmup_qps(void* /*rdma_buffer_ptr*/,
+                       int /*my_rdma_rank*/,
+                       int /*num_rdma_ranks*/,
+                       int /*num_nvl_ranks*/,
+                       int /*nvl_rank*/,
+                       sycl::queue& /*queue*/) {}
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -2505,22 +2464,18 @@ void dispatch_nvl_rdma(void* recv_x,
                         // Split-put for landing-race elimination: write the
                         // DATA portion (everything before the count field)
                         // first, then write the COUNT word alone. Both are
-                        // blocking, on the same QP. RC + same-QP ordering
-                        // guarantees the second write's bytes only commit
-                        // to the destination memory AFTER the first write's
-                        // bytes are committed. Receiver's count!=sentinel
-                        // check then becomes a true "all data has landed"
-                        // flag instead of an "ACK seen" flag, eliminating
-                        // the RDMA-Write-to-VRAM byte-level landing race
-                        // that caused the residual ~1/6 dispatch undercount.
-                        // NOTE: kept blocking on this site because switching
-                        // to NBI causes intermittent NIC DEVICE_LOST mid-run
-                        // (likely CQ pressure interaction with the heavy NBI
-                        // traffic from the dispatch payload puts above).
-                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                        ishmem_putmem(dst_region + rdma_count_offset,
-                                      region + rdma_count_offset,
-                                      sizeof(int), dst_pe);
+                        // NBI puts on the same QP. RC + same-SQ posting
+                        // order guarantees the second WQE's bytes commit
+                        // to destination memory AFTER the first WQE's
+                        // bytes. The trailing barrier_all below issues
+                        // ishmemi_ibgda_device_quiet (per barrier.cpp) to
+                        // drain both NBI WQEs before the cross-PE BARRIER,
+                        // so receivers that read count!=sentinel definitely
+                        // see all data bytes landed.
+                        ishmem_putmem_nbi(dst_region, region, rdma_count_offset, dst_pe);
+                        ishmem_putmem_nbi(dst_region + rdma_count_offset,
+                                          region + rdma_count_offset,
+                                          sizeof(int), dst_pe);
                     }
                 }
                 sycl::group_barrier(group);
@@ -3273,15 +3228,15 @@ void combine_nvl_rdma(DataType type,
                     const int dst_pe = dst_rdma * num_nvl_ranks;
                     auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                     // Split-put for landing-race elimination (see dispatch
-                    // RdmaPut for full rationale). Two sequential blocking
-                    // puts on the same QP: data first, then count alone.
-                    // Kept blocking (matching dispatch site) — NBI on this
-                    // hot path causes intermittent NIC DEVICE_LOST.
+                    // FwdWrite for full rationale). Two NBI puts on the
+                    // same QP: data first, then count. RC + same-SQ
+                    // posting order ensures count commits AFTER data.
+                    // The barrier_all below drains both NBI WQEs.
                     if (local_id == 0) {
-                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                        ishmem_putmem(dst_region + rdma_count_offset,
-                                      region + rdma_count_offset,
-                                      sizeof(int), dst_pe);
+                        ishmem_putmem_nbi(dst_region, region, rdma_count_offset, dst_pe);
+                        ishmem_putmem_nbi(dst_region + rdma_count_offset,
+                                          region + rdma_count_offset,
+                                          sizeof(int), dst_pe);
                     }
                     sycl::group_barrier(group);
                 }

@@ -41,15 +41,15 @@ x-common: &common
     - /root/.conda:/root/.conda:ro
 
     # --- Code repos (read-write) ---
-    - /data/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
-    - /data/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /data/jiafuzha/ishmem_ibgda_integration:/data/jiafuzha/ishmem_ibgda_integration:rw
+    - /data/jiafuzha/ishmem_ibgda_integration:/root/jiafuzha/ishmem_ibgda_integration:rw
     - /root/jiafuzha/code-repo/zjf2012/DeepEP:/root/jiafuzha/code-repo/zjf2012/DeepEP:rw
     - /data/jiafuzha/code-repo/zjf2012/DeepEP:/data/jiafuzha/code-repo/zjf2012/DeepEP:rw
     - /root/jiafuzha/code-repo/pytorch:/root/jiafuzha/code-repo/pytorch:rw
     - /root/jiafuzha/code-repo/intel_gpu_uar_bridge:/root/jiafuzha/code-repo/intel_gpu_uar_bridge:rw
 
     # --- iSHMEM 2026 shim (used by DeepEP at link/runtime) ---
-    - /root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:ro
+    - /root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim-upstream:/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim-upstream:ro
 
     # --- System (RDMA, GPU sysfs) ---
     - /sys:/sys:ro
