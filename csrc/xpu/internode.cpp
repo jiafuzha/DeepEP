@@ -190,9 +190,10 @@ struct DebugChannelPutPost {
         auto* src_payload = send_payload + channel * row_ints;
         auto* src_meta = send_meta + channel;
         auto* src_token = send_dst_token + channel;
-        ishmem_putmem(dst_payload, src_payload, static_cast<size_t>(row_ints) * sizeof(int), peer);
-        ishmem_putmem(dst_token, src_token, sizeof(int), peer);
-        ishmem_putmem(dst_meta, src_meta, sizeof(int), peer);
+        ishmem_putmem_nbi(dst_payload, src_payload, static_cast<size_t>(row_ints) * sizeof(int), peer);
+        ishmem_putmem_nbi(dst_token, src_token, sizeof(int), peer);
+        ishmem_putmem_nbi(dst_meta, src_meta, sizeof(int), peer);
+        ishmem_quiet();
     }
 };
 
@@ -2512,6 +2513,10 @@ void dispatch_nvl_rdma(void* recv_x,
                         // flag instead of an "ACK seen" flag, eliminating
                         // the RDMA-Write-to-VRAM byte-level landing race
                         // that caused the residual ~1/6 dispatch undercount.
+                        // NOTE: kept blocking on this site because switching
+                        // to NBI causes intermittent NIC DEVICE_LOST mid-run
+                        // (likely CQ pressure interaction with the heavy NBI
+                        // traffic from the dispatch payload puts above).
                         ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
                         ishmem_putmem(dst_region + rdma_count_offset,
                                       region + rdma_count_offset,
@@ -3270,10 +3275,8 @@ void combine_nvl_rdma(DataType type,
                     // Split-put for landing-race elimination (see dispatch
                     // RdmaPut for full rationale). Two sequential blocking
                     // puts on the same QP: data first, then count alone.
-                    // RC ordering ensures the count word only commits AFTER
-                    // every data byte has been committed at the destination,
-                    // so the receiver's count!=sentinel check definitively
-                    // means all data has landed.
+                    // Kept blocking (matching dispatch site) — NBI on this
+                    // hot path causes intermittent NIC DEVICE_LOST.
                     if (local_id == 0) {
                         ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
                         ishmem_putmem(dst_region + rdma_count_offset,
