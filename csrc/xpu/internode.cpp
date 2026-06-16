@@ -291,7 +291,9 @@ void warmup_qps(void* rdma_buffer_ptr,
                             ishmem_putmem(dst, src, 128, dst_pe);
                         }
                     }
-                    ishmemx_barrier_all_work_group(group);
+                    sycl::group_barrier(group);
+                    if (group.leader()) ishmem_barrier_all();
+                    sycl::group_barrier(group);
                 });
         });
         queue.wait();
@@ -558,9 +560,14 @@ void dispatch(void* recv_x,
                 auto* local_count_row = rdma_count_matrix + rank * num_ranks;
                 for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                     auto* remote_count_row = rdma_count_matrix + rank * num_ranks;
-                    if (dst_rank != rank) {
-                        ishmemx_putmem_nbi_work_group(
-                            remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank, group);
+                    if (dst_rank != rank && local_id == 0) {
+                        // CUDA-style scalar API: leader posts a single IBGDA WQE.
+                        // For inter-PE puts this matches the original NVSHMEM
+                        // _warp pattern (one thread doorbells, rest do useful
+                        // work).  Functionally equivalent to the work_group
+                        // variant on the IBGDA path.
+                        ishmem_putmem_nbi(
+                            remote_count_row, local_count_row, static_cast<size_t>(num_ranks) * sizeof(int), dst_rank);
                     }
                     sycl::group_barrier(group);
                 }
@@ -585,16 +592,18 @@ void dispatch(void* recv_x,
                 auto* local_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
                 for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                     auto* remote_channel_row = rdma_channel_count_matrix + static_cast<size_t>(rank) * num_ranks * num_channels;
-                    if (dst_rank != rank) {
-                        ishmemx_putmem_nbi_work_group(remote_channel_row,
-                                                      local_channel_row,
-                                                      static_cast<size_t>(num_ranks) * num_channels * sizeof(int),
-                                                      dst_rank,
-                                                      group);
+                    if (dst_rank != rank && local_id == 0) {
+                        ishmem_putmem_nbi(remote_channel_row,
+                                          local_channel_row,
+                                          static_cast<size_t>(num_ranks) * num_channels * sizeof(int),
+                                          dst_rank);
                     }
                     sycl::group_barrier(group);
                 }
-                ishmemx_quiet_work_group(group);
+                if (local_id == 0) {
+                    ishmem_quiet();
+                }
+                sycl::group_barrier(group);
             });
     });
     queue.wait();
@@ -787,26 +796,36 @@ void dispatch(void* recv_x,
                                         *dst_meta = *src_meta;
                                     }
                                 } else {
-                                    ishmemx_putmem_nbi_work_group(dst_x, src_x, row_bytes, dst_rank, group);
-                                    if (num_topk > 0) {
-                                        ishmemx_putmem_nbi_work_group(dst_topk_idx,
-                                                                      src_topk_idx,
-                                                                      static_cast<size_t>(num_topk) * sizeof(topk_idx_t),
-                                                                      dst_rank,
-                                                                      group);
-                                        ishmemx_putmem_nbi_work_group(dst_topk_weights,
-                                                                      src_topk_weights,
-                                                                      static_cast<size_t>(num_topk) * sizeof(float),
-                                                                      dst_rank,
-                                                                      group);
+                                    // CUDA-style scalar API: leader-only post
+                                    // matches the original NVSHMEM
+                                    // nvshmemi_ibgda_put_nbi_warp pattern.
+                                    // For cross-node peers this is identical
+                                    // to the work_group variant (which falls
+                                    // through to leader-only IBGDA post on the
+                                    // RDMA path).  For intra-node SHM peers
+                                    // below 32KB cutover, this serializes the
+                                    // copy on a single WI; on this stack the
+                                    // 2-rank validation is cross-node only.
+                                    if (local_id == 0) {
+                                        ishmem_putmem_nbi(dst_x, src_x, row_bytes, dst_rank);
+                                        if (num_topk > 0) {
+                                            ishmem_putmem_nbi(dst_topk_idx,
+                                                              src_topk_idx,
+                                                              static_cast<size_t>(num_topk) * sizeof(topk_idx_t),
+                                                              dst_rank);
+                                            ishmem_putmem_nbi(dst_topk_weights,
+                                                              src_topk_weights,
+                                                              static_cast<size_t>(num_topk) * sizeof(float),
+                                                              dst_rank);
+                                        }
+                                        if (num_scales > 0) {
+                                            ishmem_putmem_nbi(
+                                                dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank);
+                                        }
+                                        ishmem_putmem_nbi(
+                                            rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank);
+                                        ishmem_putmem_nbi(dst_meta, src_meta, sizeof(SourceMeta), dst_rank);
                                     }
-                                    if (num_scales > 0) {
-                                        ishmemx_putmem_nbi_work_group(
-                                            dst_scales, src_scales, static_cast<size_t>(num_scales) * sizeof(float), dst_rank, group);
-                                    }
-                                    ishmemx_putmem_nbi_work_group(
-                                        rdma_queue_dst_token + queue_slot, src_dst_token, sizeof(int), dst_rank, group);
-                                    ishmemx_putmem_nbi_work_group(dst_meta, src_meta, sizeof(SourceMeta), dst_rank, group);
                                 }
                                 sycl::group_barrier(group);
                                 if (local_id == 0) {
@@ -828,12 +847,17 @@ void dispatch(void* recv_x,
                                         rdma_queue_head[queue_pair] = wg_window_count;
                                     }
                                     sycl::group_barrier(group);
-                                    ishmemx_putmem_nbi_work_group(
-                                        rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair, sizeof(int), dst_rank, group);
+                                    if (local_id == 0) {
+                                        ishmem_putmem_nbi(
+                                            rdma_queue_tail + queue_pair, rdma_queue_head + queue_pair, sizeof(int), dst_rank);
+                                    }
                                 }
                             }
                             sycl::group_barrier(group);
-                            ishmemx_quiet_work_group(group);
+                            if (local_id == 0) {
+                                ishmem_quiet();
+                            }
+                            sycl::group_barrier(group);
                         }  // end for dst_rank
                     });
             });
@@ -1066,14 +1090,15 @@ void launch_combine_copy(void* combined_x,
                                 remote_topk_weights[k] = local_topk_weights[k];
                             }
                         } else {
-                            ishmemx_putmem_nbi_work_group(
-                                remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank, group);
-                            if (num_topk > 0) {
-                                ishmemx_putmem_nbi_work_group(remote_topk_weights,
-                                                              local_topk_weights,
-                                                              static_cast<size_t>(num_topk) * sizeof(float),
-                                                              src_rank,
-                                                              group);
+                            if (local_id == 0) {
+                                ishmem_putmem_nbi(
+                                    remote_dst, local_src, static_cast<size_t>(hidden) * sizeof(dtype_t), src_rank);
+                                if (num_topk > 0) {
+                                    ishmem_putmem_nbi(remote_topk_weights,
+                                                      local_topk_weights,
+                                                      static_cast<size_t>(num_topk) * sizeof(float),
+                                                      src_rank);
+                                }
                             }
                         }
                         sycl::group_barrier(group);
@@ -1095,8 +1120,11 @@ void launch_combine_copy(void* combined_x,
                                 rdma_queue_head[rank] = wg_window_count;
                             }
                             sycl::group_barrier(group);
-                            ishmemx_putmem_nbi_work_group(rdma_queue_tail + rank, rdma_queue_head + rank, sizeof(int), src_rank, group);
-                            ishmemx_quiet_work_group(group);
+                            if (local_id == 0) {
+                                ishmem_putmem_nbi(rdma_queue_tail + rank, rdma_queue_head + rank, sizeof(int), src_rank);
+                                ishmem_quiet();
+                            }
+                            sycl::group_barrier(group);
                         }
                     }
                     sycl::group_barrier(group);
@@ -2463,7 +2491,9 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }
-                ishmemx_barrier_all_work_group(group);
+                sycl::group_barrier(group);
+                if (group.leader()) ishmem_barrier_all();
+                sycl::group_barrier(group);
 
                 if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
@@ -2488,7 +2518,9 @@ void dispatch_nvl_rdma(void* recv_x,
                                       sizeof(int), dst_pe);
                     }
                 }
-                ishmemx_barrier_all_work_group(group);
+                sycl::group_barrier(group);
+                if (group.leader()) ishmem_barrier_all();
+                sycl::group_barrier(group);
             });
     });
     queue.wait();
@@ -3184,7 +3216,9 @@ void combine_nvl_rdma(DataType type,
                     }
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }
-                ishmemx_barrier_all_work_group(group);
+                sycl::group_barrier(group);
+                if (group.leader()) ishmem_barrier_all();
+                sycl::group_barrier(group);
 
                 if (is_puter) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
@@ -3252,7 +3286,9 @@ void combine_nvl_rdma(DataType type,
                 // Cross-PE sync to drain pending RDMA puts and make them visible at
                 // every PE before FWD WRITE reads from the receive regions.
                 // Every PE (including nvl_rank != 0) must reach this collective.
-                ishmemx_barrier_all_work_group(group);
+                sycl::group_barrier(group);
+                if (group.leader()) ishmem_barrier_all();
+                sycl::group_barrier(group);
             });
     });
     queue.wait();
