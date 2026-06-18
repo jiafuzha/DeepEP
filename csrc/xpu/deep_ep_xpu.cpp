@@ -662,7 +662,18 @@ struct Buffer {
             // writes are not dropped on a cold QP (iter-0 undercount/DEVICE_LOST).
             if (num_rdma_ranks > 1) {
                 auto _wu_t0 = std::chrono::steady_clock::now();
-                internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
+                if (low_latency_mode || global_rdma_mode) {
+                    // Flat iSHMEM PE layout: every rank is its own RDMA peer
+                    // (PE == rank, num PEs == num_ranks).  Pass nvl_ranks=1 and
+                    // my_rdma=rank so warmup addresses dst_pe = dst directly.
+                    // The default (rdma_rank, num_nvl_ranks) addressing is only
+                    // correct for the combined NVL+RDMA topology where node
+                    // leaders sit at multiples of num_nvl_ranks.
+                    internode::warmup_qps(rdma_buffer_ptr, /*my_rdma_rank=*/rank, /*num_rdma_ranks=*/num_ranks,
+                                          /*num_nvl_ranks=*/1, /*nvl_rank=*/0, queue);
+                } else {
+                    internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
+                }
                 auto _wu_t1 = std::chrono::steady_clock::now();
                 internode::barrier();
                 auto _wu_t2 = std::chrono::steady_clock::now();
