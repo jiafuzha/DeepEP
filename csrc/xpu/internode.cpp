@@ -289,11 +289,25 @@ void warmup_qps(void* rdma_buffer_ptr,
                         for (int dst_rdma = 0; dst_rdma < rdma_ranks; ++dst_rdma) {
                             if (dst_rdma == my_rdma) continue;
                             const int dst_pe = dst_rdma * nvl_ranks;
-                            ishmem_putmem(dst, src, 128, dst_pe);
+                            // Use non-blocking put: a device-side BLOCKING
+                            // ishmem_putmem deadlocks here because its completion
+                            // path needs host-proxy progress while the host
+                            // thread is parked in queue.wait().  NBI rings the
+                            // doorbell directly (ISHMEM_IBGDA_DIRECT_DOORBELL) and
+                            // the work-group barrier below device-quiets to drain
+                            // it — same pattern as the LL kernels.
+                            ishmem_putmem_nbi(dst, src, 128, dst_pe);
                         }
                     }
                     sycl::group_barrier(group);
-                    if (group.leader()) ishmem_barrier_all();
+                    // Use the work-group collective barrier (every WI participates)
+                    // rather than a single-WI ishmem_barrier_all().  On the cold-QP
+                    // first init the single-WI device-wide ishmem_barrier_all()
+                    // spins forever (it needs host-proxy progress while the host is
+                    // parked in queue.wait()), deadlocking the warmup.  The
+                    // work-group barrier is the proven path the LL/dispatch kernels
+                    // use and it both cross-PE syncs and device-quiets the NBI puts.
+                    ishmemx_barrier_all_work_group(group);
                     sycl::group_barrier(group);
                 });
         });
