@@ -16,7 +16,6 @@ class UpdateMaskBufferKernel;
 class QueryMaskBufferKernel;
 class CleanMaskBufferKernel;
 class LowLatencyDispatchMergedKernel;
-class LowLatencyCastFp8Kernel;
 class LowLatencyCombineMergedKernel;
 
 // Tier-1 multi-work-group low-latency kernels (multi-WG grid + sub-group
@@ -249,6 +248,7 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, sycl::queue& queue) 
 }
 
 void dispatch_bf16(void* packed_recv_x,
+                   void* packed_recv_x_scales,
                    int* packed_recv_src_info,
                    int64_t* packed_recv_layout_range,
                    int* packed_recv_count,
@@ -265,6 +265,9 @@ void dispatch_bf16(void* packed_recv_x,
                    int num_experts,
                    int rank,
                    int num_ranks,
+                   bool use_fp8,
+                   bool round_scale,
+                   bool use_ue8m0,
                    sycl::queue& queue) {
 #ifndef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(false, "XPU low-latency dispatch requires iSHMEM support");
@@ -421,29 +424,46 @@ void dispatch_bf16(void* packed_recv_x,
             [=](sycl::nd_item<1> item) { ishmemx_barrier_all_work_group(item.get_group()); });
     });
 
-    // --- Stage 4: pack received data (one work-group per local expert). The
-    // per-rank prefix (begin offsets) is computed serially by the WG leader, then
-    // all work-items cooperatively copy the payload and src_info per channel.
+    // --- Stage 4: pack received data. Each local expert is handled by a cohort of
+    // `pack_wgs_per_expert` work-groups; the per-rank prefix (begin offsets) is
+    // recomputed (cheaply) by every work-group, only the cohort leader writes the
+    // per-channel layout/stats, and the payload copy / src_info / FP8 conversion are
+    // partitioned across the whole cohort for parallelism.
+    // When use_fp8 is set, the BF16 payload from the RDMA staging is converted to
+    // FP8 (with per-128-channel scales) directly here — the FP8 cast is fused into
+    // dispatch rather than performed as a separate pass over the packed output.
     {
-        const int num_wgs = num_local_experts > 0 ? num_local_experts : 1;
+        const int num_scales = (hidden % 128 == 0) ? hidden / 128 : 0;
+        const int scale_packs = use_ue8m0 ? (num_scales + 3) / 4 : num_scales;
+        auto* dst_fp8 = static_cast<uint8_t*>(packed_recv_x);
+        auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
+        auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
+        const int local_experts = num_local_experts > 0 ? num_local_experts : 1;
+        const int pack_wgs_per_expert = sycl::max(1, sycl::min(kLLMaxWGs / local_experts, 32));
+        const int num_wgs = local_experts * pack_wgs_per_expert;
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<LowLatencyDispatchPackKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
                 [=](sycl::nd_item<1> item) {
-                    auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     const int local_size = static_cast<int>(item.get_local_range(0));
-                    const int local_expert = static_cast<int>(item.get_group_linear_id());
+                    const int wg = static_cast<int>(item.get_group_linear_id());
+                    const int local_expert = wg / pack_wgs_per_expert;
+                    const int sub = wg % pack_wgs_per_expert;
                     if (local_expert >= num_local_experts) {
                         return;
                     }
+                    const bool leader = (sub == 0 && local_id == 0);
+                    // Cooperating-lane identity across the whole cohort for this expert.
+                    const int cohort_id = sub * local_size + local_id;
+                    const int cohort_size = pack_wgs_per_expert * local_size;
 
                     int begin = 0;
                     int total = 0;
                     for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
                         const int clamped_count =
                             sycl::min(dispatch_count[local_expert * num_ranks + src_rank], num_max_dispatch_tokens_per_rank);
-                        if (local_id == 0) {
+                        if (leader) {
                             packed_recv_layout_range[local_expert * num_ranks + src_rank] =
                                 static_cast<int64_t>(pack_range(clamped_count, begin));
                             if (cumulative_local_expert_recv_stats != nullptr) {
@@ -458,87 +478,67 @@ void dispatch_bf16(void* packed_recv_x,
                                 (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
                             const size_t dst_base =
                                 static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
-                            coop_copy_bytes(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
-                                            dispatch_data + src_base * hidden_bytes,
-                                            static_cast<size_t>(clamped_count) * hidden_bytes, local_id, local_size);
-                            for (int slot = local_id; slot < clamped_count; slot += local_size) {
+                            if (use_fp8) {
+                                // Per-(row, 128-channel block) BF16->FP8 conversion. Each lane
+                                // owns one (row, scale block): compute amax, scale, write 128 FP8
+                                // values and the per-block scale (float, or packed UE8M0 byte).
+                                const size_t work = static_cast<size_t>(clamped_count) * num_scales;
+                                for (size_t w = cohort_id; w < work; w += cohort_size) {
+                                    const int local_row = static_cast<int>(w / num_scales);
+                                    const int scale_idx = static_cast<int>(w % num_scales);
+                                    const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                                        dispatch_data + (src_base + local_row) * hidden_bytes);
+                                    const size_t dst_row = dst_base + local_row;
+                                    const int base_h = scale_idx * 128;
+                                    float amax = 1.0e-4f;
+                                    for (int i = 0; i < 128; ++i) {
+                                        amax = sycl::fmax(amax, sycl::fabs(static_cast<float>(src_bf16[base_h + i])));
+                                    }
+                                    float scale;
+                                    float scale_inv;
+                                    if (round_scale) {
+                                        const float exp_scale_inv = sycl::ceil(sycl::log2(amax / 448.0f));
+                                        scale = sycl::exp2(-exp_scale_inv);
+                                        scale_inv = sycl::exp2(exp_scale_inv);
+                                    } else {
+                                        scale_inv = amax / 448.0f;
+                                        scale = 448.0f / amax;
+                                    }
+                                    for (int i = 0; i < 128; ++i) {
+                                        const float value = static_cast<float>(src_bf16[base_h + i]) * scale;
+                                        dst_fp8[dst_row * hidden + base_h + i] = c10::Float8_e4m3fn(value).x;
+                                    }
+                                    if (use_ue8m0) {
+                                        const int pack_idx = scale_idx / 4;
+                                        const int pack_shift = (scale_idx % 4) * 8;
+                                        const int32_t scale_byte = static_cast<int32_t>(ue8m0_from_float(scale_inv)) << pack_shift;
+                                        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                         sycl::access::address_space::global_space>
+                                            scale_pack(dst_scale_int[dst_row * scale_packs + pack_idx]);
+                                        scale_pack.fetch_or(scale_byte);
+                                    } else {
+                                        dst_scale_float[dst_row * num_scales + scale_idx] = scale_inv;
+                                    }
+                                }
+                            } else {
+                                coop_copy_bytes(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
+                                                dispatch_data + src_base * hidden_bytes,
+                                                static_cast<size_t>(clamped_count) * hidden_bytes, cohort_id, cohort_size);
+                            }
+                            for (int slot = cohort_id; slot < clamped_count; slot += cohort_size) {
                                 packed_recv_src_info[dst_base + slot] = dispatch_src[src_base + slot];
                             }
                         }
                         begin += clamped_count;
                         total += clamped_count;
                     }
-                    sycl::group_barrier(group);
-                    if (local_id == 0) {
+                    if (leader) {
                         packed_recv_count[local_expert] = total;
                     }
                 });
         });
     }
 #endif
-}
-
-void cast_bf16_to_fp8(void* packed_recv_x,
-                      void* packed_recv_x_scales,
-                      const void* packed_recv_bf16,
-                      const int* packed_recv_src_info,
-                      int num_rows,
-                      int hidden,
-                      bool round_scale,
-                      bool use_ue8m0,
-                      sycl::queue& queue) {
-    TORCH_CHECK(hidden % 128 == 0, "FP8 low-latency dispatch requires hidden to be divisible by 128");
-    const int num_scales = hidden / 128;
-    const int scale_packs = use_ue8m0 ? (num_scales + 3) / 4 : num_scales;
-    auto* dst_fp8 = static_cast<uint8_t*>(packed_recv_x);
-    auto* src_bf16 = static_cast<const sycl::ext::oneapi::bfloat16*>(packed_recv_bf16);
-    auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
-    auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<LowLatencyCastFp8Kernel>(sycl::range<1>(static_cast<size_t>(num_rows) * num_scales), [=](sycl::id<1> id) {
-            const int linear = static_cast<int>(id[0]);
-            const int row = linear / num_scales;
-            const int scale_idx = linear - row * num_scales;
-            if (packed_recv_src_info[row] < 0) {
-                return;
-            }
-            const int base_h = scale_idx * 128;
-            float amax = 1.0e-4f;
-            for (int i = 0; i < 128; ++i) {
-                const float value = static_cast<float>(src_bf16[static_cast<size_t>(row) * hidden + base_h + i]);
-                amax = sycl::fmax(amax, sycl::fabs(value));
-            }
-
-            float scale;
-            float scale_inv;
-            if (round_scale) {
-                const float exp_scale_inv = sycl::ceil(sycl::log2(amax / 448.0f));
-                scale = sycl::exp2(-exp_scale_inv);
-                scale_inv = sycl::exp2(exp_scale_inv);
-            } else {
-                scale_inv = amax / 448.0f;
-                scale = 448.0f / amax;
-            }
-
-            for (int i = 0; i < 128; ++i) {
-                const float value = static_cast<float>(src_bf16[static_cast<size_t>(row) * hidden + base_h + i]) * scale;
-                dst_fp8[static_cast<size_t>(row) * hidden + base_h + i] = c10::Float8_e4m3fn(value).x;
-            }
-
-            if (use_ue8m0) {
-                const int pack_idx = scale_idx / 4;
-                const int pack_shift = (scale_idx % 4) * 8;
-                const int32_t scale_byte = static_cast<int32_t>(ue8m0_from_float(scale_inv)) << pack_shift;
-                sycl::
-                    atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>
-                        scale_pack(dst_scale_int[static_cast<size_t>(row) * scale_packs + pack_idx]);
-                scale_pack.fetch_or(scale_byte);
-            } else {
-                dst_scale_float[static_cast<size_t>(row) * num_scales + scale_idx] = scale_inv;
-            }
-        });
-    });
 }
 
 void combine_bf16(void* combined_x,

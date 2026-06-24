@@ -1826,7 +1826,6 @@ struct Buffer {
             stream_wait(comm_stream, compute_stream);
         }
         const int num_recv_slots = num_ranks * num_max_dispatch_tokens_per_rank;
-        auto packed_recv_bf16 = use_fp8 ? torch::empty({num_local_experts, num_recv_slots, hidden}, x.options()) : torch::Tensor();
         auto packed_recv_x = use_fp8 ? torch::empty({num_local_experts, num_recv_slots, hidden}, x.options().dtype(torch::kFloat8_e4m3fn))
                                      : torch::empty({num_local_experts, num_recv_slots, hidden}, x.options());
         std::optional<torch::Tensor> packed_recv_x_scales;
@@ -1848,7 +1847,8 @@ struct Buffer {
         auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, long_options);
 
         internode_ll::dispatch_bf16(
-            use_fp8 ? packed_recv_bf16.data_ptr() : packed_recv_x.data_ptr(),
+            packed_recv_x.data_ptr(),
+            use_fp8 ? packed_recv_x_scales->data_ptr() : nullptr,
             packed_recv_src_info.data_ptr<int>(),
             packed_recv_layout_range.data_ptr<int64_t>(),
             packed_recv_count.data_ptr<int>(),
@@ -1865,19 +1865,10 @@ struct Buffer {
             num_experts,
             rank,
             num_ranks,
+            use_fp8,
+            round_scale,
+            use_ue8m0,
             comm_stream.queue());
-
-        if (use_fp8) {
-            internode_ll::cast_bf16_to_fp8(packed_recv_x.data_ptr(),
-                                           packed_recv_x_scales->data_ptr(),
-                                           packed_recv_bf16.data_ptr(),
-                                           packed_recv_src_info.data_ptr<int>(),
-                                           num_local_experts * num_recv_slots,
-                                           hidden,
-                                           round_scale,
-                                           use_ue8m0,
-                                           comm_stream.queue());
-        }
 
         EventHandle event(comm_stream);
         if (!async_finish && comm_stream != compute_stream) {
