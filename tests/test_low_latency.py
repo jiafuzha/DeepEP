@@ -445,8 +445,19 @@ if __name__ == '__main__':
 
     launcher_env = get_launcher_rank_env()
     if launcher_env is not None:
-        rank, world_size = launcher_env
-        test_loop(rank, world_size, args)
+        # Multi-node simulation (e.g. tests/docker-2node-ll): when more than one
+        # node participates (WORLD_SIZE > 1), each MPI rank must map to a *per-node*
+        # local device. Use MPI_LOCALRANKID (0..ppn-1) as the local rank and the
+        # per-node process count as num_local_ranks; init_dist() derives the global
+        # rank/world_size from RANK (node rank) and WORLD_SIZE (number of nodes).
+        # Single-node runs keep the original global-launcher behavior.
+        mpi_local_rank = os.environ.get('MPI_LOCALRANKID')
+        num_nodes = int(os.environ.get('WORLD_SIZE', '1'))
+        if mpi_local_rank is not None and num_nodes > 1:
+            test_loop(int(mpi_local_rank), num_processes, args)
+        else:
+            rank, world_size = launcher_env
+            test_loop(rank, world_size, args)
     else:
         torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
     # test_loop(num_processes, args)
