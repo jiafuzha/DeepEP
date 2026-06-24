@@ -19,6 +19,18 @@ class LowLatencyDispatchMergedKernel;
 class LowLatencyCastFp8Kernel;
 class LowLatencyCombineMergedKernel;
 
+// Tier-1 multi-work-group low-latency kernels (multi-WG grid + sub-group
+// collectives). The merged single-256-WI-work-group kernels above are kept for
+// reference / fallback; the active dispatch/combine paths now use these.
+class LowLatencyDispatchRouteKernel;
+class LowLatencyDispatchPutKernel;
+class LowLatencyDispatchBarrierKernel;
+class LowLatencyDispatchPackKernel;
+class LowLatencyCombineScatterKernel;
+class LowLatencyCombinePutKernel;
+class LowLatencyCombineBarrierKernel;
+class LowLatencyCombineReduceKernel;
+
 struct LowLatencyLayout {
     size_t dispatch_data_bytes;
     size_t dispatch_src_bytes;
@@ -104,6 +116,75 @@ inline uint8_t ue8m0_from_float(float value) {
 }
 
 constexpr int kLowLatencyMergedGroupSize = 256;
+
+// Tier-1 multi-WG tuning.
+constexpr int kLLWGSize = 256;     // work-items per work-group
+constexpr int kLLMaxWGs = 256;     // cap on grid size for grid-stride phases
+
+// Maximum bytes per single iSHMEM NBI put. On this BMG + mlx5 IBGDA stack a
+// single ishmem_putmem_nbi larger than ~256 KiB falls into a pathologically
+// slow transport path (RERING / landing-spin) that costs a fixed ~0.5 s per
+// call regardless of size. Splitting large puts into <=192 KiB chunks keeps
+// every put on the fast path. Overridable via DEEP_EP_LL_MAX_PUT_KB.
+inline size_t ll_max_put_bytes() {
+    const char* env = std::getenv("DEEP_EP_LL_MAX_PUT_KB");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0) return static_cast<size_t>(v) * 1024;
+    }
+    return static_cast<size_t>(64) * 1024;
+}
+
+inline int ll_num_wgs(size_t work_units, int wg_size, int cap) {
+    const char* env = std::getenv("DEEP_EP_LL_NUM_WGS");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0) return v;
+    }
+    size_t n = (work_units + static_cast<size_t>(wg_size) - 1) / static_cast<size_t>(wg_size);
+    if (n < 1) n = 1;
+    if (n > static_cast<size_t>(cap)) n = static_cast<size_t>(cap);
+    return static_cast<int>(n);
+}
+
+// Cooperative copy of `n` bytes from src to dst using a strided set of
+// cooperating lanes (lane in [0, lanes)). Uses 16-byte vector chunks when both
+// pointers are 16-byte aligned (always true for the 128-byte-aligned symmetric
+// heap regions and bf16/fp8 payloads here), falling back to bytes for any tail.
+inline void coop_copy_bytes(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0xF) == 0 && (reinterpret_cast<uintptr_t>(src) & 0xF) == 0) {
+        const size_t n16 = n >> 4;
+        auto* d16 = reinterpret_cast<sycl::vec<uint32_t, 4>*>(dst);
+        auto* s16 = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n16; j += static_cast<size_t>(lanes)) {
+            d16[j] = s16[j];
+        }
+        done = n16 << 4;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes)) {
+        dst[b] = src[b];
+    }
+}
+
+#ifdef DEEP_EP_ENABLE_ISHMEM
+// Issue an iSHMEM NBI put of `n` bytes from a single work-item, split into
+// chunks no larger than `max_chunk` to stay on the IBGDA fast path (see
+// ll_max_put_bytes). Chunk boundaries are 16-byte aligned for safety.
+inline void chunked_put_nbi(uint8_t* dst, const uint8_t* src, size_t n, int dst_pe, size_t max_chunk) {
+    if (max_chunk == 0 || n <= max_chunk) {
+        ishmem_putmem_nbi(dst, src, n, dst_pe);
+        return;
+    }
+    const size_t step = max_chunk & ~static_cast<size_t>(0xF);
+    size_t off = 0;
+    while (off < n) {
+        const size_t this_bytes = sycl::min(step, n - off);
+        ishmem_putmem_nbi(dst + off, src + off, this_bytes, dst_pe);
+        off += this_bytes;
+    }
+}
+#endif
 
 }  // namespace
 
@@ -200,37 +281,39 @@ void dispatch_bf16(void* packed_recv_x,
     auto* send_src = reinterpret_cast<int*>(base + layout.send_src_offset);
     auto* send_count = reinterpret_cast<int*>(base + layout.send_count_offset);
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<LowLatencyDispatchMergedKernel>(
-            sycl::nd_range<1>(sycl::range<1>(kLowLatencyMergedGroupSize), sycl::range<1>(kLowLatencyMergedGroupSize)),
-            [=](sycl::nd_item<1> item) {
-                auto group = item.get_group();
-                const int local_id = static_cast<int>(item.get_local_id(0));
-                const int local_size = static_cast<int>(item.get_local_range(0));
-                const size_t send_count_elems = static_cast<size_t>(num_ranks) * num_local_experts;
-                const size_t slot_elems = send_count_elems * num_max_dispatch_tokens_per_rank;
+    const size_t send_count_elems = static_cast<size_t>(num_ranks) * num_local_experts;
+    const size_t slot_elems = send_count_elems * num_max_dispatch_tokens_per_rank;
+    const size_t recv_src_elems = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
+    const size_t max_put = ll_max_put_bytes();
 
-                // Zero only LOCAL staging and output tensors.
-                // Symmetric buffer regions (dispatch_count, dispatch_src, dispatch_data)
-                // are already zeroed by clean_low_latency_buffer with cross-PE barriers.
-                for (size_t i = local_id; i < send_count_elems; i += local_size) {
-                    send_count[i] = 0;
-                }
-                for (size_t i = local_id; i < slot_elems; i += local_size) {
-                    send_src[i] = -1;
-                    packed_recv_src_info[i] = -1;
-                }
-                for (int local_expert = local_id; local_expert < num_local_experts; local_expert += local_size) {
-                    packed_recv_count[local_expert] = 0;
-                }
-                sycl::group_barrier(group);
+    // --- Stage 0: zero LOCAL staging + output tensors (multi-WG via memset).
+    // Symmetric receive buffers (dispatch_*) are zeroed by clean_low_latency_buffer
+    // with cross-PE barriers. send_src / packed_recv_src_info use -1 (0xFF bytes).
+    queue.memset(send_count, 0, send_count_elems * sizeof(int));
+    queue.memset(packed_recv_count, 0, static_cast<size_t>(num_local_experts) * sizeof(int));
+    queue.memset(send_src, 0xFF, slot_elems * sizeof(int));
+    queue.memset(packed_recv_src_info, 0xFF, recv_src_elems * sizeof(int));
 
-                // No barrier_all needed here — clean_low_latency_buffer guarantees
-                // all PEs have zeroed the symmetric receive buffers before dispatch.
+    // --- Stage 1: route tokens into local send staging (multi-WG, one sub-group
+    // per (token, k) pair; the sub-group cooperatively copies the token payload).
+    {
+        const size_t num_pairs = static_cast<size_t>(num_tokens) * num_topk;
+        const int num_wgs = ll_num_wgs(num_pairs, kLLWGSize, kLLMaxWGs);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyDispatchRouteKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
+                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_range()[0]);
+                    const int global_sg =
+                        static_cast<int>(item.get_group_linear_id()) * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
+                    const int num_global_sgs = static_cast<int>(item.get_group_range(0)) * sgs_per_wg;
 
-                // Route tokens into local send staging
-                for (int token_idx = local_id; token_idx < num_tokens; token_idx += local_size) {
-                    for (int k = 0; k < num_topk; ++k) {
+                    for (int p = global_sg; p < static_cast<int>(num_pairs); p += num_global_sgs) {
+                        const int token_idx = p / num_topk;
+                        const int k = p - token_idx * num_topk;
                         const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
                         if (expert < 0 || expert >= num_experts) {
                             continue;
@@ -240,102 +323,129 @@ void dispatch_bf16(void* packed_recv_x,
                             continue;
                         }
                         const int local_expert = expert - dst_rank * num_local_experts;
-                        sycl::atomic_ref<int,
-                                         sycl::memory_order::relaxed,
-                                         sycl::memory_scope::work_group,
-                                         sycl::access::address_space::global_space>
-                            count_ref(send_count[dst_rank * num_local_experts + local_expert]);
-                        const int slot = count_ref.fetch_add(1);
+                        // Single lane reserves the slot; broadcast to the sub-group.
+                        int slot = -1;
+                        if (sg_local == 0) {
+                            sycl::atomic_ref<int,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space>
+                                count_ref(send_count[dst_rank * num_local_experts + local_expert]);
+                            slot = count_ref.fetch_add(1);
+                        }
+                        slot = sycl::group_broadcast(sg, slot, 0);
                         if (slot >= num_max_dispatch_tokens_per_rank) {
                             continue;
                         }
                         const size_t packed_slot =
                             (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank + slot;
-                        auto* dst = send_data + packed_slot * hidden_bytes;
-                        auto* src = static_cast<const uint8_t*>(x) + static_cast<size_t>(token_idx) * hidden_bytes;
-                        for (size_t b = 0; b < hidden_bytes; ++b) {
-                            dst[b] = src[b];
+                        coop_copy_bytes(send_data + packed_slot * hidden_bytes,
+                                        static_cast<const uint8_t*>(x) + static_cast<size_t>(token_idx) * hidden_bytes,
+                                        hidden_bytes, sg_local, sg_size);
+                        if (sg_local == 0) {
+                            send_src[packed_slot] = token_idx;
                         }
-                        send_src[packed_slot] = token_idx;
                     }
-                }
-                sycl::group_barrier(group);
+                });
+        });
+    }
 
-                // Phase 1a: Local copies (all WIs cooperate for data parallelism)
-                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                    const size_t src_slot =
-                        (static_cast<size_t>(rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
-                    const size_t dst_slot =
-                        (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                    const int count = sycl::min(send_count[rank * num_local_experts + local_expert],
-                                                num_max_dispatch_tokens_per_rank);
-                    if (local_id == 0) {
-                        dispatch_count[local_expert * num_ranks + rank] = count;
-                    }
-                    auto* dst_src_ptr = dispatch_src + dst_slot;
-                    auto* src_src_ptr = send_src + src_slot;
-                    for (int slot = local_id; slot < num_max_dispatch_tokens_per_rank; slot += local_size) {
-                        dst_src_ptr[slot] = src_src_ptr[slot];
-                    }
-                    auto* dst_ptr = dispatch_data + dst_slot * hidden_bytes;
-                    auto* src_ptr = send_data + src_slot * hidden_bytes;
-                    const size_t bytes = static_cast<size_t>(count) * hidden_bytes;
-                    for (size_t b = local_id; b < bytes; b += local_size) {
-                        dst_ptr[b] = src_ptr[b];
-                    }
-                }
-                sycl::group_barrier(group);
+    // --- Stage 2: local self-copy + remote NBI puts (multi-WG).
+    // Local self-copy is heavily data-parallel across the whole grid; the remote
+    // NBI put issuing is intentionally bounded to one work-item per channel
+    // (num_experts channels) to avoid oversubscribing the single QP per PE.
+    {
+        const size_t self_bytes = static_cast<size_t>(num_local_experts) * num_max_dispatch_tokens_per_rank * hidden_bytes;
+        const int num_wgs = ll_num_wgs(self_bytes >> 4, kLLWGSize, kLLMaxWGs);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyDispatchPutKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    const int gid = static_cast<int>(item.get_global_id(0));
+                    const int gsize = static_cast<int>(item.get_global_range(0));
 
-                // Phase 1b: Remote RDMA puts using scalar NBI APIs.
-                // Each work-item independently handles assigned channels,
-                // eliminating the serialized WG put loop.
-                {
+                    // Local (self) copy of dispatch_count / dispatch_src / dispatch_data.
+                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                        const size_t src_slot =
+                            (static_cast<size_t>(rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
+                        const size_t dst_slot =
+                            (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                        const int count =
+                            sycl::min(send_count[rank * num_local_experts + local_expert], num_max_dispatch_tokens_per_rank);
+                        if (gid == 0) {
+                            dispatch_count[local_expert * num_ranks + rank] = count;
+                        }
+                        for (int slot = gid; slot < num_max_dispatch_tokens_per_rank; slot += gsize) {
+                            dispatch_src[dst_slot + slot] = send_src[src_slot + slot];
+                        }
+                        coop_copy_bytes(dispatch_data + dst_slot * hidden_bytes,
+                                        send_data + src_slot * hidden_bytes,
+                                        static_cast<size_t>(count) * hidden_bytes, gid, gsize);
+                    }
+
+                    // Remote NBI puts: one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) continue;
+                        if (dst_rank == rank) {
+                            continue;
+                        }
                         for (int le = 0; le < num_local_experts; ++le) {
-                            if (ch % local_size == local_id) {
+                            if (ch == gid) {
                                 const int sc_idx = dst_rank * num_local_experts + le;
                                 send_count[sc_idx] = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
                                 const int count = send_count[sc_idx];
-                                const size_t src_slot =
-                                    static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
+                                const size_t src_slot = static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
                                 const size_t dst_slot =
                                     (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-
-                                // Put count to remote
-                                ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank,
-                                                  send_count + sc_idx, sizeof(int), dst_rank);
+                                ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank, send_count + sc_idx, sizeof(int), dst_rank);
                                 if (count > 0) {
-                                    // Put src info
                                     ishmem_putmem_nbi(dispatch_src + dst_slot, send_src + src_slot,
                                                       static_cast<size_t>(count) * sizeof(int), dst_rank);
-                                    // Put data
-                                    ishmem_putmem_nbi(dispatch_data + dst_slot * hidden_bytes,
-                                                      send_data + src_slot * hidden_bytes,
-                                                      static_cast<size_t>(count) * hidden_bytes, dst_rank);
+                                    chunked_put_nbi(dispatch_data + dst_slot * hidden_bytes, send_data + src_slot * hidden_bytes,
+                                                    static_cast<size_t>(count) * hidden_bytes, dst_rank, max_put);
                                 }
                             }
                             ch++;
                         }
                     }
-                }
-                sycl::group_barrier(group);
+                });
+        });
+    }
 
-                // Phase 2: Barrier ensures all PEs have completed their puts
-                // (barrier_all internally does quiet + cross-PE synchronization)
-                ishmemx_barrier_all_work_group(group);
+    // --- Stage 3: cross-PE barrier (single WG). Drains the NBI puts (quiet) and
+    // synchronizes all PEs before the receive/pack stage. Runs after Stage 2
+    // completes on the in-order queue, so all puts have been issued.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyDispatchBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
+            [=](sycl::nd_item<1> item) { ishmemx_barrier_all_work_group(item.get_group()); });
+    });
 
-                // Phase 3: Pack received data — batch contiguous ranges per channel
-                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+    // --- Stage 4: pack received data (one work-group per local expert). The
+    // per-rank prefix (begin offsets) is computed serially by the WG leader, then
+    // all work-items cooperatively copy the payload and src_info per channel.
+    {
+        const int num_wgs = num_local_experts > 0 ? num_local_experts : 1;
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyDispatchPackKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto group = item.get_group();
+                    const int local_id = static_cast<int>(item.get_local_id(0));
+                    const int local_size = static_cast<int>(item.get_local_range(0));
+                    const int local_expert = static_cast<int>(item.get_group_linear_id());
+                    if (local_expert >= num_local_experts) {
+                        return;
+                    }
+
                     int begin = 0;
+                    int total = 0;
                     for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
                         const int clamped_count =
                             sycl::min(dispatch_count[local_expert * num_ranks + src_rank], num_max_dispatch_tokens_per_rank);
-                        packed_recv_layout_range[local_expert * num_ranks + src_rank] =
-                            static_cast<int64_t>(pack_range(clamped_count, begin));
                         if (local_id == 0) {
-                            packed_recv_count[local_expert] += clamped_count;
+                            packed_recv_layout_range[local_expert * num_ranks + src_rank] =
+                                static_cast<int64_t>(pack_range(clamped_count, begin));
                             if (cumulative_local_expert_recv_stats != nullptr) {
                                 cumulative_local_expert_recv_stats[local_expert] += clamped_count;
                             }
@@ -344,28 +454,27 @@ void dispatch_bf16(void* packed_recv_x,
                             }
                         }
                         if (clamped_count > 0) {
-                            // Batch copy all data for this channel
                             const size_t src_base =
                                 (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
                             const size_t dst_base =
                                 static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
-                            auto* src = dispatch_data + src_base * hidden_bytes;
-                            auto* dst = static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes;
-                            const size_t total_bytes = static_cast<size_t>(clamped_count) * hidden_bytes;
-                            for (size_t b = local_id; b < total_bytes; b += local_size) {
-                                dst[b] = src[b];
-                            }
-                            // Copy src_info for this channel
+                            coop_copy_bytes(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
+                                            dispatch_data + src_base * hidden_bytes,
+                                            static_cast<size_t>(clamped_count) * hidden_bytes, local_id, local_size);
                             for (int slot = local_id; slot < clamped_count; slot += local_size) {
                                 packed_recv_src_info[dst_base + slot] = dispatch_src[src_base + slot];
                             }
                         }
-                        sycl::group_barrier(group);
                         begin += clamped_count;
+                        total += clamped_count;
                     }
-                }
-            });
-    });
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        packed_recv_count[local_expert] = total;
+                    }
+                });
+        });
+    }
 #endif
 }
 
@@ -463,94 +572,113 @@ void combine_bf16(void* combined_x,
     auto* combine_data = base + layout.combine_data_offset;
     (void)layout.combine_flag_offset;  // combine_flag zeroed by clean_low_latency_buffer
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<LowLatencyCombineMergedKernel>(
-            sycl::nd_range<1>(sycl::range<1>(kLowLatencyMergedGroupSize), sycl::range<1>(kLowLatencyMergedGroupSize)),
-            [=](sycl::nd_item<1> item) {
-                auto group = item.get_group();
-                const int local_id = static_cast<int>(item.get_local_id(0));
-                const int local_size = static_cast<int>(item.get_local_range(0));
-                const size_t send_elems = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
-                auto* send_bf16 = reinterpret_cast<sycl::ext::oneapi::bfloat16*>(send_data);
+    const size_t send_elems = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
+    const size_t max_put = ll_max_put_bytes();
 
-                // Zero only local send staging. combine_data and combine_flag are
-                // already zeroed by clean_low_latency_buffer with cross-PE barriers.
-                for (size_t i = local_id; i < send_elems * hidden; i += local_size) {
-                    send_bf16[i] = sycl::ext::oneapi::bfloat16(0.0f);
-                }
-                sycl::group_barrier(group);
+    // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
+    // combine_flag are already zeroed by clean_low_latency_buffer (cross-PE barrier).
+    queue.memset(send_data, 0, send_elems * hidden_bytes);
 
-                // No barrier_all needed here — clean_low_latency_buffer guarantees
-                // all PEs have zeroed combine_data/combine_flag before dispatch+combine.
+    // --- Stage 1: scatter the received expert payload (x) into the per-source send
+    // staging slots indexed by (src_rank, local_expert, original_token). One
+    // sub-group per (local_expert, src_rank, slot) triple cooperatively copies a row.
+    {
+        const size_t num_rows = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
+        const int num_wgs = ll_num_wgs(num_rows, kLLWGSize, kLLMaxWGs);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyCombineScatterKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
+                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_range()[0]);
+                    const int global_sg =
+                        static_cast<int>(item.get_group_linear_id()) * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
+                    const int num_global_sgs = static_cast<int>(item.get_group_range(0)) * sgs_per_wg;
+                    const size_t rows_per_expert = static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
 
-                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
+                    for (size_t r = global_sg; r < num_rows; r += num_global_sgs) {
+                        const int local_expert = static_cast<int>(r / rows_per_expert);
+                        const int rem = static_cast<int>(r % rows_per_expert);
+                        const int src_rank = rem / num_max_dispatch_tokens_per_rank;
+                        const int slot = rem % num_max_dispatch_tokens_per_rank;
                         if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
                             continue;
                         }
                         int count = 0, begin = 0;
                         unpack_range(layout_range[local_expert * num_ranks + src_rank], count, begin);
                         const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                        for (int slot = 0; slot < clamped_count; ++slot) {
-                            const int original_token =
-                                src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                            if (original_token < 0 || original_token >= num_max_dispatch_tokens_per_rank) {
-                                continue;
-                            }
-                            auto* staged_dst = send_data +
-                                (static_cast<size_t>(src_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
-                                 original_token) *
-                                    hidden_bytes;
-                            auto* src = static_cast<const uint8_t*>(x) +
-                                (static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot) *
-                                    hidden_bytes;
-                            for (size_t b = local_id; b < hidden_bytes; b += local_size) {
-                                staged_dst[b] = src[b];
-                            }
+                        if (slot >= clamped_count) {
+                            continue;
                         }
-                    }
-                }
-                sycl::group_barrier(group);
-
-                // Combine put phase: local copies + parallel remote scalar NBI puts
-                // Step 1: Local copies (all WIs cooperate on data copy)
-                for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                    const int global_expert = rank * num_local_experts + local_expert;
-                    int count = 0, begin = 0;
-                    unpack_range(layout_range[local_expert * num_ranks + rank], count, begin);
-                    const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                    int min_token = num_max_dispatch_tokens_per_rank;
-                    int max_token = -1;
-                    for (int slot = 0; slot < clamped_count; ++slot) {
                         const int original_token =
                             src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                        if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                            min_token = sycl::min(min_token, original_token);
-                            max_token = sycl::max(max_token, original_token);
+                        if (original_token < 0 || original_token >= num_max_dispatch_tokens_per_rank) {
+                            continue;
                         }
-                    }
-                    if (max_token >= min_token) {
-                        auto* src_ptr = send_data +
-                            (static_cast<size_t>(rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
-                             min_token) *
+                        auto* staged_dst = send_data +
+                            (static_cast<size_t>(src_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
+                             original_token) *
                                 hidden_bytes;
-                        auto* dst_ptr = combine_data +
-                            (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
-                        const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                        for (size_t b = local_id; b < bytes; b += local_size) {
-                            dst_ptr[b] = src_ptr[b];
+                        auto* src = static_cast<const uint8_t*>(x) +
+                            (static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot) *
+                                hidden_bytes;
+                        coop_copy_bytes(staged_dst, src, hidden_bytes, sg_local, sg_size);
+                    }
+                });
+        });
+    }
+
+    // --- Stage 2: combine put — local self-copy (grid-parallel) + bounded remote
+    // NBI puts (one work-item per channel) of the per-destination min/max token span.
+    {
+        const size_t self_bytes = static_cast<size_t>(num_local_experts) * num_max_dispatch_tokens_per_rank * hidden_bytes;
+        const int num_wgs = ll_num_wgs(self_bytes >> 4, kLLWGSize, kLLMaxWGs);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyCombinePutKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    const int gid = static_cast<int>(item.get_global_id(0));
+                    const int gsize = static_cast<int>(item.get_global_range(0));
+
+                    // Step 1: local self-copy (dst_rank == rank), grid-parallel.
+                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                        const int global_expert = rank * num_local_experts + local_expert;
+                        int count = 0, begin = 0;
+                        unpack_range(layout_range[local_expert * num_ranks + rank], count, begin);
+                        const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
+                        int min_token = num_max_dispatch_tokens_per_rank;
+                        int max_token = -1;
+                        for (int slot = 0; slot < clamped_count; ++slot) {
+                            const int original_token =
+                                src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin +
+                                         slot];
+                            if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                                min_token = sycl::min(min_token, original_token);
+                                max_token = sycl::max(max_token, original_token);
+                            }
+                        }
+                        if (max_token >= min_token) {
+                            auto* src_ptr = send_data +
+                                (static_cast<size_t>(rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
+                                 min_token) *
+                                    hidden_bytes;
+                            auto* dst_ptr = combine_data +
+                                (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
+                            const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
+                            coop_copy_bytes(dst_ptr, src_ptr, bytes, gid, gsize);
                         }
                     }
-                }
-                sycl::group_barrier(group);
 
-                // Step 2: Remote scalar NBI puts (parallel across work-items)
-                {
+                    // Step 2: remote NBI puts, one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) continue;
+                        if (dst_rank == rank) {
+                            continue;
+                        }
                         for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                            if (ch % local_size == local_id) {
+                            if (ch == gid) {
                                 const int global_expert = rank * num_local_experts + local_expert;
                                 int count = 0, begin = 0;
                                 unpack_range(layout_range[local_expert * num_ranks + dst_rank], count, begin);
@@ -576,45 +704,60 @@ void combine_bf16(void* combined_x,
                                         (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) *
                                             hidden_bytes;
                                     const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                                    ishmem_putmem_nbi(dst_ptr, src_ptr, bytes, dst_rank);
+                                    chunked_put_nbi(dst_ptr, src_ptr, bytes, dst_rank, max_put);
                                 }
                             }
                             ch++;
                         }
                     }
-                }
-                sycl::group_barrier(group);
+                });
+        });
+    }
 
-                ishmemx_barrier_all_work_group(group);
-
-                auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
-                const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
-                for (size_t idx = local_id; idx < reduce_work; idx += local_size) {
-                    const int token_idx = static_cast<int>(idx / hidden);
-                    const int h = static_cast<int>(idx % hidden);
-                    float acc = 0.0f;
-                    for (int k = 0; k < num_topk; ++k) {
-                        const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
-                        if (expert < 0 || expert >= num_experts) {
-                            continue;
-                        }
-                        const int src_rank = expert / num_local_experts;
-                        if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
-                            continue;
-                        }
-                        const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
-                            combine_data + (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
-                        acc += static_cast<float>(value[h]) * topk_weights[token_idx * num_topk + k];
-                    }
-                    out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
-                }
-                if (combine_wait_recv_cost_stats != nullptr) {
-                    for (int i = local_id; i < num_ranks; i += local_size) {
-                        combine_wait_recv_cost_stats[i] += 0;
-                    }
-                }
-            });
+    // --- Stage 3: cross-PE barrier (single WG). Drains NBI puts (quiet) + syncs PEs.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<LowLatencyCombineBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
+            [=](sycl::nd_item<1> item) { ishmemx_barrier_all_work_group(item.get_group()); });
     });
+
+    // --- Stage 4: weighted reduction over top-k into combined_x (grid-parallel).
+    {
+        const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
+        const int num_wgs = ll_num_wgs(reduce_work, kLLWGSize, kLLMaxWGs);
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyCombineReduceKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    const int gid = static_cast<int>(item.get_global_id(0));
+                    const int gsize = static_cast<int>(item.get_global_range(0));
+                    auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
+                    for (size_t idx = gid; idx < reduce_work; idx += gsize) {
+                        const int token_idx = static_cast<int>(idx / hidden);
+                        const int h = static_cast<int>(idx % hidden);
+                        float acc = 0.0f;
+                        for (int k = 0; k < num_topk; ++k) {
+                            const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
+                            if (expert < 0 || expert >= num_experts) {
+                                continue;
+                            }
+                            const int src_rank = expert / num_local_experts;
+                            if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
+                                continue;
+                            }
+                            const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                                combine_data +
+                                (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
+                            acc += static_cast<float>(value[h]) * topk_weights[token_idx * num_topk + k];
+                        }
+                        out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
+                    }
+                    if (combine_wait_recv_cost_stats != nullptr && gid < num_ranks) {
+                        combine_wait_recv_cost_stats[gid] += 0;
+                    }
+                });
+        });
+    }
 #endif
 }
 
