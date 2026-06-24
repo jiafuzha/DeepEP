@@ -356,6 +356,7 @@ void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_ten
 void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, sycl::queue& queue);
 
 void dispatch_bf16(void* packed_recv_x,
+                   void* packed_recv_x_scales,
                    int* packed_recv_src_info,
                    int64_t* packed_recv_layout_range,
                    int* packed_recv_count,
@@ -372,17 +373,10 @@ void dispatch_bf16(void* packed_recv_x,
                    int num_experts,
                    int rank,
                    int num_ranks,
+                   bool use_fp8,
+                   bool round_scale,
+                   bool use_ue8m0,
                    sycl::queue& queue);
-
-void cast_bf16_to_fp8(void* packed_recv_x,
-                      void* packed_recv_x_scales,
-                      const void* packed_recv_bf16,
-                      const int* packed_recv_src_info,
-                      int num_rows,
-                      int hidden,
-                      bool round_scale,
-                      bool use_ue8m0,
-                      sycl::queue& queue);
 
 void combine_bf16(void* combined_x,
                   void* rdma_buffer,
