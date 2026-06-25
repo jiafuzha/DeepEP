@@ -72,11 +72,26 @@ SYCL_EXTERNAL inline T uc_load(const T* ptr) {
 template <typename T>
 SYCL_EXTERNAL inline void uc_store(T* ptr, T value) {
 #ifdef __SYCL_DEVICE_ONLY__
-    if constexpr (sizeof(T) == 4) {
+    if constexpr (sizeof(T) == 1) {
+        uint8_t v;
+        __builtin_memcpy(&v, &value, 1);
+        *reinterpret_cast<volatile uint8_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint8_t*>(ptr), "sycl-cache-write-hint", 0x7)) = v;
+    } else if constexpr (sizeof(T) == 2) {
+        uint16_t v;
+        __builtin_memcpy(&v, &value, 2);
+        *reinterpret_cast<volatile uint16_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint16_t*>(ptr), "sycl-cache-write-hint", 0x7)) = v;
+    } else if constexpr (sizeof(T) == 4) {
         uint32_t v;
         __builtin_memcpy(&v, &value, 4);
         *reinterpret_cast<volatile uint32_t*>(__builtin_intel_sycl_ptr_annotation(
             reinterpret_cast<uint32_t*>(ptr), "sycl-cache-write-hint", 0x7)) = v;
+    } else if constexpr (sizeof(T) == 8) {
+        uint64_t v;
+        __builtin_memcpy(&v, &value, 8);
+        *reinterpret_cast<volatile uint64_t*>(__builtin_intel_sycl_ptr_annotation(
+            reinterpret_cast<uint64_t*>(ptr), "sycl-cache-write-hint", 0x7)) = v;
     } else {
         *ptr = value;
     }
