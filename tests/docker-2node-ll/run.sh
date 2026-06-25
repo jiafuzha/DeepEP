@@ -273,6 +273,8 @@ run_test() {
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
                 -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
                 -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
+                -genv DEEP_EP_LL_FLAG_PROGRESS \"\${DEEP_EP_LL_FLAG_PROGRESS:-0}\" \
+                -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \
