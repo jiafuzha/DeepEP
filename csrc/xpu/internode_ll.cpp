@@ -315,6 +315,43 @@ inline void ll_sender_flush(int mode) {
     (void)mode;
 }
 
+// Receiver-side bulk-read acquire mode for the flag path. The default flag path
+// USED to read EVERY delivered payload byte with an uncached uc_load (L2-bypassing),
+// so each byte paid a memory round-trip. Better: once the per-expert flags confirm
+// the RDMA payload has landed, issue a SINGLE system-scope acquire / cache-invalidate
+// at the start of the read kernel so the GPU L2 becomes coherent with the NIC writes,
+// then read the bulk payload with FAST CACHED loads (the same mechanism the barrier
+// path relies on). Trades a per-byte uncached tax for one invalidate + cached reads.
+//   0 = per-byte uncached uc_load (fallback; ~15% slower on loopback)
+//   1 = one sycl::atomic_fence(acquire, system) at kernel entry + cached reads (DEFAULT)
+//   2 = one LSC lsc_fence.ugm.invalidate.sysacq at kernel entry + cached reads
+//       (UNSTABLE on 2-node: reproducibly trips UR_RESULT_ERROR_DEVICE_LOST; do NOT use)
+// Measured (flag path on): loopback ~1581 us (mode 1) vs ~1870 us (mode 0); true 2-node
+// is transport-bound so all modes ~1150 us. Mode 1 is correct on both and faster on
+// loopback, so it is the default; mode 0 stays as an opt-out fallback.
+inline int ll_flag_recv_acq() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_RECV_ACQ");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v >= 0)
+            return v;
+    }
+    return 1;
+}
+
+// Device-side receiver acquire/invalidate (see ll_flag_recv_acq). Issued ONCE per
+// work-item at the start of the payload-read kernel, before any cached load.
+inline void ll_recv_acquire(int mode) {
+#ifdef __SYCL_DEVICE_ONLY__
+    if (mode == 1) {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    } else if (mode >= 2) {
+        lsc_fence_sysacq();
+    }
+#endif
+    (void)mode;
+}
+
 // Spin-poll iteration cap for flag waits (BMG has no portable cycle counter, so
 // a bounded busy-spin replaces CUDA's clock64 timeout). Overridable via
 // DEEP_EP_LL_POLL_CAP. On timeout the slot is treated as "0 tokens" (graceful
@@ -518,6 +555,10 @@ void dispatch_bf16(void* packed_recv_x,
     const bool flag_diag_barrier = ll_flag_diag_barrier();
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
+    const int flag_recv_acq = ll_flag_recv_acq();
+    // When the receiver does a single acquire/invalidate up front, the bulk payload
+    // is read with CACHED loads instead of per-byte uncached uc_load.
+    const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
     auto* combine_flag = base + layout.combine_flag_offset;
 
     // --- Stage 0: zero LOCAL staging + output tensors (multi-WG via memset).
@@ -813,6 +854,14 @@ void dispatch_bf16(void* packed_recv_x,
                     const int cohort_id = sub * local_size + local_id;
                     const int cohort_size = pack_wgs_per_expert * local_size;
 
+                    // Flag path: the per-expert flags already confirmed (Stage 3) that
+                    // the RDMA payload has landed in memory. Issue a SINGLE system-scope
+                    // acquire/invalidate here so the subsequent CACHED payload reads see
+                    // the NIC-delivered bytes (when flag_recv_acq != 0). No-op otherwise.
+                    if (flag_progress && flag_recv_acq != 0) {
+                        ll_recv_acquire(flag_recv_acq);
+                    }
+
                     int begin = 0;
                     int total = 0;
                     for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
@@ -861,7 +910,7 @@ void dispatch_bf16(void* packed_recv_x,
                                     float blk[128];
                                     float amax = 1.0e-4f;
                                     for (int i = 0; i < 128; ++i) {
-                                        const float fv = flag_progress ? static_cast<float>(uc_load(&src_bf16[base_h + i]))
+                                        const float fv = recv_uncached ? static_cast<float>(uc_load(&src_bf16[base_h + i]))
                                                                        : static_cast<float>(src_bf16[base_h + i]);
                                         blk[i] = fv;
                                         amax = sycl::fmax(amax, sycl::fabs(fv));
@@ -895,7 +944,7 @@ void dispatch_bf16(void* packed_recv_x,
                                     }
                                 }
                             } else {
-                                if (flag_progress) {
+                                if (recv_uncached) {
                                     coop_copy_bytes_uc(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
                                                        dispatch_data + src_base * hidden_bytes,
                                                        static_cast<size_t>(clamped_count) * hidden_bytes,
@@ -911,7 +960,7 @@ void dispatch_bf16(void* packed_recv_x,
                             }
                             for (int slot = cohort_id; slot < clamped_count; slot += cohort_size) {
                                 packed_recv_src_info[dst_base + slot] =
-                                    flag_progress ? uc_load(&dispatch_src[src_base + slot]) : dispatch_src[src_base + slot];
+                                    recv_uncached ? uc_load(&dispatch_src[src_base + slot]) : dispatch_src[src_base + slot];
                             }
                         }
                         begin += clamped_count;
@@ -966,6 +1015,8 @@ void combine_bf16(void* combined_x,
     const bool flag_diag_barrier = ll_flag_diag_barrier();
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
+    const int flag_recv_acq = ll_flag_recv_acq();
+    const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
 
     // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
     // combine_flag are already zeroed by clean_low_latency_buffer (cross-PE barrier).
@@ -1209,6 +1260,12 @@ void combine_bf16(void* combined_x,
                     const int gid = static_cast<int>(item.get_global_id(0));
                     const int gsize = static_cast<int>(item.get_global_range(0));
                     auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
+                    // Flag path: one acquire/invalidate up front (Stage 3 confirmed the
+                    // combine payload landed) so the reduction reads CACHED instead of
+                    // per-byte uncached, when flag_recv_acq != 0.
+                    if (flag_progress && flag_recv_acq != 0) {
+                        ll_recv_acquire(flag_recv_acq);
+                    }
                     for (size_t idx = gid; idx < reduce_work; idx += gsize) {
                         const int token_idx = static_cast<int>(idx / hidden);
                         const int h = static_cast<int>(idx % hidden);
@@ -1224,7 +1281,7 @@ void combine_bf16(void* combined_x,
                             }
                             const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
                                 combine_data + (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
-                            const float fv = flag_progress ? static_cast<float>(uc_load(&value[h])) : static_cast<float>(value[h]);
+                            const float fv = recv_uncached ? static_cast<float>(uc_load(&value[h])) : static_cast<float>(value[h]);
                             acc += fv * topk_weights[token_idx * num_topk + k];
                         }
                         out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);

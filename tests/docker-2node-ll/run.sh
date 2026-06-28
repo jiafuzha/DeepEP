@@ -290,6 +290,7 @@ run_test() {
                 -genv DEEP_EP_LL_FLAG_PROGRESS \"\${DEEP_EP_LL_FLAG_PROGRESS:-0}\" \
                 -genv DEEP_EP_LL_FLAG_LSC \"\${DEEP_EP_LL_FLAG_LSC:-0}\" \
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
+                -genv DEEP_EP_LL_FLAG_RECV_ACQ \"\${DEEP_EP_LL_FLAG_RECV_ACQ:-1}\" \
                 -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
