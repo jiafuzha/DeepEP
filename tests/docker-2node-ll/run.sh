@@ -226,10 +226,24 @@ ensure_port_free() {
     return 0
 }
 
+# --- Gate: verify iSHMEM auto GPU->NIC selection is same-PCIe-switch per rank ---
+verify_nic_selection() {
+    DEEP_EP_DIR="$DEEP_EP_DIR" \
+    ISHMEM_DIR="${ISHMEM_DIR:-/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim}" \
+    NUM_PROCESSES="$NUM_PROCESSES" \
+    ISHMEM_SYMMETRIC_SIZE="$ISHMEM_SYMMETRIC_SIZE" \
+        bash "$SCRIPT_DIR/verify_nic_selection.sh"
+}
+
 # --- Run DeepEP internode test: launch mpirun INSIDE node0; spawn rank on node1 via SSH ---
 run_test() {
     ensure_up
     verify_rdma || { echo "RDMA accessibility check failed; aborting test." >&2; return 1; }
+    verify_nic_selection || {
+        echo "iSHMEM auto NIC selection check FAILED (a rank's NIC is not under" >&2
+        echo "the same PCIe switch as its GPU); aborting test." >&2
+        return 1
+    }
     clean_ipc_state
     ensure_port_free || { echo "MASTER_PORT cleanup failed; aborting test." >&2; return 1; }
 
@@ -274,6 +288,8 @@ run_test() {
                 -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
                 -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
                 -genv DEEP_EP_LL_FLAG_PROGRESS \"\${DEEP_EP_LL_FLAG_PROGRESS:-0}\" \
+                -genv DEEP_EP_LL_FLAG_LSC \"\${DEEP_EP_LL_FLAG_LSC:-0}\" \
+                -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
                 -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \

@@ -46,10 +46,11 @@ ISHMEM_DIR="${ISHMEM_DIR:-/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d
 UT_BIN="$ISHMEM_REPO/build/test/unit/deepep/xpu_ishmem_mapped_api_ut"
 UT_BUILD="$ISHMEM_REPO/test/unit/deepep/build_xpu_ishmem_mapped_api_ut.sh"
 # Cases to run (space-separated). The four ext_flag_* cases are the experiment.
-CASES="${CASES:-ext_flag_ucload ext_flag_aref_sys ext_flag_fence_sys}"
+CASES="${CASES:-ext_flag_ucload ext_flag_lscuc ext_flag_lscuc_acq ext_flag_aref_sys ext_flag_fence_sys}"
 UT_NUM_ELEMS="${UT_NUM_ELEMS:-64}"
 UT_PEER_MODE="${UT_PEER_MODE:-all2all}"
 UT_SPIN_CAP="${UT_SPIN_CAP:-200000000}"
+UT_BENCH_ITERS="${UT_BENCH_ITERS:-2000000}"
 
 # Test parameters (small by default for fast iteration)
 NUM_PROCESSES="${NUM_PROCESSES:-2}"   # num local ranks (= ppn)
@@ -296,6 +297,7 @@ run_test() {
                     -genv WORLD_SIZE 2 \
                     -genv UT_PEER_MODE $UT_PEER_MODE \
                     -genv UT_SPIN_CAP $UT_SPIN_CAP \
+                    -genv UT_BENCH_ITERS $UT_BENCH_ITERS \
                     -launcher ssh \
                     -bootstrap-exec-args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa' \
                     $WRAPPER_PATH \

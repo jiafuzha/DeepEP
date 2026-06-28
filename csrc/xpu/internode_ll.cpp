@@ -7,6 +7,48 @@
 #include <ishmemx.h>
 #endif
 
+// ============================================================================
+// Two receiver-progress paths (dispatch & combine). Both move the same data via
+// ishmem_putmem_nbi over RDMA; they differ ONLY in how the receiver learns the
+// RDMA writes have landed before reading them. Selected by ll_flag_progress()
+// (env DEEP_EP_LL_FLAG_PROGRESS, default 0 = barrier path).
+//
+//   1. BARRIER PATH  (DEFAULT, DEEP_EP_LL_FLAG_PROGRESS unset/0)
+//      - Sync: one global ishmemx_barrier_all_work_group between the put stage
+//        and the pack/reduce stage.
+//      - The barrier doubles as a system-scope acquire/invalidate, making GPU L2
+//        coherent with NIC RDMA writes -> receiver reads delivered data with
+//        FAST CACHED loads.
+//      - Latency is gated by the slowest peer (all-to-all sync); cheap at low PE
+//        counts, grows with scale. Proven-stable, including true 2-node.
+//
+//   2. FLAG PATH  (opt-in, DEEP_EP_LL_FLAG_PROGRESS=1)
+//      - Sync: NO global barrier. Instead (a) a LOCAL ishmemx_quiet_work_group
+//        drains only this PE's outbound NBI puts, then (b) per-expert completion
+//        flags/counts that the receiver SPIN-POLLS (bounded by DEEP_EP_LL_POLL_CAP).
+//      - With no barrier there is no acquire/invalidate and BMG's L2 is NOT
+//        coherent with NIC RDMA writes, so EVERY delivered byte (flag + payload)
+//        must be read with L2-bypassing uncached uc_load (RECEIVER side).
+//      - SENDER side: the flag VALUE is staged via uc_store then RDMA-WRITE-put;
+//        uc_store's write-through hint only bypasses L1, so the NIC could DMA-read
+//        a STALE L3-resident 0 and transmit it -> receiver spins forever ->
+//        watchdog DEVICE_LOST on 2-node. A sender-side release/flush fence between
+//        the uc_store and the put (ll_sender_flush, DEEP_EP_LL_FLAG_SENDER_FENCE,
+//        DEFAULT 1 = sycl::atomic_fence(release,system); 2 = LSC evict.sysrel)
+//        evicts the value to the memory domain the NIC reads. With this flush the
+//        flag path PASSES true 2-node (avg ~1.15-1.24 ms, no DEVICE_LOST); it was
+//        the missing piece (NOT the receiver read primitive, NOT the NIC PCIe
+//        domain, NOT transport latency).
+//      - Removes the all-to-all sync so latency no longer tracks the slowest peer
+//        (mirrors CUDA's amo_nonfetch_add + receiver-poll). Still pays an
+//        uncached-read tax per byte (loopback ~1861 vs barrier ~1130 us/iter).
+//
+// uc_load is confirmed to be a genuine uncached load (equivalent to explicit LSC
+// .uc.uc asm and the only correct way to read post-RDMA data without a barrier);
+// see ll_flag_progress() below for the full rationale and the flip-to-flags
+// criteria. Tier-2's job is to close the flag path's per-byte read-cost gap.
+// ============================================================================
+
 namespace deep_ep {
 namespace internode_ll {
 namespace {
@@ -205,6 +247,72 @@ inline bool ll_flag_progress_combine() {
 inline bool ll_flag_diag_barrier() {
     const char* env = std::getenv("DEEP_EP_LL_FLAG_DIAG_BARRIER");
     return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+}
+
+// A/B toggle for the flag-path dispatch_count read primitive. Default 0 keeps
+// the hint-based uc_load (sycl-cache-read-hint 0x7, L1-uncached). Set
+// DEEP_EP_LL_FLAG_LSC=1 to read the per-expert flag via explicit LSC
+// `lsc_load.ugm.uc.uc` (L1+L3 uncached at the GenISA message level) to test
+// whether 2-node correctness/staleness differs from the hint. Optionally also
+// issues an `lsc_fence.ugm.invalidate.sysacq` before each read when value >= 2.
+inline int ll_flag_lsc_mode() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_LSC");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0)
+            return v;
+    }
+    return 0;
+}
+
+// Sender-side flush fence mode for the flag path. After uc_store-ing the encoded
+// flag value into the symmetric send staging, the NIC DMA-reads that staging to
+// RDMA-WRITE it into the receiver's slot. If the GPU has not flushed the store
+// past L3 to the system memory domain the NIC reads, the NIC can transmit a STALE
+// value (e.g. 0), so the receiver spins forever (-> watchdog DEVICE_LOST on
+// 2-node) even with a perfect uncached read. This emits a release/flush fence
+// between the uc_store and the flag put:
+//   0 = none   1 = sycl::atomic_fence(release, system) [DEFAULT, portable]
+//   2 = LSC lsc_fence.ugm.evict.sysrel (explicit L3 evict to memory, ~1% faster)
+// DEFAULT 1: the flag path is INCORRECT on 2-node without this flush (empirically
+// the NIC reads a stale 0); set DEEP_EP_LL_FLAG_SENDER_FENCE=0 only to reproduce
+// the broken behavior, =2 to use the explicit LSC evict.
+inline int ll_flag_sender_fence() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_SENDER_FENCE");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v >= 0)
+            return v;
+    }
+    return 1;
+}
+
+// Device-side flag read used by the flag path. lsc_mode 0 = hint-based uc_load
+// (L1 uncached); 1 = explicit LSC `lsc_load.ugm.uc.uc` (L1+L3 uncached); >=2 =
+// LSC load preceded by an `invalidate.sysacq` cache-invalidate fence.
+inline int ll_read_flag(const int* p, int lsc_mode) {
+#ifdef __SYCL_DEVICE_ONLY__
+    if (lsc_mode >= 2) {
+        lsc_fence_sysacq();
+    }
+    if (lsc_mode >= 1) {
+        return lsc_uc_load_i32(p);
+    }
+#endif
+    return uc_load(p);
+}
+
+// Device-side sender-side flush fence (see ll_flag_sender_fence). Forces freshly
+// uc_store-d staging bytes out to the memory domain the NIC DMA-reads.
+inline void ll_sender_flush(int mode) {
+#ifdef __SYCL_DEVICE_ONLY__
+    if (mode == 1) {
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    } else if (mode >= 2) {
+        lsc_fence_sysrel();
+    }
+#endif
+    (void)mode;
 }
 
 // Spin-poll iteration cap for flag waits (BMG has no portable cycle counter, so
@@ -408,6 +516,8 @@ void dispatch_bf16(void* packed_recv_x,
     const bool flag_progress = ll_flag_progress();
     const uint64_t poll_cap = ll_poll_cap();
     const bool flag_diag_barrier = ll_flag_diag_barrier();
+    const int flag_lsc_mode = ll_flag_lsc_mode();
+    const int flag_sender_fence = ll_flag_sender_fence();
     auto* combine_flag = base + layout.combine_flag_offset;
 
     // --- Stage 0: zero LOCAL staging + output tensors (multi-WG via memset).
@@ -590,6 +700,10 @@ void dispatch_bf16(void* packed_recv_x,
                                                         max_put);
                                     }
                                     uc_store(&send_count[sc_idx], -count - 1);  // write-through so NIC reads fresh
+                                    // Optional sender-side release/flush so the NIC DMA-reads the
+                                    // freshly-stored flag (not a stale cached value). See
+                                    // ll_flag_sender_fence / DEEP_EP_LL_FLAG_SENDER_FENCE.
+                                    ll_sender_flush(flag_sender_fence);
                                     ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank, send_count + sc_idx, sizeof(int), dst_rank);
                                 } else {
                                     ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank, send_count + sc_idx, sizeof(int), dst_rank);
@@ -647,7 +761,7 @@ void dispatch_bf16(void* packed_recv_x,
                                                                        continue;  // masked peer never sends; leave 0 -> 0 tokens
                                                                    }
                                                                    uint64_t spins = 0;
-                                                                   while (uc_load(&dispatch_count[le * num_ranks + src_rank]) == 0) {
+                                                                   while (ll_read_flag(&dispatch_count[le * num_ranks + src_rank], flag_lsc_mode) == 0) {
                                                                        if (++spins >= poll_cap) {
                                                                            break;  // timeout -> leave 0 -> treated as 0 tokens
                                                                        }
@@ -707,7 +821,7 @@ void dispatch_bf16(void* packed_recv_x,
                             // Flag encoding: 0 = not-arrived/timeout -> 0 tokens;
                             // otherwise raw = -count-1 -> count = -raw-1. uc_load
                             // forces a fetch of the RDMA-delivered (NIC-written) slot.
-                            const int raw = uc_load(&dispatch_count[local_expert * num_ranks + src_rank]);
+                            const int raw = ll_read_flag(&dispatch_count[local_expert * num_ranks + src_rank], flag_lsc_mode);
                             clamped_count = (raw == 0) ? 0 : sycl::min(-raw - 1, num_max_dispatch_tokens_per_rank);
                         } else {
                             clamped_count =
@@ -850,6 +964,8 @@ void combine_bf16(void* combined_x,
     const bool flag_progress = ll_flag_progress_combine();
     const uint64_t poll_cap = ll_poll_cap();
     const bool flag_diag_barrier = ll_flag_diag_barrier();
+    const int flag_lsc_mode = ll_flag_lsc_mode();
+    const int flag_sender_fence = ll_flag_sender_fence();
 
     // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
     // combine_flag are already zeroed by clean_low_latency_buffer (cross-PE barrier).
@@ -1025,6 +1141,9 @@ void combine_bf16(void* combined_x,
                                     // Same-QP RC ordering (QPS_PER_PE=1) lands it after the payload put.
                                     const int sc_idx = dst_rank * num_local_experts + local_expert;
                                     uc_store(&send_count[sc_idx], 1);
+                                    // Flush the staged flag past L3 so the NIC DMA-reads the fresh
+                                    // value (same hazard as dispatch; see ll_flag_sender_fence).
+                                    ll_sender_flush(flag_sender_fence);
                                     ishmem_putmem_nbi(combine_flag_i + global_expert * 2, send_count + sc_idx, sizeof(int), dst_rank);
                                 }
                             }
@@ -1062,7 +1181,7 @@ void combine_bf16(void* combined_x,
                                                                       continue;  // masked owner never sends
                                                                   }
                                                                   uint64_t spins = 0;
-                                                                  while (uc_load(&combine_flag_i[ge * 2]) == 0) {
+                                                                  while (ll_read_flag(&combine_flag_i[ge * 2], flag_lsc_mode) == 0) {
                                                                       if (++spins >= poll_cap) {
                                                                           break;  // timeout -> proceed; Reduce reads zeros
                                                                       }
