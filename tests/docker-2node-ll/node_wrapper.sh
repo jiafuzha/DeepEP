@@ -50,6 +50,9 @@ export RANK=${RANK:-$NODE_RANK}
 # NOTE: ISHMEM_IBGDA_NIC is intentionally NOT set here. iSHMEM auto-selects the
 # NIC closest to the chosen GPU by PCIe topology, which is correct in this
 # 2-node simulation since each node only exposes its own GPUs (4,5 or 6,7).
+# The auto-selection is independently verified before each test run by
+# verify_nic_selection.sh / nic_pcie_check (run.sh), which asserts the
+# auto-picked NIC shares the GPU's PCIe switch.
 export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package

@@ -65,6 +65,47 @@ SYCL_EXTERNAL inline T uc_load(const T* ptr) {
 #endif
 }
 
+// LSC (Load-Store-Cache) explicit cache-control uncached 32-bit load. Unlike
+// uc_load (which annotates the pointer with the sycl-cache-read-hint and lets
+// IGC lower it), this emits the GenISA `lsc_load.ugm.uc.uc` directly, forcing
+// BOTH L1 and L3 uncached at the message descriptor level. Used to A/B whether
+// the flag-path 2-node staleness/correctness differs from the hint-based load
+// (toggle DEEP_EP_LL_FLAG_LSC=1). GenISA syntax mirrors the proven form in
+// ishmem_ibgda test/diagnostic/uar_doorbell_method_test.cpp (the `.d32x1`/"=r"
+// form is rejected by IGC; `(M1, 1) %0:d32 flat[%1]:a64` with "=rw"/"rw" works).
+SYCL_EXTERNAL inline int lsc_uc_load_i32(const int* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    uint32_t out;
+    asm volatile(
+        "lsc_load.ugm.uc.uc (M1, 1) %0:d32 flat[%1]:a64\n"
+        : "=rw"(out)
+        : "rw"(ptr)
+        : "memory");
+    int r;
+    __builtin_memcpy(&r, &out, 4);
+    return r;
+#else
+    return *ptr;
+#endif
+}
+
+// Acquire/invalidate counterpart of the LSC release fence: invalidates the GPU
+// data cache so a subsequent load observes externally-written (NIC RDMA) data.
+SYCL_EXTERNAL inline void lsc_fence_sysacq() {
+#ifdef __SYCL_DEVICE_ONLY__
+    asm volatile("lsc_fence.ugm.invalidate.sysacq\n" ::: "memory");
+#endif
+}
+
+// Release/flush LSC fence: evicts/flushes the GPU data cache to the system memory
+// domain so an external agent (NIC DMA reading the symmetric send staging) sees
+// the freshly-stored bytes. Pairs with lsc_fence_sysacq.
+SYCL_EXTERNAL inline void lsc_fence_sysrel() {
+#ifdef __SYCL_DEVICE_ONLY__
+    asm volatile("lsc_fence.ugm.evict.sysrel\n" ::: "memory");
+#endif
+}
+
 // Uncached (write-through) store, paired with uc_load. Writing the RDMA
 // receive-region sentinel through this (instead of a cached store) guarantees
 // the UC-load reader observes the sentinel, not a stale cached line from a
