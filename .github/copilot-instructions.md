@@ -35,3 +35,7 @@
 - SM90-specific launch/TMA/FP8 behavior is guarded by `DISABLE_SM90_FEATURES`. Keep the fallback launch path in `csrc/kernels/launch.cuh` working for A100/CUDA 11 builds.
 - `format.sh` temporarily rewrites `#pragma unroll` before running `clang-format`; do not replace this with a plain clang-format command if preserving existing formatting behavior matters.
 - For CUDA-to-SYCL/XPU migration work, use the repository agent in `.github/agents/cuda-to-sycl-xpu.agent.md` and the migration skills under `.github/skills/` before manually converting PTX, NVSHMEM, or memory-ordering code.
+- For CUDA IPC / symmetric-memory migration to Intel Level Zero IPC, use `.github/agents/cuda-ipc-symmetric-memory-level-zero.agent.md`.
+- Two migration skills are available under `.github/skills/`: `memory-semantics-and-ptx-assembly-converter` (PTX fences, bar.sync, mbarrier, cp.async, atomics → SYCL) and `nvshmem-ibgda-to-ishmem` (NVSHMEM/IBGDA API → iSHMEM). Invoke these skills before making manual PTX or NVSHMEM edits.
+- `nvshmem_ishmem_api_mapping.txt` at the repo root documents the full NVSHMEM/IBGDA → iSHMEM API symbol mapping for kernel migration; consult it when renaming NVSHMEM calls.
+- In-progress XPU/SYCL migration lives in `csrc/xpu/`; files there are SYCL counterparts of the CUDA kernels in `csrc/kernels/` (e.g. `intranode.cpp`, `internode.cpp`, `layout.cpp`). `xpu_kernels.hpp` and `xpu_runtime.hpp` are the XPU-side equivalents of `api.cuh` and `runtime.cu`.
