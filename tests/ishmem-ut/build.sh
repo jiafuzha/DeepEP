@@ -1,5 +1,7 @@
 #!/bin/bash
-# Build the standalone iSHMEM device-PUT reproducer (ll_put_repro.cpp).
+# Build the standalone iSHMEM reproducers:
+#   ll_put_repro       - device putmem_nbi delivery (low-latency path)
+#   normal_putmem_repro- blocking putmem + device-wide barrier (normal path)
 #
 # Selects the iSHMEM install via ISHMEM_DIR so you can build against either the
 # known-good or the suspect iSHMEM and compare:
@@ -26,14 +28,25 @@ export PKG_CONFIG_PATH="$ISHMEM_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 ISHMEM_CFLAGS="$(pkg-config --cflags ishmem)"
 ISHMEM_LIBS="$(pkg-config --libs ishmem)"
 
-OUT="$SCRIPT_DIR/ll_put_repro"
-SRC="$SCRIPT_DIR/ll_put_repro.cpp"
+build_one() {
+    local name="$1"
+    local src="$SCRIPT_DIR/$name.cpp"
+    local out="$SCRIPT_DIR/$name"
+    [ -f "$src" ] || { echo "skip $name (no $src)"; return 0; }
+    echo "===== Building $name against ISHMEM_DIR=$ISHMEM_DIR ====="
+    set -x
+    icpx -O3 -std=c++17 -fsycl -fsycl-rdc -fsycl-targets=spir64 \
+        $ISHMEM_CFLAGS \
+        "$src" -o "$out" \
+        $ISHMEM_LIBS -lze_loader -lhwloc -libverbs -lpthread
+    set +x
+    echo "===== Built $out ====="
+}
 
-echo "===== Building ll_put_repro against ISHMEM_DIR=$ISHMEM_DIR ====="
-set -x
-icpx -O3 -std=c++17 -fsycl -fsycl-rdc -fsycl-targets=spir64 \
-    $ISHMEM_CFLAGS \
-    "$SRC" -o "$OUT" \
-    $ISHMEM_LIBS -lze_loader -lhwloc -libverbs
-set +x
-echo "===== Built $OUT ====="
+# Optionally build a single target: `build.sh normal_putmem_repro`
+if [ "$#" -ge 1 ]; then
+    build_one "$1"
+else
+    build_one ll_put_repro
+    build_one normal_putmem_repro
+fi

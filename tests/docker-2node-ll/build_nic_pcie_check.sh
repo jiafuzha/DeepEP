@@ -19,6 +19,6 @@ icpx -std=c++20 -O2 -fsycl -fsycl-rdc -fsycl-targets=spir64 \
     $ISHMEM_CFLAGS \
     "$SRC" \
     -o "$OUT" \
-    -lze_loader $ISHMEM_LIBS
+    -lze_loader $ISHMEM_LIBS -lhwloc
 
 echo "$OUT"
