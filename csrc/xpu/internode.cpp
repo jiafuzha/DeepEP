@@ -2507,7 +2507,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }
                 sycl::group_barrier(group);
-                if (group.leader()) ishmem_barrier_all();
+                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
                 sycl::group_barrier(group);
 
                 if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
@@ -2538,7 +2538,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
                 sycl::group_barrier(group);
-                if (group.leader()) ishmem_barrier_all();
+                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
                 sycl::group_barrier(group);
             });
     });
@@ -3236,7 +3236,7 @@ void combine_nvl_rdma(DataType type,
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                 }
                 sycl::group_barrier(group);
-                if (group.leader()) ishmem_barrier_all();
+                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
                 sycl::group_barrier(group);
 
                 if (is_puter) {
@@ -3304,7 +3304,7 @@ void combine_nvl_rdma(DataType type,
                 // every PE before FWD WRITE reads from the receive regions.
                 // Every PE (including nvl_rank != 0) must reach this collective.
                 sycl::group_barrier(group);
-                if (group.leader()) ishmem_barrier_all();
+                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
                 sycl::group_barrier(group);
             });
     });
