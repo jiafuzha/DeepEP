@@ -49,4 +49,5 @@ if [ "$#" -ge 1 ]; then
 else
     build_one ll_put_repro
     build_one normal_putmem_repro
+    build_one finalize_repro
 fi

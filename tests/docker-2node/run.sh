@@ -2,12 +2,14 @@
 # ===========================================================================
 # Launch 2-node DeepEP internode (NVL+RDMA) test using Docker containers.
 #
-# Each container is a separate "node" with its own hostname and bridge IP:
-#   deepep-node0: 172.31.0.10, GPUs 4,5, NICs mlx5_4,mlx5_5
-#   deepep-node1: 172.31.0.11, GPUs 6,7, NICs mlx5_6,mlx5_7
+# Each container is a separate "node" with its own hostname and SSH port on
+# the host network namespace:
+#   deepep-node0: 127.0.0.1:2300, GPUs 4,5, NICs mlx5_4,mlx5_5
+#   deepep-node1: 127.0.0.1:2301, GPUs 6,7, NICs mlx5_6,mlx5_7
 #
 # mpirun is launched INSIDE deepep-node0 (via docker exec); it spawns ranks
-# on deepep-node1 via SSH using the bridge IP. With ppn=2 the topology is:
+# on deepep-node1 via SSH using the configured SSH port. With ppn=2 the
+# topology is:
 #   - rank 0,1 on node0 -> local_rank 0,1 -> GPU 4,5 + NIC mlx5_4,mlx5_5
 #   - rank 2,3 on node1 -> local_rank 0,1 -> GPU 6,7 + NIC mlx5_6,mlx5_7
 #
@@ -25,9 +27,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-DEEP_EP_DIR="/data/jiafuzha/code-repo/zjf2012/DeepEP"
+DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_internode.py}"
 SSH_DIR="/tmp/deepep-docker-ssh"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 
 # DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
 DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
@@ -45,6 +48,21 @@ NUM_EXPERTS="${NUM_EXPERTS:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
 
 # --- Helpers ---
+init_ib_device_config() {
+    read -r -a NODE0_IB_DEVICES_ARR <<< "${NODE0_IB_DEVICES:-mlx5_4 mlx5_5}"
+    read -r -a NODE1_IB_DEVICES_ARR <<< "${NODE1_IB_DEVICES:-mlx5_6 mlx5_7}"
+    NODE0_IB_DEVICES_STR="${NODE0_IB_DEVICES:-mlx5_4 mlx5_5}"
+    NODE1_IB_DEVICES_STR="${NODE1_IB_DEVICES:-mlx5_6 mlx5_7}"
+    if [ "${#NODE0_IB_DEVICES_ARR[@]}" -eq 0 ] || [ "${#NODE1_IB_DEVICES_ARR[@]}" -eq 0 ]; then
+        echo "NODE0_IB_DEVICES and NODE1_IB_DEVICES must each contain at least one IB device" >&2
+        exit 1
+    fi
+}
+
+init_ib_device_config
+NODE0_PRIMARY_IB_DEVICE="${NODE0_IB_DEVICES_ARR[0]}"
+NODE1_PRIMARY_IB_DEVICE="${NODE1_IB_DEVICES_ARR[0]}"
+
 setup_ssh_keys() {
     if [ ! -f "$SSH_DIR/id_rsa" ]; then
         mkdir -p "$SSH_DIR"
@@ -53,16 +71,16 @@ setup_ssh_keys() {
     fi
     cat > "$SSH_DIR/config" << 'EOF'
 Host deepep-node0
-    HostName 172.31.0.10
-    Port 22
+    HostName 127.0.0.1
+    Port 2300
     User root
     IdentityFile /root/.ssh/id_rsa
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
 
 Host deepep-node1
-    HostName 172.31.0.11
-    Port 22
+    HostName 127.0.0.1
+    Port 2301
     User root
     IdentityFile /root/.ssh/id_rsa
     StrictHostKeyChecking no
@@ -99,7 +117,7 @@ up() {
         if docker exec deepep-node0 ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
               -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa \
               deepep-node1 true 2>/dev/null; then
-            echo "Containers ready: deepep-node0 (172.31.0.10), deepep-node1 (172.31.0.11)"
+            echo "Containers ready: deepep-node0 (127.0.0.1:2300), deepep-node1 (127.0.0.1:2301)"
             return 0
         fi
         sleep 2
@@ -134,30 +152,33 @@ verify_rdma() {
         echo "$c IB devices: $devs"
     done
 
-    # 2. node0 PORT_ACTIVE check on mlx5_4
-    if ! docker exec deepep-node0 bash -lc 'ibv_devinfo -d mlx5_4 2>/dev/null | grep -q PORT_ACTIVE'; then
-        echo "FAIL: deepep-node0 mlx5_4 port not active"
+    # 2. Verify the assigned IB ports are ACTIVE. Use sysfs instead of
+    #    ibv_devinfo here because the container bind-mounts host RDMA userspace
+    #    libs, and ibv_devinfo can fail with libibverbs ABI mismatches even when
+    #    the device itself is visible and active.
+    if ! docker exec deepep-node0 bash -lc "grep -q 'ACTIVE' /sys/class/infiniband/$NODE0_PRIMARY_IB_DEVICE/ports/1/state"; then
+        echo "FAIL: deepep-node0 $NODE0_PRIMARY_IB_DEVICE port not active"
         return 1
     fi
-    if ! docker exec deepep-node1 bash -lc 'ibv_devinfo -d mlx5_6 2>/dev/null | grep -q PORT_ACTIVE'; then
-        echo "FAIL: deepep-node1 mlx5_6 port not active"
+    if ! docker exec deepep-node1 bash -lc "grep -q 'ACTIVE' /sys/class/infiniband/$NODE1_PRIMARY_IB_DEVICE/ports/1/state"; then
+        echo "FAIL: deepep-node1 $NODE1_PRIMARY_IB_DEVICE port not active"
         return 1
     fi
     echo "Both nodes report PORT_ACTIVE on assigned NICs."
 
     # 3. Bridge network reachability (control-plane). Use bash TCP since `ping` may be missing.
-    if ! docker exec deepep-node0 bash -lc 'timeout 3 bash -c ">/dev/tcp/deepep-node1/22" 2>/dev/null'; then
-        echo "FAIL: deepep-node0 cannot reach deepep-node1:22 over bridge network"
+    if ! docker exec deepep-node0 bash -lc 'timeout 3 bash -c ">/dev/tcp/deepep-node1/2301" 2>/dev/null'; then
+        echo "FAIL: deepep-node0 cannot reach deepep-node1:2301 over host network"
         return 1
     fi
-    echo "Bridge control-plane reachable (deepep-node1:22 from deepep-node0)."
+    echo "Control-plane reachable (deepep-node1:2301 from deepep-node0)."
 
     # 4. Quick RoCE/RDMA loopback smoke between the two containers using ibv_rc_pingpong
     #    Uses the physical RoCE NICs (mlx5_4 on node0, mlx5_6 on node1), not the bridge IP.
-    docker exec -d deepep-node0 bash -lc 'pkill -f ibv_rc_pingpong 2>/dev/null; ibv_rc_pingpong -d mlx5_4 -g 3 -n 1 >/tmp/rdma_srv.log 2>&1' || true
+    docker exec -d deepep-node0 bash -lc "pkill -f ibv_rc_pingpong 2>/dev/null; ibv_rc_pingpong -d $NODE0_PRIMARY_IB_DEVICE -g 3 -n 1 >/tmp/rdma_srv.log 2>&1" || true
     sleep 1
-    if docker exec deepep-node1 bash -lc 'timeout 10 ibv_rc_pingpong -d mlx5_6 -g 3 -n 1 deepep-node0 >/tmp/rdma_cli.log 2>&1'; then
-        echo "RoCE ibv_rc_pingpong mlx5_6<->mlx5_4 SUCCEEDED."
+    if docker exec deepep-node1 bash -lc "timeout 10 ibv_rc_pingpong -d $NODE1_PRIMARY_IB_DEVICE -g 3 -n 1 deepep-node0 >/tmp/rdma_cli.log 2>&1"; then
+        echo "RoCE ibv_rc_pingpong $NODE1_PRIMARY_IB_DEVICE<->$NODE0_PRIMARY_IB_DEVICE SUCCEEDED."
     else
         echo "WARNING: ibv_rc_pingpong over the bridge hostname did not succeed."
         echo "         (Test still proceeds; iSHMEM uses physical NICs via /dev/infiniband)."
@@ -239,6 +260,9 @@ run_test() {
     set +e
     docker exec \
         -e ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}" \
+        -e ISHMEM_DIR="$ISHMEM_DIR" \
+        -e NODE0_IB_DEVICES="$NODE0_IB_DEVICES_STR" \
+        -e NODE1_IB_DEVICES="$NODE1_IB_DEVICES_STR" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
@@ -247,6 +271,8 @@ run_test() {
             source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
             eval \"\$(conda shell.bash hook 2>/dev/null)\"
             conda activate jiafuzha_deepep 2>/dev/null || true
+            export ISHMEM_DIR=$ISHMEM_DIR
+            export LD_LIBRARY_PATH=\${LD_LIBRARY_PATH:-}:\$ISHMEM_DIR/lib
             cd $DEEP_EP_DIR
 
             timeout $TIMEOUT_SEC mpirun \
@@ -263,6 +289,9 @@ run_test() {
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
                 -genv FI_PROVIDER tcp \
+                -genv ISHMEM_DIR $ISHMEM_DIR \
+                -genv NODE0_IB_DEVICES '$NODE0_IB_DEVICES_STR' \
+                -genv NODE1_IB_DEVICES '$NODE1_IB_DEVICES_STR' \
                 -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
@@ -273,8 +302,6 @@ run_test() {
                 -genv MASTER_ADDR deepep-node0 \
                 -genv MASTER_PORT $MASTER_PORT \
                 -genv WORLD_SIZE 2 \
-                \
-                \
                 -genv TORCH_DISTRIBUTED_DEBUG OFF \
                 -launcher ssh \
                 -bootstrap-exec-args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa' \
