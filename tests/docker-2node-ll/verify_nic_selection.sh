@@ -18,9 +18,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DEEP_EP_DIR="${DEEP_EP_DIR:-/data/jiafuzha/code-repo/zjf2012/DeepEP}"
-ISHMEM_DIR="${ISHMEM_DIR:-/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim}"
+DEEP_EP_DIR="${DEEP_EP_DIR:-/root/jiafuzha/code-repo/zjf2012/DeepEP}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 NUM_PROCESSES="${NUM_PROCESSES:-2}"
+NODE0_IB_DEVICES="${NODE0_IB_DEVICES:-mlx5_4 mlx5_5}"
+NODE1_IB_DEVICES="${NODE1_IB_DEVICES:-mlx5_6 mlx5_7}"
 MASTER_PORT="${NIC_CHECK_MASTER_PORT:-29540}"
 ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"
 TIMEOUT_SEC="${NIC_CHECK_TIMEOUT_SEC:-120}"
@@ -39,6 +41,7 @@ docker exec deepep-ll-node0 bash -lc "
     conda activate jiafuzha_deepep 2>/dev/null || true
     export ISHMEM_DIR=$ISHMEM_DIR
     export PKG_CONFIG_PATH=$ISHMEM_DIR/lib/pkgconfig:\${PKG_CONFIG_PATH:-}
+    export LD_LIBRARY_PATH=\${LD_LIBRARY_PATH:-}:$ISHMEM_DIR/lib
     chmod +x $CHECK_DIR/build_nic_pcie_check.sh $WRAPPER_PATH 2>/dev/null || true
     bash $CHECK_DIR/build_nic_pcie_check.sh
 " || { echo "FAIL: nic_pcie_check build failed" >&2; return 1 2>/dev/null || exit 1; }
@@ -51,6 +54,8 @@ docker exec deepep-ll-node0 bash -lc "
     source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
     eval \"\$(conda shell.bash hook 2>/dev/null)\"
     conda activate jiafuzha_deepep 2>/dev/null || true
+    export ISHMEM_DIR=$ISHMEM_DIR
+    export LD_LIBRARY_PATH=\${LD_LIBRARY_PATH:-}:$ISHMEM_DIR/lib
     cd $DEEP_EP_DIR
     timeout $TIMEOUT_SEC mpirun \
         -n $TOTAL_RANKS -ppn $NUM_PROCESSES \
@@ -66,6 +71,9 @@ docker exec deepep-ll-node0 bash -lc "
         -genv ISHMEM_IBGDA_BAR_BACKEND igub \
         -genv I_MPI_FABRICS shm:ofi \
         -genv FI_PROVIDER tcp \
+        -genv ISHMEM_DIR $ISHMEM_DIR \
+        -genv NODE0_IB_DEVICES '$NODE0_IB_DEVICES' \
+        -genv NODE1_IB_DEVICES '$NODE1_IB_DEVICES' \
         -genv ISHMEM_DEBUG 1 \
         -genv MASTER_ADDR deepep-ll-node0 \
         -genv MASTER_PORT $MASTER_PORT \

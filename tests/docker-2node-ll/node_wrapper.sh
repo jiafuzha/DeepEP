@@ -21,7 +21,25 @@ fi
 eval "$(conda shell.bash hook 2>/dev/null)" 2>/dev/null
 conda activate jiafuzha_deepep 2>/dev/null
 export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${ISHMEM_DIR}/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"
+
+resolve_iface_from_ibdev() {
+    local ibdev="$1"
+    local net_dir="/sys/class/infiniband/$ibdev/device/net"
+    if [ ! -d "$net_dir" ]; then
+        echo "Missing sysfs netdev mapping for IB device $ibdev" >&2
+        return 1
+    fi
+    local iface
+    iface=$(ls "$net_dir" 2>/dev/null | head -n 1)
+    if [ -z "$iface" ]; then
+        echo "No netdev found for IB device $ibdev" >&2
+        return 1
+    fi
+    printf '%s\n' "$iface"
+}
 
 # Each container has its own hostname / network namespace, so MPI assigns
 # MPI_LOCALRANKID = 0..PPN-1 within each container correctly.
@@ -32,16 +50,17 @@ export LOCAL_RANK
 HOSTNAME_VAL=$(hostname)
 case "$HOSTNAME_VAL" in
     *node1*|*node-1*)
-        IFACES=(ens5008f0np0 ens5008f1np1)
+        NODE_IB_DEVICES_STR=${NODE1_IB_DEVICES:-mlx5_6 mlx5_7}
         export ZE_AFFINITY_MASK=6,7
         NODE_RANK=1
         ;;
     *)
-        IFACES=(ens4013f0np0 ens4013f1np1)
+        NODE_IB_DEVICES_STR=${NODE0_IB_DEVICES:-mlx5_4 mlx5_5}
         export ZE_AFFINITY_MASK=4,5
         NODE_RANK=0
         ;;
 esac
+read -r -a NODE_IB_DEVICES <<< "$NODE_IB_DEVICES_STR"
 
 # init_dist (tests/utils.py) reads RANK as the *node* rank (0..WORLD_SIZE-1).
 # WORLD_SIZE is set by run.sh to the number of nodes.
@@ -53,15 +72,20 @@ export RANK=${RANK:-$NODE_RANK}
 # The auto-selection is independently verified before each test run by
 # verify_nic_selection.sh / nic_pcie_check (run.sh), which asserts the
 # auto-picked NIC shares the GPU's PCIe switch.
-export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
+if [ "$LOCAL_RANK" -ge "${#NODE_IB_DEVICES[@]}" ]; then
+    echo "LOCAL_RANK=$LOCAL_RANK exceeds configured IB devices: $NODE_IB_DEVICES_STR" >&2
+    exit 1
+fi
+IB_DEVICE=${NODE_IB_DEVICES[$LOCAL_RANK]}
+export FI_VERBS_IFACE=$(resolve_iface_from_ibdev "$IB_DEVICE")
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package
-export PYTHONPATH=/data/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
+export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
 
 # DeepEP / iSHMEM needs MASTER_ADDR (rank-0 node hostname)
 export MASTER_ADDR=${MASTER_ADDR:-deepep-ll-node0}
 
-echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK IFACE=$FI_VERBS_IFACE" >&2
+echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK IB_DEVICE=$IB_DEVICE IFACE=$FI_VERBS_IFACE" >&2
 
 ulimit -c unlimited
 exec "$@"

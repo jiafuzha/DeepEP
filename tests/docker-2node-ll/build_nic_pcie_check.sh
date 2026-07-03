@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/nic_pcie_check.cpp"
 OUT="$HERE/nic_pcie_check"
 
-ISHMEM_DIR="${ISHMEM_DIR:-/opt/intel/ishmem}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 if [ -f "$ISHMEM_DIR/lib/pkgconfig/ishmem.pc" ]; then
     export PKG_CONFIG_PATH="$ISHMEM_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 fi

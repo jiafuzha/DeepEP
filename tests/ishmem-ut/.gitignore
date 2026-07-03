@@ -1,2 +1,4 @@
 ll_put_repro
 *.o
+normal_putmem_repro
+finalize_repro
