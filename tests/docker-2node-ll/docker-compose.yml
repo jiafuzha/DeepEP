@@ -2,16 +2,21 @@
 # Docker Compose: 2-Node DeepEP Internode LOW-LATENCY Simulation
 #
 # Simulates 2 physical nodes, each with 2 GPUs + 2 NICs:
+# for smc26
 #   deepep-ll-node0: GPUs 0,1 + NICs mlx5_0,mlx5_1  (172.31.1.10)
 #   deepep-ll-node1: GPUs 2,3 + NICs mlx5_2,mlx5_3  (172.31.1.11)
+# for 140
+#   deepep-ll-node0: GPUs 4,5 + NICs mlx5_4,mlx5_5  (SSH on 127.0.0.1:2310)
+#   deepep-ll-node1: GPUs 6,7 + NICs mlx5_6,mlx5_7  (SSH on 127.0.0.1:2311)
 #
-# Distinct identity (deepep-ll-*, 172.31.1.0/24, ports 2310/2311, deepep-ll-net)
-# from the normal-path docker-2node sim so the two compose projects do not
-# collide; they share the same physical GPUs/NICs and must not run at once.
+# Distinct identity (deepep-ll-* with ports 2310/2311) from the normal-path
+# docker-2node sim so the two compose projects do not collide; they share the
+# same physical GPUs/NICs and must not run at once.
 #
-# Uses a private bridge network so each container has its own hostname and
-# IP - MPI then treats them as TWO real nodes (correct PPN, MPI_LOCALRANKID).
-# RDMA/verbs work via bind-mounted /dev/infiniband and /sys (privileged).
+# Uses host networking instead of a private bridge. In this environment, RoCE
+# GID tables are zeroed inside bridge-network containers, which breaks iSHMEM
+# IBGDA address-handle creation. Host networking preserves the real NIC/GID
+# state while still keeping the two simulated nodes distinct by SSH port/name.
 # ===========================================================================
 
 x-common: &common
@@ -45,15 +50,16 @@ x-common: &common
     - /root/.conda:/root/.conda:ro
 
     # --- Code repos (read-write) ---
+    # for smc26
     - /root/jiafuzha/code-repo/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
     - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
     - /root/jiafuzha/code-repo/ishmem_ibgda:/root/jiafuzha/code-repo/ishmem_ibgda:rw
+    # for 140
+    # - /root/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
+    # - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
     - /root/jiafuzha/code-repo/zjf2012/DeepEP:/root/jiafuzha/code-repo/zjf2012/DeepEP:rw
     - /root/jiafuzha/code-repo/pytorch:/root/jiafuzha/code-repo/pytorch:rw
     - /root/jiafuzha/code-repo/intel_gpu_uar_bridge:/root/jiafuzha/code-repo/intel_gpu_uar_bridge:rw
-
-    # --- iSHMEM 2026 shim (used by DeepEP at link/runtime) ---
-    - /root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim:ro
 
     # --- System (RDMA, GPU sysfs) ---
     - /sys:/sys:ro
@@ -74,18 +80,18 @@ services:
     <<: *common
     container_name: deepep-ll-node0
     hostname: deepep-ll-node0
-    networks:
-      deepep-ll-net:
-        ipv4_address: 172.31.1.10
-    ports:
-      - "2310:22"
+    network_mode: host
     extra_hosts:
-      - "deepep-ll-node0:172.31.1.10"
-      - "deepep-ll-node1:172.31.1.11"
+      - "deepep-ll-node0:127.0.0.1"
+      - "deepep-ll-node1:127.0.0.1"
     environment:
+      # for smc26
       - ZE_AFFINITY_MASK=0,1
+      # for 140
+      # - ISHMEM_DIR=/root/jiafuzha/ishmem_ibgda/build/_install
+      # - ZE_AFFINITY_MASK=4,5
       - NODE_ID=0
-      - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
+      - LD_LIBRARY_PATH=/root/jiafuzha/ishmem_ibgda/build/_install/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >
       bash -c "
         ln -sf /usr/bin/kmod /usr/sbin/insmod 2>/dev/null;
@@ -96,8 +102,8 @@ services:
         cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
         cp /tmp/ssh-keys/config /root/.ssh/config &&
         chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
-        /usr/sbin/sshd -p 22 &&
-        echo 'deepep-ll-node0 ready (hostname=deepep-ll-node0, IP=172.31.1.10, SSH 22)' &&
+        /usr/sbin/sshd -p 2310 &&
+        echo 'deepep-ll-node0 ready (hostname=deepep-ll-node0, SSH 127.0.0.1:2310)' &&
         sleep infinity
       "
 
@@ -105,18 +111,18 @@ services:
     <<: *common
     container_name: deepep-ll-node1
     hostname: deepep-ll-node1
-    networks:
-      deepep-ll-net:
-        ipv4_address: 172.31.1.11
-    ports:
-      - "2311:22"
+    network_mode: host
     extra_hosts:
-      - "deepep-ll-node0:172.31.1.10"
-      - "deepep-ll-node1:172.31.1.11"
+      - "deepep-ll-node0:127.0.0.1"
+      - "deepep-ll-node1:127.0.0.1"
     environment:
+      # for smc26
       - ZE_AFFINITY_MASK=2,3
+      # for 140
+      # - ISHMEM_DIR=/root/jiafuzha/ishmem_ibgda/build/_install
+      # - ZE_AFFINITY_MASK=6,7
       - NODE_ID=1
-      - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
+      - LD_LIBRARY_PATH=/root/jiafuzha/ishmem_ibgda/build/_install/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >
       bash -c "
         ln -sf /usr/bin/kmod /usr/sbin/insmod 2>/dev/null;
@@ -127,14 +133,7 @@ services:
         cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
         cp /tmp/ssh-keys/config /root/.ssh/config &&
         chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
-        /usr/sbin/sshd -p 22 &&
-        echo 'deepep-ll-node1 ready (hostname=deepep-ll-node1, IP=172.31.1.11, SSH 22)' &&
+        /usr/sbin/sshd -p 2311 &&
+        echo 'deepep-ll-node1 ready (hostname=deepep-ll-node1, SSH 127.0.0.1:2311)' &&
         sleep infinity
       "
-
-networks:
-  deepep-ll-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.31.1.0/24

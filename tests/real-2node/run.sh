@@ -208,6 +208,7 @@ run_test() {
         -genv DEEP_EP_DBG_DISPATCH "${DEEP_EP_DBG_DISPATCH:-}" \
         -genv DEEP_EP_DBG_COMBINE "${DEEP_EP_DBG_COMBINE:-}" \
         -genv DEEP_EP_TIME_WARMUP "${DEEP_EP_TIME_WARMUP:-}" \
+        -genv DEEP_EP_XPU_ISHMEM_FINALIZE "${DEEP_EP_XPU_ISHMEM_FINALIZE:-}" \
         -genv DEEP_EP_NVL_RANKS "$NUM_PROCESSES" \
         -genv DEEP_EP_NVL_BYTES "$DEEP_EP_NVL_BYTES" \
         -genv DEEP_EP_RDMA_BYTES "$DEEP_EP_RDMA_BYTES" \
