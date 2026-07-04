@@ -158,10 +158,20 @@ def test_main(args: argparse.Namespace,
                 assert False, f'segment src_rank={i} values mismatch'  # noqa: B011
             check_start = check_end
 
-    for previous_mode in (False, True):
-        for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
-                for with_topk in (False, True):
+    # DEEP_EP_MIN: minimal reproducer mode. Shrinks the 32-combination sweep to
+    # a single deterministic case (BF16 `x`, with top-k, sync, no previous
+    # event) so the internode-normal DEVICE_LOST can be reproduced with the
+    # fewest dispatch/combine calls.
+    _min = os.getenv('DEEP_EP_MIN')
+    _prev_modes = (False, ) if _min else (False, True)
+    _async_modes = (False, ) if _min else (False, True)
+    _x_variants = (x, ) if _min else (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3)
+    _topk_variants = (True, ) if _min else (False, True)
+
+    for previous_mode in _prev_modes:
+        for async_mode in _async_modes:
+            for current_x in _x_variants:
+                for with_topk in _topk_variants:
                     is_rand = current_x is x_pure_rand or current_x is x_pure_rand_e4m3
                     if local_rank == 0:
                         print(
@@ -201,6 +211,19 @@ def test_main(args: argparse.Namespace,
 
                     # On XPU, num_worst_tokens > 0 returns padded tensors; trim to actual count
                     recv_gbl_rank_prefix_sum = handle[-4]
+                    if os.getenv('DEEP_EP_MIN') and device_type == 'xpu':
+                        _ps = recv_gbl_rank_prefix_sum
+                        print(
+                            f'[MIN rank={rank}] recv_gbl_rank_prefix_sum={_ps.tolist() if _ps is not None else None}, '
+                            f'recv_x.shape={tuple(recv_x[0].shape) if isinstance(recv_x, tuple) else tuple(recv_x.shape)}, '
+                            f'recv_topk_idx.shape={None if recv_topk_idx is None else tuple(recv_topk_idx.shape)}',
+                            flush=True)
+                        if recv_topk_idx is not None:
+                            _ti = recv_topk_idx
+                            print(
+                                f'[MIN rank={rank}] recv_topk_idx min={int(_ti.min())} max={int(_ti.max())} '
+                                f'first16={_ti.flatten()[:16].tolist()}',
+                                flush=True)
                     if device_type == 'xpu' and recv_gbl_rank_prefix_sum is not None:
                         actual_count = int(recv_gbl_rank_prefix_sum[-1].item())
                         if isinstance(recv_x, tuple):
@@ -240,8 +263,13 @@ def test_main(args: argparse.Namespace,
                         # Check `topk_weights`
                         recv_topk_weights_clone = recv_topk_weights.clone()
                         if not is_rand:
-                            recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(
-                                dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
+                            # NOTE: boolean-mask indexing (`t[mask]`) and
+                            # `.nonzero()` hit a PyTorch-XPU allocation bug that
+                            # attempts a 128 GiB alloc even for an all-False
+                            # mask. Use `torch.where` (elementwise select, no
+                            # nonzero) instead of masked assignment.
+                            _fill = recv_topk_weights.amax(dim=1, keepdim=True).expand_as(recv_topk_weights)
+                            recv_topk_weights = torch.where(recv_topk_idx.eq(-1), _fill, recv_topk_weights)
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test `num_worst_tokens != 0`

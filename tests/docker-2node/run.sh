@@ -3,13 +3,13 @@
 # Launch 2-node DeepEP internode (NVL+RDMA) test using Docker containers.
 #
 # Each container is a separate "node" with its own hostname and bridge IP:
-#   deepep-node0: 172.31.0.10, GPUs 4,5, NICs mlx5_4,mlx5_5
-#   deepep-node1: 172.31.0.11, GPUs 6,7, NICs mlx5_6,mlx5_7
+#   deepep-node0: 172.31.0.10, GPUs 0,1, NICs mlx5_0,mlx5_1
+#   deepep-node1: 172.31.0.11, GPUs 2,3, NICs mlx5_2,mlx5_3
 #
 # mpirun is launched INSIDE deepep-node0 (via docker exec); it spawns ranks
 # on deepep-node1 via SSH using the bridge IP. With ppn=2 the topology is:
-#   - rank 0,1 on node0 -> local_rank 0,1 -> GPU 4,5 + NIC mlx5_4,mlx5_5
-#   - rank 2,3 on node1 -> local_rank 0,1 -> GPU 6,7 + NIC mlx5_6,mlx5_7
+#   - rank 0,1 on node0 -> local_rank 0,1 -> GPU 0,1 + NIC mlx5_0,mlx5_1
+#   - rank 2,3 on node1 -> local_rank 0,1 -> GPU 2,3 + NIC mlx5_2,mlx5_3
 #
 # DeepEP test_internode.py reads MPI_LOCALRANKID and uses it as `local_rank`.
 # Since DEEP_EP_NVL_RANKS=2, num_local_ranks=2 simulates 2 nodes x 2 GPUs.
@@ -25,7 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-DEEP_EP_DIR="/data/jiafuzha/code-repo/zjf2012/DeepEP"
+DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_internode.py}"
 SSH_DIR="/tmp/deepep-docker-ssh"
 
@@ -71,8 +71,8 @@ EOF
 }
 
 # --- Mutual exclusion: this normal-path sim and the low-latency sim
-#     (tests/docker-2node-ll) use the SAME physical XPU devices (4,5,6,7) and
-#     NICs (mlx5_4..7). Running both at once makes them fight over the GPUs/NICs.
+#     (tests/docker-2node-ll) use the SAME physical XPU devices (0,1,2,3) and
+#     NICs (mlx5_0..3). Running both at once makes them fight over the GPUs/NICs.
 #     Remove the LL peer containers before bringing ours up. ---
 PEER_CONTAINERS=("deepep-ll-node0" "deepep-ll-node1")
 stop_peer_containers() {
@@ -134,13 +134,13 @@ verify_rdma() {
         echo "$c IB devices: $devs"
     done
 
-    # 2. node0 PORT_ACTIVE check on mlx5_4
-    if ! docker exec deepep-node0 bash -lc 'ibv_devinfo -d mlx5_4 2>/dev/null | grep -q PORT_ACTIVE'; then
-        echo "FAIL: deepep-node0 mlx5_4 port not active"
+    # 2. node0 PORT_ACTIVE check on mlx5_0
+    if ! docker exec deepep-node0 bash -lc 'ibv_devinfo -d mlx5_0 2>/dev/null | grep -q PORT_ACTIVE'; then
+        echo "FAIL: deepep-node0 mlx5_0 port not active"
         return 1
     fi
-    if ! docker exec deepep-node1 bash -lc 'ibv_devinfo -d mlx5_6 2>/dev/null | grep -q PORT_ACTIVE'; then
-        echo "FAIL: deepep-node1 mlx5_6 port not active"
+    if ! docker exec deepep-node1 bash -lc 'ibv_devinfo -d mlx5_2 2>/dev/null | grep -q PORT_ACTIVE'; then
+        echo "FAIL: deepep-node1 mlx5_2 port not active"
         return 1
     fi
     echo "Both nodes report PORT_ACTIVE on assigned NICs."
@@ -153,11 +153,11 @@ verify_rdma() {
     echo "Bridge control-plane reachable (deepep-node1:22 from deepep-node0)."
 
     # 4. Quick RoCE/RDMA loopback smoke between the two containers using ibv_rc_pingpong
-    #    Uses the physical RoCE NICs (mlx5_4 on node0, mlx5_6 on node1), not the bridge IP.
-    docker exec -d deepep-node0 bash -lc 'pkill -f ibv_rc_pingpong 2>/dev/null; ibv_rc_pingpong -d mlx5_4 -g 3 -n 1 >/tmp/rdma_srv.log 2>&1' || true
+    #    Uses the physical RoCE NICs (mlx5_0 on node0, mlx5_2 on node1), not the bridge IP.
+    docker exec -d deepep-node0 bash -lc 'pkill -f ibv_rc_pingpong 2>/dev/null; ibv_rc_pingpong -d mlx5_0 -g 3 -n 1 >/tmp/rdma_srv.log 2>&1' || true
     sleep 1
-    if docker exec deepep-node1 bash -lc 'timeout 10 ibv_rc_pingpong -d mlx5_6 -g 3 -n 1 deepep-node0 >/tmp/rdma_cli.log 2>&1'; then
-        echo "RoCE ibv_rc_pingpong mlx5_6<->mlx5_4 SUCCEEDED."
+    if docker exec deepep-node1 bash -lc 'timeout 10 ibv_rc_pingpong -d mlx5_2 -g 3 -n 1 deepep-node0 >/tmp/rdma_cli.log 2>&1'; then
+        echo "RoCE ibv_rc_pingpong mlx5_2<->mlx5_0 SUCCEEDED."
     else
         echo "WARNING: ibv_rc_pingpong over the bridge hostname did not succeed."
         echo "         (Test still proceeds; iSHMEM uses physical NICs via /dev/infiniband)."
@@ -240,6 +240,7 @@ run_test() {
     docker exec \
         -e ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
+        -e DEEP_EP_MIN="${DEEP_EP_MIN:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
         deepep-node0 \
@@ -265,6 +266,7 @@ run_test() {
                 -genv FI_PROVIDER tcp \
                 -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
+                -genv DEEP_EP_MIN \"\${DEEP_EP_MIN:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
                 -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \

@@ -18,8 +18,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DEEP_EP_DIR="${DEEP_EP_DIR:-/data/jiafuzha/code-repo/zjf2012/DeepEP}"
-ISHMEM_DIR="${ISHMEM_DIR:-/root/.copilot/session-state/d757e418-b21f-4f96-8d86-d872b34e7e42/files/ishmem-2026-shim}"
+DEEP_EP_DIR="${DEEP_EP_DIR:-/root/jiafuzha/code-repo/zjf2012/DeepEP}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}"
 NUM_PROCESSES="${NUM_PROCESSES:-2}"
 MASTER_PORT="${NIC_CHECK_MASTER_PORT:-29540}"
 ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"
@@ -93,7 +93,7 @@ import os, re, sys
 
 raw = open(sys.argv[1], errors="replace").read()
 # iSHMEM log_binding_summary line:
-#   pe=0 ze_mask=4,5 expected_nic=auto selected_nic=mlx5_4 nic_bdf=0000:b2:00.0 gpu_bdf=0000:ac:00.0
+#   pe=0 ze_mask=0,1 expected_nic=auto selected_nic=mlx5_0 nic_bdf=0000:25:00.0 gpu_bdf=0000:1f:00.0
 pat = re.compile(
     r"pe=(\d+).*?ze_mask=(\S+).*?expected_nic=(\S+).*?selected_nic=(\S+).*?"
     r"nic_bdf=(\S+).*?gpu_bdf=(\S+)")

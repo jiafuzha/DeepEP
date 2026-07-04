@@ -3065,7 +3065,13 @@ void combine_nvl_rdma(DataType type,
     auto* rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr);
 
     NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, 0);
-    NvlForwardLayout fwd_layout(num_combined_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
+    // Forward buffer must hold every token forwarded to a single NVL peer,
+    // summed across ALL source RDMA ranks (remote ranks plus the self RDMA
+    // rank now handled locally). Bound it by num_rdma_ranks * num_combined_tokens
+    // so a peer receiving contributions from multiple source RDMA ranks never
+    // overruns its forward region. num_nvl_bytes is provisioned far above this.
+    const int max_fwd_tokens = num_rdma_ranks * num_combined_tokens;
+    NvlForwardLayout fwd_layout(max_fwd_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
     // fwd_base_offset must be IDENTICAL across all ranks, otherwise a rank
     // writing into a peer's NVL buffer via IPC at its own offset will land at
     // a different address than where the peer reads from. Use the global upper
@@ -3099,6 +3105,16 @@ void combine_nvl_rdma(DataType type,
     const size_t total_recv_regions = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
     const size_t init_range = std::max({total_combined, total_topk, total_recv_regions, static_cast<size_t>(1)});
 
+    static const bool kDbgCombine = std::getenv("DEEP_EP_DBG_COMBINE") != nullptr;
+    auto dbg_stage = [&](const char* name) {
+        if (kDbgCombine) {
+            std::fprintf(stderr, "[combine rank=%d nvl=%d rdma=%d] stage done: %s\n",
+                         rank, nvl_rank, my_rdma_rank, name);
+            std::fflush(stderr);
+        }
+    };
+    dbg_stage("0-entry");
+
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
             const size_t linear = static_cast<size_t>(id[0]);
@@ -3114,6 +3130,7 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
+    dbg_stage("1-Init");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombinePackKernel<dtype_t>>([=]() {
@@ -3140,6 +3157,7 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
+    dbg_stage("2-Pack");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
@@ -3147,6 +3165,7 @@ void combine_nvl_rdma(DataType type,
             [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item); });
     });
     queue.wait();
+    dbg_stage("3-PackBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineRdmaSendKernel<dtype_t>>([=]() {
@@ -3200,6 +3219,7 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
+    dbg_stage("4-RdmaSend");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineRdmaPushKernel<dtype_t>>(
@@ -3241,7 +3261,20 @@ void combine_nvl_rdma(DataType type,
 
                 if (is_puter) {
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    // For the self RDMA rank, gather directly into this rank's
+                    // LOCAL recv region (rdma_base + my_rdma_rank*region) with no
+                    // RDMA put, so CombineFwdWrite forwards these same-node tokens
+                    // to the correct NVL peer. This mirrors the CUDA combine,
+                    // which uses the recv_buffer (not the send_buffer) when
+                    // dst_rdma_rank == rdma_rank. Without it, a token whose
+                    // combine head lands on the self RDMA rank but a *different*
+                    // NVL peer (the off-diagonal ranks where nvl_rank != rdma_rank)
+                    // is serviced by neither the NVL-local path nor the RDMA
+                    // forward path and reduces to zero.
+                    const bool is_self_rdma = (dst_rdma == my_rdma_rank);
+                    auto* region = is_self_rdma
+                        ? (rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes)
+                        : (rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes);
                     auto* rdma_x = reinterpret_cast<dtype_t*>(region);
                     auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
                     auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
@@ -3250,54 +3283,66 @@ void combine_nvl_rdma(DataType type,
                     if (local_id == 0) {
                         *rdma_count = 0;
                     }
-                    if (dst_rdma == my_rdma_rank) {
-                        continue;
-                    }
 
                     if (local_id == 0) {
+                        // Acquire fence + uncached reads of the NVL peers' packed
+                        // combine buffers (IPC-mapped remote GPU VRAM written in
+                        // the Pack stage). Cached/reordered cross-device reads
+                        // here intermittently miss a peer's freshly-packed token
+                        // (leader reads peer != nvl_rank), dropping it from the
+                        // forward and yielding combined==0 for that token.
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         int count = 0;
                         for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                             auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                             auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
                             auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
-                            const int peer_count = *peer_count_ptr;
+                            const int peer_count = uc_load(peer_count_ptr);
                             auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
                             auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
                             for (int t = 0; t < peer_count; ++t) {
-                                if (peer_meta[t].src_rdma_rank != dst_rdma) {
+                                if (uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) {
                                     continue;
                                 }
                                 for (int h = 0; h < hidden; ++h) {
-                                    rdma_x[count * hidden + h] = peer_x[t * hidden + h];
+                                    rdma_x[count * hidden + h] = uc_load(&peer_x[t * hidden + h]);
                                 }
                                 if (combined_topk_weights != nullptr) {
                                     for (int k = 0; k < num_topk; ++k) {
-                                        rdma_wt[count * num_topk + k] = peer_topk[t * num_topk + k];
+                                        rdma_wt[count * num_topk + k] = uc_load(&peer_topk[t * num_topk + k]);
                                     }
                                 }
-                                rdma_recv_pos[count] = peer_meta[t].is_token_in_nvl_rank_bits;
-                                rdma_src_nvl[count] = peer_meta[t].src_nvl_rank;
+                                rdma_recv_pos[count] = uc_load(&peer_meta[t].is_token_in_nvl_rank_bits);
+                                rdma_src_nvl[count] = uc_load(&peer_meta[t].src_nvl_rank);
                                 ++count;
                             }
                         }
                         *rdma_count = count;
+                        if (is_self_rdma) {
+                            // Publish the locally-gathered self region before the
+                            // forward kernel reads it (paired with FwdWrite's
+                            // acquire fence). No RDMA put is issued for self.
+                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                        }
                     }
                     sycl::group_barrier(group);
 
-                    const int dst_pe = dst_rdma * num_nvl_ranks;
-                    auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                    // Split-put for landing-race elimination (see dispatch
-                    // RdmaPut for full rationale). Two sequential blocking
-                    // puts on the same QP: data first, then count alone.
-                    // Kept blocking (matching dispatch site) — NBI on this
-                    // hot path causes intermittent NIC DEVICE_LOST.
-                    if (local_id == 0) {
-                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                        ishmem_putmem(dst_region + rdma_count_offset,
-                                      region + rdma_count_offset,
-                                      sizeof(int), dst_pe);
+                    if (!is_self_rdma) {
+                        const int dst_pe = dst_rdma * num_nvl_ranks;
+                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                        // Split-put for landing-race elimination (see dispatch
+                        // RdmaPut for full rationale). Two sequential blocking
+                        // puts on the same QP: data first, then count alone.
+                        // Kept blocking (matching dispatch site) — NBI on this
+                        // hot path causes intermittent NIC DEVICE_LOST.
+                        if (local_id == 0) {
+                            ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                            ishmem_putmem(dst_region + rdma_count_offset,
+                                          region + rdma_count_offset,
+                                          sizeof(int), dst_pe);
+                        }
+                        sycl::group_barrier(group);
                     }
-                    sycl::group_barrier(group);
                 }
                 }  // end if (is_puter)
                 // Cross-PE sync to drain pending RDMA puts and make them visible at
@@ -3309,6 +3354,7 @@ void combine_nvl_rdma(DataType type,
             });
     });
     queue.wait();
+    dbg_stage("5-RdmaPush");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineFwdWriteKernel<dtype_t>>([=]() {
@@ -3329,9 +3375,11 @@ void combine_nvl_rdma(DataType type,
             }
 
             for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                if (src_rdma == my_rdma_rank) {
-                    continue;
-                }
+                // NOTE: src_rdma == my_rdma_rank is NOT skipped. Its recv region
+                // was populated locally by RdmaPush (no RDMA put), so the same
+                // forward-to-NVL-peer logic delivers same-node tokens whose
+                // combine head lands on a different NVL peer. Skipping it drops
+                // those tokens on the off-diagonal ranks.
                 int before[NUM_MAX_NVL_PEERS] = {0};
                 for (int peer = 0; peer < num_nvl_ranks; ++peer) {
                     before[peer] = peer_offsets[peer];
@@ -3368,6 +3416,12 @@ void combine_nvl_rdma(DataType type,
                     auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
                     auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
                     auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
+                    // Guard against overrunning the target peer's forward buffer
+                    // (capacity == max_fwd_tokens). Overrunning would write OOB
+                    // into an adjacent peer's IPC-mapped VRAM.
+                    if (peer_offsets[target_nvl] >= max_fwd_tokens) {
+                        continue;
+                    }
                     const int dst_idx = peer_offsets[target_nvl]++;
                     for (int h = 0; h < hidden; ++h) {
                         fwd_x[dst_idx * hidden + h] = uc_load(&rdma_x[i * hidden + h]);
@@ -3397,6 +3451,7 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
+    dbg_stage("6-FwdWrite");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineFwdBarrierKernel<dtype_t>>(
@@ -3404,6 +3459,7 @@ void combine_nvl_rdma(DataType type,
             [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
     });
     queue.wait();
+    dbg_stage("7-FwdBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedCombineReduceKernel<dtype_t>>([=]() {
@@ -3417,9 +3473,25 @@ void combine_nvl_rdma(DataType type,
             auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
             auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
             auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
+            // Capacity of this rank's forwarded buffer, in tokens (must match
+            // the max_fwd_tokens used to size fwd_layout and the FwdWrite guard).
+            // The sum of all per-source counts can never legitimately exceed
+            // this; a larger value is a corrupt/stale count that would drive an
+            // unbounded, out-of-bounds reduction loop and wedge the GPU
+            // (DEVICE_LOST). When counts are valid this clamp is a no-op.
+            const int fwd_capacity = num_rdma_ranks * num_combined_tokens;
             int fwd_offset = 0;
             for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                const int count = fwd_counts[src_rdma];
+                int count = fwd_counts[src_rdma];
+                if (count < 0) {
+                    count = 0;
+                }
+                if (fwd_offset + count > fwd_capacity) {
+                    count = fwd_capacity - fwd_offset;
+                    if (count < 0) {
+                        count = 0;
+                    }
+                }
                 for (int i = 0; i < count; ++i) {
                     const int idx = fwd_offset + i;
                     const int recv_pos = fwd_meta[idx].is_token_in_nvl_rank_bits;
@@ -3458,6 +3530,7 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
+    dbg_stage("8-Reduce");
 #else
     TORCH_CHECK(false, "combine_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
 #endif

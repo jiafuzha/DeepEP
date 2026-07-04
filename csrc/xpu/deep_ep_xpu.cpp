@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -618,7 +619,15 @@ struct Buffer {
                         }
                     }
                     int close_result = ::close(handle.fd);
-                    TORCH_CHECK(close_result == 0, "failed to close received XPU IPC file descriptor for rank ", global_rank);
+                    int close_errno = close_result == 0 ? 0 : errno;
+                    // Some Level Zero driver implementations take ownership of the
+                    // imported dma-buf file descriptor during zeMemAllocDevice /
+                    // zeMemGetIpcHandleFromFileDescriptorExp and close it internally.
+                    // In that case our own close() legitimately fails with EBADF; the
+                    // FD is already released, so treat that as success.
+                    TORCH_CHECK(close_result == 0 || close_errno == EBADF,
+                                "failed to close received XPU IPC file descriptor for rank ", global_rank,
+                                " (errno=", close_errno, ")");
                     TORCH_CHECK(import_result == ZE_RESULT_SUCCESS || open_result == ZE_RESULT_SUCCESS,
                                 "Level Zero IPC import failed, zeMemAllocDevice import returned ",
                                 static_cast<int>(import_result),
