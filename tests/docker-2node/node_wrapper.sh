@@ -32,13 +32,13 @@ export LOCAL_RANK
 HOSTNAME_VAL=$(hostname)
 case "$HOSTNAME_VAL" in
     *node1*|*node-1*)
-        IFACES=(ens5008f0np0 ens5008f1np1)
-        export ZE_AFFINITY_MASK=6,7
+        IFACES=(ens2005f0np0 ens2005f1np1)
+        export ZE_AFFINITY_MASK=2,3
         NODE_RANK=1
         ;;
     *)
-        IFACES=(ens4013f0np0 ens4013f1np1)
-        export ZE_AFFINITY_MASK=4,5
+        IFACES=(ens1006f0np0 ens1006f1np1)
+        export ZE_AFFINITY_MASK=0,1
         NODE_RANK=0
         ;;
 esac

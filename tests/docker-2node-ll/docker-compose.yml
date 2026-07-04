@@ -2,8 +2,8 @@
 # Docker Compose: 2-Node DeepEP Internode LOW-LATENCY Simulation
 #
 # Simulates 2 physical nodes, each with 2 GPUs + 2 NICs:
-#   deepep-ll-node0: GPUs 4,5 + NICs mlx5_4,mlx5_5  (172.31.1.10)
-#   deepep-ll-node1: GPUs 6,7 + NICs mlx5_6,mlx5_7  (172.31.1.11)
+#   deepep-ll-node0: GPUs 0,1 + NICs mlx5_0,mlx5_1  (172.31.1.10)
+#   deepep-ll-node1: GPUs 2,3 + NICs mlx5_2,mlx5_3  (172.31.1.11)
 #
 # Distinct identity (deepep-ll-*, 172.31.1.0/24, ports 2310/2311, deepep-ll-net)
 # from the normal-path docker-2node sim so the two compose projects do not
@@ -45,10 +45,10 @@ x-common: &common
     - /root/.conda:/root/.conda:ro
 
     # --- Code repos (read-write) ---
-    - /data/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
-    - /data/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/code-repo/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/code-repo/ishmem_ibgda:/root/jiafuzha/code-repo/ishmem_ibgda:rw
     - /root/jiafuzha/code-repo/zjf2012/DeepEP:/root/jiafuzha/code-repo/zjf2012/DeepEP:rw
-    - /data/jiafuzha/code-repo/zjf2012/DeepEP:/data/jiafuzha/code-repo/zjf2012/DeepEP:rw
     - /root/jiafuzha/code-repo/pytorch:/root/jiafuzha/code-repo/pytorch:rw
     - /root/jiafuzha/code-repo/intel_gpu_uar_bridge:/root/jiafuzha/code-repo/intel_gpu_uar_bridge:rw
 
@@ -83,7 +83,7 @@ services:
       - "deepep-ll-node0:172.31.1.10"
       - "deepep-ll-node1:172.31.1.11"
     environment:
-      - ZE_AFFINITY_MASK=4,5
+      - ZE_AFFINITY_MASK=0,1
       - NODE_ID=0
       - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >
@@ -114,7 +114,7 @@ services:
       - "deepep-ll-node0:172.31.1.10"
       - "deepep-ll-node1:172.31.1.11"
     environment:
-      - ZE_AFFINITY_MASK=6,7
+      - ZE_AFFINITY_MASK=2,3
       - NODE_ID=1
       - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >

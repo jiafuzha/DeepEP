@@ -2,8 +2,8 @@
 # Docker Compose: 2-Node DeepEP Internode Simulation
 #
 # Simulates 2 physical nodes, each with 2 GPUs + 2 NICs:
-#   deepep-node0: GPUs 4,5 + NICs mlx5_4,mlx5_5  (172.31.0.10)
-#   deepep-node1: GPUs 6,7 + NICs mlx5_6,mlx5_7  (172.31.0.11)
+#   deepep-node0: GPUs 0,1 + NICs mlx5_0,mlx5_1  (172.31.0.10)
+#   deepep-node1: GPUs 2,3 + NICs mlx5_2,mlx5_3  (172.31.0.11)
 #
 # Uses a private bridge network so each container has its own hostname and
 # IP - MPI then treats them as TWO real nodes (correct PPN, MPI_LOCALRANKID).
@@ -41,10 +41,10 @@ x-common: &common
     - /root/.conda:/root/.conda:ro
 
     # --- Code repos (read-write) ---
-    - /data/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
-    - /data/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/code-repo/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
+    - /root/jiafuzha/code-repo/ishmem_ibgda:/root/jiafuzha/code-repo/ishmem_ibgda:rw
     - /root/jiafuzha/code-repo/zjf2012/DeepEP:/root/jiafuzha/code-repo/zjf2012/DeepEP:rw
-    - /data/jiafuzha/code-repo/zjf2012/DeepEP:/data/jiafuzha/code-repo/zjf2012/DeepEP:rw
     - /root/jiafuzha/code-repo/pytorch:/root/jiafuzha/code-repo/pytorch:rw
     - /root/jiafuzha/code-repo/intel_gpu_uar_bridge:/root/jiafuzha/code-repo/intel_gpu_uar_bridge:rw
 
@@ -79,7 +79,7 @@ services:
       - "deepep-node0:172.31.0.10"
       - "deepep-node1:172.31.0.11"
     environment:
-      - ZE_AFFINITY_MASK=4,5
+      - ZE_AFFINITY_MASK=0,1
       - NODE_ID=0
       - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >
@@ -110,7 +110,7 @@ services:
       - "deepep-node0:172.31.0.10"
       - "deepep-node1:172.31.0.11"
     environment:
-      - ZE_AFFINITY_MASK=6,7
+      - ZE_AFFINITY_MASK=2,3
       - NODE_ID=1
       - LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/intel/oneapi/lib:/host-libs
     command: >

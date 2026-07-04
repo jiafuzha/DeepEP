@@ -4,14 +4,14 @@
 # Sets up oneAPI/conda env, ZE_AFFINITY_MASK and ISHMEM_IBGDA_NIC based on
 # container hostname (node identity) and MPI_LOCALRANKID (rank within node).
 #
-# Hardware topology (NUMA 1):
-#   GPU 4 (0000:ac:00.0) <-> mlx5_4 (0000:b2:00.0)
-#   GPU 5 (0000:b0:00.0) <-> mlx5_5 (0000:b2:00.1)
-#   GPU 6 (0000:bd:00.0) <-> mlx5_6 (0000:ba:00.0)
-#   GPU 7 (0000:c1:00.0) <-> mlx5_7 (0000:ba:00.1)
+# Hardware topology (NUMA 0):
+#   GPU 0 (0000:1f:00.0) <-> mlx5_0 (0000:25:00.0)
+#   GPU 1 (0000:23:00.0) <-> mlx5_1 (0000:25:00.1)
+#   GPU 2 (0000:42:00.0) <-> mlx5_2 (0000:48:00.0)
+#   GPU 3 (0000:46:00.0) <-> mlx5_3 (0000:48:00.1)
 #
-# Node 0 (deepep-ll-node0): GPUs 4,5 + NICs mlx5_4,mlx5_5
-# Node 1 (deepep-ll-node1): GPUs 6,7 + NICs mlx5_6,mlx5_7
+# Node 0 (deepep-ll-node0): GPUs 0,1 + NICs mlx5_0,mlx5_1
+# Node 1 (deepep-ll-node1): GPUs 2,3 + NICs mlx5_2,mlx5_3
 
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 # Use miniforge3 for conda env
@@ -32,13 +32,13 @@ export LOCAL_RANK
 HOSTNAME_VAL=$(hostname)
 case "$HOSTNAME_VAL" in
     *node1*|*node-1*)
-        IFACES=(ens5008f0np0 ens5008f1np1)
-        export ZE_AFFINITY_MASK=6,7
+        IFACES=(ens2005f0np0 ens2005f1np1)
+        export ZE_AFFINITY_MASK=2,3
         NODE_RANK=1
         ;;
     *)
-        IFACES=(ens4013f0np0 ens4013f1np1)
-        export ZE_AFFINITY_MASK=4,5
+        IFACES=(ens1006f0np0 ens1006f1np1)
+        export ZE_AFFINITY_MASK=0,1
         NODE_RANK=0
         ;;
 esac
@@ -49,14 +49,14 @@ export RANK=${RANK:-$NODE_RANK}
 
 # NOTE: ISHMEM_IBGDA_NIC is intentionally NOT set here. iSHMEM auto-selects the
 # NIC closest to the chosen GPU by PCIe topology, which is correct in this
-# 2-node simulation since each node only exposes its own GPUs (4,5 or 6,7).
+# 2-node simulation since each node only exposes its own GPUs (0,1 or 2,3).
 # The auto-selection is independently verified before each test run by
 # verify_nic_selection.sh / nic_pcie_check (run.sh), which asserts the
 # auto-picked NIC shares the GPU's PCIe switch.
 export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package
-export PYTHONPATH=/data/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
+export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
 
 # DeepEP / iSHMEM needs MASTER_ADDR (rank-0 node hostname)
 export MASTER_ADDR=${MASTER_ADDR:-deepep-ll-node0}
