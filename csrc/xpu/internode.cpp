@@ -2712,13 +2712,20 @@ void dispatch_nvl_rdma(void* recv_x,
     ddbg_stage("7-FwdBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
-        cgh.single_task<CombinedDispatchAssembleKernel>([=]() {
+        cgh.parallel_for<CombinedDispatchAssembleKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
+            const int local_id = static_cast<int>(item.get_local_id(0));
             // Acquire fence: invalidate any stale local cache and order all
             // subsequent reads of the NVL peers' forwarded/send buffers
             // (IPC-mapped remote GPU memory) after the leader's release fence,
             // mirroring CUDA's ld_acquire_sys_global on the NVL channel tail.
             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
             constexpr int kMaxRanks = 64;
+            // per_src_count/cursors are recomputed identically by every
+            // work-item from deterministic reads, so token placement (pos) is
+            // consistent across the work-group without a broadcast. The bulk
+            // row copy is split by local_id; per-token scalar metadata is
+            // written by WI 0 only.
             int per_src_count[kMaxRanks] = {0};
             int cursors[kMaxRanks] = {0};
 
@@ -2767,7 +2774,7 @@ void dispatch_nvl_rdma(void* recv_x,
                 cursors[s] = total;
                 total += per_src_count[s];
             }
-            if (recv_gbl_rank_prefix_sum != nullptr) {
+            if (recv_gbl_rank_prefix_sum != nullptr && local_id == 0) {
                 int prefix = 0;
                 for (int s = 0; s < num_ranks; ++s) {
                     prefix += per_src_count[s];
@@ -2781,7 +2788,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
             }
-            if (recv_rdma_rank_prefix_sum != nullptr) {
+            if (recv_rdma_rank_prefix_sum != nullptr && local_id == 0) {
                 int prefix = 0;
                 for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                     int count = 0;
@@ -2817,21 +2824,23 @@ void dispatch_nvl_rdma(void* recv_x,
                     const int pos = cursors[src_rank]++;
                     auto* src_row = peer_x + static_cast<size_t>(t) * row_bytes;
                     auto* dst_row = dst + static_cast<size_t>(pos) * row_bytes;
-                    for (size_t b = 0; b < row_bytes; ++b) {
+                    for (size_t b = local_id; b < row_bytes; b += kIshmemWGSize) {
                         dst_row[b] = src_row[b];
                     }
-                    if (meta != nullptr) {
-                        meta[pos] = peer_m[t];
-                    }
-                    if (recv_topk_idx != nullptr) {
-                        for (int k = 0; k < num_topk; ++k) {
-                            recv_topk_idx[pos * num_topk + k] = peer_idx[t * num_topk + k];
-                            recv_topk_weights[pos * num_topk + k] = peer_wt[t * num_topk + k];
+                    if (local_id == 0) {
+                        if (meta != nullptr) {
+                            meta[pos] = peer_m[t];
                         }
-                    }
-                    if (recv_x_scales != nullptr) {
-                        for (int s = 0; s < num_scales; ++s) {
-                            recv_x_scales[pos * num_scales + s] = peer_scales[t * num_scales + s];
+                        if (recv_topk_idx != nullptr) {
+                            for (int k = 0; k < num_topk; ++k) {
+                                recv_topk_idx[pos * num_topk + k] = peer_idx[t * num_topk + k];
+                                recv_topk_weights[pos * num_topk + k] = peer_wt[t * num_topk + k];
+                            }
+                        }
+                        if (recv_x_scales != nullptr) {
+                            for (int s = 0; s < num_scales; ++s) {
+                                recv_x_scales[pos * num_scales + s] = peer_scales[t * num_scales + s];
+                            }
                         }
                     }
                 }
@@ -2846,21 +2855,23 @@ void dispatch_nvl_rdma(void* recv_x,
                     const int pos = cursors[src_rank]++;
                     auto* src_row = my_fwd_x + static_cast<size_t>(idx) * row_bytes;
                     auto* dst_row = dst + static_cast<size_t>(pos) * row_bytes;
-                    for (size_t b = 0; b < row_bytes; ++b) {
+                    for (size_t b = local_id; b < row_bytes; b += kIshmemWGSize) {
                         dst_row[b] = src_row[b];
                     }
-                    if (meta != nullptr) {
-                        meta[pos] = sm;
-                    }
-                    if (recv_topk_idx != nullptr) {
-                        for (int k = 0; k < num_topk; ++k) {
-                            recv_topk_idx[pos * num_topk + k] = my_fwd_idx[idx * num_topk + k];
-                            recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                    if (local_id == 0) {
+                        if (meta != nullptr) {
+                            meta[pos] = sm;
                         }
-                    }
-                    if (recv_x_scales != nullptr) {
-                        for (int s = 0; s < num_scales; ++s) {
-                            recv_x_scales[pos * num_scales + s] = my_fwd_scales[idx * num_scales + s];
+                        if (recv_topk_idx != nullptr) {
+                            for (int k = 0; k < num_topk; ++k) {
+                                recv_topk_idx[pos * num_topk + k] = my_fwd_idx[idx * num_topk + k];
+                                recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                            }
+                        }
+                        if (recv_x_scales != nullptr) {
+                            for (int s = 0; s < num_scales; ++s) {
+                                recv_x_scales[pos * num_scales + s] = my_fwd_scales[idx * num_scales + s];
+                            }
                         }
                     }
                 }
@@ -2870,23 +2881,25 @@ void dispatch_nvl_rdma(void* recv_x,
             // Zero-fill leftover rows beyond the actual receive count (capacity may exceed actual).
             for (int idx = total; idx < num_recv_tokens; ++idx) {
                 auto* dst_row = dst + static_cast<size_t>(idx) * row_bytes;
-                for (size_t b = 0; b < row_bytes; ++b) {
+                for (size_t b = local_id; b < row_bytes; b += kIshmemWGSize) {
                     dst_row[b] = 0;
                 }
-                if (meta != nullptr) {
-                    meta[idx].src_rdma_rank = -1;
-                    meta[idx].is_token_in_nvl_rank_bits = 0;
-                    meta[idx].src_nvl_rank = -1;
-                }
-                if (recv_topk_idx != nullptr) {
-                    for (int k = 0; k < num_topk; ++k) {
-                        recv_topk_idx[idx * num_topk + k] = -1;
-                        recv_topk_weights[idx * num_topk + k] = 0.0f;
+                if (local_id == 0) {
+                    if (meta != nullptr) {
+                        meta[idx].src_rdma_rank = -1;
+                        meta[idx].is_token_in_nvl_rank_bits = 0;
+                        meta[idx].src_nvl_rank = -1;
                     }
-                }
-                if (recv_x_scales != nullptr) {
-                    for (int s = 0; s < num_scales; ++s) {
-                        recv_x_scales[idx * num_scales + s] = 0.0f;
+                    if (recv_topk_idx != nullptr) {
+                        for (int k = 0; k < num_topk; ++k) {
+                            recv_topk_idx[idx * num_topk + k] = -1;
+                            recv_topk_weights[idx * num_topk + k] = 0.0f;
+                        }
+                    }
+                    if (recv_x_scales != nullptr) {
+                        for (int s = 0; s < num_scales; ++s) {
+                            recv_x_scales[idx * num_scales + s] = 0.0f;
+                        }
                     }
                 }
             }
