@@ -81,12 +81,11 @@ export RANK=${RANK:-$NODE_RANK}
 # The auto-selection is independently verified before each test run by
 # verify_nic_selection.sh / nic_pcie_check (run.sh), which asserts the
 # auto-picked NIC shares the GPU's PCIe switch.
-if [ "$LOCAL_RANK" -ge "${#NODE_IB_DEVICES[@]}" ]; then
-    echo "LOCAL_RANK=$LOCAL_RANK exceeds configured IB devices: $NODE_IB_DEVICES_STR" >&2
+if [ "$LOCAL_RANK" -ge "${#IFACES[@]}" ]; then
+    echo "LOCAL_RANK=$LOCAL_RANK exceeds configured IFACES: ${IFACES[*]}" >&2
     exit 1
 fi
-IB_DEVICE=${NODE_IB_DEVICES[$LOCAL_RANK]}
-export FI_VERBS_IFACE=$(resolve_iface_from_ibdev "$IB_DEVICE")
+export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package
 export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
@@ -94,7 +93,7 @@ export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
 # DeepEP / iSHMEM needs MASTER_ADDR (rank-0 node hostname)
 export MASTER_ADDR=${MASTER_ADDR:-deepep-ll-node0}
 
-echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK IB_DEVICE=$IB_DEVICE IFACE=$FI_VERBS_IFACE" >&2
+echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK IFACE=$FI_VERBS_IFACE" >&2
 
 ulimit -c unlimited
 exec "$@"

@@ -362,6 +362,25 @@ def test_main(args: argparse.Namespace,
     if local_rank == 0:
         print('', flush=True)
 
+    # DEEP_EP_PERF: lightweight wall-clock perf capture (XPU-safe). The kineto
+    # tuning sweep above is skipped on XPU (skip_benchmark), so this uses the
+    # accelerator-Event based bench() on the cached dispatch/combine to report
+    # latency and effective RDMA/NVL bandwidth without the fragile profiler path.
+    if os.getenv('DEEP_EP_PERF'):
+        perf_dispatch_args = {'x': x, 'handle': handle, 'config': config}
+        d_avg, d_min, d_max = bench(lambda: buffer.dispatch(**perf_dispatch_args), num_warmups=10, num_tests=20)
+        perf_combine_args = {'x': recv_x, 'handle': handle, 'config': config}
+        c_avg, c_min, c_max = bench(lambda: buffer.combine(**perf_combine_args), num_warmups=10, num_tests=20)
+        print(
+            f'[PERF rank={rank}] num_tokens={num_tokens} hidden={hidden} '
+            f'dispatch: {d_avg * 1e6:.1f} us (min {d_min * 1e6:.1f}, max {d_max * 1e6:.1f}), '
+            f'rdma_send={dispatch_bf16_rdma_send_bytes / 1e6:.3f} MB @ {dispatch_bf16_rdma_send_bytes / 1e9 / d_avg:.4f} GB/s, '
+            f'nvl_recv={dispatch_bf16_nvl_recv_bytes / 1e6:.3f} MB @ {dispatch_bf16_nvl_recv_bytes / 1e9 / d_avg:.4f} GB/s | '
+            f'combine: {c_avg * 1e6:.1f} us (min {c_min * 1e6:.1f}, max {c_max * 1e6:.1f}), '
+            f'rdma_recv={combine_bf16_rdma_recv_bytes / 1e6:.3f} MB @ {combine_bf16_rdma_recv_bytes / 1e9 / c_avg:.4f} GB/s, '
+            f'nvl_send={combine_bf16_nvl_send_bytes / 1e6:.3f} MB @ {combine_bf16_nvl_send_bytes / 1e9 / c_avg:.4f} GB/s',
+            flush=True)
+
     if skip_benchmark:
         return hash_value
 

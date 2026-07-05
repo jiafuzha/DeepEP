@@ -293,6 +293,7 @@ run_test() {
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_MIN="${DEEP_EP_MIN:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
+        -e DEEP_EP_PERF="${DEEP_EP_PERF:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
         deepep-node0 \
         bash -lc "
@@ -324,6 +325,7 @@ run_test() {
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
                 -genv DEEP_EP_MIN \"\${DEEP_EP_MIN:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
+                -genv DEEP_EP_PERF \"\${DEEP_EP_PERF:-}\" \
                 -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \

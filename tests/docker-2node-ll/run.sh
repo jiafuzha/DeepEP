@@ -286,11 +286,15 @@ verify_nic_selection() {
 run_test() {
     ensure_up
     verify_rdma || { echo "RDMA accessibility check failed; aborting test." >&2; return 1; }
-    verify_nic_selection || {
-        echo "iSHMEM auto NIC selection check FAILED (a rank's NIC is not under" >&2
-        echo "the same PCIe switch as its GPU); aborting test." >&2
-        return 1
-    }
+    if [ -n "${SKIP_NIC_CHECK:-}" ]; then
+        echo "SKIP_NIC_CHECK set: skipping iSHMEM auto NIC selection pre-flight." >&2
+    else
+        verify_nic_selection || {
+            echo "iSHMEM auto NIC selection check FAILED (a rank's NIC is not under" >&2
+            echo "the same PCIe switch as its GPU); aborting test." >&2
+            return 1
+        }
+    fi
     clean_ipc_state
     ensure_port_free || { echo "MASTER_PORT cleanup failed; aborting test." >&2; return 1; }
 
