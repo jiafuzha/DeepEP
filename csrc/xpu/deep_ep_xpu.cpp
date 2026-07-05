@@ -11,9 +11,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
 #ifdef DEEP_EP_ENABLE_ISHMEM
@@ -231,18 +233,58 @@ void quiet() {
 }
 
 void finalize() {
-    // NOTE: ishmem_finalize() in the oneAPI-2026 iSHMEM-IBGDA stack can hang
-    // after a long workload (proxy/MPI window quiesce). DeepEP teardown is
-    // process-exit anyway, so skip the global finalize by default. Set
-    // DEEP_EP_XPU_ISHMEM_FINALIZE=1 to force calling it.
+    // Empirical finding on this Intel XPU + igub_vmem BAR-bridge stack:
+    //   * There is NO resource leak on normal program/test exit. Process exit
+    //     tears down the Level-Zero context, which drops the imported NIC-BAR
+    //     dma_buf references; the igub_vmem module refcount returns to 0 and
+    //     the GPUs stay healthy across repeated runs. NIC QPs/MRs and the
+    //     symmetric heap are likewise reclaimed via fd/context close at exit.
+    //   * Performing an EXPLICIT mid-process IBGDA teardown here (closing the
+    //     NIC UAR->GPU BAR mapping via zeMemCloseIpcHandle and destroying the
+    //     live DEVX QPs) instead DESTABILIZES the device: unmapping MMIO from
+    //     the GPU page tables while the driver context is shared corrupts GPU
+    //     state and reproducibly triggers UR_RESULT_ERROR_DEVICE_LOST on a
+    //     subsequent run.
+    //
+    // Therefore we DEFAULT TO SKIP the explicit teardown and rely on
+    // process-exit reclamation (which is leak-free here). The teardown remains
+    // available opt-in via DEEP_EP_XPU_ISHMEM_FINALIZE=1 for environments where
+    // ishmem/IBGDA resources are NOT reclaimed at exit; when enabled it uses
+    // ishmem_finalize_ibgda_resources() (releases NIC/BAR resources without
+    // finalizing the shared MPI/oneCCL runtime) under a watchdog.
     const char* env = std::getenv("DEEP_EP_XPU_ISHMEM_FINALIZE");
-    if (env == nullptr || env[0] == 0 || env[0] == '0') {
+    if (env == nullptr || env[0] == '\0' || env[0] == '0') {
         return;
     }
     int initialized = 0;
     ishmemx_query_initialized(&initialized);
-    if (initialized) {
-        ishmem_finalize();
+    if (!initialized) {
+        return;
+    }
+
+    int timeout_sec = 20;
+    try_parse_env_int("DEEP_EP_XPU_FINALIZE_TIMEOUT_SEC", &timeout_sec);
+    if (timeout_sec <= 0) {
+        ishmem_finalize_ibgda_resources();
+        return;
+    }
+
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> fut = done->get_future();
+    std::thread worker([done]() {
+        ishmem_finalize_ibgda_resources();
+        done->set_value();
+    });
+
+    if (fut.wait_for(std::chrono::seconds(timeout_sec)) == std::future_status::ready) {
+        worker.join();
+    } else {
+        std::fprintf(stderr,
+            "[DeepEP] ishmem_finalize_ibgda_resources() did not complete within %d s "
+            "(proxy/barrier quiesce hang); detaching and continuing teardown. "
+            "Tune with DEEP_EP_XPU_FINALIZE_TIMEOUT_SEC.\n",
+            timeout_sec);
+        worker.detach();
     }
 }
 #else
