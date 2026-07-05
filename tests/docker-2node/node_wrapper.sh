@@ -52,11 +52,13 @@ case "$HOSTNAME_VAL" in
     *node1*|*node-1*)
 # for smc26
         IFACES=(ens2005f0np0 ens2005f1np1)
+        IBDEVS=(mlx5_2 mlx5_3)
         export ZE_AFFINITY_MASK=2,3
         NODE_RANK=1
         ;;
     *)
         IFACES=(ens1006f0np0 ens1006f1np1)
+        IBDEVS=(mlx5_0 mlx5_1)
         export ZE_AFFINITY_MASK=0,1
 # for 140
 #        NODE_IB_DEVICES_STR=${NODE1_IB_DEVICES:-mlx5_6 mlx5_7}
@@ -70,7 +72,6 @@ case "$HOSTNAME_VAL" in
         ;;
 esac
 read -r -a NODE_IB_DEVICES <<< "$NODE_IB_DEVICES_STR"
-
 # init_dist (tests/utils.py) reads RANK as the *node* rank (0..WORLD_SIZE-1).
 # WORLD_SIZE is set by run.sh to the number of nodes.
 export RANK=${RANK:-$NODE_RANK}
@@ -80,13 +81,13 @@ export RANK=${RANK:-$NODE_RANK}
 # known GPU<->NIC pairing used by the lower-level docker dispatch reproducer:
 #   node0 lr0->GPU4<->mlx5_4, lr1->GPU5<->mlx5_5
 #   node1 lr0->GPU6<->mlx5_6, lr1->GPU7<->mlx5_7
-if [ "$LOCAL_RANK" -ge "${#NODE_IB_DEVICES[@]}" ]; then
-    echo "LOCAL_RANK=$LOCAL_RANK exceeds configured IB devices: $NODE_IB_DEVICES_STR" >&2
+if [ "$LOCAL_RANK" -ge "${#IFACES[@]}" ]; then
+    echo "LOCAL_RANK=$LOCAL_RANK exceeds configured IFACES: ${IFACES[*]}" >&2
     exit 1
 fi
-IB_DEVICE=${NODE_IB_DEVICES[$LOCAL_RANK]}
+IB_DEVICE=${IBDEVS[$LOCAL_RANK]}
 export ISHMEM_IBGDA_NIC="$IB_DEVICE"
-export FI_VERBS_IFACE=$(resolve_iface_from_ibdev "$IB_DEVICE")
+export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package
 export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}

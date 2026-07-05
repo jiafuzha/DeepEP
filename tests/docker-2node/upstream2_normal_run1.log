@@ -1,0 +1,102 @@
+Starting containers...
+ Network docker-2node_deepep-net Creating 
+ Network docker-2node_deepep-net Created 
+ Container deepep-node1 Creating 
+ Container deepep-node0 Creating 
+ Container deepep-node0 Created 
+ Container deepep-node1 Created 
+ Container deepep-node0 Starting 
+ Container deepep-node1 Starting 
+ Container deepep-node0 Started 
+ Container deepep-node1 Started 
+Containers ready: deepep-node0 (172.31.0.10), deepep-node1 (172.31.0.11)
+===== Verifying RDMA accessibility =====
+deepep-node0 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+deepep-node1 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+Both nodes report PORT_ACTIVE on assigned NICs.
+Bridge control-plane reachable (deepep-node1:22 from deepep-node0).
+WARNING: ibv_rc_pingpong over the bridge hostname did not succeed.
+         (Test still proceeds; iSHMEM uses physical NICs via /dev/infiniband).
+  local address:  LID 0x0000, QPN 0x000b98, PSN 0xb99296, GID ::ffff:192.168.8.105
+  remote address: LID 0x0000, QPN 0x000cb9, PSN 0x747966, GID ::ffff:192.168.8.95
+8192 bytes in 0.00 seconds = 93.62 Mbit/sec
+1 iters in 0.00 seconds = 700.00 usec/iter
+Couldn't connect to deepep-node0:18515
+  local address:  LID 0x0000, QPN 0x000220, PSN 0xc9888e, GID ::ffff:192.168.1.76
+===== RDMA accessibility check done =====
+===== Cleaning leaked IPC state (/dev/shm PSM3/CCL sems) =====
+===== Ensuring MASTER_PORT 29500 free on both nodes =====
+[deepep-node0] port 29500 is free
+[deepep-node1] port 29500 is free
+===== RUN tests/test_internode.py (2 nodes x 2 ranks = 4 total) =====
+[deepep-node1 lr=1 gr=3] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f1np1
+[deepep-node0 lr=1 gr=1] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f1np1
+[deepep-node1 lr=0 gr=2] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f0np0
+[deepep-node0 lr=0 gr=0] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f0np0
+[rank 3] Creating buffer: num_local_ranks=2, num_nodes=2, num_ranks=4, nvl_bytes=134217728, rdma_bytes=67108864
+[rank 1] Creating buffer: num_local_ranks=2, num_nodes=2, num_ranks=4, nvl_bytes=134217728, rdma_bytes=67108864
+[rank 2] Creating buffer: num_local_ranks=2, num_nodes=2, num_ranks=4, nvl_bytes=134217728, rdma_bytes=67108864
+[rank 0] Creating buffer: num_local_ranks=2, num_nodes=2, num_ranks=4, nvl_bytes=134217728, rdma_bytes=67108864
+[rank 2] Buffer created successfully
+Testing with seed 0 ...
+[rank 3] Buffer created successfully
+[rank 0] Buffer created successfully
+Testing with seed 0 ...
+[rank 1] Buffer created successfully
+[config] num_tokens=64, hidden=1024, num_topk_groups=1, num_topk=2
+[config] num_tokens=64, hidden=1024, num_topk_groups=1, num_topk=2
+[layout] Kernel performance: 0.082 ms
+
+[layout] Kernel performance: 0.087 ms
+
+[testing] Running with BF16, without top-k (async=False, previous=False) ...[testing] Running with BF16, without top-k (async=False, previous=False) ... passed
+[testing] Running with BF16, with top-k (async=False, previous=False) ... passed
+[testing] Running with BF16, with top-k (async=False, previous=False) ...[rank0]: Traceback (most recent call last):
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 531, in <module>
+[rank0]:     test_loop(local_rank, num_processes, args)
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 462, in test_loop
+[rank0]:     ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+[rank0]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 185, in test_main
+[rank0]:     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(
+[rank0]:                                                                                                ^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 481, in dispatch
+[rank0]:     return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 787, in internode_dispatch
+[rank0]:     recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+[rank0]:                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 531, in <module>
+[rank1]:     test_loop(local_rank, num_processes, args)
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 462, in test_loop
+[rank1]:     ref_hash += test_main(args, i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,
+[rank1]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_internode.py", line 185, in test_main
+[rank1]:     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(
+[rank1]:                                                                                                ^^^^^^^^^^^^^^^^
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 481, in dispatch
+[rank1]:     return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 787, in internode_dispatch
+[rank1]:     recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+[rank1]:                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+terminate called without an active exception
+terminate called without an active exception
+
+===================================================================================
+=   BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES
+=   RANK 0 PID 538 RUNNING AT deepep-node0
+=   KILLED BY SIGNAL: 6 (Aborted)
+===================================================================================
+
+===================================================================================
+=   BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES
+=   RANK 1 PID 539 RUNNING AT deepep-node0
+=   KILLED BY SIGNAL: 6 (Aborted)
+===================================================================================
+===== FAIL tests/test_internode.py (rc=255) =====
