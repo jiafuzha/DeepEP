@@ -74,6 +74,18 @@ init_ib_device_config
 NODE0_PRIMARY_IB_DEVICE="${NODE0_IB_DEVICES_ARR[0]}"
 NODE1_PRIMARY_IB_DEVICE="${NODE1_IB_DEVICES_ARR[0]}"
 
+# OFI provider for Intel MPI's control fabric (I_MPI_FABRICS shm:ofi).
+# Override with FI_PROVIDER=... . Default 'tcp' is the ONLY provider that
+# completes MPI/ishmem bootstrap in this cross-container docker setup:
+#   - 'verbs;ofi_rxm' hangs in init (RoCE RC connection-manager cannot do
+#      cross-container address exchange over the docker bridge)
+#   - 'psm3' segfaults in MPI init ("OFI get address vector map failed")
+# Note: FI_PROVIDER only governs MPI's *control* fabric (bootstrap/collectives);
+# the DeepEP token RDMA data path uses IBGDA over verbs directly (igub BAR
+# backend), independent of FI_PROVIDER. So this knob does not affect the
+# internode token data transport.
+FI_PROVIDER_VAL="${FI_PROVIDER:-tcp}"
+
 setup_ssh_keys() {
     if [ ! -f "$SSH_DIR/id_rsa" ]; then
         mkdir -p "$SSH_DIR"
@@ -291,6 +303,7 @@ run_test() {
         -e NODE0_IB_DEVICES="$NODE0_IB_DEVICES_STR" \
         -e NODE1_IB_DEVICES="$NODE1_IB_DEVICES_STR" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
+        -e DEEP_EP_DBG_DROP="${DEEP_EP_DBG_DROP:-}" \
         -e DEEP_EP_MIN="${DEEP_EP_MIN:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_PERF="${DEEP_EP_PERF:-}" \
@@ -317,12 +330,13 @@ run_test() {
                 -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
-                -genv FI_PROVIDER tcp \
+                -genv FI_PROVIDER '$FI_PROVIDER_VAL' \
                 -genv ISHMEM_DIR $ISHMEM_DIR \
                 -genv NODE0_IB_DEVICES '$NODE0_IB_DEVICES_STR' \
                 -genv NODE1_IB_DEVICES '$NODE1_IB_DEVICES_STR' \
                 -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
+                -genv DEEP_EP_DBG_DROP \"\${DEEP_EP_DBG_DROP:-}\" \
                 -genv DEEP_EP_MIN \"\${DEEP_EP_MIN:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
                 -genv DEEP_EP_PERF \"\${DEEP_EP_PERF:-}\" \
