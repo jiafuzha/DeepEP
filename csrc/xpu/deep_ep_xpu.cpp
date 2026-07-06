@@ -1505,7 +1505,7 @@ struct Buffer {
                                          barrier_signal_ptrs_gpu,
                                          nvl_rank,
                                          num_nvl_ranks,
-                                         reserve_barrier_signals(2),
+                                         reserve_barrier_signals(3),
                                          rank,
                                          num_ranks,
                                          comm_stream.queue());

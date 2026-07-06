@@ -51,6 +51,8 @@ class NvlDispatchCopyKernel;
 class CombinedDispatchInitKernel;
 class CombinedDispatchPackKernel;
 class CombinedDispatchPackBarrierKernel;
+class CombinedDispatchStageKernel;
+class CombinedDispatchStageBarrierKernel;
 class CombinedDispatchRdmaSendKernel;
 class CombinedDispatchRdmaPutKernel;
 class CombinedDispatchFwdWriteKernel;
@@ -2218,6 +2220,17 @@ void dispatch_nvl_rdma(void* recv_x,
     NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks);
     const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
 
+    // Push-staging region (fixes the racy cross-rank IPC READ in RdmaSend).
+    // On this BMG stack a GPU's IPC/P2P READ of an NVL peer's *freshly-Pack-
+    // written* send buffer is not P2P-coherent in time, but a cross-device
+    // WRITE (owner -> peer) is reliable. So instead of the leader READING peer
+    // send buffers, each rank COPIES its own (coherent) send buffer into a
+    // per-src_nvl slot in the leader's NVL buffer; the leader then reads its
+    // OWN staging (same-GPU coherent). stage_stride mirrors the full NVL
+    // buffer layout so RdmaSend can reuse layout.send_*_offset unchanged.
+    const size_t stage_stride = align_offset(layout.total_bytes, 128);
+    const size_t stage_base_offset = align_offset(fwd_base_offset + fwd_layout.total_bytes, 128);
+
     const size_t rdma_x_size = static_cast<size_t>(num_recv_tokens) * row_bytes;
     const size_t rdma_meta_size = static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
     const size_t rdma_topk_idx_size = static_cast<size_t>(num_recv_tokens) * num_topk * sizeof(topk_idx_t);
@@ -2417,14 +2430,52 @@ void dispatch_nvl_rdma(void* recv_x,
     queue.wait();
     ddbg_stage("3-PackBarrier");
 
+    // StageToLeader: every rank copies its OWN (coherent) send buffer into a
+    // per-src_nvl slot in the LEADER's NVL buffer via a reliable cross-device
+    // WRITE. This replaces the leader's racy IPC READ of peer send buffers.
+    {
+        const size_t stage_bytes = layout.total_bytes;
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<CombinedDispatchStageKernel>(
+                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto group = item.get_group();
+                    auto* leader_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[0]);
+                    auto* self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                    auto* stage_dst = leader_buf + stage_base_offset + static_cast<size_t>(nvl_rank) * stage_stride;
+                    const size_t lid = group.get_local_linear_id();
+                    const size_t stride = group.get_local_linear_range();
+                    for (size_t b = lid; b < stage_bytes; b += stride) {
+                        stage_dst[b] = self_buf[b];
+                    }
+                    sycl::group_barrier(group);
+                    // Release the P2P writes into the leader's VRAM so its
+                    // RdmaSend (after the barrier) observes settled data.
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                });
+        });
+        queue.wait();
+        ddbg_stage("3b-Stage");
+    }
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombinedDispatchStageBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
+    });
+    queue.wait();
+    ddbg_stage("3c-StageBarrier");
+
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchRdmaSendKernel>([=]() {
             if (nvl_rank != 0) {
                 return;
             }
-            // Acquire fence: order reads of the NVL peers' packed send buffers
-            // (IPC-mapped remote GPU memory) after their Pack release fence.
+            // Acquire fence: order reads of the staged send buffers (now in
+            // THIS leader's OWN NVL VRAM, written by every rank's StageToLeader)
+            // after the StageBarrier release.
             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
             for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                 auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                 auto* rdma_x = region;
@@ -2440,7 +2491,10 @@ void dispatch_nvl_rdma(void* recv_x,
 
                 int count = 0;
                 for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
-                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
+                    // Read the src_nvl peer's data from the leader's OWN staging
+                    // slot (coherent same-GPU read) instead of the peer's buffer
+                    // over IPC (which races on freshly-written data).
+                    auto* peer_buf = leader_self_buf + stage_base_offset + static_cast<size_t>(src_nvl) * stage_stride;
                     auto* peer_x = peer_buf + layout.send_x_offset;
                     auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
                     auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
@@ -2706,7 +2760,7 @@ void dispatch_nvl_rdma(void* recv_x,
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedDispatchFwdBarrierKernel>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
     });
     queue.wait();
     ddbg_stage("7-FwdBarrier");
