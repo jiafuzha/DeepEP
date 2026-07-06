@@ -134,8 +134,6 @@ void mpi_barrier();
 
 void quiet();
 
-void warmup_qps(void* rdma_buffer_ptr, int my_rdma_rank, int num_rdma_ranks, int num_nvl_ranks, int nvl_rank, sycl::queue& queue);
-
 void finalize();
 
 int get_source_meta_bytes();

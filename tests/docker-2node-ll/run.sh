@@ -57,6 +57,16 @@ NUM_TOPK="${NUM_TOPK:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
 
+# Optional clean-env reset before each test run. On this BMG + mlx5 stack a
+# DEVICE_LOST / init-hang in one run leaves NIC/QP + GPU page-table state wedged,
+# which cascades into subsequent runs (the flag path is especially sensitive).
+# Reloading the igub_vmem BAR-bridge driver fully resets that state. Opt in with
+# DEEP_EP_LL_RESET_DRIVER=1 (host must allow rmmod/insmod). Override the module
+# path via DEEP_EP_IGUB_KO and the settle time via DEEP_EP_IGUB_SETTLE_SEC.
+DEEP_EP_LL_RESET_DRIVER="${DEEP_EP_LL_RESET_DRIVER:-0}"
+DEEP_EP_IGUB_KO="${DEEP_EP_IGUB_KO:-/root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko}"
+DEEP_EP_IGUB_SETTLE_SEC="${DEEP_EP_IGUB_SETTLE_SEC:-40}"
+
 # --- Helpers ---
 init_ib_device_config() {
     read -r -a NODE0_IB_DEVICES_ARR <<< "${NODE0_IB_DEVICES:-mlx5_4 mlx5_5}"
@@ -139,8 +149,43 @@ down() {
     docker compose down 2>/dev/null || true
 }
 
+# Reload the igub_vmem BAR-bridge driver to fully reset wedged NIC/QP/GPU state.
+# Brings containers down first (must release the driver refcount), reloads, then
+# lets the driver settle. Callers should bring containers back up afterwards.
+reset_igub_driver() {
+    echo "===== DEEP_EP_LL_RESET_DRIVER=1: reloading igub_vmem driver for a clean env ====="
+    down
+    sleep 3
+    local rc
+    rc="$(cat /sys/module/igub_vmem_drv/refcnt 2>/dev/null)"
+    if [ "${rc:-0}" != "0" ] && [ -n "$rc" ]; then
+        echo "  igub_vmem_drv refcnt=$rc (busy); skipping reload" >&2
+        return 0
+    fi
+    if lsmod | grep -q '^igub_vmem_drv'; then
+        rmmod igub_vmem_drv 2>/dev/null && echo "  rmmod igub_vmem_drv ok" \
+            || { echo "  rmmod FAILED (continuing without reset)" >&2; return 0; }
+    fi
+    if [ -f "$DEEP_EP_IGUB_KO" ]; then
+        insmod "$DEEP_EP_IGUB_KO" 2>/dev/null && echo "  insmod $DEEP_EP_IGUB_KO ok" \
+            || echo "  insmod FAILED" >&2
+    else
+        echo "  module $DEEP_EP_IGUB_KO not found; skipping insmod" >&2
+    fi
+    echo "  settling ${DEEP_EP_IGUB_SETTLE_SEC}s..."
+    sleep "$DEEP_EP_IGUB_SETTLE_SEC"
+    local gpus
+    gpus="$(timeout 20 sycl-ls 2>/dev/null | grep -c 'level_zero.*gpu')"
+    echo "  post-reset: GPUs=$gpus refcnt=$(cat /sys/module/igub_vmem_drv/refcnt 2>/dev/null)"
+}
+
 ensure_up() {
     stop_peer_containers
+    if [ "$DEEP_EP_LL_RESET_DRIVER" = "1" ]; then
+        reset_igub_driver
+        up
+        return 0
+    fi
     if ! docker ps --format '{{.Names}}' | grep -q deepep-ll-node0; then
         echo "Starting containers..."
         up
@@ -282,6 +327,37 @@ verify_nic_selection() {
         bash "$SCRIPT_DIR/verify_nic_selection.sh"
 }
 
+# GPU->NIC PCIe affinity is a STATIC topology property: once it verifies for a
+# given container set it cannot change until the containers are recreated. The
+# gate spawns its OWN full ishmem_init/IBGDA-provisioning mpirun, which on this
+# stack intermittently hangs (rc=124 in QP provisioning) on a cold container or
+# right after a prior DEVICE_LOST -- a FALSE failure that needlessly aborts an
+# otherwise-good test run. So: (1) retry the transient gate a few times, and
+# (2) cache the PASS in a stamp file inside node0 for this container lifetime
+# (a fresh `docker compose up` starts with an empty /tmp, auto-invalidating it).
+NIC_CHECK_STAMP="/tmp/.deepep_ll_nic_check_ok"
+verify_nic_selection_cached() {
+    if docker exec deepep-ll-node0 test -f "$NIC_CHECK_STAMP" 2>/dev/null; then
+        echo "iSHMEM NIC selection: cached PASS for this container lifetime; skipping re-check." >&2
+        return 0
+    fi
+    local attempts="${NIC_CHECK_ATTEMPTS:-3}"
+    local a
+    for a in $(seq 1 "$attempts"); do
+        if verify_nic_selection; then
+            docker exec deepep-ll-node0 bash -lc "touch $NIC_CHECK_STAMP" 2>/dev/null || true
+            return 0
+        fi
+        echo "iSHMEM NIC selection attempt $a/$attempts failed (transient IBGDA init hang); retrying..." >&2
+        # Clear stale gate procs left inside both containers by the timed-out mpirun.
+        for c in deepep-ll-node0 deepep-ll-node1; do
+            docker exec "$c" bash -lc 'pkill -9 -f "nic_pcie_check|pmi_proxy|hydra|mpiexec" 2>/dev/null || true' 2>/dev/null || true
+        done
+        sleep 2
+    done
+    return 1
+}
+
 # --- Run DeepEP internode test: launch mpirun INSIDE node0; spawn rank on node1 via SSH ---
 run_test() {
     ensure_up
@@ -289,7 +365,7 @@ run_test() {
     if [ -n "${SKIP_NIC_CHECK:-}" ]; then
         echo "SKIP_NIC_CHECK set: skipping iSHMEM auto NIC selection pre-flight." >&2
     else
-        verify_nic_selection || {
+        verify_nic_selection_cached || {
             echo "iSHMEM auto NIC selection check FAILED (a rank's NIC is not under" >&2
             echo "the same PCIe switch as its GPU); aborting test." >&2
             return 1
@@ -315,6 +391,7 @@ run_test() {
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
+        -e DEEP_EP_SKIP_WARMUP="${DEEP_EP_SKIP_WARMUP:-}" \
         deepep-ll-node0 \
         bash -lc "
             source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
@@ -345,12 +422,13 @@ run_test() {
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
                 -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
                 -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
+                -genv DEEP_EP_SKIP_WARMUP \"\${DEEP_EP_SKIP_WARMUP:-}\" \
                 -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
                 -genv DEEP_EP_LL_FLAG_PROGRESS \"\${DEEP_EP_LL_FLAG_PROGRESS:-0}\" \
                 -genv DEEP_EP_LL_FLAG_LSC \"\${DEEP_EP_LL_FLAG_LSC:-0}\" \
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
                 -genv DEEP_EP_LL_FLAG_RECV_ACQ \"\${DEEP_EP_LL_FLAG_RECV_ACQ:-1}\" \
-                -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
+                -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-1000000}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \

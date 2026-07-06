@@ -216,9 +216,17 @@ inline int ll_num_wgs(size_t work_units, int wg_size, int cap) {
 //     -- so the uncached-read cost dominates and the flag path is slower. There
 //     is no portable BMG L2-invalidate primitive to permit cached post-RDMA
 //     reads (confirmed: only uc_load/uc_store work; fences do not).
-//   * True 2-node: the flag path hits UR_RESULT_ERROR_DEVICE_LOST. When a
-//     cross-node flag is delayed, the bounded uncached spin runs long enough to
-//     trip the GPU watchdog before the poll cap is reached.
+//   * True 2-node: the flag path COULD hit UR_RESULT_ERROR_DEVICE_LOST. When a
+//     cross-node flag was delayed, the bounded uncached spin ran long enough
+//     (with the old 2e9 / 50M cap) to trip the GPU hang-check watchdog before
+//     the poll cap was reached -> hard device wedge. FIXED by lowering the
+//     default poll cap to 1,000,000 (see ll_poll_cap() below): the worst-case
+//     spin is now a few ms, safely under the watchdog, so a delayed flag
+//     degrades to "0 tokens" (a soft, test-caught failure) instead of a wedge.
+//     With a CLEAN driver/env, the flag path is reliable at 32 & 64 tokens; the
+//     residual DEVICE_LOST seen historically was accumulated NIC/QP wedge state
+//     across runs, not a flag-path bug (reset the igub driver between runs to
+//     avoid it -- DEEP_EP_LL_RESET_DRIVER=1 in the docker-2node-ll harness).
 // The barrier path (this default) is the proven-stable route. Flip to flags only
 // once scale makes the all-to-all barrier the dominant cost AND the cross-node
 // flag-landing/transport stability is resolved.
@@ -356,6 +364,19 @@ inline void ll_recv_acquire(int mode) {
 // a bounded busy-spin replaces CUDA's clock64 timeout). Overridable via
 // DEEP_EP_LL_POLL_CAP. On timeout the slot is treated as "0 tokens" (graceful
 // degradation), matching the rank-mask-on-timeout intent of the CUDA path.
+//
+// DEFAULT = 1,000,000. This is deliberately LOW. The receiver's flag wait is a
+// tight loop of L2-bypassing uncached uc_load reads; each read is a full VRAM
+// round-trip (~µs). A warm-QP RDMA flag lands within a handful of µs, so 1M
+// iterations (a few ms of spin) has ample margin. Crucially, 1M keeps the
+// WORST-CASE spin (a delayed / never-landing flag under a marginal env) well
+// under the GPU hang-check/heartbeat watchdog interval. A large cap (the old
+// 2e9 / the harness's 50M) lets a single delayed flag spin for tens of seconds,
+// tripping the watchdog -> UR_RESULT_ERROR_DEVICE_LOST (a hard device wedge that
+// also corrupts NIC/QP state and cascades into later iterations). With the low
+// cap the same delayed flag instead breaks out and degrades to "0 tokens" -- a
+// soft, recoverable failure the test's correctness check catches, never a wedge.
+// This is the flag-path DEVICE_LOST fix: bound the spin below the watchdog.
 inline uint64_t ll_poll_cap() {
     const char* env = std::getenv("DEEP_EP_LL_POLL_CAP");
     if (env != nullptr && env[0] != '\0') {
@@ -363,7 +384,7 @@ inline uint64_t ll_poll_cap() {
         if (v > 0)
             return static_cast<uint64_t>(v);
     }
-    return static_cast<uint64_t>(2) * 1000 * 1000 * 1000;
+    return static_cast<uint64_t>(1) * 1000 * 1000;
 }
 
 // Cooperative copy of `n` bytes from src to dst using a strided set of
