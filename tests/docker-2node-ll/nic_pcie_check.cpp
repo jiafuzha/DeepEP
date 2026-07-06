@@ -93,6 +93,17 @@ int main() {
     std::cerr.flush();
 
     ishmem_barrier_all();
-    ishmem_finalize();
+    // ishmem_finalize() is known to intermittently HANG on this BMG/IBGDA stack
+    // (proxy/barrier quiesce wedge) -- the same reason the real LL test defaults
+    // to DEEP_EP_XPU_ISHMEM_FINALIZE=0 and relies on process-exit reclamation.
+    // When this short-lived check binary hung in finalize, mpirun timed out
+    // (rc=124) and verify_nic_selection.sh reported "no binding summary found
+    // (init failed?)" -- a false failure, since init + the binding summary had
+    // already succeeded. Default to SKIP finalize (leak-free: the process exits
+    // immediately and the OS reclaims). Opt in with DEEP_EP_XPU_ISHMEM_FINALIZE=1.
+    const char* fin = std::getenv("DEEP_EP_XPU_ISHMEM_FINALIZE");
+    if (fin != nullptr && fin[0] != '\0' && fin[0] != '0') {
+        ishmem_finalize();
+    }
     return 0;
 }

@@ -709,34 +709,7 @@ struct Buffer {
             auto& queue = comm_stream.queue();
             queue.memset(rdma_buffer_ptr, 0, num_rdma_bytes).wait();
             internode::barrier();
-            // Warm up the IBGDA RC connections so the first dispatch's RDMA
-            // writes are not dropped on a cold QP (iter-0 undercount/DEVICE_LOST).
-            if (num_rdma_ranks > 1) {
-                auto _wu_t0 = std::chrono::steady_clock::now();
-                if (low_latency_mode || global_rdma_mode) {
-                    // Flat iSHMEM PE layout: every rank is its own RDMA peer
-                    // (PE == rank, num PEs == num_ranks).  Pass nvl_ranks=1 and
-                    // my_rdma=rank so warmup addresses dst_pe = dst directly.
-                    // The default (rdma_rank, num_nvl_ranks) addressing is only
-                    // correct for the combined NVL+RDMA topology where node
-                    // leaders sit at multiples of num_nvl_ranks.
-                    internode::warmup_qps(rdma_buffer_ptr, /*my_rdma_rank=*/rank, /*num_rdma_ranks=*/num_ranks,
-                                          /*num_nvl_ranks=*/1, /*nvl_rank=*/0, queue);
-                } else {
-                    internode::warmup_qps(rdma_buffer_ptr, rdma_rank, num_rdma_ranks, num_nvl_ranks, nvl_rank, queue);
-                }
-                auto _wu_t1 = std::chrono::steady_clock::now();
-                internode::barrier();
-                auto _wu_t2 = std::chrono::steady_clock::now();
-                const char* twenv = std::getenv("DEEP_EP_TIME_WARMUP");
-                if (rdma_rank == 0 && nvl_rank == 0 && twenv != nullptr && twenv[0] != '\0') {
-                    double wu_ms = std::chrono::duration<double, std::milli>(_wu_t1 - _wu_t0).count();
-                    double br_ms = std::chrono::duration<double, std::milli>(_wu_t2 - _wu_t1).count();
-                    std::fprintf(stderr,
-                                 "[warmup_qps timing] num_rdma_ranks=%d kernel+wait=%.3f ms barrier=%.3f ms total=%.3f ms\n",
-                                 num_rdma_ranks, wu_ms, br_ms, wu_ms + br_ms);
-                }
-            }
+            (void)queue;
         }
         available = true;
     }
