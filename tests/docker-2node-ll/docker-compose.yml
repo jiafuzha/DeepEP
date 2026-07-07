@@ -54,6 +54,13 @@ x-common: &common
     - /root/jiafuzha/code-repo/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
     - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
     - /root/jiafuzha/code-repo/ishmem_ibgda:/root/jiafuzha/code-repo/ishmem_ibgda:rw
+    # Selected ishmem_ibgda repo root (the tree ISHMEM_DIR lives in). run.sh
+    # derives ISHMEM_HOST_ROOT from ISHMEM_DIR (strips /build/_install) and
+    # exports it before `docker compose up`, so switching ISHMEM_DIR to a repo
+    # not already bind-mounted above still mounts that tree at the SAME host path
+    # in-container (required for the in-container nic_pcie_check pkg-config build).
+    # Defaults to /root/jiafuzha/ishmem_ibgda (matches the ISHMEM_DIR default).
+    - ${ISHMEM_HOST_ROOT:-/root/jiafuzha/ishmem_ibgda}:${ISHMEM_HOST_ROOT:-/root/jiafuzha/ishmem_ibgda}:rw
     # for 140
     # - /root/jiafuzha/ishmem_ibgda:/data/jiafuzha/ishmem_ibgda:rw
     # - /root/jiafuzha/ishmem_ibgda:/root/jiafuzha/ishmem_ibgda:rw
