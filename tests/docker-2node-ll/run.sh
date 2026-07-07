@@ -40,6 +40,13 @@ DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_low_latency.py}"
 SSH_DIR="/tmp/deepep-docker-ssh"
 ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
+# Switching ISHMEM_DIR to a repo the containers don't already bind-mount fails
+# the in-container nic_pcie_check build (pkg-config ishmem: "Package ishmem was
+# not found"). Derive the repo ROOT from ISHMEM_DIR (strip /build/_install) and
+# export it as ISHMEM_HOST_ROOT so docker-compose bind-mounts that tree at the
+# same host path in-container, making ISHMEM_DIR sufficient on its own.
+ISHMEM_HOST_ROOT="${ISHMEM_HOST_ROOT:-${ISHMEM_DIR%/build/_install}}"
+export ISHMEM_DIR ISHMEM_HOST_ROOT
 
 # DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
 DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
