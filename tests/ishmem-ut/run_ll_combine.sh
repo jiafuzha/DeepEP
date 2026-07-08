@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ===========================================================================
 # Launch the standalone iSHMEM low-latency DATA-CORRECTNESS reproducer
-# (ll_count_repro) across the two real nodes b70-hq-1 and b70-hq-2. Run FROM
+# (ll_combine_repro) across the two real nodes b70-hq-1 and b70-hq-2. Run FROM
 # b70-hq-1.
 #
 # Reproduces the DeepEP low-latency TOKEN-LOSS regression that appears with the
@@ -29,7 +29,7 @@
 #
 # Usage:
 #   ISHMEM_DIR=/root/jiafuzha/ishmem_ibgda/build/_install \
-#       bash tests/ishmem-ut/build.sh ll_count_repro
+#       bash tests/ishmem-ut/build.sh ll_combine_repro
 #   bash tests/ishmem-ut/run_ll_count.sh                    # default REPRO_SYNC=quiet
 #   REPRO_SYNC=barrier bash tests/ishmem-ut/run_ll_count.sh
 # ===========================================================================
@@ -41,23 +41,25 @@ DEEP_EP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NODE0=b70-hq-1
 NODE1=b70-hq-2
 
-BIN="$SCRIPT_DIR/ll_count_repro"
+BIN="$SCRIPT_DIR/ll_combine_repro"
 ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"  # 256 MiB
 NUM_PROCESSES="${NUM_PROCESSES:-2}"   # ranks per node (= ppn); 2x2 = 4 PEs
 TIMEOUT_SEC="${TIMEOUT_SEC:-180}"
 REPRO_SYNC="${REPRO_SYNC:-quiet}"
 REPRO_MAX_TOKENS="${REPRO_MAX_TOKENS:-64}"
 REPRO_LOCAL_EXPERTS="${REPRO_LOCAL_EXPERTS:-2}"
+REPRO_RECV_ACQ="${REPRO_RECV_ACQ:-1}"
+REPRO_CLEAR="${REPRO_CLEAR:-cached}"
 REPRO_ROW_INTS="${REPRO_ROW_INTS:-3584}"
 REPRO_ITERS="${REPRO_ITERS:-4}"
 REPRO_MAX_PUT_KB="${REPRO_MAX_PUT_KB:-0}"
-REPRO_RESET_BARRIER="${REPRO_RESET_BARRIER:-1}"
+REPRO_RESET_BARRIER="${REPRO_RESET_BARRIER:-0}"
 REPRO_SKEW_US="${REPRO_SKEW_US:-0}"
 REPRO_VERIFY="${REPRO_VERIFY:-perslot}"
 
 if [ ! -x "$BIN" ]; then
     echo "ERROR: $BIN not found. Build it first:" >&2
-    echo "  ISHMEM_DIR=<path> bash tests/ishmem-ut/build.sh ll_count_repro" >&2
+    echo "  ISHMEM_DIR=<path> bash tests/ishmem-ut/build.sh ll_combine_repro" >&2
     exit 1
 fi
 
@@ -93,7 +95,7 @@ run_test() {
     clean_ipc_state
 
     local TOTAL_RANKS=$((NUM_PROCESSES * 2))
-    echo "===== RUN ll_count_repro REPRO_SYNC=$REPRO_SYNC (2 nodes x ${NUM_PROCESSES} ranks = $TOTAL_RANKS PEs) ====="
+    echo "===== RUN ll_combine_repro REPRO_SYNC=$REPRO_SYNC (2 nodes x ${NUM_PROCESSES} ranks = $TOTAL_RANKS PEs) ====="
 
     local WRAPPER_PATH="$SCRIPT_DIR/node_wrapper.sh"
     chmod +x "$WRAPPER_PATH"
@@ -124,13 +126,15 @@ run_test() {
         -genv REPRO_RESET_BARRIER "$REPRO_RESET_BARRIER" \
         -genv REPRO_SKEW_US "$REPRO_SKEW_US" \
         -genv REPRO_VERIFY "$REPRO_VERIFY" \
+        -genv REPRO_RECV_ACQ "$REPRO_RECV_ACQ" \
+        -genv REPRO_CLEAR "$REPRO_CLEAR" \
         -launcher ssh \
         "$WRAPPER_PATH" \
         "$BIN"
     local rc=$?
     set -e
 
-    echo "----- ll_count_repro exit rc=$rc -----"
+    echo "----- ll_combine_repro exit rc=$rc -----"
     if [ $rc -ne 0 ]; then
         echo "===== REPRODUCED: LL token-loss/correctness regression (rc=$rc). ====="
         echo "      Look for '... FAIL first_bad_slot=... got=X exp=Y' above."
