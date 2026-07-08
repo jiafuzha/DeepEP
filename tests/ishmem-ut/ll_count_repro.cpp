@@ -89,6 +89,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <chrono>
 
 #include <ishmem.h>
 #include <ishmemx.h>
@@ -143,6 +145,17 @@ int main(int argc, char** argv) {
     const uint64_t poll_cap = static_cast<uint64_t>(env_int("REPRO_POLL_CAP", 1000000));
     const int sender_fence = env_int("REPRO_SENDER_FENCE", 1);
     const int recv_acq = env_int("REPRO_RECV_ACQ", 1);
+    // Per-iteration cross-PE sync AFTER clearing the receive buffers and BEFORE
+    // the puts. The real flag-progress (DEEP_EP_LL_FLAG_PROGRESS=1) path has NO
+    // such global barrier between iterations -- it relies on next_clean ordering
+    // alone. Set REPRO_RESET_BARRIER=0 to drop it and expose the barrier-free
+    // race the real perf path actually runs (a fast peer's put can land in the
+    // window where its target is still verifying / re-clearing the prior iter).
+    const int reset_barrier = env_int("REPRO_RESET_BARRIER", 1);
+    // Per-PE host skew (microseconds) injected before each iteration's put stage
+    // to DESYNCHRONIZE the PEs (= my_pe * skew_us). Widens the barrier-free
+    // cross-iteration clear/put race window the real flag path is exposed to.
+    const int skew_us = env_int("REPRO_SKEW_US", 0);
     std::string sync_mode = env_str("REPRO_SYNC", "quiet");
     if (sync_mode != "quiet" && sync_mode != "barrier") sync_mode = "quiet";
 
@@ -181,6 +194,12 @@ int main(int argc, char** argv) {
     int total_fail = 0;
 
     for (int it = 0; it < iters; ++it) {
+        // Inject per-PE host skew so the PEs fall out of lockstep: a lagging
+        // receiver runs its buffer clear (fill below) LATE, after a fast peer has
+        // already put its flag -> the clear clobbers the delivered flag = token
+        // loss, the barrier-free hazard the real flag path is exposed to.
+        if (skew_us > 0 && me > 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(skew_us * me));
         // Stage the payload + flag this PE will send on every channel.
         q.submit([&](sycl::handler& cgh) {
              cgh.parallel_for(sycl::range<1>(nchan), [=](sycl::id<1> cid) {
@@ -199,7 +218,8 @@ int main(int argc, char** argv) {
         // Reset receiver buffers to a sentinel so dropped puts are visible.
         q.fill(dispatch_count, 0, nslots).wait();      // 0 == not-arrived (flag encoding)
         q.fill(dispatch_data, -777, data_ints).wait();
-        ishmem_barrier_all();
+        if (reset_barrier)
+            ishmem_barrier_all();
 
         // Stage 2: one work-item per (dst, le) channel. Payload put first, then
         // the 4-byte flag put -- same ordering as the flag path in internode_ll.
@@ -273,7 +293,15 @@ int main(int argc, char** argv) {
                              const int src = s % npes;
                              if (src == me) continue;  // self slot written locally
                              uint64_t spins = 0;
-                             while (dispatch_count[s] == 0) {
+			     /* Use system-scope atomic load to bypass GPU L3 cache.
+                              * NIC DMA writes bypass L3; without invalidation the
+                              * GPU keeps reading stale cached zeros forever. */
+                             sycl::atomic_ref<int, sycl::memory_order::acq_rel,
+                                              sycl::memory_scope::system,
+                                              sycl::access::address_space::global_space>
+                                 flag_ref(dispatch_count[s]);
+                             while (flag_ref.load(sycl::memory_order::acquire) == 0) {
+                             //while (dispatch_count[s] == 0) {
                                  if (++spins >= poll_cap) break;  // timeout -> 0 tokens
                              }
                          }
@@ -282,42 +310,90 @@ int main(int argc, char** argv) {
         }
 
         // Stage 4: verify every (local_expert, source) slot on this receiver.
+        // REPRO_VERIFY selects the receiver-read STRUCTURE:
+        //   perslot  (default) - one work-item per slot; the acquire happens right
+        //                        before that slot's payload read (this is coherent).
+        //   packlike           - mirrors csrc/xpu/internode_ll.cpp PACK kernel: a
+        //                        SINGLE work-item does the acquire ONCE at entry,
+        //                        then loops over ALL slots reading the flag
+        //                        (atomic-acquire) + payload (cached). This exposes
+        //                        the real-code staleness: the once-at-entry acquire
+        //                        does NOT keep later slots' payload L3 lines fresh.
+        //   packlike_fix       - packlike but re-issues the acquire before EACH
+        //                        slot's payload read (candidate fix).
         for (size_t s = 0; s < nslots; ++s) {
             fail[s] = 0;
             got[s] = 0;
             exp[s] = 0;
         }
-        q.submit([&](sycl::handler& cgh) {
-             cgh.parallel_for(sycl::range<1>(nslots), [=](sycl::id<1> sid) {
-                 const int slot = static_cast<int>(sid);
-                 const int le = slot / npes;
-                 const int src = slot % npes;
-                 const int expected = channel_count(src, me, le, max_tokens, it);
-                 // Acquire(system) so the CACHED payload reads below observe the
-                 // NIC-delivered bytes (mirrors ll_recv_acquire / RECV_ACQ=1).
-                 if (recv_acq)
-                     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                 const int raw = dispatch_count[slot];
-                 const int delivered = (raw == 0) ? 0 : (-raw - 1);  // flag decode
-                 got[slot] = delivered;
-                 exp[slot] = expected;
-                 int bad = (delivered != expected) ? 1 : 0;
-                 // Verify payload bytes for the rows the flag says arrived. A
-                 // flag-before-payload reordering yields delivered==expected but
-                 // STALE payload (sentinel -777) -> caught here.
-                 const int rows = delivered;
-                 const size_t base = static_cast<size_t>(slot) * max_tokens * row_ints;
-                 for (int r = 0; r < rows && bad == 0; ++r) {
-                     for (int i = 0; i < row_ints; ++i) {
-                         if (dispatch_data[base + static_cast<size_t>(r) * row_ints + i] != encode(src, le, r, i)) {
-                             bad = 1;
-                             break;
+        const std::string verify_mode = env_str("REPRO_VERIFY", "perslot");
+        auto read_flag_atomic = [](int* p) {
+            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                r(*p);
+            return r.load(sycl::memory_order::acquire);
+        };
+        if (verify_mode == "packlike" || verify_mode == "packlike_fix") {
+            const bool per_slot_acq = (verify_mode == "packlike_fix");
+            q.submit([&](sycl::handler& cgh) {
+                 cgh.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) {
+                     if (recv_acq)  // ll_recv_acquire ONCE at "kernel entry"
+                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                     for (int slot = 0; slot < static_cast<int>(nslots); ++slot) {
+                         const int le = slot / npes;
+                         const int src = slot % npes;
+                         const int expected = channel_count(src, me, le, max_tokens, it);
+                         if (per_slot_acq)
+                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                         const int raw = read_flag_atomic(&dispatch_count[slot]);
+                         const int delivered = (raw == 0) ? 0 : (-raw - 1);
+                         got[slot] = delivered;
+                         exp[slot] = expected;
+                         int bad = (delivered != expected) ? 1 : 0;
+                         const size_t base = static_cast<size_t>(slot) * max_tokens * row_ints;
+                         for (int r = 0; r < delivered && bad == 0; ++r)
+                             for (int i = 0; i < row_ints; ++i)
+                                 if (dispatch_data[base + static_cast<size_t>(r) * row_ints + i] != encode(src, le, r, i)) {
+                                     bad = 1;
+                                     break;
+                                 }
+                         fail[slot] = bad;
+                     }
+                 });
+             }).wait();
+        } else {
+            q.submit([&](sycl::handler& cgh) {
+                 cgh.parallel_for(sycl::range<1>(nslots), [=](sycl::id<1> sid) {
+                     const int slot = static_cast<int>(sid);
+                     const int le = slot / npes;
+                     const int src = slot % npes;
+                     const int expected = channel_count(src, me, le, max_tokens, it);
+                     // Acquire(system) so the CACHED payload reads below observe the
+                     // NIC-delivered bytes (mirrors ll_recv_acquire / RECV_ACQ=1).
+                     if (recv_acq)
+                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                     const int raw = dispatch_count[slot];
+                     const int delivered = (raw == 0) ? 0 : (-raw - 1);  // flag decode
+                     got[slot] = delivered;
+                     exp[slot] = expected;
+                     int bad = (delivered != expected) ? 1 : 0;
+                     // Verify payload bytes for the rows the flag says arrived. A
+                     // flag-before-payload reordering yields delivered==expected but
+                     // STALE payload (sentinel -777) -> caught here.
+                     const int rows = delivered;
+                     const size_t base = static_cast<size_t>(slot) * max_tokens * row_ints;
+                     for (int r = 0; r < rows && bad == 0; ++r) {
+                         for (int i = 0; i < row_ints; ++i) {
+                             if (dispatch_data[base + static_cast<size_t>(r) * row_ints + i] != encode(src, le, r, i)) {
+                                 bad = 1;
+                                 break;
+                             }
                          }
                      }
-                 }
-                 fail[slot] = bad;
-             });
-         }).wait();
+                     fail[slot] = bad;
+                 });
+             }).wait();
+        }
 
         int slots_ok = 0, tok_exp = 0, tok_got = 0, bad_slots = 0;
         std::string first_bad;
@@ -344,7 +420,11 @@ int main(int argc, char** argv) {
                     ok ? "PASS" : "FAIL",
                     ok ? "" : " first_bad_slot=", ok ? "" : first_bad.c_str());
         std::fflush(stdout);
-        ishmem_barrier_all();
+        // Per-iteration cross-PE barrier. The real flag-progress path has NONE;
+        // gating it under reset_barrier lets the PEs run free so a fast peer's
+        // next-iter put can race this receiver's clear (token loss).
+        if (reset_barrier)
+            ishmem_barrier_all();
     }
 
     ishmem_barrier_all();
