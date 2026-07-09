@@ -99,6 +99,14 @@ class Buffer:
         self._xpu_internode_handle_cache = {}
         self._xpu_low_latency_handle_cache = {}
         self._xpu_low_latency_combine_buffer_cache = {}
+        # Persistent, shape-stable, REUSED device buffers for the LL comm path so
+        # torch's XPU caching allocator never grows a NEW segment (a zeMemAllocDevice
+        # VM_BIND) during dispatch/combine. A fresh VM_BIND concurrent with the bcs
+        # copy engine is the necessary trigger for the residual transient spurious
+        # OUT_OF_DEVICE_MEMORY (err-39) / bcs+VM-worker-EBUSY wedge. Keyed by
+        # (role, shape, dtype); dispatch outputs use a 2-slot ring (ping-pong) to
+        # honour the "cannot hold more than 2 low-latency results at once" contract.
+        self._xpu_ll_persist = {}
         self._xpu_low_latency_mask_status = None
         if self.is_xpu_runtime and enable_shrink:
             self._xpu_low_latency_mask_status = torch.zeros((self.group_size, ), dtype=torch.int32, device='xpu')
@@ -868,6 +876,74 @@ class Buffer:
             return
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
+    def _xpu_alloc_retry(self, thunk: Callable[[], torch.Tensor]) -> torch.Tensor:
+        """Transient-retry safety net for the LL comm path.
+
+        A transiently-wedged bcs (blitter/copy) engine can make a device allocation's
+        VM_BIND fail with EBUSY, surfaced by the L0/UR stack as
+        UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (err-39) even though VRAM is free. The
+        wedge is self-recovering, so synchronize + short exponential backoff + retry
+        turns a spurious hard failure into a small stall. Non-transient OOM (genuine
+        exhaustion) is re-raised immediately on the last attempt.
+        """
+        retries = int(os.environ.get('DEEP_EP_LL_ALLOC_RETRIES', '8'))
+        delay = 0.001
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                return thunk()
+            except RuntimeError as e:
+                s = str(e)
+                sl = s.lower()
+                transient = ('out_of_device_memory' in sl or 'out of memory' in sl
+                             or 'error 39' in sl or 'error: 39' in sl
+                             or 'device_lost' in sl)
+                if not transient or attempt == retries:
+                    raise
+                last = e
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
+                time.sleep(delay)
+                delay = min(delay * 2, 0.005)
+        raise last  # pragma: no cover
+
+    def _xpu_ll_buf(self, role: str, shape, dtype: torch.dtype, device,
+                    fill=None, slots: int = 1) -> torch.Tensor:
+        """Return a persistent, REUSED device buffer keyed by (role, shape, dtype).
+
+        With DEEP_EP_LL_PERSIST_BUFFERS on (default), the buffer is allocated once
+        (via the transient-retry net) and thereafter reused in-place, keeping peak
+        memory flat so the caching allocator never grows a new segment during comm.
+        `slots`=2 gives a ping-pong ring so two back-to-back dispatch results don't
+        alias. `fill` (0 -> zero_, other -> fill_) reproduces the current init.
+        """
+        shape = tuple(int(s) for s in shape)
+        if os.environ.get('DEEP_EP_LL_PERSIST_BUFFERS', '1') != '1':
+            t = self._xpu_alloc_retry(lambda: torch.empty(shape, dtype=dtype, device=device))
+            if fill == 0:
+                t.zero_()
+            elif fill is not None:
+                t.fill_(fill)
+            return t
+        key = (role, shape, dtype, str(device))
+        entry = self._xpu_ll_persist.get(key)
+        if entry is None:
+            entry = {'bufs': [None] * slots, 'idx': 0}
+            self._xpu_ll_persist[key] = entry
+        idx = entry['idx']
+        buf = entry['bufs'][idx]
+        if buf is None:
+            buf = self._xpu_alloc_retry(lambda: torch.empty(shape, dtype=dtype, device=device))
+            entry['bufs'][idx] = buf
+        entry['idx'] = (idx + 1) % slots
+        if fill == 0:
+            buf.zero_()
+        elif fill is not None:
+            buf.fill_(fill)
+        return buf
+
     def _xpu_low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                                   num_max_dispatch_tokens_per_rank: int, num_experts: int,
                                   cumulative_local_expert_recv_stats: Optional[torch.Tensor],
@@ -882,16 +958,18 @@ class Buffer:
         mask_status = self._xpu_low_latency_mask_status
         active_mask = None if mask_status is None else mask_status == 0
 
-        gathered_x = self._xpu_all_gather_tensor(x)
-        gathered_topk_idx = self._xpu_all_gather_tensor(topk_idx)
-        packed_bf16 = torch.empty((num_local_experts, num_slots, hidden), dtype=torch.bfloat16, device=device)
-        packed_bf16.zero_()
-        packed_recv_src_info = torch.empty((num_local_experts, num_slots), dtype=torch.int32, device=device)
-        packed_recv_src_info.fill_(-1)
-        packed_recv_layout_range = torch.empty((num_local_experts, self.group_size), dtype=torch.int64, device=device)
-        packed_recv_layout_range.zero_()
-        packed_recv_count = torch.empty((num_local_experts, ), dtype=torch.int32, device=device)
-        packed_recv_count.zero_()
+        gathered_x = self._xpu_alloc_retry(lambda: self._xpu_all_gather_tensor(x))
+        gathered_topk_idx = self._xpu_alloc_retry(lambda: self._xpu_all_gather_tensor(topk_idx))
+        # Persistent 2-slot ring for the recurring dispatch outputs (ping-pong keeps
+        # two back-to-back results non-aliasing) so no fresh VM_BIND on the hot path.
+        packed_bf16 = self._xpu_ll_buf('packed_bf16', (num_local_experts, num_slots, hidden),
+                                       torch.bfloat16, device, fill=0, slots=2)
+        packed_recv_src_info = self._xpu_ll_buf('packed_recv_src_info', (num_local_experts, num_slots),
+                                                torch.int32, device, fill=-1, slots=2)
+        packed_recv_layout_range = self._xpu_ll_buf('packed_recv_layout_range', (num_local_experts, self.group_size),
+                                                    torch.int64, device, fill=0, slots=2)
+        packed_recv_count = self._xpu_ll_buf('packed_recv_count', (num_local_experts, ),
+                                             torch.int32, device, fill=0, slots=2)
 
         handle_entries = []
         local_expert_begin = self.rank * num_local_experts
@@ -923,8 +1001,15 @@ class Buffer:
 
         if use_fp8:
             flat_fp8, flat_scales = self._xpu_per_token_cast_to_fp8(packed_bf16.view(-1, hidden))
-            packed_recv_x = flat_fp8.view(num_local_experts, num_slots, hidden)
-            packed_recv_x_scales = flat_scales.view(num_local_experts, num_slots, -1)
+            # Copy into persistent buffers so the returned payload holds no freshly
+            # VM_BIND'd segment; the cast temporaries are same-size each call and are
+            # served from the caching allocator's freelist (no new segment growth).
+            persist_fp8 = self._xpu_ll_buf('flat_fp8', flat_fp8.shape, flat_fp8.dtype, device, slots=2)
+            persist_scales = self._xpu_ll_buf('flat_scales', flat_scales.shape, flat_scales.dtype, device, slots=2)
+            persist_fp8.copy_(flat_fp8)
+            persist_scales.copy_(flat_scales)
+            packed_recv_x = persist_fp8.view(num_local_experts, num_slots, hidden)
+            packed_recv_x_scales = persist_scales.view(num_local_experts, num_slots, -1)
             recv_payload = (packed_recv_x, packed_recv_x_scales)
         else:
             packed_recv_x = packed_bf16
@@ -1040,7 +1125,8 @@ class Buffer:
         gathered = [None] * self.group_size
         dist.all_gather_object(gathered, contributions, self.group)
 
-        combined_x = out if out is not None else torch.empty((num_combined_tokens, hidden), dtype=x.dtype, device=x.device)
+        combined_x = out if out is not None else self._xpu_ll_buf(
+            'combined_x', (num_combined_tokens, hidden), x.dtype, x.device, slots=1)
         combined_x.zero_()
         for rank_contribs in gathered:
             for global_expert, src_rank, token_indices_cpu, values_cpu in rank_contribs:

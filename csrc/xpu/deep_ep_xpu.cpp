@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cerrno>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -483,6 +484,19 @@ struct Buffer {
     int low_latency_num_max_dispatch_tokens_per_rank = 0;
     int low_latency_hidden = 0;
     int low_latency_num_experts = 0;
+    // Persistent, REUSED low-latency output buffers so the LL comm path never grows a
+    // fresh torch::empty / zeMemAllocDevice segment (a VM_BIND) during dispatch/combine.
+    // A fresh VM_BIND concurrent with the bcs copy engine is the necessary trigger for
+    // the residual transient spurious OUT_OF_DEVICE_MEMORY (err-39) / bcs+VM-worker-EBUSY
+    // wedge. Dispatch uses a 2-slot ring (ping-pong) to honour the "cannot hold more than
+    // 2 low-latency results at once" contract; combine is single-slot.
+    int ll_persist_slot = 0;
+    torch::Tensor ll_dispatch_x[2];
+    torch::Tensor ll_dispatch_x_scales[2];
+    torch::Tensor ll_dispatch_count[2];
+    torch::Tensor ll_dispatch_src_info[2];
+    torch::Tensor ll_dispatch_layout_range[2];
+    torch::Tensor ll_combine_out;
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
     volatile int* moe_recv_rdma_counter = nullptr;
@@ -1958,6 +1972,61 @@ struct Buffer {
         internode_ll::clean_mask_buffer(low_latency_mask_buffer_ptr, num_ranks, comm_stream.queue());
     }
 
+    static bool ll_persist_enabled() {
+        static const bool enabled = [] {
+            const char* e = std::getenv("DEEP_EP_LL_PERSIST_BUFFERS");
+            return e == nullptr || std::string(e) != "0";
+        }();
+        return enabled;
+    }
+
+    static int ll_alloc_retries() {
+        static const int n = [] {
+            const char* e = std::getenv("DEEP_EP_LL_ALLOC_RETRIES");
+            int v = e ? std::atoi(e) : 8;
+            return v < 0 ? 0 : v;
+        }();
+        return n;
+    }
+
+    // Allocate (or return a matching cached) tensor with a transient-retry safety net.
+    // A transiently-wedged bcs (blitter/copy) engine can make a device allocation's
+    // VM_BIND fail EBUSY, surfaced by L0/UR as OUT_OF_DEVICE_MEMORY (err-39) even though
+    // VRAM is free; the wedge self-recovers, so synchronize + short backoff + retry turns
+    // a spurious hard failure into a small stall. Genuine OOM re-raises on the last try.
+    torch::Tensor ll_alloc(torch::Tensor* slot, at::IntArrayRef shape, const torch::TensorOptions& opts) {
+        const bool persist = (slot != nullptr) && ll_persist_enabled();
+        if (persist && slot->defined() && slot->sizes() == shape &&
+            slot->dtype() == opts.dtype() && slot->device() == opts.device()) {
+            return *slot;
+        }
+        const int retries = ll_alloc_retries();
+        int delay_us = 1000;
+        std::exception_ptr last;
+        for (int attempt = 0; attempt <= retries; ++attempt) {
+            try {
+                torch::Tensor t = torch::empty(shape, opts);
+                if (persist) *slot = t;
+                return t;
+            } catch (const std::exception& e) {
+                std::string msg = e.what();
+                std::string lower = msg;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                bool transient = lower.find("out_of_device_memory") != std::string::npos ||
+                                 lower.find("out of memory") != std::string::npos ||
+                                 lower.find("device_lost") != std::string::npos ||
+                                 lower.find("error 39") != std::string::npos ||
+                                 lower.find("error: 39") != std::string::npos;
+                if (!transient || attempt == retries) throw;
+                last = std::current_exception();
+                try { c10::xpu::getCurrentXPUStream().synchronize(); } catch (...) {}
+                usleep(delay_us);
+                delay_us = std::min(delay_us * 2, 5000);
+            }
+        }
+        std::rethrow_exception(last);  // unreachable
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, EventHandle, pybind11::object>
     low_latency_dispatch(const torch::Tensor& x,
                          const torch::Tensor& topk_idx,
@@ -1998,25 +2067,33 @@ struct Buffer {
             stream_wait(comm_stream, compute_stream);
         }
         const int num_recv_slots = num_ranks * num_max_dispatch_tokens_per_rank;
-        auto packed_recv_x = use_fp8 ? torch::empty({num_local_experts, num_recv_slots, hidden}, x.options().dtype(torch::kFloat8_e4m3fn))
-                                     : torch::empty({num_local_experts, num_recv_slots, hidden}, x.options());
+        const bool persist = ll_persist_enabled();
+        const int slot = persist ? ll_persist_slot : 0;
+        if (persist) ll_persist_slot ^= 1;
+        auto packed_recv_x = use_fp8 ? ll_alloc(persist ? &ll_dispatch_x[slot] : nullptr,
+                                                {num_local_experts, num_recv_slots, hidden}, x.options().dtype(torch::kFloat8_e4m3fn))
+                                     : ll_alloc(persist ? &ll_dispatch_x[slot] : nullptr,
+                                                {num_local_experts, num_recv_slots, hidden}, x.options());
         std::optional<torch::Tensor> packed_recv_x_scales;
         if (use_fp8) {
             TORCH_CHECK(hidden % 128 == 0, "FP8 low-latency dispatch requires hidden to be divisible by 128");
             const int num_scales = hidden / 128;
             if (use_ue8m0) {
-                packed_recv_x_scales =
-                    torch::empty({num_local_experts, num_recv_slots, (num_scales + 3) / 4}, x.options().dtype(torch::kInt32));
+                packed_recv_x_scales = ll_alloc(persist ? &ll_dispatch_x_scales[slot] : nullptr,
+                                                {num_local_experts, num_recv_slots, (num_scales + 3) / 4}, x.options().dtype(torch::kInt32));
                 packed_recv_x_scales->zero_();
             } else {
-                packed_recv_x_scales = torch::empty({num_local_experts, num_recv_slots, num_scales}, x.options().dtype(torch::kFloat32));
+                packed_recv_x_scales = ll_alloc(persist ? &ll_dispatch_x_scales[slot] : nullptr,
+                                                {num_local_experts, num_recv_slots, num_scales}, x.options().dtype(torch::kFloat32));
             }
         }
         auto int_options = x.options().dtype(torch::kInt32);
         auto long_options = x.options().dtype(torch::kInt64);
-        auto packed_recv_count = torch::empty({num_local_experts}, int_options);
-        auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, int_options);
-        auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, long_options);
+        auto packed_recv_count = ll_alloc(persist ? &ll_dispatch_count[slot] : nullptr, {num_local_experts}, int_options);
+        auto packed_recv_src_info = ll_alloc(persist ? &ll_dispatch_src_info[slot] : nullptr,
+                                             {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, int_options);
+        auto packed_recv_layout_range = ll_alloc(persist ? &ll_dispatch_layout_range[slot] : nullptr,
+                                                 {num_local_experts, num_ranks}, long_options);
 
         internode_ll::dispatch_bf16(
             packed_recv_x.data_ptr(),
@@ -2102,7 +2179,8 @@ struct Buffer {
                 "out shape or dtype mismatch");
             combined_x = *out;
         } else {
-            combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+            combined_x = ll_alloc(ll_persist_enabled() ? &ll_combine_out : nullptr,
+                                  {num_combined_tokens, hidden}, x.options());
         }
         internode_ll::combine_bf16(combined_x.data_ptr(),
                                    rdma_buffer_ptr,

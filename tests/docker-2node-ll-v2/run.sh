@@ -399,6 +399,19 @@ run_test() {
         -e DEEP_EP_SKIP_WARMUP="${DEEP_EP_SKIP_WARMUP:-}" \
         -e DEEP_EP_LL_QUIESCE="${DEEP_EP_LL_QUIESCE:-1}" \
         -e DEEP_EP_LL_ORDERLY_EXIT="${DEEP_EP_LL_ORDERLY_EXIT:-2}" \
+        -e DEEP_EP_LL_PERSIST_BUFFERS="${DEEP_EP_LL_PERSIST_BUFFERS:-}" \
+        -e DEEP_EP_LL_ALLOC_RETRIES="${DEEP_EP_LL_ALLOC_RETRIES:-}" \
+        -e REPRO_COMBINE_PERSIST="${REPRO_COMBINE_PERSIST:-}" \
+        -e REPRO_MODE="${REPRO_MODE:-}" \
+        -e ITERS="${ITERS:-}" \
+        -e DUAL_STREAM="${DUAL_STREAM:-}" \
+        -e FP8_ALTERNATE="${FP8_ALTERNATE:-}" \
+        -e STOP_ON_OOM="${STOP_ON_OOM:-}" \
+        -e HEARTBEAT="${HEARTBEAT:-}" \
+        -e CHURN_MB="${CHURN_MB:-}" \
+        -e CHURN_VARY="${CHURN_VARY:-}" \
+        -e EMPTY_CACHE_EVERY="${EMPTY_CACHE_EVERY:-}" \
+        -e GUARD_ALLOC="${GUARD_ALLOC:-}" \
         "$NODE0_CONTAINER" \
         bash -lc "
             source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
@@ -419,6 +432,16 @@ run_test() {
                 -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
                 -genv ISHMEM_IBGDA_DB_MODE \"\${ISHMEM_IBGDA_DB_MODE:-0}\" \
                 -genv ISHMEM_IBGDA_STATS_DIR \"\${ISHMEM_IBGDA_STATS_DIR:-}\" \
+                -genv REPRO_MODE \"\${REPRO_MODE:-}\" \
+                -genv ITERS \"\${ITERS:-}\" \
+                -genv DUAL_STREAM \"\${DUAL_STREAM:-}\" \
+                -genv FP8_ALTERNATE \"\${FP8_ALTERNATE:-}\" \
+                -genv STOP_ON_OOM \"\${STOP_ON_OOM:-}\" \
+                -genv HEARTBEAT \"\${HEARTBEAT:-}\" \
+                -genv CHURN_MB \"\${CHURN_MB:-}\" \
+                -genv CHURN_VARY \"\${CHURN_VARY:-}\" \
+                -genv EMPTY_CACHE_EVERY \"\${EMPTY_CACHE_EVERY:-}\" \
+                -genv GUARD_ALLOC \"\${GUARD_ALLOC:-}\" \
                 -genv DEEP_EP_TEST_DEBUG \"\${DEEP_EP_TEST_DEBUG:-0}\" \
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
@@ -432,6 +455,9 @@ run_test() {
                 -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
                 -genv DEEP_EP_LL_QUIESCE "${DEEP_EP_LL_QUIESCE:-1}" \
                 -genv DEEP_EP_LL_ORDERLY_EXIT "${DEEP_EP_LL_ORDERLY_EXIT:-2}" \
+                -genv DEEP_EP_LL_PERSIST_BUFFERS "${DEEP_EP_LL_PERSIST_BUFFERS:-1}" \
+                -genv DEEP_EP_LL_ALLOC_RETRIES "${DEEP_EP_LL_ALLOC_RETRIES:-8}" \
+                -genv REPRO_COMBINE_PERSIST "${REPRO_COMBINE_PERSIST:-1}" \
                 -genv DEEP_EP_LL_FLAG_PROGRESS \"\${DEEP_EP_LL_FLAG_PROGRESS:-0}\" \
                 -genv DEEP_EP_LL_FLAG_LSC \"\${DEEP_EP_LL_FLAG_LSC:-0}\" \
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \

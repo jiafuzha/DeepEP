@@ -15,8 +15,7 @@ Always prefer a reproducible A/B on clean hardware over speculation. Never attri
 perf number or a `DEVICE_LOST` to a code change until you have ruled out the two most
 common non-code causes below (wrong iSHMEM archive; bmg-only AOT) and hardware wedge.
 
-## Residual LL mid-test DEVICE_LOST (2026-07, INVESTIGATED — HW ceiling, NOT a lost doorbell)
-After the lifecycle fix (clean LR-exec-queue quiesce/drain at end-of-run, DeepEP `Buffer::quiesce()`
+## Residual LL mid-test DEVICE_LOST (2026-07, INVESTIGATED — HW ceiling, NOT a lost doorbell)After the lifecycle fix (clean LR-exec-queue quiesce/drain at end-of-run, DeepEP `Buffer::quiesce()`
 → `stop_proxy()`, `DEEP_EP_LL_ORDERLY_EXIT=2` mode), warm back-to-back LL still has a residual
 per-run failure. It is **NOT** a lost/unfenced doorbell and is **NOT** fixable by fence/DB_MODE/LL-flag
 tuning. Confirmed evidence (ISHMEM_DEBUG=1 + ISHMEM_IBGDA_STATS_DIR, clean no-stats repro, gdb):
@@ -45,6 +44,30 @@ tuning. Confirmed evidence (ISHMEM_DEBUG=1 + ISHMEM_IBGDA_STATS_DIR, clean no-st
     on a transiently-wedged copy engine), NOT code-addressable via the iSHMEM doorbell/fence or any LL
     flag. Best config = the validated defaults (DB_MODE=0, SENDER_FENCE=1, RECV_ACQ=1, LSC=0,
     PROGRESS=0, POLL_CAP=1e6, ORDERLY_EXIT=2). Normal internode sim PASSES (no regression).
+
+## iSHMEM-only reproducer for the residual OOM (2026-07-09) — NEGATIVE RESULT (confirms non-iSHMEM)
+Standalone iSHMEM UT `ishmem_ibgda/test/unit/oom_copy_engine_probe.cpp` (+ `run_oom_copy_engine_probe.sh`
++ `oom_probe_wrapper.sh`) was built to reproduce the residual `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`
+(err 39) with iSHMEM alone (NO DeepEP/torch/python). It mimics the LL-dispatch shape: init IBGDA(igub
+UAR)+symmetric heap, loop of {IBGDA put+quiet doorbell kernel (DO_DOORBELL toggle) → barrier → batch of
+small `sycl::malloc_device` allocs checked for OOM → memset + H2D/D2H blitter(bcs) pressure + scalar D2H
+`.item()`-style reads → optional dual-stream OVERLAP compute kernel on a 2nd queue}. Reports iter +
+FREE/TOTAL VRAM + IBGDA stats (post_put_nbi/doorbell_writes) at any failure; no `ishmem_finalize`. Build:
+plain unit test (`file(GLOB)`), needs `-DBUILD_UNIT_TESTS=ON`; run via the deepep-ll-v2 2-node sim
+(4 PEs, 1 GPU+NIC each, GPUs 0,1/2,3 + mlx5_0..3), built in-container (oneAPI 2025.3).
+  - RESULT: did **NOT** reproduce across 42 warm process launches in 3 escalating configs
+    (basic 20×; big 8 MiB allocs + 128 puts 10×; dual-stream overlap + 4 MiB 12×): **0 OOM, 0 nullptr,
+    0 probe-triggered engine resets** (dmesg bcs/GT-reset lines were all older timestamps from prior
+    DeepEP runs; the probe added none). VRAM stayed pinned at 22.711 GiB; IBGDA flags=0x3f, db_writes
+    climbed normally. DO_DOORBELL=0 confirms the alloc/copy path runs pre-doorbell (db_writes=0) cleanly.
+  - CONCLUSION (independently confirms the substrate-level verdict): the residual OOM CANNOT be produced
+    by the iSHMEM IBGDA/RDMA/doorbell + copy-engine substrate — even maximally hammering the exact
+    doorbell + small-alloc + blitter path. The trigger is **DeepEP/torch-specific**: the torch XPU
+    caching allocator's large-segment `zeMemAllocDevice` reservations + the heavy LL dispatch/combine
+    mega-kernels (fp8 quant, topk, warp-specialized poll/quiet) + torch dual-stream scheduling — none of
+    which live in iSHMEM. So the residual is definitively NOT an iSHMEM doorbell/put/RDMA bug; any future
+    fix belongs on the DeepEP/torch-allocator/compute side (or is a stock-xe+igub HW ceiling). Keep the UT
+    as a fast regression guard that the iSHMEM path stays clean.
 
 ## Golden rules (most bugs are one of these)
 
@@ -239,6 +262,85 @@ DeepEP LL flags: `DEEP_EP_LL_FLAG_SENDER_FENCE=1`, `DEEP_EP_LL_FLAG_RECV_ACQ=1`,
   NUM_EXPERTS=8` → good ~1138 µs @ H7168 (~687 µs @ H2048). ~32 ms/iter ⇒ wrong iSHMEM archive.
 - Normal internode (`tests/docker-2node`): `NUM_PROCESSES=2 NUM_TOKENS=32 HIDDEN=1024 NUM_TOPK=2
   NUM_EXPERTS=8` → expect `===== PASS tests/test_internode.py =====`.
+
+## LL residual mid-test failure — persistent-buffer fix + the REAL failure taxonomy (2026-07-09)
+- **The LL hot path is C++, NOT the Python `_xpu_low_latency_dispatch`.** On the XPU IBGDA runtime
+  `self.is_xpu_runtime = hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd')` is True, so the public
+  `buffer.py` `low_latency_dispatch`/`low_latency_combine` call `self.runtime.low_latency_dispatch`
+  (C++, `csrc/xpu/deep_ep_xpu.cpp`), which does the real IBGDA puts. The Python
+  `_xpu_low_latency_*` methods are DEAD CODE (CUDA all_gather emulation fallback). Any LL alloc/perf
+  fix MUST be in C++ and needs an in-container rebuild — it is NOT pure-python.
+- **Persistent-buffer + retry fix (implemented, uncommitted, `deep_ep_xpu.cpp`):** members
+  `ll_dispatch_x[2]/x_scales[2]/count[2]/src_info[2]/layout_range[2]`, `ll_combine_out`, helpers
+  `ll_persist_enabled()` (`DEEP_EP_LL_PERSIST_BUFFERS`, default ON), `ll_alloc_retries()`
+  (`DEEP_EP_LL_ALLOC_RETRIES`, default 8), and `ll_alloc(slot, shape, opts)` which returns a cached
+  shape/dtype/device-matched tensor (2-slot ping-pong ring for dispatch, single-slot for combine) or
+  allocates with a transient-retry net (catch OOM/`device_lost`/`out_of_device_memory`/`error 39`,
+  `getCurrentXPUStream().synchronize()`, 1→5ms exp backoff). Reuse is numerically identical (the
+  kernel fully writes packed_recv_*; only ue8m0 scales were ever zeroed — preserved). Retry is
+  collective-SAFE because it runs BEFORE `internode_ll::dispatch_bf16/combine_bf16` (a per-rank
+  stall just makes peers wait in poll; a retry around the whole collective would be UNSAFE → hang).
+- **RESULT: fix is correct + regression-free but does NOT measurably move the per-run failure rate.**
+  Clean single run fix ON = PASS @ min_t≈1151-1157 µs / avg_t≈1167 µs (baseline; NO perf regression —
+  the earlier ~10 ms "avg_t" anomaly was a WEDGED GPU, not the reuse). Reset-between A/B (real
+  test_low_latency, HIDDEN=7168): fix ON 3/5 vs fix OFF 3/5 — indistinguishable at n=5.
+- **DECISIVE controlled reproducer A/B (`tests/repro_ll_oom.py`, REPRO_MODE=full ITERS=300
+  EMPTY_CACHE_EVERY=1 GUARD_ALLOC=0 DUAL_STREAM=1 HIDDEN=7168, 12 launches/arm, health-gated):**
+  the err-39 OOM class **DID NOT REPRODUCE AT ALL — 0/36 launches** (12 reset-between baseline +
+  12 warm baseline + 12 warm fixed, 0 OOM39 total) on the current HW. Per-arm:
+  - reset-between PERSIST=0: no-repro 11, OOM39 **0**, hang 1.
+  - warm PERSIST=0: no-repro 9, OOM39 **0**, HANG124 1 (launch10) → DEVICE_LOST cascade (launch11 `ishmemi_copy` ZE-FAIL).
+  - warm PERSIST=1 (fix, RETRIES=8): no-repro 11, OOM39 **0**, HANG124 1 (launch9) → **no cascade** (launch10-12 recovered).
+  The prior-phase "~1/6 err-39" was on differently-accumulated HW; it is **not reproducible on demand**.
+- **What the controlled A/B proved about the trigger + the err-39 vs hang duality:**
+  1. **Reset+health-gate before each launch REMOVES the err-39 trigger** (accumulated bcs/VM-worker HW
+     state). The err-39 correlates with NON-reset warm HW, not with a single clean-HW dispatch loop —
+     so a reset-between protocol is NULL-on-NULL for err-39 and cannot demonstrate the fix on it.
+  2. On current HW the residual wedge lands as a **collective HANG (rc=124 at an early dispatch/combine
+     iter) or an `ishmemi_copy` DEVICE_LOST — NOT as a torch-alloc err-39.** Failure dmesg is always
+     `Engine reset engine_class=bcs` (+`VM worker error: -16` when it hits VM_BIND). The fixed HANG124
+     hung at iter=2 in the collective, i.e. the persist-buffer fix's target site (the dispatch-output
+     `torch::empty`/VM_BIND) is NOT the current landing site → the fix has nothing to catch.
+  3. bcs Engine resets occurred in several *no-repro* launches too (warm baseline launch6/7, fixed
+     launch5/11) and self-recovered → a bcs reset is not necessarily fatal; it's fatal only when it
+     lands on an in-flight collective/copy/alloc.
+- **VERDICT (definitive, this HW): the err-39 OOM class is a rare, non-on-demand-reproducible landing
+  of the SAME accumulated bcs-engine/VM_BIND wedge; the dominant residual is the collective-HANG/
+  DEVICE_LOST class (golden rule 4 HW ceiling), which the persist-buffer fix does NOT address (it
+  only removes the alloc landing site + adds an alloc retry).** The fix is CORRECT, regression-free
+  (1157 µs), harmless, and defensively removes one genuine fresh-VM_BIND site — KEEP default ON — but
+  it is NOT a cure for the residual, which is the driver-level bcs/GT wedge accumulation. Suggestive
+  (n=1, not significant): the fixed arm did not cascade to DEVICE_LOST after its hang whereas baseline
+  did — plausibly the RETRIES=8 alloc net, but under-powered to claim.
+- **Reproducer A/B harnesses (uncommitted, `/tmp/`):** `repro_ab.sh` (reset+gate BEFORE EACH launch)
+  and `repro_warm.sh` (ONE gated reset, then warm back-to-back — the protocol that at least produces
+  the hang/DEVICE_LOST cascade). Both regenerate the LL ssh config (shared `/tmp/deepep-docker-ssh/
+  config` is CLOBBERED by the normal `docker-2node-v2` sim → node0 can't ssh node1 → MPI hydra
+  bstrap_proxy fails; symptom `connect to host ... port 6699: Connection refused`; sshd actually
+  listens on 2331). Per-launch health gate = bare `torch.randn@randn` on ZE_AFFINITY_MASK 0..3.
+- **Why the fix can't win here: the dominant residual is HW/GT-wedge ACCUMULATION (golden rule 4),
+  not fresh dispatch VM_BINDs.** PROOF: a bare `torch.randn(2048,2048,device='xpu'); a@a` matmul
+  (NO ishmem, NO DeepEP) DEVICE_LOSTs on the wedged GPUs after a cascade. Failure signatures seen:
+  rc=124 init-hang (`queue.memset(workspace).wait()` never signals; dmesg `xe_guc_exec_queue_lr_cleanup`)
+  and rc=255 mid/teardown DEVICE_LOST (dmesg `VM worker error: -16`/`-62` + `Engine reset
+  engine_class=bcs` + `GT0: reset`). The bcs+VM-worker-16 IS the copy-engine/VM_BIND race the fix
+  targets, but it is driven by ACCUMULATED driver state that survives igub reset, so eliminating the
+  dispatch-internal fresh binds is not sufficient. Keep the fix (default ON): it removes a genuine
+  fresh-VM_BIND site + gives self-recovering transient-EBUSY retry (defense-in-depth), zero downside.
+- **igub reset is NECESSARY but INSUFFICIENT + has two silent-failure traps:**
+  1. `rmmod igub_vmem_drv` SILENTLY no-ops when the module refcount>0 (a container GPU context still
+     maps the UAR) → the reset never happens → next run inherits the wedge. ALWAYS `docker compose
+     down` fully, kill host-side `mpirun` stragglers, and VERIFY with `lsmod | grep '^igub_vmem_drv'`
+     (must be gone) before `insmod`; retry rmmod in a loop.
+  2. **Recovery recipe that actually clears a bcs/GT wedge WITHOUT reboot:** containers DOWN → rmmod
+     igub (verify unloaded) → **sleep ~40s with igub OUT and containers DOWN** to let the xe
+     `exec queue reset detected` loop drain → insmod igub → sleep 20. The 40s drain-while-unmapped is
+     the step that recovered 2 hard-DEVICE_LOST GPUs (a short sleep-2 reset does NOT). A hard 2+ GPU
+     wedge that this cannot clear needs a reboot (do not self-reboot; escalate).
+- **Per-GPU health gate:** run the bare-torch matmul above per `ZE_AFFINITY_MASK=0..3` to prove HW is
+  clean BEFORE trusting any LL A/B — it isolates HW wedge from code in one cheap step.
+- Campaign harness: `/tmp/ll_campaign.sh <PERSIST 0|1> <RUNS>` (reset-between, robust rmmod-verify,
+  logs dmesg sigs) → `/tmp/llcamp/persist${P}_run${i}.log`.
 
 ## Diagnostic playbook
 1. Reproduce on clean HW (reset/clean-env above) as the FIRST run; capture the exact site of any
