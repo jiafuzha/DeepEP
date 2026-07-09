@@ -96,6 +96,56 @@ For iSHMEM/IBGDA specifics, also use `.github/agents/ishmem-ibgda-xpu-perf-debug
 - `ishmem_finalize` is problematic and is intentionally NOT called by DeepEP; keep it skipped in
   any downstream (e.g. DeepSymm) too.
 
+### LL DEVICE_LOST from lost IBGDA doorbells — UAR WC/PAT root cause (2026-07)
+- The residual LL `DEVICE_LOST` (wedge at iter ~2-6, dmesg `xe_guc_exec_queue_lr_cleanup` +
+  "Schedule disable failed to respond" + `VM worker error: -16`) is a **lost GPU→NIC doorbell**:
+  the UAR MMIO store never egresses as a PCIe Memory-Write TLP, so the NIC CQ never advances and
+  the GPU quiet/poll loop spins past the GuC hang-check watchdog → GT reset → `DEVICE_LOST`.
+- **iSHMEM-side fix (done, in `src/ibgda_device_impl.h`):** (1) ring the UAR doorbell and write
+  SND_DBR with an **uncached LSC store** (`__builtin_intel_sycl_ptr_annotation(...,
+  "sycl-cache-write-hint", 0x7)` → `store.ugm.uc.uc`) via new helpers
+  `ishmemi_ibgda_uc_store32/64`, and (2) use a **system-scope** fence
+  (`atomic_fence(seq_cst, memory_scope::system)` for the doorbell; `release/system` for the
+  WQE/SND_DBR publish) — the old "system scope → coherency-tracker DEVICE_LOST" comment is
+  OBSOLETE (disproven by commit `45dd3b2c` UT `ext_flag_fence_sys`/`ext_flag_aref_sys`). This cut
+  the failure rate from wedge-by-iter-2 to ~8/10, but does NOT reach 10/10 by itself.
+- **Why iSHMEM alone is insufficient — the memory TYPE (PAT), not just cache hints:** cache-write
+  hints bypass L1/L3, but if the imported UAR page's **PTE PAT is WB/WC** the store can still be
+  write-combined at the memory-controller level. iSHMEM already imports the UAR with
+  `ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED` (`src/ibgda.cpp` `map_uar_to_gpu_va_*`), but that flag is
+  honored end-to-end ONLY with the two OS patches under
+  `/root/jiafuzha/code-repo/intel_gpu_uar_bridge/patches/`:
+  `0001-fix-drm-honor-uncacheable-flag-on-shared-dma-buf-imp.patch` (compute-runtime/NEO: select
+  `CachePolicy::uncached` when `flags.uncacheable`) and
+  `0001-drm-xe-force-XE_CACHE_NONE-on-peer-to-peer-MMIO-dma-.patch` (kernel xe: force UC PAT on
+  P2P MMIO dma-buf imports). **Check they are applied before blaming iSHMEM code:** kernel
+  `uname -r` must be the patched xe build (a stock `*-generic` mainline kernel has NO NEEDS_UC);
+  `dpkg -l | grep libze-intel-gpu1` being a stock distro package (e.g. `25.48.36300.8-0`) means
+  NEO patch #2 is NOT applied and `BIAS_UNCACHED` is silently dropped → UAR bound WB/WC → residual
+  doorbell loss. Re-apply/rebuild the patched kernel + compute-runtime to restore UC and reach
+  10/10 (the in-code "session 647f1a24" note documents this working state).
+- **DEAD-END UPDATE (2026-07-08): with the patched xe (true-UC PAT[3]) LOADED, the LL hang is a GPU
+  COMPUTE (ccs) wedge, NOT a lost doorbell — the doorbell path is never reached.** On freshly-reset
+  igub HW, iSHMEM init + `Buffer::sync` complete, then the test hangs in the first *local* XPU
+  tensor ops (`torch.ones/randn/topk`) before any dispatch; GPU counters show
+  `stats_doorbell_writes=0 / post_put_nbi_calls=0`, WQ all-zero, CQ all `0xFF`, and dmesg shows
+  `engine_class=ccs` reset + `VM worker error: -62`. The identical torch ops run fine STANDALONE
+  (no ishmem init) on the same clean HW, so the UC P2P-MMIO import wedges compute once bound into the
+  process VM. This is mode-independent (see env-selectable `ISHMEM_IBGDA_DB_MODE` 0..5 +
+  `DEEP_EP_SYNC_DBG=1` tracing) and NOT fixable by iSHMEM doorbell tuning. Because the patched xe
+  forces UC on ALL `sg_dma_is_bus_address` P2P imports regardless of userspace flags, WB/WC cannot be
+  restored from userspace — reverting to the prior WB/WC 8/10 path needs a REBOOT to stock xe (revert
+  kernel patch #1); that A/B is a user decision. Do NOT keep tuning the doorbell for the true-UC stack.
+
+### Build/toolchain parity: build iSHMEM + DeepEP with the SAME oneAPI the runtime uses
+- The DeepEP `.so` device-links the iSHMEM `.cpp.o` bitcode; a **compiler-version mismatch** yields
+  `llvm-link: error: linked module is broken!`. If the host oneAPI was upgraded (e.g. to 2026.0
+  where MKL ships `libmkl_intel_lp64.so.2` → `.so.3`, breaking torch import) but the docker sims
+  run oneAPI 2025.3, **build iSHMEM AND DeepEP INSIDE the container** (which has 2025.3 + a torch
+  with matching MKL): `docker exec deepep-ll-v2-node0 bash -lc '... _build_ishmem.sh ...; python3
+  setup.py build_ext --inplace'`. `_build_ishmem.sh` must `source setvars.sh --force` (plain
+  `source` returns 3 when oneAPI is already in-env, and `set -e` aborts the build silently).
+
 ### Correct XPU build command (multi-device AOT, explicit iSHMEM archive)
 ```
 source /opt/intel/oneapi/setvars.sh --force && conda activate <env>

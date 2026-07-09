@@ -15,7 +15,124 @@ Always prefer a reproducible A/B on clean hardware over speculation. Never attri
 perf number or a `DEVICE_LOST` to a code change until you have ruled out the two most
 common non-code causes below (wrong iSHMEM archive; bmg-only AOT) and hardware wedge.
 
+## Residual LL mid-test DEVICE_LOST (2026-07, INVESTIGATED — HW ceiling, NOT a lost doorbell)
+After the lifecycle fix (clean LR-exec-queue quiesce/drain at end-of-run, DeepEP `Buffer::quiesce()`
+→ `stop_proxy()`, `DEEP_EP_LL_ORDERLY_EXIT=2` mode), warm back-to-back LL still has a residual
+per-run failure. It is **NOT** a lost/unfenced doorbell and is **NOT** fixable by fence/DB_MODE/LL-flag
+tuning. Confirmed evidence (ISHMEM_DEBUG=1 + ISHMEM_IBGDA_STATS_DIR, clean no-stats repro, gdb):
+  - PRIMARY error is `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (err 39) inside
+    `buffer.low_latency_dispatch` (test_low_latency.py:198 → deep_ep_xpu.cpp `low_latency_dispatch`),
+    which only does small `torch::empty` output allocs (MBs) on a GPU with **22.7 GiB free / ~227 MiB
+    used** → the OOM is SPURIOUS: the L0 driver misreports OOM for the first device-touch on an
+    already-transiently-bad device. `configure_low_latency_layout` allocates nothing (just offsets into
+    the pre-allocated RDMA buffer) — no leak.
+  - The `DEVICE_LOST` (err 20) is only a SECONDARY teardown error from `buffer.destroy()`
+    (buffer.py:247) on the already-faulted context; sometimes it surfaces first at the next
+    synchronizing call `recv_count.item()` (line 218, a D2H copy) — that is the reporter, not the site.
+  - IBGDA stats at failure: `stats_post_put_nbi_calls=0 stats_doorbell_writes=0`, wqe_log empty, NO
+    CQE/QP error (`direct_cq_poll_error`/`cqe_error` never fire). Init/QP fully succeeded (DIRECT
+    DOORBELL ACTIVE, 4/4 PEs, RC QPs RTS). ⇒ the put/doorbell path is NEVER reached → DB_MODE 0..5 and
+    `DEEP_EP_LL_FLAG_{SENDER_FENCE,RECV_ACQ,LSC,PROGRESS}` (they only tune the put/doorbell/fence path)
+    are mechanistically IRRELEVANT to this residual. No flag A/B can move a pre-doorbell OOM.
+  - dmesg at failure: only benign `bcs` (blitter/copy engine) resets + `VM worker error: -16` (EBUSY);
+    NO `ccs` compute wedge, NO `lr_cleanup`, NO GT reset (lifecycle fix holds).
+  - It is a **self-reinforcing wedge CASCADE** (golden rule 4): once one run loses the device the next
+    ~2 inherit it. Same default config gave **7/10 then 2/10** on two consecutive warm loops (run1 of
+    the clean-reset loop lost the device at DL=24 and never recovered) → run-to-run variance dwarfs any
+    flag delta, so a flag A/B is unmeasurable AND moot. A fresh igub reset→immediate-container-up can
+    itself SEED a cascade (do not treat resets as a reliable clear).
+  - VERDICT: genuine per-run HW/driver flakiness of the stock-xe + igub P2P-MMIO stack (spurious-OOM
+    on a transiently-wedged copy engine), NOT code-addressable via the iSHMEM doorbell/fence or any LL
+    flag. Best config = the validated defaults (DB_MODE=0, SENDER_FENCE=1, RECV_ACQ=1, LSC=0,
+    PROGRESS=0, POLL_CAP=1e6, ORDERLY_EXIT=2). Normal internode sim PASSES (no regression).
+
 ## Golden rules (most bugs are one of these)
+
+0. **Lost IBGDA doorbell = LL DEVICE_LOST, and its FULL fix needs the UAR bound UC (PAT), not
+   just cache hints.** dmesg `xe_guc_exec_queue_lr_cleanup` + "Schedule disable failed to respond"
+   + `VM worker error: -16` = a GPU→NIC UAR doorbell that never egressed as a PCIe MemWr TLP; the
+   NIC CQ stalls, the GPU quiet/poll loop spins past the GuC watchdog → GT reset → DEVICE_LOST.
+   - iSHMEM-side fix (in `src/ibgda_device_impl.h`, done 2026-07): ring the UAR + write SND_DBR
+     with an **uncached LSC store** (`"sycl-cache-write-hint", 0x7` → `store.ugm.uc.uc`, helpers
+     `ishmemi_ibgda_uc_store32/64`) plus a **system-scope** fence
+     (`atomic_fence(seq_cst, memory_scope::system)`; `release/system` for WQE/SND_DBR publish).
+     The old "system scope → coherency-tracker DEVICE_LOST" comment is OBSOLETE (disproven by
+     commit `45dd3b2c` UT `ext_flag_fence_sys`/`ext_flag_aref_sys`). This cuts failures from
+     wedge-by-iter-2 to ~8/10 but is NOT sufficient alone.
+   - Cache hints bypass L1/L3 but NOT the WB/WC **memory type**: if the imported UAR PTE PAT is
+     WB/WC the store can still be write-combined. iSHMEM already imports the UAR with
+     `ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED` (`src/ibgda.cpp` `map_uar_to_gpu_va_*`) but that is honored
+     end-to-end ONLY with BOTH OS patches under
+     `/root/jiafuzha/code-repo/intel_gpu_uar_bridge/patches/` (NEO honor-uncacheable + xe
+     force-XE_CACHE_NONE). **Verify they are applied before blaming iSHMEM:** stock `*-generic`
+     mainline kernel has NO xe NEEDS_UC; stock `dpkg` `libze-intel-gpu1` (e.g. `25.48.36300.8-0`)
+     drops `BIAS_UNCACHED`. Re-apply/rebuild both to reach 10/10 (see in-code "session 647f1a24").
+     - **NEO patch #2 alone is INERT — it needs two more NEO changes to actually pass a UC pat_index
+       (discovered 2026-07, Option A rebuild).** `zeMemOpenIpcHandle(BIAS_UNCACHED)` for the UAR goes
+       `openIpcMemHandle → getMemHandlePtr → DriverHandleImp::importFdHandle`, which (a) sets the
+       BIAS_UNCACHED flag only POST-hoc on `SvmAllocationData.locallyUncachedResource` (too late; the
+       import already ran) and (b) `Drm::getPatIndex()` IGNORES the `cachePolicy` arg on the non-CLOS
+       path — it derives the PAT index purely from `allocationType`'s GMM usage type, so a `buffer`
+       import always got the cacheable `patIndex=1`. Required NEO edits (in `neo-build/compute-runtime`):
+         1. patch #2 → `drm_memory_manager.cpp createGraphicsAllocationFromSharedHandle`: pick
+            `CachePolicy::uncached` when `properties.flags.uncacheable`.
+         2. `driver_handle_imp.cpp importFdHandle`/`importFdHandles`: set
+            `unifiedMemoryProperties.flags.uncacheable = 1` when `flags & (…BIAS_UNCACHED)` BEFORE the
+            create call.
+         3. `drm_neo.cpp getPatIndex`: `forceUncached = (cachePolicy == CachePolicy::uncached)` and pass
+            it to `CacheSettingsHelper::getGmmUsageType(...)`.
+       Verify with an env-gated `fprintf` in the patched branch: UAR imports must print
+       `uncacheable=1 cachePolicy=0 patIndex=3` (PAT[3] = `XE_CACHE_NONE` = true UC on Xe2/BMG). With
+       only patch #2 + edit 1/2 you get `patIndex=1` (still WB) — the whole thing is a no-op.
+     - **EMPIRICAL BLOCKER (2026-07): userspace UC pat_index=3 alone does NOT fix it on the STOCK xe
+       kernel — it regresses.** With NEO correctly selecting `patIndex=3`, LL wedged on iter 1 on
+       freshly-reset HW (reproduced twice), WORSE than the WB `patIndex=1` path (~5/10). Kernel
+       patch #1 (`force-XE_CACHE_NONE`) targets the EXACT same `pat.idx[XE_CACHE_NONE]=PAT[3]` but
+       forces it kernel-side in `xe_pt_stage_bind_entry()` gated by an import-time
+       `XE_BO_FLAG_NEEDS_UC` (set in `xe_bo_move_dmabuf` when `sg_dma_is_bus_address`). Conclusion:
+       the stock xe VM_BIND does NOT faithfully bind userspace `pat_index=3` into the PTE for a P2P
+       MMIO import (or UC via that path is HW-incompatible) → **kernel patch #1 is required; the
+       compute-runtime (Option A) userspace patch is necessary-but-insufficient.** Applying kernel
+       patch #1 needs an xe-module rebuild/reload (reboot risk) — escalate for approval.
+     - **DEAD-END (2026-07-08, patched-xe true-UC LOADED): with kernel patch #1 forcing PAT[3] the
+       LL hang is a GPU COMPUTE (ccs) wedge, NOT a lost doorbell — the doorbell path is never even
+       reached.** Reproduced on freshly-reset igub HW across doorbell variants (see the env-selectable
+       `ISHMEM_IBGDA_DB_MODE` 0..5 added to `ibgda_device_impl.h::ishmemi_ibgda_device_uc_uar_write`):
+       iSHMEM init OK, `Buffer::sync` (host proxy barrier + GPU memset + barrier) COMPLETES on all
+       ranks (gate `DEEP_EP_SYNC_DBG=1`), test reaches `test_main` then HANGS in the **local XPU
+       tensor ops** (`torch.ones/randn/topk`) BEFORE any all_gather/dispatch. GPU counters at hang:
+       `stats_post_put_nbi_calls=0 stats_doorbell_writes=0`, WQ all-zero, CQ all `0xFF` (NIC untouched)
+       ⇒ IBGDA device doorbell NEVER executed, so H1/H2 doorbell store/fence tuning is IRRELEVANT and
+       mode-independent. dmesg: `engine_class=ccs` reset on all GPUs + `VM worker error: -62` +
+       "Suspend fence failed to respond". CONTROL: the identical torch ops run fine STANDALONE in the
+       same container on clean HW (no ishmem init) — so the compute engine is healthy; the wedge
+       appears only AFTER the UC-UAR import binds into the process VM. Earlier "sync barrier hangs" was
+       an ACCUMULATED-WEDGE cascade (golden rule 4) — ALWAYS reset igub before each attempt.
+       Conclusion: the true-UC P2P-MMIO import is incompatible with GPU compute on this HW; it is NOT
+       fixable by iSHMEM doorbell tuning. With patched xe loaded, UC is forced kernel-side on ALL
+       `sg_dma_is_bus_address` P2P imports regardless of NEO/iSHMEM userspace flags, so WB/WC cannot be
+       restored from userspace — reverting to the prior WB/WC 8/10 path (`~1168 µs`, iSHMEM
+       system-scope-fence + uncached-LSC-store doorbell fix) requires a REBOOT to stock xe (revert
+       kernel patch #1). That A/B + the residual 2/10 (treat as HW accumulation, reset-between-runs)
+       is a user decision. **Do not keep tuning the doorbell for the true-UC stack — it is a dead end.**
+     - **NEO in-container build recipe (25.48.36300.8):** clone `compute-runtime` @ tag; deps via
+       pkg-config — install exact IGC devel debs `intel-igc-{core,opencl}-devel_2.24.8+20344` (give
+       `igc-opencl.pc`), build gmmlib `intel-gmmlib-22.8.2` from source to a prefix (`igdgmm.pc`;
+       releases are source-only, no dev deb), and fetch level-zero **v1.26.0** headers (system
+       `libze-dev 1.21.9` lacks `zer_ddi.h`) into `<root>/include/level_zero/`. cmake:
+       `-DLevelZero_INCLUDE_DIR=<l0-root>/include -DNEO__GMM_LIBRARY_PATH=<gmmlib-install>`, and
+       `LIBRARY_PATH=<gmmlib-install>/lib ninja bin/libze_intel_gpu.so.1`. Install the built
+       `.so.1.14.36300` over `/usr/lib/x86_64-linux-gnu/…` — but a single-file **bind-mount pins the
+       inode**, so a ninja relink (unlink+create) is invisible until containers are recreated; and the
+       IGC devel debs live in the EPHEMERAL container fs (wiped on `docker rm`, so reinstall before
+       every rebuild). The docker-2node-ll-v2/-v2 composes now bind-mount the patched `.so`.
+
+0b. **Toolchain parity:** build iSHMEM AND DeepEP with the SAME oneAPI the docker sims run
+   (2025.3). A compiler mismatch → `llvm-link: error: linked module is broken!` at device-link.
+   If the host oneAPI was upgraded (2026.0 → MKL `.so.3`, torch import fails on missing `.so.2`),
+   build **inside the container** (`docker exec … _build_ishmem.sh` then `python3 setup.py
+   build_ext --inplace`). `_build_ishmem.sh` must `source setvars.sh --force` (plain source
+   returns 3 under `set -e` → silent build abort).
 
 1. **iSHMEM archive parity is the #1 root cause of BOTH LL perf gaps AND DEVICE_LOST.**
    `libishmem.a` is **statically linked** into `deep_ep_cpp*.so` (merged into the SYCL

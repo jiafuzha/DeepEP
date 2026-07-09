@@ -247,6 +247,19 @@ class Buffer:
         self.runtime.destroy()
         self.runtime = None
 
+    def quiesce(self):
+        """
+        Lightweight per-process GPU + NIC quiesce, safe to call right before a hard
+        process exit (e.g. os._exit on the XPU LL direct-doorbell path) that bypasses
+        destroy(). Drains all in-flight GPU work -- including the long-running IBGDA
+        poll/quiet exec queues -- and this PE's outbound RDMA, WITHOUT tearing down the
+        symmetric heap / QPs / NIC BAR. This lets the GuC retire the long-running exec
+        queue cleanly at exit instead of GT-resetting it (which would wedge the next
+        process's first GPU submission -> init hang / DEVICE_LOST).
+        """
+        if self.runtime is not None:
+            self.runtime.quiesce()
+
     @staticmethod
     def is_sm90_compiled():
         return deep_ep_cpp.is_sm90_compiled()
