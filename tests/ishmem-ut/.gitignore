@@ -3,3 +3,5 @@ ll_put_repro
 normal_putmem_repro
 finalize_repro
 ll_quiet_repro
+ll_count_repro
+ll_combine_repro
