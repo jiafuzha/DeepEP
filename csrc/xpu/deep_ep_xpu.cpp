@@ -27,6 +27,20 @@
 
 namespace py = pybind11;
 
+#ifdef DEEP_EP_ENABLE_ISHMEM
+// Forward declaration at TRUE global scope (matches mangled symbol
+// _Z18ishmemi_proxy_finiv) of an iSHMEM-internal entry point defined in
+// ishmem_ibgda/src/proxy.cpp and statically linked into this .so via
+// libishmem.a. It signals the host proxy thread to EXIT and joins it (bounded),
+// and frees the proxy ring/message host buffers -- but it does NOT touch the NIC
+// QPs/MRs, the UAR->GPU BAR mapping (no zeMemCloseIpcHandle), the symmetric heap,
+// or the MPI/oneCCL runtime. Stopping ONLY the proxy is the safe half of
+// teardown: it removes the proxy-vs-Level-Zero-context-destroy race (ishmemi_copy
+// ZE_RESULT_ERROR_UNINITIALIZED storm -> teardown GT reset) WITHOUT the BAR unmap
+// that empirically destabilizes this stack (see deep_ep::internode::finalize()).
+int ishmemi_proxy_fini();
+#endif
+
 namespace deep_ep {
 
 namespace {
@@ -232,6 +246,39 @@ void quiet() {
     ishmem_quiet();
 }
 
+// Stop ONLY the iSHMEM host proxy thread (bounded) before an orderly process
+// exit destroys the Level-Zero context. This eliminates the proxy-vs-context
+// teardown race without the destabilizing NIC-BAR unmap (see finalize()).
+// Watchdog-guarded: a wedged proxy join must never re-introduce an init hang.
+void stop_proxy() {
+    int initialized = 0;
+    ishmemx_query_initialized(&initialized);
+    if (!initialized) {
+        return;
+    }
+    int timeout_sec = 10;
+    try_parse_env_int("DEEP_EP_XPU_STOP_PROXY_TIMEOUT_SEC", &timeout_sec);
+    if (timeout_sec <= 0) {
+        ::ishmemi_proxy_fini();
+        return;
+    }
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> fut = done->get_future();
+    std::thread worker([done]() {
+        ::ishmemi_proxy_fini();
+        done->set_value();
+    });
+    if (fut.wait_for(std::chrono::seconds(timeout_sec)) == std::future_status::ready) {
+        worker.join();
+    } else {
+        std::fprintf(stderr,
+            "[DeepEP] stop_proxy(): ishmemi_proxy_fini() did not complete within %d s; "
+            "detaching and continuing exit.\n",
+            timeout_sec);
+        worker.detach();
+    }
+}
+
 void finalize() {
     // Empirical finding on this Intel XPU + igub_vmem BAR-bridge stack:
     //   * There is NO resource leak on normal program/test exit. Process exit
@@ -307,6 +354,7 @@ void barrier() {
 }
 
 void finalize() {}
+void stop_proxy() {}
 #endif
 
 int get_source_meta_bytes() {
@@ -704,11 +752,18 @@ struct Buffer {
             const int num_ishmem_ranks = all_ranks_ishmem ? num_ranks : num_rdma_ranks;
             TORCH_CHECK(internode::init(root_unique_id, ishmem_rank, num_ishmem_ranks, low_latency_mode) == ishmem_rank,
                         "XPU iSHMEM initialized with an unexpected rank");
+            // Opt-in host-side sync-phase tracing (DEEP_EP_SYNC_DBG=1). Used to
+            // localize Buffer-construction hangs (proxy barrier vs GPU memset).
+            static const bool kSyncDbg = std::getenv("DEEP_EP_SYNC_DBG") != nullptr;
+            if (kSyncDbg) { fprintf(stderr, "[SYNCDBG rank %d] init done, before barrier#1\n", rank); fflush(stderr); }
             internode::barrier();
+            if (kSyncDbg) { fprintf(stderr, "[SYNCDBG rank %d] after barrier#1, before alloc+memset\n", rank); fflush(stderr); }
             rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
             auto& queue = comm_stream.queue();
             queue.memset(rdma_buffer_ptr, 0, num_rdma_bytes).wait();
+            if (kSyncDbg) { fprintf(stderr, "[SYNCDBG rank %d] after memset, before barrier#2\n", rank); fflush(stderr); }
             internode::barrier();
+            if (kSyncDbg) { fprintf(stderr, "[SYNCDBG rank %d] after barrier#2 (sync complete)\n", rank); fflush(stderr); }
             (void)queue;
         }
         available = true;
@@ -792,6 +847,99 @@ struct Buffer {
         barrier_signal_ptrs_gpu = nullptr;
         destroyed = true;
         available = false;
+    }
+
+    // Lightweight per-process GPU + NIC quiesce, safe to call immediately before a
+    // HARD process exit (e.g. the LL direct-doorbell path's os._exit()/MPI_Finalize
+    // fast-teardown, which deliberately bypasses destroy() and C++ dtors).
+    //
+    // Root cause it fixes: DeepEP LL submits long-running IBGDA poll/quiet kernels
+    // on the comm stream. If the process is torn down with such a kernel still
+    // in-flight (or its exec queue merely still *submitted*), the Xe GuC cannot
+    // preempt the long-running exec queue at L0-context destroy ->
+    // "Schedule disable failed to respond" -> xe_guc_exec_queue_lr_cleanup -> GT
+    // reset. The NEXT process then inherits a reset/wedged GT and its very first
+    // GPU submission (Buffer ctor's queue.memset(workspace).wait()) never signals
+    // -> init hang (rc=124); repeated resets accumulate -> DEVICE_LOST (rc=255).
+    //
+    // Draining every stream on the device leaves the long-running exec queue IDLE,
+    // so the GuC retires it cleanly at exit. This is NOT a teardown: it does not
+    // free the symmetric heap, close QPs, or unmap the NIC BAR (the operations that
+    // were empirically shown to destabilize this stack), so it is safe to run even
+    // when destroy()/ishmem_finalize is intentionally skipped.
+    void quiesce() {
+        // 1) Drain this rank's comm stream (retires the last LL dispatch/combine +
+        //    IBGDA poll/quiet kernels submitted here).
+        try {
+            comm_stream.queue().wait_and_throw();
+        } catch (...) {
+        }
+        // 2) Drain EVERY reserved XPU stream on this device (pool + default/compute),
+        //    so no long-running exec queue is left submitted on the GT at exit.
+        try {
+            c10::xpu::syncStreamsOnDevice(device_id);
+        } catch (...) {
+        }
+#ifdef DEEP_EP_ENABLE_ISHMEM
+        // 3) Drain this PE's outbound RDMA (ishmem_quiet) so the NIC CQ is quiesced.
+        //    This is the light drain (no QP/BAR/heap teardown). Guard it with a
+        //    watchdog: if it were ever to hang we must still exit having done the
+        //    critical GPU-queue drain above (step 1/2) which is what prevents the
+        //    GT reset -- a hung quiet must not re-introduce an init hang.
+        {
+            int initialized = 0;
+            ishmemx_query_initialized(&initialized);
+            if (initialized) {
+                int timeout_sec = 10;
+                try_parse_env_int("DEEP_EP_XPU_QUIESCE_TIMEOUT_SEC", &timeout_sec);
+                if (timeout_sec <= 0) {
+                    internode::quiet();
+                } else {
+                    auto done = std::make_shared<std::promise<void>>();
+                    std::future<void> fut = done->get_future();
+                    std::thread worker([done]() {
+                        internode::quiet();
+                        done->set_value();
+                    });
+                    if (fut.wait_for(std::chrono::seconds(timeout_sec)) == std::future_status::ready) {
+                        worker.join();
+                    } else {
+                        std::fprintf(stderr,
+                            "[DeepEP] quiesce(): ishmem_quiet() did not complete within %d s; "
+                            "GPU queues already drained, continuing to exit.\n",
+                            timeout_sec);
+                        worker.detach();
+                    }
+                }
+            }
+        }
+        // 4) Re-drain the device once more: ishmem_quiet may itself have submitted a
+        //    completion/quiet kernel; make sure nothing is left in-flight.
+        try {
+            c10::xpu::syncStreamsOnDevice(device_id);
+        } catch (...) {
+        }
+        // 5) Stop the iSHMEM host proxy thread BEFORE the process exits. When the
+        //    LL direct-doorbell path exits ORDERLY (letting libze's static
+        //    destructors run zeContextDestroy so the next same-affinity exec
+        //    queue does not collide -> no init hang), a still-live proxy thread
+        //    races the context destroy: it keeps polling the GPU ring and issues
+        //    ishmemi_copy (zeCommandListAppendMemoryCopy) against a context that
+        //    is being torn down -> ZE_RESULT_ERROR_UNINITIALIZED storm on a
+        //    long-running exec queue -> "Schedule disable failed to respond" ->
+        //    xe_guc_exec_queue_lr_cleanup GT reset -> DEVICE_LOST accumulation.
+        //    Stopping the proxy here (the safe half of teardown; NO NIC-BAR
+        //    unmap) closes that race. Default ON; disable with
+        //    DEEP_EP_XPU_STOP_PROXY=0. Only meaningful for orderly exit; harmless
+        //    (proxy simply stops early) on the os._exit fast path.
+        {
+            int stop = 1;
+            try_parse_env_int("DEEP_EP_XPU_STOP_PROXY", &stop);
+            if (stop != 0) {
+                internode::stop_proxy();
+            }
+        }
+#endif
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>> get_dispatch_layout(
@@ -2043,6 +2191,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream", &Buffer::get_comm_stream)
         .def("sync", &Buffer::sync)
         .def("destroy", &Buffer::destroy)
+        .def("quiesce", &Buffer::quiesce)
         .def("get_dispatch_layout", &Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &Buffer::intranode_dispatch)
         .def("intranode_combine", &Buffer::intranode_combine)
