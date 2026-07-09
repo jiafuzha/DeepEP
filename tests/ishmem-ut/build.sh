@@ -51,4 +51,6 @@ else
     build_one normal_putmem_repro
     build_one finalize_repro
     build_one ll_quiet_repro
+    build_one ll_count_repro
+    build_one ll_combine_repro
 fi

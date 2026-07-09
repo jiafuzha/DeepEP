@@ -163,6 +163,12 @@ def _synchronize(device: torch.device) -> None:
         torch.xpu.synchronize(device)
 
 
+def _accelerator_module(device: torch.device):
+    if device.type == "xpu":
+        return torch.xpu
+    return None
+
+
 def _dtype_bytes(dtype: torch.dtype) -> int:
     return torch.empty(0, dtype=dtype).element_size()
 
@@ -172,12 +178,26 @@ def _time_op(op, device: torch.device, warmup: int, iters: int) -> List[float]:
         op()
     _synchronize(device)
     dist.barrier()
+
+    accelerator = _accelerator_module(device)
+    if accelerator is not None:
+        # Event-based timing: record device events around each call and only
+        # synchronize once at the end, avoiding a heavy per-iteration device sync.
+        start_events = [accelerator.Event(enable_timing=True) for _ in range(iters)]
+        end_events = [accelerator.Event(enable_timing=True) for _ in range(iters)]
+        for i in range(iters):
+            start_events[i].record()
+            op()
+            end_events[i].record()
+        accelerator.synchronize()
+        # Event.elapsed_time returns milliseconds; convert to seconds.
+        return [start_events[i].elapsed_time(end_events[i]) / 1e3 for i in range(iters)]
+
+    # CPU fallback: no device events, measure wall-clock per iteration.
     latencies: List[float] = []
     for _ in range(iters):
-        _synchronize(device)
         start = time.perf_counter()
         op()
-        _synchronize(device)
         latencies.append(time.perf_counter() - start)
     return latencies
 
