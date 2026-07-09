@@ -200,6 +200,7 @@ run_test() {
         -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
         -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
         -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+        -genv ISHMEM_IBGDA_DB_MODE "${ISHMEM_IBGDA_DB_MODE:-0}" \
         -genv ISHMEM_IBGDA_BAR_BACKEND igub \
         -genv I_MPI_FABRICS shm:ofi \
         -genv FI_PROVIDER tcp \
@@ -207,9 +208,11 @@ run_test() {
         -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
         -genv DEEP_EP_LL_FLAG_PROGRESS "${DEEP_EP_LL_FLAG_PROGRESS:-0}" \
         -genv DEEP_EP_LL_FLAG_LSC "${DEEP_EP_LL_FLAG_LSC:-0}" \
-        -genv DEEP_EP_LL_FLAG_SENDER_FENCE "${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}" \
-        -genv DEEP_EP_LL_FLAG_RECV_ACQ "${DEEP_EP_LL_FLAG_RECV_ACQ:-1}" \
-        -genv DEEP_EP_LL_POLL_CAP "${DEEP_EP_LL_POLL_CAP:-50000000}" \
+        -genv DEEP_EP_LL_FLAG_SENDER_FENCE "${DEEP_EP_LL_FLAG_SENDER_FENCE:-2}" \
+        -genv DEEP_EP_LL_FLAG_RECV_ACQ "${DEEP_EP_LL_FLAG_RECV_ACQ:-2}" \
+        -genv DEEP_EP_LL_POLL_CAP "${DEEP_EP_LL_POLL_CAP:-5000000}" \
+        -genv DEEP_EP_LL_QUIESCE "${DEEP_EP_LL_QUIESCE:-1}" \
+        -genv DEEP_EP_LL_ORDERLY_EXIT "${DEEP_EP_LL_ORDERLY_EXIT:-2}" \
         -genv DEEP_EP_NVL_RANKS "$NUM_PROCESSES" \
         -genv DEEP_EP_NVL_BYTES "$DEEP_EP_NVL_BYTES" \
         -genv DEEP_EP_RDMA_BYTES "$DEEP_EP_RDMA_BYTES" \

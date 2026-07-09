@@ -227,9 +227,31 @@ inline int ll_num_wgs(size_t work_units, int wg_size, int cap) {
 //     residual DEVICE_LOST seen historically was accumulated NIC/QP wedge state
 //     across runs, not a flag-path bug (reset the igub driver between runs to
 //     avoid it -- DEEP_EP_LL_RESET_DRIVER=1 in the docker-2node-ll harness).
-// The barrier path (this default) is the proven-stable route. Flip to flags only
-// once scale makes the all-to-all barrier the dominant cost AND the cross-node
-// flag-landing/transport stability is resolved.
+//   * True 2-node CORRECTNESS (dispatch UNDERCOUNT -- UNDER ACTIVE FIX via L3
+//     eviction): on real 2-node HW the flag path failed a dispatch UNDERCOUNT
+//     whose received count VARIED run to run (8/16/18/20/22) against a stable
+//     ground truth (e.g. 27, 31); the self slot (written locally, never polled)
+//     always survived while the 3 REMOTE src slots were lost. This was first
+//     mis-attributed to a bounded-poll timing race. The real root cause is L3
+//     NON-COHERENCE: uc_store only bypasses L1, so the receiver's per-iteration
+//     clean-zero of dispatch_count LINGERS in L3; a plain
+//     sycl::atomic_fence(release, system) only ORDERS and does NOT evict/
+//     invalidate L3 on BMG, so (a) the stale L3 zero can evict to HBM AFTER the
+//     peer's next-dispatch flag RDMA-write lands -> clobber -> undercount, and
+//     (b) the receiver's uc_load can hit the stale L3 zero. FIX (this build):
+//     replace the release fence on BOTH cleans (dispatch combine_flag clean and
+//     combine dispatch_count clean) with an explicit LSC evict fence
+//     lsc_fence.ugm.evict.sysrel (lsc_fence_sysrel) that FLUSHES the clean line
+//     out of L3 to HBM; also default the sender flush to the same LSC evict
+//     (DEEP_EP_LL_FLAG_SENDER_FENCE=2) so the NIC DMA-reads the fresh flag; and
+//     read the flag with a looped uc_load (DEEP_EP_LL_FLAG_LSC=0) which, once the
+//     clean line is evicted from L3, misses L3 and fetches the NIC-delivered
+//     value from HBM. (A prior attempt with release-only fences + LSC=2
+//     invalidate reads did NOT work -- release fences do not evict L3.)
+// The barrier path (this default) remains the proven-stable route. The flag path
+// is EXPERIMENTAL and under active validation with the L3-eviction coherence fix
+// above; keep it opt-in until a clean-HW 2-node run confirms the undercount is
+// resolved.
 inline bool ll_flag_progress() {
     const char* env = std::getenv("DEEP_EP_LL_FLAG_PROGRESS");
     if (env != nullptr && env[0] != '\0') {
@@ -280,11 +302,14 @@ inline int ll_flag_lsc_mode() {
 // value (e.g. 0), so the receiver spins forever (-> watchdog DEVICE_LOST on
 // 2-node) even with a perfect uncached read. This emits a release/flush fence
 // between the uc_store and the flag put:
-//   0 = none   1 = sycl::atomic_fence(release, system) [DEFAULT, portable]
-//   2 = LSC lsc_fence.ugm.evict.sysrel (explicit L3 evict to memory, ~1% faster)
-// DEFAULT 1: the flag path is INCORRECT on 2-node without this flush (empirically
-// the NIC reads a stale 0); set DEEP_EP_LL_FLAG_SENDER_FENCE=0 only to reproduce
-// the broken behavior, =2 to use the explicit LSC evict.
+//   0 = none   1 = sycl::atomic_fence(release, system) [orders only, does NOT
+//                   evict L3 on BMG -> NIC can still read a stale L3 value]
+//   2 = LSC lsc_fence.ugm.evict.sysrel (explicit L3 evict to HBM) [DEFAULT]
+// DEFAULT 2: the flag path is INCORRECT on 2-node without a real L3 evict --
+// empirically the NIC DMA-reads a stale 0 from L3 because a plain release fence
+// only orders and does not flush the freshly uc_store-d value out of L3. Set
+// DEEP_EP_LL_FLAG_SENDER_FENCE=0 to reproduce the broken behavior, =1 for the
+// (insufficient) atomic_fence.
 inline int ll_flag_sender_fence() {
     const char* env = std::getenv("DEEP_EP_LL_FLAG_SENDER_FENCE");
     if (env != nullptr && env[0] != '\0') {
@@ -292,7 +317,7 @@ inline int ll_flag_sender_fence() {
         if (v >= 0)
             return v;
     }
-    return 1;
+    return 2;
 }
 
 // Device-side flag read used by the flag path. lsc_mode 0 = hint-based uc_load
@@ -330,13 +355,26 @@ inline void ll_sender_flush(int mode) {
 // at the start of the read kernel so the GPU L2 becomes coherent with the NIC writes,
 // then read the bulk payload with FAST CACHED loads (the same mechanism the barrier
 // path relies on). Trades a per-byte uncached tax for one invalidate + cached reads.
-//   0 = per-byte uncached uc_load (fallback; ~15% slower on loopback)
-//   1 = one sycl::atomic_fence(acquire, system) at kernel entry + cached reads (DEFAULT)
+//   0 = per-byte uncached uc_load (fallback; reads L1-bypass but still hits L3 ->
+//       does NOT fix combine_data staleness on its own)
+//   1 = one sycl::atomic_fence(acquire, system) at kernel entry + cached reads.
+//       ORDERS ONLY -- does NOT invalidate L3 on BMG, so cached reads can return a
+//       STALE L3 line left by the previous iteration's read (combine diff failure).
 //   2 = one LSC lsc_fence.ugm.invalidate.sysacq at kernel entry + cached reads
-//       (UNSTABLE on 2-node: reproducibly trips UR_RESULT_ERROR_DEVICE_LOST; do NOT use)
-// Measured (flag path on): loopback ~1581 us (mode 1) vs ~1870 us (mode 0); true 2-node
-// is transport-bound so all modes ~1150 us. Mode 1 is correct on both and faster on
-// loopback, so it is the default; mode 0 stays as an opt-out fallback.
+//       [DEFAULT]. This is the read-side ANALOG of the write-side lsc_fence_sysrel
+//       evict: it INVALIDATES the GPU L3 so the cached bulk read misses L3 and
+//       fetches the NIC-delivered bytes from HBM. Required for combine correctness
+//       (dispatch payload happens to survive with mode 1, but combine_data does not
+//       -- diff ~0.13 with mode 1, PASS with mode 2). The historical "mode 2 trips
+//       DEVICE_LOST" was an artifact of the old wedged stack and does NOT reproduce
+//       with the L3-eviction cleans + 5M poll cap; measured tight ~1551 us/iter,
+//       no tail. STABILITY CAVEAT: mode 2 is still INTERMITTENTLY DEVICE_LOST on
+//       the current 2-node stack -- the invalidate.sysacq appears to interact with
+//       residual NIC/QP page-table wedge that CASCADES from an earlier DEVICE_LOST
+//       (a passing barrier-path run does NOT prove the flag-path QP state is clean).
+//       A clean-HW (reboot / igub reset) A/B of mode 2 vs mode 0 (per-byte uc_load,
+//       which never populates L3 and needs no invalidate fence) is still pending to
+//       pick the stable default; correctness of mode 2 is confirmed, stability is not.
 inline int ll_flag_recv_acq() {
     const char* env = std::getenv("DEEP_EP_LL_FLAG_RECV_ACQ");
     if (env != nullptr && env[0] != '\0') {
@@ -344,7 +382,7 @@ inline int ll_flag_recv_acq() {
         if (v >= 0)
             return v;
     }
-    return 1;
+    return 2;
 }
 
 // Device-side receiver acquire/invalidate (see ll_flag_recv_acq). Issued ONCE per
@@ -365,18 +403,18 @@ inline void ll_recv_acquire(int mode) {
 // DEEP_EP_LL_POLL_CAP. On timeout the slot is treated as "0 tokens" (graceful
 // degradation), matching the rank-mask-on-timeout intent of the CUDA path.
 //
-// DEFAULT = 1,000,000. This is deliberately LOW. The receiver's flag wait is a
-// tight loop of L2-bypassing uncached uc_load reads; each read is a full VRAM
-// round-trip (~µs). A warm-QP RDMA flag lands within a handful of µs, so 1M
-// iterations (a few ms of spin) has ample margin. Crucially, 1M keeps the
-// WORST-CASE spin (a delayed / never-landing flag under a marginal env) well
-// under the GPU hang-check/heartbeat watchdog interval. A large cap (the old
-// 2e9 / the harness's 50M) lets a single delayed flag spin for tens of seconds,
-// tripping the watchdog -> UR_RESULT_ERROR_DEVICE_LOST (a hard device wedge that
-// also corrupts NIC/QP state and cascades into later iterations). With the low
-// cap the same delayed flag instead breaks out and degrades to "0 tokens" -- a
-// soft, recoverable failure the test's correctness check catches, never a wedge.
-// This is the flag-path DEVICE_LOST fix: bound the spin below the watchdog.
+// DEFAULT = 5,000,000. Empirically tuned on real 2-node HW. The receiver's flag
+// wait is a tight loop of uncached uc_load reads; a same-node RDMA flag lands in
+// a handful of us, but the CROSS-NODE peer's flag can land much later (measured
+// worst-case spin ~69 ms at 5M iterations). A too-low cap (1M) times out on the
+// cross-node peer before its flag lands -> that peer's slot stays 0 -> dispatch
+// UNDERCOUNT (self + same-node slots survive, cross-node lost). 5M gives the
+// cross-node flag enough window to land -> correct. Crucially 5M (~69 ms) is
+// still under the GPU hang-check/heartbeat watchdog, so a genuinely never-landing
+// flag still breaks out and degrades to "0 tokens" (soft, test-caught) rather
+// than spinning into UR_RESULT_ERROR_DEVICE_LOST. Do NOT raise toward the old
+// 2e9 / 50M values -- those spin tens of seconds and trip the watchdog -> hard
+// device wedge that corrupts NIC/QP state and cascades into later iterations.
 inline uint64_t ll_poll_cap() {
     const char* env = std::getenv("DEEP_EP_LL_POLL_CAP");
     if (env != nullptr && env[0] != '\0') {
@@ -384,7 +422,7 @@ inline uint64_t ll_poll_cap() {
         if (v > 0)
             return static_cast<uint64_t>(v);
     }
-    return static_cast<uint64_t>(1) * 1000 * 1000;
+    return static_cast<uint64_t>(5) * 1000 * 1000;
 }
 
 // Cooperative copy of `n` bytes from src to dst using a strided set of
@@ -611,6 +649,16 @@ void dispatch_bf16(void* packed_recv_x,
                     const int i = static_cast<int>(item.get_global_linear_id());
                     if (i < n_flag_ints) {
                         uc_store(&combine_flag_ints[i], 0);
+                        // Publish the zero to HBM before this dispatch's later outbound sends.
+                        // uc_store only bypasses L1; the zero can linger in L3 and (a) evict to
+                        // HBM AFTER a peer's next-combine flag RDMA-write has landed -> clobber
+                        // to 0, or (b) be re-read stale by the receiver poll. A system-release
+                        // atomic_fence only ORDERS -- it does NOT evict/invalidate L3 on BMG, so
+                        // it does not fix either failure. Use an explicit LSC evict fence
+                        // (lsc_fence.ugm.evict.sysrel) to FLUSH the clean line out of L3 to HBM:
+                        // once evicted, the receiver's later uc_load misses L3 and fetches the
+                        // NIC-delivered value from HBM. Mirrors CUDA's next_clean release publish.
+                        lsc_fence_sysrel();
                     }
                 });
         });
@@ -1061,6 +1109,16 @@ void combine_bf16(void* combined_x,
                     const int i = static_cast<int>(item.get_global_linear_id());
                     if (i < n_count_ints) {
                         uc_store(&dispatch_count[i], 0);
+                        // Publish the zero to HBM before this combine's later outbound sends.
+                        // uc_store only bypasses L1; the zero can linger in L3 and evict to HBM
+                        // AFTER a peer's next-dispatch count-flag RDMA-write has landed -> clobber
+                        // to 0 -> that peer's tokens are lost (dispatch UNDERCOUNT). A system-
+                        // release atomic_fence only ORDERS -- it does NOT evict/invalidate L3 on
+                        // BMG. Use an explicit LSC evict fence (lsc_fence.ugm.evict.sysrel) to
+                        // FLUSH the clean line out of L3 to HBM so (a) it cannot later clobber the
+                        // landed flag and (b) the receiver's uc_load misses L3 and fetches the
+                        // NIC-delivered value. Mirrors CUDA's next_clean release publish.
+                        lsc_fence_sysrel();
                     }
                 });
         });
