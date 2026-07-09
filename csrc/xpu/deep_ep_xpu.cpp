@@ -312,14 +312,14 @@ void finalize() {
     int timeout_sec = 20;
     try_parse_env_int("DEEP_EP_XPU_FINALIZE_TIMEOUT_SEC", &timeout_sec);
     if (timeout_sec <= 0) {
-        ishmem_finalize_ibgda_resources();
+        //ishmem_finalize_ibgda_resources();
         return;
     }
 
     auto done = std::make_shared<std::promise<void>>();
     std::future<void> fut = done->get_future();
     std::thread worker([done]() {
-        ishmem_finalize_ibgda_resources();
+        //ishmem_finalize_ibgda_resources();
         done->set_value();
     });
 
