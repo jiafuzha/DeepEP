@@ -295,17 +295,6 @@ inline int ll_flag_sender_fence() {
     return 1;
 }
 
-// Design-(b) cooperative sub-group aggregated NBI put path (opt-in,
-// DEEP_EP_LL_COOP_PUT=1, default 0). When enabled (and flag_progress is on) the
-// dispatch/combine remote puts are issued via ishmemx_putmem_nbi_sub_group so a
-// single leader per (sub-group, QP) publishes SND_DBR monotonically for all its
-// lanes — removing the concurrent-producer doorbell race. Requires the ishmem
-// build that exports ishmemx_putmem_nbi_sub_group. Keep OFF until validated on HW.
-inline bool ll_coop_put() {
-    const char* env = std::getenv("DEEP_EP_LL_COOP_PUT");
-    return env != nullptr && env[0] == '1';
-}
-
 // Device-side flag read used by the flag path. lsc_mode 0 = hint-based uc_load
 // (L1 uncached); 1 = explicit LSC `lsc_load.ugm.uc.uc` (L1+L3 uncached); >=2 =
 // LSC load preceded by an `invalidate.sysacq` cache-invalidate fence.
@@ -588,7 +577,6 @@ void dispatch_bf16(void* packed_recv_x,
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
-    const bool coop_put = ll_coop_put();
     // When the receiver does a single acquire/invalidate up front, the bulk payload
     // is read with CACHED loads instead of per-byte uncached uc_load.
     const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
@@ -738,47 +726,7 @@ void dispatch_bf16(void* packed_recv_x,
                         }
                     }
 
-                    // Remote NBI puts.
-                    if (coop_put && flag_progress) {
-                        // Design-(b) cooperative path: the WHOLE sub-group enters each
-                        // put convergently; each lane owns channel = gid (if in range).
-                        // Payload+flag share one affinity QP (aff = gid) so in-order
-                        // delivery still guarantees "flag lands after payload", while a
-                        // single leader per (sub-group, QP) publishes SND_DBR.
-                        auto sg = item.get_sub_group();
-                        const int num_channels = (num_ranks - 1) * num_local_experts;
-                        bool ch_active = (gid < num_channels);
-                        int my_dst_rank = 0, my_le = 0, my_sc_idx = 0, my_count = 0;
-                        size_t my_src_slot = 0, my_dst_slot = 0;
-                        if (ch_active) {
-                            const int dr = gid / num_local_experts;   // index among non-self ranks
-                            my_le = gid % num_local_experts;
-                            my_dst_rank = (dr < rank) ? dr : dr + 1;   // skip self
-                            my_sc_idx = my_dst_rank * num_local_experts + my_le;
-                            send_count[my_sc_idx] = sycl::min(send_count[my_sc_idx], num_max_dispatch_tokens_per_rank);
-                            my_count = send_count[my_sc_idx];
-                            my_src_slot = static_cast<size_t>(my_sc_idx) * num_max_dispatch_tokens_per_rank;
-                            my_dst_slot = (static_cast<size_t>(my_le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        }
-                        const unsigned int aff = static_cast<unsigned int>(gid);
-                        const bool pay = ch_active && (my_count > 0);
-                        // 1) payload: source token indices
-                        ishmemx_putmem_nbi_sub_group(dispatch_src + my_dst_slot, send_src + my_src_slot,
-                                                     static_cast<size_t>(my_count) * sizeof(int),
-                                                     my_dst_rank, pay, aff, sg);
-                        // 2) payload: token data (cooperative emit chunks internally)
-                        ishmemx_putmem_nbi_sub_group(dispatch_data + my_dst_slot * hidden_bytes,
-                                                     send_data + my_src_slot * hidden_bytes,
-                                                     static_cast<size_t>(my_count) * hidden_bytes,
-                                                     my_dst_rank, pay, aff, sg);
-                        // 3) local flag store + sender flush, then the completion flag put
-                        if (ch_active) uc_store(&send_count[my_sc_idx], -my_count - 1);
-                        ll_sender_flush(flag_sender_fence);
-                        ishmemx_putmem_nbi_sub_group(dispatch_count + my_le * num_ranks + rank,
-                                                     send_count + my_sc_idx, sizeof(int),
-                                                     my_dst_rank, ch_active, aff, sg);
-                    } else {
-                    // one work-item per channel.
+                    // Remote NBI puts: one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                         if (dst_rank == rank) {
@@ -837,7 +785,6 @@ void dispatch_bf16(void* packed_recv_x,
                             ch++;
                         }
                     }
-                    }  // end else (non-cooperative per-channel path)
                 });
         });
     }
@@ -1090,7 +1037,6 @@ void combine_bf16(void* combined_x,
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
-    const bool coop_put = ll_coop_put();
     const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
 
     // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
@@ -1222,61 +1168,7 @@ void combine_bf16(void* combined_x,
                         }
                     }
 
-                    // Step 2: remote NBI puts.
-                    if (coop_put && flag_progress) {
-                        // Design-(b) cooperative path (see dispatch stage 2 for rationale).
-                        auto sg = item.get_sub_group();
-                        const int num_channels = (num_ranks - 1) * num_local_experts;
-                        bool ch_active = (gid < num_channels);
-                        int my_dst_rank = 0, my_local_expert = 0, my_global_expert = 0, my_sc_idx = 0;
-                        bool has_payload = false;
-                        size_t my_bytes = 0;
-                        uint8_t* my_src_ptr = send_data;
-                        uint8_t* my_dst_ptr = combine_data;
-                        if (ch_active) {
-                            const int dr = gid / num_local_experts;
-                            my_local_expert = gid % num_local_experts;
-                            my_dst_rank = (dr < rank) ? dr : dr + 1;
-                            my_global_expert = rank * num_local_experts + my_local_expert;
-                            my_sc_idx = my_dst_rank * num_local_experts + my_local_expert;
-                            int count = 0, begin = 0;
-                            unpack_range(layout_range[my_local_expert * num_ranks + my_dst_rank], count, begin);
-                            const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                            int min_token = num_max_dispatch_tokens_per_rank;
-                            int max_token = -1;
-                            for (int slot = 0; slot < clamped_count; ++slot) {
-                                const int original_token =
-                                    src_info[static_cast<size_t>(my_local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin +
-                                             slot];
-                                if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                                    min_token = sycl::min(min_token, original_token);
-                                    max_token = sycl::max(max_token, original_token);
-                                }
-                            }
-                            if (max_token >= min_token) {
-                                has_payload = true;
-                                my_src_ptr = send_data +
-                                    (static_cast<size_t>(my_dst_rank * num_local_experts + my_local_expert) *
-                                         num_max_dispatch_tokens_per_rank +
-                                     min_token) *
-                                        hidden_bytes;
-                                my_dst_ptr = combine_data +
-                                    (static_cast<size_t>(my_global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
-                                my_bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                            }
-                        }
-                        const unsigned int aff = static_cast<unsigned int>(gid);
-                        const bool pay = ch_active && has_payload;
-                        // payload put (cooperative emit chunks internally)
-                        ishmemx_putmem_nbi_sub_group(my_dst_ptr, my_src_ptr, my_bytes, my_dst_rank, pay, aff, sg);
-                        // local flag store + flush, then completion flag put
-                        if (ch_active) uc_store(&send_count[my_sc_idx], 1);
-                        ll_sender_flush(flag_sender_fence);
-                        ishmemx_putmem_nbi_sub_group(combine_flag_i + my_global_expert * 2,
-                                                     send_count + my_sc_idx, sizeof(int),
-                                                     my_dst_rank, ch_active, aff, sg);
-                    } else {
-                    // one work-item per channel.
+                    // Step 2: remote NBI puts, one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                         if (dst_rank == rank) {
@@ -1330,7 +1222,6 @@ void combine_bf16(void* combined_x,
                             ch++;
                         }
                     }
-                    }  // end else (non-cooperative per-channel path)
                 });
         });
     }
