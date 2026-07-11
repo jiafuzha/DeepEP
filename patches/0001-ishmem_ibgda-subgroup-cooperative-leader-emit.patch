@@ -1,0 +1,1273 @@
+From 429e0b3ce4a9ebec0e2b90a6acfcfc4b3d3962fb Mon Sep 17 00:00:00 2001
+From: Jiafu Zhang <jiafu.zhang@intel.com>
+Date: Fri, 10 Jul 2026 12:53:38 +0000
+Subject: [PATCH] subgroup cooperative leader emit APIs
+
+Signed-off-by: Jiafu Zhang <jiafu.zhang@intel.com>
+---
+ src/ibgda.cpp                                 |  23 +-
+ src/ibgda_device_impl.h                       | 233 +++++++++++++
+ src/ishmemx.h                                 |   6 +
+ src/nbi.cpp                                   |  15 +
+ test/unit/ibgda_doorbell_stress.cpp           | 189 +++++++++++
+ test/unit/oom_copy_engine_probe.cpp           | 321 ++++++++++++++++++
+ test/unit/oom_probe_wrapper.sh                |  40 +++
+ .../unit/run_ibgda_doorbell_proof_local_g0.sh |  70 ++++
+ .../run_ibgda_doorbell_stress_local_g0.sh     |  74 ++++
+ test/unit/run_oom_copy_engine_probe.sh        | 180 ++++++++++
+ 10 files changed, 1146 insertions(+), 5 deletions(-)
+ create mode 100644 test/unit/ibgda_doorbell_stress.cpp
+ create mode 100644 test/unit/oom_copy_engine_probe.cpp
+ create mode 100755 test/unit/oom_probe_wrapper.sh
+ create mode 100755 test/unit/run_ibgda_doorbell_proof_local_g0.sh
+ create mode 100755 test/unit/run_ibgda_doorbell_stress_local_g0.sh
+ create mode 100755 test/unit/run_oom_copy_engine_probe.sh
+
+diff --git a/src/ibgda.cpp b/src/ibgda.cpp
+index 12449eb4..9e2d85f5 100644
+--- a/src/ibgda.cpp
++++ b/src/ibgda.cpp
+@@ -5731,10 +5731,22 @@ int ishmemi_ibgda_init(bool gpu_enabled)
+      * issuing copies on a torn-down context, which floods the log with
+      * ZE_RESULT_ERROR_UNINITIALIZED / DEVICE_LOST and can hang process exit.
+      *
+-     * Only enable it when ISHMEM_IBGDA_STATS_DIR is explicitly set, so normal
+-     * runs finalize cleanly.  (Set the env to re-enable the dumper for
+-     * debugging.) */
+-    if (::getenv("ISHMEM_IBGDA_STATS_DIR") != nullptr) {
++     * Only enable it when ISHMEM_IBGDA_STATS_DIR is explicitly set to a
++     * NON-EMPTY value, so normal runs finalize cleanly.  (Set the env to a
++     * directory path to re-enable the dumper for debugging.)
++     *
++     * NOTE: the check MUST reject an empty string, not just NULL.  Launchers
++     * commonly forward the variable unconditionally (e.g. mpirun
++     * `-genv ISHMEM_IBGDA_STATS_DIR ""` / docker `-e ISHMEM_IBGDA_STATS_DIR=`),
++     * which makes getenv() return a non-NULL empty string.  Gating on
++     * `!= nullptr` alone would then wrongly enable the dumper and its
++     * never-joined 100ms copy thread, whose ishmemi_copy() calls race process
++     * teardown once Level Zero is uninitialised — flooding the log with
++     * ZE_RESULT_ERROR_UNINITIALIZED and leaving the NIC/QP + GPU in a wedged
++     * state that cascades into the next run. */
++    {
++    const char *stats_dir_env = ::getenv("ISHMEM_IBGDA_STATS_DIR");
++    if ((stats_dir_env != nullptr) && (stats_dir_env[0] != '\0')) {
+     static std::once_flag s_dump_once;
+     std::call_once(s_dump_once, []() {
+         static auto dump_fn = []() {
+@@ -5934,7 +5946,8 @@ int ishmemi_ibgda_init(bool gpu_enabled)
+             }
+         }).detach();
+     });
+-    }  /* end if (ISHMEM_IBGDA_STATS_DIR set) */
++    }  /* end if (ISHMEM_IBGDA_STATS_DIR set to non-empty) */
++    }  /* end stats_dir_env scope */
+ 
+     ishmemi_ibgda_free_direct_resources();
+     ishmemi_ibgda_close_ibverbs();
+diff --git a/src/ibgda_device_impl.h b/src/ibgda_device_impl.h
+index bb129c80..d387ff05 100644
+--- a/src/ibgda_device_impl.h
++++ b/src/ibgda_device_impl.h
+@@ -115,6 +115,32 @@ ishmemi_ibgda_device_peer_context_rr(ishmemi_ibgda_device_context_t *ctx, int pe
+ #endif
+ }
+ 
++/* Multi-QP AFFINITY selection (design-(b) subgroup-cooperative path).
++ *
++ * Deterministically maps a caller-supplied affinity id (e.g. the producing
++ * sub-group's global id) to a fixed QP for this PE.  Unlike the round-robin
++ * _rr selector, this keeps EVERY put from one ordered unit (a producer's
++ * payload stream + its completion flag) on the SAME RC QP, so in-order NIC
++ * delivery still guarantees "payload visible before flag".  Different
++ * producers hash to different QPs and run in parallel — this is what lets the
++ * cooperative publish (which serialises SND_DBR per QP) scale: racers-per-QP =
++ * producing-subgroups / num_qps_per_pe.  See ishmemi_ibgda_device_post_put_nbi_sub_group. */
++ISHMEM_DEVICE_ATTRIBUTES inline ishmemi_ibgda_peer_context_t *
++ishmemi_ibgda_device_peer_context_sg(ishmemi_ibgda_device_context_t *ctx, int pe,
++                                     uint32_t affinity_id)
++{
++#ifdef __SYCL_DEVICE_ONLY__
++    if (ctx == nullptr) return nullptr;
++    if ((pe < 0) || (static_cast<uint32_t>(pe) >= ctx->n_pes)) return nullptr;
++    uint32_t qp = (ctx->num_qps_per_pe <= 1u) ? 0u
++                                              : (affinity_id & (ctx->num_qps_per_pe - 1u));
++    return &ctx->peers[static_cast<uint32_t>(pe) * ctx->num_qps_per_pe + qp];
++#else
++    (void) pe; (void) affinity_id;
++    return nullptr;
++#endif
++}
++
+ ISHMEM_DEVICE_ATTRIBUTES inline bool ishmemi_ibgda_device_emit_staged_wqe(uint32_t opcode,
+                                                                            const void *local_addr,
+                                                                            const void *remote_addr,
+@@ -1678,6 +1704,213 @@ ISHMEM_DEVICE_ATTRIBUTES inline bool ishmemi_ibgda_device_post_get(void *dst, co
+ #endif
+ }
+ 
++/* ============================================================================
++ * Design (b): sub-group-cooperative aggregated WQE publish.
++ *
++ * Root cause it fixes: the scalar emit path has every producing work-item
++ * independently fetch_add its own SQ slot, write its WQE body, then write
++ * SND_DBR + ring the UAR with NO ordering vs. other producers.  The NIC treats
++ * SND_DBR as the authoritative producer index and DMA-fetches every WQE below
++ * it — so it can fetch a WQE whose body a sibling producer has not finished
++ * writing -> garbage rkey/addr -> illegal RDMA -> QP error -> DEVICE_LOST.
++ *
++ * The cooperative path makes ONE leader per (sub-group, QP) publish on behalf
++ * of all its lanes:
++ *   1. partition the sub-group by key = (pe, qp)  [lanes may target different PEs]
++ *   2. per key: leader does ONE aggregated fetch_add(total_chunks) -> base
++ *   3. every lane writes its own chunks' WQE bodies into distinct slots
++ *      [base+off, base+off+my_chunks)  (fully parallel, no shared slot)
++ *   4. sub-group barrier
++ *   5. leader publishes SND_DBR = base+total ONCE and rings the UAR ONCE,
++ *      gated by nic_wq_commit so SND_DBR stays MONOTONIC across the sub-groups
++ *      sharing this QP.
++ *
++ * Two properties make this SIMD-safe on Intel EU threads (unlike the removed
++ * post-loop spin protocol):
++ *   - A sub-group is ONE EU thread.  All lanes' WQE-body stores therefore come
++ *     from a single hardware thread, so the leader's system-release fence in
++ *     ring_doorbell orders ALL of them (its own and its mates') before SND_DBR
++ *     becomes externally visible to the NIC.
++ *   - The only spin (the commit gate) waits on an EXTERNAL cross-sub-group
++ *     counter, never on a sibling lane, so there is no intra-sub-group mutual
++ *     wait -> no reconvergence deadlock.
++ *
++ * INTEGRATION CONTRACT: for a QP driven by this path, ALL producers to that QP
++ * must go through this path (they all advance nic_wq_commit).  Mixing scalar
++ * post_put_nbi emits on the same QP would break the commit gate.  DeepEP LL
++ * routes its dispatch/combine payload+flag puts here on affinity QPs.
++ *
++ * OCCUPANCY CAVEAT: the commit gate assumes the sub-group holding
++ * commit==base is resident and will publish.  Confine a QP's producers to
++ * co-resident work-groups (or one work-group) — a grid-wide set of producers
++ * where some are not resident can starve the gate.
++ * ========================================================================== */
++
++/* Forward decl: the cooperative fallback path calls the scalar put, defined below. */
++ISHMEM_DEVICE_ATTRIBUTES inline bool ishmemi_ibgda_device_post_put_nbi(const void *src, void *dst,
++                                                                       size_t nbytes, int pe);
++
++/* Write a single mlx5 RDMA WQE body at a given SQ slot.  Does NOT fetch_add and
++ * does NOT touch the doorbell — publish is the caller's (leader's) job.  Body
++ * layout mirrors emit_direct_wqe_skeleton (32-bit-split addr math: Xe2 SIMD16
++ * 64-bit codegen bug). */
++ISHMEM_DEVICE_ATTRIBUTES inline void ishmemi_ibgda_device_write_wqe_body(
++    ishmemi_ibgda_device_context_t *ctx,
++    ishmemi_ibgda_peer_context_t *peer_ctx,
++    uint32_t opcode, uint32_t wqe_idx,
++    const void *local_addr, const void *remote_addr, size_t nbytes)
++{
++#ifdef __SYCL_DEVICE_ONLY__
++    const uint32_t num_wqebb = peer_ctx->nic_wq_slots;
++    volatile uint32_t *wqe = reinterpret_cast<volatile uint32_t *>(
++        peer_ctx->nic_wq_base_addr +
++        (static_cast<size_t>(wqe_idx & (num_wqebb - 1)) << 6));
++
++    const uint32_t nic_opcode = (opcode == ISHMEMI_IBGDA_WQE_OP_PUT) ? 0x8u : 0x10u;
++    constexpr uint32_t ds = 3u;
++
++    uint32_t remote_offset = static_cast<uint32_t>(
++        reinterpret_cast<uintptr_t>(remote_addr) - ctx->heap_base);
++    uint32_t rv_lo = static_cast<uint32_t>(peer_ctx->remote_vaddr & 0xFFFFFFFFu);
++    uint32_t rv_hi = static_cast<uint32_t>(peer_ctx->remote_vaddr >> 32u);
++    uint32_t raddr_lo = rv_lo + remote_offset;
++    uint32_t raddr_hi = rv_hi + ((raddr_lo < rv_lo) ? 1u : 0u);
++
++    uint32_t la_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(local_addr) & 0xFFFFFFFFu);
++    uint32_t la_hi = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(local_addr) >> 32u);
++
++    uint32_t wqe_ctr16 = (wqe_idx & 0xFFFFu);
++    wqe[0] = ishmemi_ibgda_htobe32((wqe_ctr16 << 8u) | nic_opcode);
++    wqe[1] = ishmemi_ibgda_htobe32(((peer_ctx->sq_num & 0xFFFFFFu) << 8u) | ds);
++    wqe[2] = ishmemi_ibgda_htobe32(0x08u); /* fm_ce_se: CQE on completion */
++    wqe[3] = 0;
++    wqe[4] = ishmemi_ibgda_htobe32(raddr_hi);
++    wqe[5] = ishmemi_ibgda_htobe32(raddr_lo);
++    wqe[6] = peer_ctx->rkey_be;
++    wqe[7] = 0;
++    wqe[8]  = ishmemi_ibgda_htobe32(static_cast<uint32_t>(nbytes));
++    wqe[9]  = peer_ctx->lkey_be;
++    wqe[10] = ishmemi_ibgda_htobe32(la_hi);
++    wqe[11] = ishmemi_ibgda_htobe32(la_lo);
++    wqe[12] = 0; wqe[13] = 0; wqe[14] = 0; wqe[15] = 0;
++#else
++    (void) ctx; (void) peer_ctx; (void) opcode; (void) wqe_idx;
++    (void) local_addr; (void) remote_addr; (void) nbytes;
++#endif
++}
++
++/* Cooperative NBI put.  ALL lanes of the sub-group must call this convergently;
++ * a lane with no work passes active=false (its src/dst/nbytes are ignored).
++ * affinity_id selects the QP (keep the same value for a producer's payload and
++ * its flag so they stay on one ordered QP).  Returns true on the emit path. */
++ISHMEM_DEVICE_ATTRIBUTES inline bool ishmemi_ibgda_device_post_put_nbi_sub_group(
++    const void *src, void *dst, size_t nbytes, int pe, bool active,
++    uint32_t affinity_id, const sycl::sub_group &sg)
++{
++#ifdef __SYCL_DEVICE_ONLY__
++    ishmemi_ibgda_device_context_t *ctx = ishmemi_ibgda_device_get_context();
++    if (ctx == nullptr) return false;
++
++    const bool can_direct = ishmemi_ibgda_device_can_direct_doorbell(ctx);
++    /* mlx5 direct-doorbell only in the cooperative path (bnxt uses scalar). */
++    if (!can_direct || ctx->nic_vendor == ISHMEMI_IBGDA_NIC_VENDOR_BNXT) {
++        /* Fallback: each active lane uses the proven scalar path. */
++        if (active && nbytes > 0)
++            return ishmemi_ibgda_device_post_put_nbi(src, dst, nbytes, pe);
++        return true;
++    }
++
++    constexpr size_t chunk_size = ISHMEMI_IBGDA_NBI_PUT_CHUNK_SIZE;
++    const uint32_t nqp = ctx->num_qps_per_pe;
++    uint32_t qp_idx = (nqp <= 1u) ? 0u : (affinity_id & (nqp - 1u));
++
++    /* Per-lane key + chunk count. */
++    bool     lane_active = active && (nbytes > 0);
++    uint32_t my_chunks   = lane_active
++        ? static_cast<uint32_t>((nbytes + chunk_size - 1) / chunk_size) : 0u;
++    if (my_chunks == 0u) lane_active = false;
++    int      key = lane_active ? (pe * static_cast<int>(nqp) + static_cast<int>(qp_idx)) : -1;
++
++    const uint32_t lane = sg.get_local_id()[0];
++    const uint32_t sz   = sg.get_local_range()[0];
++
++    bool todo = lane_active;
++    for (uint32_t iter = 0; iter < sz; ++iter) {
++        uint32_t any = sycl::reduce_over_group(sg, todo ? 1u : 0u, sycl::plus<uint32_t>());
++        if (any == 0u) break;
++
++        uint32_t rep = sycl::reduce_over_group(sg, todo ? lane : sz, sycl::minimum<uint32_t>());
++        int      k    = sycl::group_broadcast(sg, key, rep);
++        int      pe_k = sycl::group_broadcast(sg, pe,  rep);
++        uint32_t qp_k = sycl::group_broadcast(sg, qp_idx, rep);
++        ishmemi_ibgda_peer_context_t *peer_ctx =
++            ishmemi_ibgda_device_peer_context_qp(ctx, pe_k, qp_k);
++
++        bool same = todo && (key == k);
++        uint32_t cnt_lane = same ? my_chunks : 0u;
++        uint32_t off      = sycl::exclusive_scan_over_group(sg, cnt_lane, sycl::plus<uint32_t>());
++        uint32_t total_c  = sycl::reduce_over_group(sg, cnt_lane, sycl::plus<uint32_t>());
++        uint32_t leader_lane = sycl::reduce_over_group(sg, same ? lane : sz, sycl::minimum<uint32_t>());
++        bool leader = same && (lane == leader_lane);
++
++        uint32_t base = 0u;
++        if (leader && total_c > 0u && peer_ctx != nullptr) {
++            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
++                             sycl::access::address_space::global_space>
++                a(*reinterpret_cast<uint32_t *>(peer_ctx->nic_wq_cnt_addr));
++            base = a.fetch_add(total_c);
++        }
++        base = sycl::group_broadcast(sg, base, leader_lane);
++
++        /* Each same-key lane writes its own chunks' WQE bodies (distinct slots). */
++        if (same && peer_ctx != nullptr) {
++            size_t   offset = 0;
++            uint32_t widx   = base + off;
++            for (uint32_t c = 0; c < my_chunks; ++c) {
++                size_t this_chunk = nbytes - offset;
++                if (this_chunk > chunk_size) this_chunk = chunk_size;
++                const void *cl = reinterpret_cast<const void *>(
++                    reinterpret_cast<uintptr_t>(src) + offset);
++                void *cr = reinterpret_cast<void *>(
++                    reinterpret_cast<uintptr_t>(dst) + offset);
++                ishmemi_ibgda_device_write_wqe_body(ctx, peer_ctx, ISHMEMI_IBGDA_WQE_OP_PUT,
++                                                    widx, cl, cr, this_chunk);
++                offset += this_chunk;
++                ++widx;
++            }
++        }
++
++        sycl::group_barrier(sg);   /* all WQE bodies written before publish */
++
++        if (leader && total_c > 0u && peer_ctx != nullptr) {
++            uint32_t new_prod = base + total_c;
++            /* Commit gate: publish in claim order -> SND_DBR monotonic per QP.
++             * Waits on a cross-sub-group counter (distinct EU threads), never a
++             * sibling lane. */
++            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
++                             sycl::access::address_space::global_space>
++                commit(*reinterpret_cast<uint32_t *>(peer_ctx->nic_wq_commit_addr));
++            while (commit.load(sycl::memory_order::acquire) != base) { /* spin */ }
++
++            const uint32_t num_wqebb = peer_ctx->nic_wq_slots;
++            volatile uint32_t *last_wqe = reinterpret_cast<volatile uint32_t *>(
++                peer_ctx->nic_wq_base_addr +
++                (static_cast<size_t>((new_prod - 1u) & (num_wqebb - 1)) << 6));
++            ishmemi_ibgda_device_ring_doorbell(peer_ctx, last_wqe, new_prod);
++
++            commit.store(new_prod, sycl::memory_order::release);  /* release next leader */
++        }
++
++        todo = same ? false : todo;   /* retire handled lanes */
++    }
++    return true;
++#else
++    (void) src; (void) dst; (void) nbytes; (void) pe; (void) active;
++    (void) affinity_id; (void) sg;
++    return false;
++#endif
++}
++
+ ISHMEM_DEVICE_ATTRIBUTES inline bool ishmemi_ibgda_device_post_put_nbi(const void *src, void *dst,
+                                                                        size_t nbytes, int pe)
+ {
+diff --git a/src/ishmemx.h b/src/ishmemx.h
+index 8b0becfc..7a7c8f76 100644
+--- a/src/ishmemx.h
++++ b/src/ishmemx.h
+@@ -557,6 +557,12 @@ template <typename Group> ISHMEM_DEVICE_ATTRIBUTES void ishmemx_put64_nbi_work_g
+ template <typename Group> ISHMEM_DEVICE_ATTRIBUTES void ishmemx_put128_nbi_work_group(void *, const void *, size_t, int, const Group &);
+ template <typename Group> ISHMEM_DEVICE_ATTRIBUTES void ishmemx_putmem_nbi_work_group(void *, const void *, size_t, int, const Group &);
+ 
++/* putmem_nbi_sub_group (design-(b) cooperative aggregated publish).
++ * ALL lanes of the sub-group must call this convergently; a lane with no work
++ * passes active=false. affinity_id selects the QP (keep it equal for a
++ * producer's payload and its flag so they share one ordered RC QP). */
++ISHMEM_DEVICE_ATTRIBUTES void ishmemx_putmem_nbi_sub_group(void *dest, const void *src, size_t nbytes, int pe, bool active, unsigned int affinity_id, const sycl::sub_group &grp);
++
+ /* get_nbi_on_queue */
+ template <typename T> sycl::event ishmemx_get_nbi_on_queue(T *, const T *, size_t, int, sycl::queue &, const std::vector<sycl::event> & = {});
+ sycl::event ishmemx_float_get_nbi_on_queue(float *, const float *, size_t, int, sycl::queue &, const std::vector<sycl::event> & = {});
+diff --git a/src/nbi.cpp b/src/nbi.cpp
+index 6852c4a7..6f3949f3 100644
+--- a/src/nbi.cpp
++++ b/src/nbi.cpp
+@@ -64,6 +64,21 @@ void ishmemx_putmem_nbi_work_group(void *dest, const void *src, size_t nelems, i
+     ishmemx_internal_put_nbi_work_group((uint8_t *) dest, (uint8_t *) src, nelems, pe, grp);
+ }
+ 
++/* Cooperative NBI put (design-(b) sub-group aggregated publish). Thin export
++ * over the device emit; see ibgda_device_impl.h for the algorithm/contract. */
++void ishmemx_putmem_nbi_sub_group(void *dest, const void *src, size_t nbytes, int pe, bool active,
++                                  unsigned int affinity_id, const sycl::sub_group &grp)
++{
++#ifdef __SYCL_DEVICE_ONLY__
++    (void) ishmemi_ibgda_device_post_put_nbi_sub_group(src, dest, nbytes, pe, active,
++                                                       affinity_id, grp);
++#else
++    (void) dest; (void) src; (void) nbytes; (void) pe;
++    (void) active; (void) affinity_id; (void) grp;
++    RAISE_ERROR_MSG("ISHMEMX_PUTMEM_NBI_SUB_GROUP is not callable from host\n");
++#endif
++}
++
+ /* clang-format off */
+ #define ISHMEMI_API_IMPL_PUT_NBI(TYPENAME, TYPE)                                                                                                                  \
+     ISHMEM_INSTANTIATE_TYPE_##TYPENAME(TYPE);                                                                                                                     \
+diff --git a/test/unit/ibgda_doorbell_stress.cpp b/test/unit/ibgda_doorbell_stress.cpp
+new file mode 100644
+index 00000000..082f82fc
+--- /dev/null
++++ b/test/unit/ibgda_doorbell_stress.cpp
+@@ -0,0 +1,189 @@
++/* Copyright (C) 2026 Intel Corporation
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * ibgda_doorbell_stress.cpp
++ *
++ * Stress variant of ibgda_doorbell_proof.cpp.  Same faithful iSHMEM DEVX QP +
++ * GPU-VRAM SQ/DBR + igub-mapped UAR path (exactly what DeepEP exercises), but
++ * adds the two dimensions that the single-work-item proof test does NOT cover
++ * and that the identified LL root cause depends on:
++ *
++ *   1. CONCURRENT PRODUCERS.  DeepEP LL dispatch/combine issues RDMA puts from
++ *      MANY concurrent work-items; with ISHMEM_IBGDA_QPS_PER_PE=1 they all post
++ *      to the SAME peer QP and ring the SAME UAR doorbell.  This is where the
++ *      concurrent-producer doorbell race lives (a higher-index producer can
++ *      advance snd_dbr + ring the UAR before a lower-index producer published
++ *      its WQE -> NIC fetches a stale WQE -> illegal RDMA / DEVICE_LOST).
++ *   2. SCALE.  Larger N_PUTS / element counts / repeated kernels, to drive the
++ *      intermittent failure toward determinism (the whole point of the sweep).
++ *
++ * Env knobs (all optional):
++ *   ISHMEM_PROOF_NPUTS      total puts issued per kernel   (default 64)
++ *   ISHMEM_PROOF_ELEMS      ints per put                   (default 1)
++ *   ISHMEM_PROOF_WORKITEMS  concurrent work-items          (default 1 = serial)
++ *   ISHMEM_PROOF_KITERS     kernel repetitions             (default 1)
++ *
++ * Pass criteria (per PE, per final kernel):
++ *   - flags == 0x3f (direct-doorbell armed)
++ *   - stats_doorbell_writes advanced (GPU rang the UAR)
++ *   - dst[] holds the expected pattern from prev_pe (data delivered)
++ *
++ * Exit codes: 0 pass; 1 data-mismatch; 2 no doorbell advance; 3 not armed.
++ */
++
++#include <common.h>
++#include "ibgda.h"
++#include "ibgda_types.h"
++
++static int env_int(const char *name, int dflt)
++{
++    const char *v = getenv(name);
++    if (!v || !v[0]) return dflt;
++    int x = std::atoi(v);
++    return (x > 0) ? x : dflt;
++}
++
++int main(int /*argc*/, char ** /*argv*/)
++{
++    ishmem_init();
++    sycl::queue q;
++
++    const int my_pe = ishmem_my_pe();
++    const int npes  = ishmem_n_pes();
++
++    if (npes < 2) {
++        std::cout << "[PE " << my_pe << "] SKIP: need >= 2 PEs\n";
++        ishmem_finalize();
++        return 0;
++    }
++    const int next_pe = (my_pe + 1) % npes;
++    const int prev_pe = (my_pe + npes - 1) % npes;
++
++    const int N_PUTS    = env_int("ISHMEM_PROOF_NPUTS", 64);
++    const int ELEMS     = env_int("ISHMEM_PROOF_ELEMS", 1);
++    const int WORKITEMS = std::min(env_int("ISHMEM_PROOF_WORKITEMS", 1), N_PUTS);
++    const int KITERS    = env_int("ISHMEM_PROOF_KITERS", 1);
++    const int VEC       = N_PUTS * ELEMS;
++
++    if (my_pe == 0) {
++        std::cout << "[stress] N_PUTS=" << N_PUTS << " ELEMS=" << ELEMS
++                  << " WORKITEMS=" << WORKITEMS << " KITERS=" << KITERS << "\n";
++    }
++
++    ishmemi_ibgda_device_context_t *dctx = ishmemi_ibgda_device_context();
++    if (dctx == nullptr) {
++        std::cerr << "[PE " << my_pe << "] FAIL: ibgda_device_context()==nullptr\n";
++        ishmem_finalize();
++        return 3;
++    }
++
++    const uint32_t flags_before = dctx->flags;
++    const int direct_path_armed = (flags_before == 0x3f) ? 1 : 0;
++    std::cout << "[PE " << my_pe << "] flags=0x" << std::hex << flags_before
++              << std::dec << " (expected 0x3f)\n";
++
++    int *src = static_cast<int *>(ishmem_malloc(VEC * sizeof(int)));
++    int *dst = static_cast<int *>(ishmem_malloc(VEC * sizeof(int)));
++    CHECK_ALLOC(src);
++    CHECK_ALLOC(dst);
++
++    uint64_t dbs_before = dctx->stats_doorbell_writes;
++    int final_errors = 0;
++
++    for (int k = 0; k < KITERS; ++k) {
++        /* init src (my sentinel) + clear dst */
++        q.submit([&](sycl::handler &h) {
++             h.single_task([=]() {
++                 for (int i = 0; i < VEC; ++i) {
++                     src[i] = (my_pe << 20) | (k << 16) | (i & 0xFFFF);
++                     dst[i] = -1;
++                 }
++             });
++         }).wait_and_throw();
++        ishmem_barrier_all();
++
++        if (WORKITEMS <= 1) {
++            /* serial megakernel (identical to proof test) */
++            q.submit([&](sycl::handler &h) {
++                 h.single_task([=]() {
++                     for (int i = 0; i < N_PUTS; ++i)
++                         ishmem_int_put_nbi(&dst[i * ELEMS], &src[i * ELEMS],
++                                            ELEMS, next_pe);
++                     ishmem_quiet();
++                 });
++             }).wait_and_throw();
++        } else {
++            /* CONCURRENT producers: WORKITEMS work-items each issue a strided
++             * subset of the N_PUTS to the SAME next_pe (same QP). This is the
++             * concurrent-producer doorbell-race path. */
++            const int W = WORKITEMS;
++            q.submit([&](sycl::handler &h) {
++                 h.parallel_for(sycl::range<1>(W), [=](sycl::id<1> idx) {
++                     const int w = static_cast<int>(idx[0]);
++                     for (int i = w; i < N_PUTS; i += W)
++                         ishmem_int_put_nbi(&dst[i * ELEMS], &src[i * ELEMS],
++                                            ELEMS, next_pe);
++                 });
++             }).wait_and_throw();
++            /* single-work-item quiet to flush all outstanding puts */
++            q.submit([&](sycl::handler &h) {
++                 h.single_task([=]() { ishmem_quiet(); });
++             }).wait_and_throw();
++        }
++
++        ishmem_barrier_all();
++
++        /* validate this iteration's delivery */
++        int *dst_h = sycl::malloc_host<int>(VEC, q);
++        CHECK_ALLOC(dst_h);
++        q.memcpy(dst_h, dst, VEC * sizeof(int)).wait();
++        int n_errors = 0;
++        for (int i = 0; i < N_PUTS; ++i) {
++            for (int e = 0; e < ELEMS; ++e) {
++                const int off = i * ELEMS + e;
++                const int expect = (prev_pe << 20) | (k << 16) | (off & 0xFFFF);
++                if (dst_h[off] != expect) {
++                    if (n_errors < 4)
++                        std::cerr << "[PE " << my_pe << "] k=" << k << " dst["
++                                  << off << "]=0x" << std::hex << dst_h[off]
++                                  << " expect=0x" << expect << std::dec << "\n";
++                    ++n_errors;
++                }
++            }
++        }
++        sycl::free(dst_h, q);
++        final_errors += n_errors;
++        if (n_errors)
++            std::cerr << "[PE " << my_pe << "] k=" << k << " data errors="
++                      << n_errors << "/" << VEC << "\n";
++    }
++
++    const uint64_t dbs_delta = dctx->stats_doorbell_writes - dbs_before;
++    std::cout << "[PE " << my_pe << "] doorbells_delta=" << dbs_delta
++              << " (expected >= " << (uint64_t) N_PUTS * KITERS << ")\n";
++
++    int exit_code = 0;
++    if (!direct_path_armed) {
++        std::cerr << "[PE " << my_pe << "] FAIL(3): flags != 0x3f\n";
++        exit_code = 3;
++    } else if (dbs_delta < (uint64_t) N_PUTS * KITERS) {
++        std::cerr << "[PE " << my_pe << "] FAIL(2): doorbells_delta=" << dbs_delta
++                  << " < " << (uint64_t) N_PUTS * KITERS << "\n";
++        exit_code = 2;
++    } else if (final_errors != 0) {
++        std::cerr << "[PE " << my_pe << "] FAIL(1): " << final_errors
++                  << " total data errors across " << KITERS << " kernels\n";
++        exit_code = 1;
++    } else {
++        std::cout << "[PE " << my_pe << "] PASS: flags=0x3f, " << dbs_delta
++                  << " doorbells, all data delivered across " << KITERS
++                  << " kernels\n";
++    }
++
++    fflush(stdout);
++    fflush(stderr);
++    ishmem_free(src);
++    ishmem_free(dst);
++    ishmem_finalize();
++    return exit_code;
++}
+diff --git a/test/unit/oom_copy_engine_probe.cpp b/test/unit/oom_copy_engine_probe.cpp
+new file mode 100644
+index 00000000..981a6786
+--- /dev/null
++++ b/test/unit/oom_copy_engine_probe.cpp
+@@ -0,0 +1,321 @@
++/* Copyright (C) 2026 Intel Corporation
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * oom_copy_engine_probe.cpp
++ *
++ * STANDALONE iSHMEM-ONLY reproducer for the residual DeepEP-LL mid-test
++ * failure that surfaces as
++ *     RuntimeError: level_zero backend failed with error:
++ *                   39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
++ * inside buffer.low_latency_dispatch, even though the GPU has ~22.7 GiB free.
++ *
++ * Root-cause characterization (from the DeepEP investigation) that this UT
++ * tries to reproduce with iSHMEM alone (NO DeepEP, NO torch, NO python):
++ *   - The OOM is on the SMALL OUTPUT/scratch device allocations that
++ *     low_latency_dispatch makes with torch::empty (a few MB) BEFORE it
++ *     launches the IBGDA put kernel -> i.e. it is PRE-DOORBELL
++ *     (stats_post_put_nbi_calls==0, stats_doorbell_writes==0 at failure).
++ *   - dmesg at failure shows only benign copy-engine (bcs) resets +
++ *     "VM worker error: -16" (EBUSY); no ccs wedge, no lr_cleanup, no GT reset.
++ *   - It is a transiently-wedged copy(bcs) engine causing the L0 driver to
++ *     MISREPORT OOM for the first device-touch allocation.
++ *
++ * Reproduction strategy (mimics the LL-dispatch memory/engine pattern):
++ *   init IBGDA (igub UAR) + symmetric heap exactly like the LL path, then loop
++ *   ITERS times.  Each iteration reproduces one dispatch "shape":
++ *     1. (optional, DO_DOORBELL) comm-queue kernel that issues PUTS_PER_ITER
++ *        ishmem_int_put_nbi to the ring-next PE + in-kernel ishmem_quiet
++ *        (this is the doorbell/UAR + NIC activity DeepEP does), then a barrier.
++ *        With DO_DOORBELL=0 the put kernel is skipped so we prove the OOM is
++ *        PRE-doorbell (the failing alloc happens before any put in the real bug).
++ *     2. free the previous iteration's device allocations (allocator churn).
++ *     3. allocate a batch of NUM_ALLOCS SMALL sycl::malloc_device buffers
++ *        (ALLOC_BYTES each, default 256 KiB) on the SAME device/context and
++ *        CHECK EACH for OOM (sycl::exception errc::memory_allocation / UR 39 /
++ *        nullptr).  These stand in for packed_recv_x / scales / counts.
++ *     4. copy-engine (bcs) pressure: memset + a tiny compute kernel that writes
++ *        each buffer, then a D2H memcpy of a scalar back to host (== the
++ *        recv_count.item() D2H that first observes the wedge), plus H2D churn.
++ *   At the moment of any OOM we print: iteration, alloc index, FREE/TOTAL
++ *   device memory (proving memory was actually free), and the IBGDA stats
++ *   (post_put_nbi_calls / doorbell_writes / flags) proving pre-doorbell timing.
++ *
++ * NO ishmem_finalize() (matches DeepEP), so teardown effects are excluded.
++ *
++ * Controls (env vars):
++ *   ITERS          number of dispatch-shaped iterations           (default 50)
++ *   NUM_ALLOCS     small device allocs per iteration               (default 24)
++ *   ALLOC_BYTES    bytes per small device alloc                    (default 262144)
++ *   PUTS_PER_ITER  ishmem_int_put_nbi per comm kernel              (default 64)
++ *   DO_DOORBELL    1=run put+quiet comm kernel; 0=pre-doorbell only(default 1)
++ *   COPY_PRESSURE  1=interleave H2D/D2H memcpy to stress bcs       (default 1)
++ *   D2H_ITERS      extra D2H scalar reads per iteration            (default 8)
++ *   STOP_ON_OOM    1=stop loop at first OOM; 0=keep going          (default 1)
++ *   HEARTBEAT      print free-mem line every N iters               (default 1)
++ *
++ * Exit codes:
++ *   0  completed all iterations with NO OOM (did not reproduce)
++ *   39 reproduced the OUT_OF_DEVICE_MEMORY (matches the level_zero err code)
++ *   2  a different fatal device error (e.g. DEVICE_LOST) was observed
++ */
++
++#include <common.h>
++#include "ibgda.h"
++#include "ibgda_types.h"
++
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static long env_long(const char *name, long dflt)
++{
++    const char *v = std::getenv(name);
++    if (v == nullptr || v[0] == '\0') return dflt;
++    return std::strtol(v, nullptr, 0);
++}
++
++/* Best-effort free-VRAM query.  Requires ZES_ENABLE_SYSMAN=1; returns 0 on
++ * failure so the caller can note it was unavailable. */
++static size_t query_free_mem(sycl::device &dev)
++{
++    try {
++        return dev.get_info<sycl::ext::intel::info::device::free_memory>();
++    } catch (...) {
++        return 0;
++    }
++}
++
++static bool is_oom_exception(const sycl::exception &e)
++{
++    if (e.code() == sycl::errc::memory_allocation) return true;
++    const std::string w = e.what();
++    return (w.find("OUT_OF_DEVICE_MEMORY") != std::string::npos) ||
++           (w.find("error: 39") != std::string::npos) ||
++           (w.find("error 39") != std::string::npos);
++}
++
++int main()
++{
++    sycl::queue q;
++    ishmem_init();
++
++    const int my_pe = ishmem_my_pe();
++    const int npes  = ishmem_n_pes();
++    const int next_pe = (my_pe + 1) % npes;
++
++    const long iters        = env_long("ITERS", 50);
++    const long num_allocs   = env_long("NUM_ALLOCS", 24);
++    const size_t alloc_bytes= (size_t) env_long("ALLOC_BYTES", 262144);
++    const long puts_per_iter= env_long("PUTS_PER_ITER", 64);
++    const int  do_doorbell  = (int) env_long("DO_DOORBELL", 1);
++    const int  copy_pressure= (int) env_long("COPY_PRESSURE", 1);
++    const long d2h_iters    = env_long("D2H_ITERS", 8);
++    const int  stop_on_oom  = (int) env_long("STOP_ON_OOM", 1);
++    const long heartbeat    = env_long("HEARTBEAT", 1);
++    const int  overlap      = (int) env_long("OVERLAP_KERNEL", 0);
++    const long overlap_spin = env_long("OVERLAP_SPIN", 2000000);
++    (void) stop_on_oom;
++
++    sycl::device dev = q.get_device();
++    /* Optional 2nd in-order queue on the SAME device -> dual-stream contention
++     * like DeepEP's comm_stream vs compute_stream (an in-flight compute kernel
++     * overlapping the alloc + blitter copy traffic). */
++    sycl::queue q2(dev, sycl::property::queue::in_order());
++    const size_t total_mem = dev.get_info<sycl::info::device::global_mem_size>();
++
++    ishmemi_ibgda_device_context_t *dctx = ishmemi_ibgda_device_context();
++    const uint32_t flags0 = dctx ? dctx->flags : 0xDEADu;
++
++    std::fprintf(stderr,
++        "[pe=%d/%d] START oom_copy_engine_probe dev=%s total=%.2f GiB free0=%.2f GiB\n"
++        "          iters=%ld num_allocs=%ld alloc_bytes=%zu puts/iter=%ld "
++        "do_doorbell=%d copy_pressure=%d d2h_iters=%ld ibgda_flags=0x%x\n",
++        my_pe, npes, dev.get_info<sycl::info::device::name>().c_str(),
++        total_mem / (1024.0 * 1024.0 * 1024.0),
++        query_free_mem(dev) / (1024.0 * 1024.0 * 1024.0),
++        iters, num_allocs, alloc_bytes, puts_per_iter, do_doorbell,
++        copy_pressure, d2h_iters, flags0);
++    std::fflush(stderr);
++
++    /* Symmetric buffers for the comm (put) activity -- like the LL RDMA buf. */
++    const size_t sym_elems = (size_t) (puts_per_iter > 0 ? puts_per_iter : 1);
++    int *src = (int *) ishmem_malloc(sym_elems * sizeof(int));
++    int *dst = (int *) ishmem_malloc(sym_elems * sizeof(int));
++    CHECK_ALLOC(src);
++    CHECK_ALLOC(dst);
++    q.single_task([=]() {
++         for (size_t i = 0; i < sym_elems; i++) { src[i] = (int) i; dst[i] = -1; }
++     }).wait_and_throw();
++    ishmem_barrier_all();
++
++    /* host staging buffer for D2H/H2D churn (pinned) */
++    const size_t host_elems = alloc_bytes / sizeof(int);
++    int *host_stage = sycl::malloc_host<int>(host_elems ? host_elems : 1, q);
++    CHECK_ALLOC(host_stage);
++
++    std::vector<void *> prev_batch;
++    int exit_code = 0;
++    bool reproduced = false;
++
++    for (long it = 0; it < iters && !reproduced; ++it) {
++        /* ---- 1. comm-queue kernel: puts + quiet (doorbell/UAR + NIC) ---- */
++        if (do_doorbell && puts_per_iter > 0) {
++            try {
++                q.single_task([=]() {
++                     for (long i = 0; i < puts_per_iter; ++i)
++                         ishmem_int_put_nbi(&dst[i], &src[i], 1, next_pe);
++                     ishmem_quiet();
++                 }).wait_and_throw();
++            } catch (sycl::exception const &e) {
++                std::fprintf(stderr, "[pe=%d] iter=%ld COMM_KERNEL_EXC: %s\n",
++                             my_pe, it, e.what());
++                std::fflush(stderr);
++                exit_code = is_oom_exception(e) ? 39 : 2;
++                reproduced = true;
++                break;
++            }
++            ishmem_barrier_all();
++        }
++
++        /* ---- 2. free previous iteration's allocations (churn) ---- */
++        for (void *p : prev_batch)
++            if (p) sycl::free(p, q);
++        prev_batch.clear();
++
++        /* ---- 2b. OPTIONAL dual-stream contention: launch a long compute
++         *      kernel on q2 (NOT waited) so it overlaps the alloc + blitter
++         *      copy traffic below, mirroring DeepEP comm/compute stream overlap
++         *      and maximizing the chance of a bcs/ccs engine wedge. ---- */
++        int *spin_buf = nullptr;
++        if (overlap) {
++            try {
++                spin_buf = (int *) sycl::malloc_device(4096, q2);
++                if (spin_buf) {
++                    q2.parallel_for(sycl::range<1>(1024), [=](sycl::id<1> gid) {
++                        volatile long acc = 0;
++                        for (long s = 0; s < overlap_spin; ++s) acc += (s ^ gid[0]) & 0xff;
++                        spin_buf[gid[0] % 1024] = (int) acc;
++                    });
++                }
++            } catch (...) { spin_buf = nullptr; }
++        }
++
++        /* ---- 3. batch of SMALL device allocations, checked for OOM ---- */
++        std::vector<void *> batch;
++        batch.reserve(num_allocs);
++        for (long a = 0; a < num_allocs; ++a) {
++            void *p = nullptr;
++            try {
++                p = sycl::malloc_device(alloc_bytes, q);
++            } catch (sycl::exception const &e) {
++                size_t freem = query_free_mem(dev);
++                std::fprintf(stderr,
++                    "\n[pe=%d] *** OOM/EXC at iter=%ld alloc=%ld ***\n"
++                    "        exc: %s\n"
++                    "        alloc_bytes=%zu  FREE=%.3f GiB / TOTAL=%.3f GiB "
++                    "(so memory was %s exhausted)\n"
++                    "        IBGDA: flags=0x%x post_put_nbi_calls=%llu "
++                    "doorbell_writes=%llu  => %s\n",
++                    my_pe, it, a, e.what(), alloc_bytes,
++                    freem / (1024.0 * 1024.0 * 1024.0),
++                    total_mem / (1024.0 * 1024.0 * 1024.0),
++                    (freem > (size_t) alloc_bytes * 64) ? "NOT" : "possibly",
++                    dctx ? dctx->flags : 0xDEADu,
++                    (unsigned long long) (dctx ? dctx->stats_post_put_nbi_calls : 0),
++                    (unsigned long long) (dctx ? dctx->stats_doorbell_writes : 0),
++                    (dctx && dctx->stats_doorbell_writes == 0)
++                        ? "PRE-DOORBELL (matches DeepEP bug)"
++                        : "post-doorbell");
++                std::fflush(stderr);
++                exit_code = is_oom_exception(e) ? 39 : 2;
++                reproduced = true;
++                break;
++            }
++            if (p == nullptr) {
++                size_t freem = query_free_mem(dev);
++                std::fprintf(stderr,
++                    "\n[pe=%d] *** malloc_device RETURNED NULL at iter=%ld "
++                    "alloc=%ld FREE=%.3f GiB ***\n",
++                    my_pe, it, a, freem / (1024.0 * 1024.0 * 1024.0));
++                std::fflush(stderr);
++                exit_code = 39;
++                reproduced = true;
++                break;
++            }
++            batch.push_back(p);
++        }
++        if (reproduced) {
++            for (void *p : batch) if (p) sycl::free(p, q);
++            break;
++        }
++
++        /* ---- 4. copy-engine (bcs) pressure on the fresh allocations ---- */
++        try {
++            for (void *p : batch) {
++                /* memset the "output" (compute/copy engine) */
++                q.memset(p, 0, alloc_bytes);
++                if (copy_pressure) {
++                    /* H2D then D2H forces the blitter (bcs) copy engine */
++                    q.memcpy(p, host_stage, alloc_bytes);
++                    q.memcpy(host_stage, p, alloc_bytes);
++                }
++                /* tiny compute kernel writing the buffer (like a dispatch op) */
++                int *ip = (int *) p;
++                size_t n = alloc_bytes / sizeof(int);
++                q.parallel_for(sycl::range<1>(n),
++                               [=](sycl::id<1> i) { ip[i] = (int) (i[0] + it); });
++            }
++            /* scalar D2H reads: the "recv_count.item()" that first sees a wedge */
++            for (long d = 0; d < d2h_iters && !batch.empty(); ++d) {
++                int scalar = 0;
++                q.memcpy(&scalar, batch[d % batch.size()], sizeof(int)).wait();
++                (void) scalar;
++            }
++            q.wait_and_throw();
++            if (spin_buf) { q2.wait_and_throw(); sycl::free(spin_buf, q2); spin_buf = nullptr; }
++        } catch (sycl::exception const &e) {
++            size_t freem = query_free_mem(dev);
++            std::fprintf(stderr,
++                "\n[pe=%d] *** COPY/COMPUTE EXC at iter=%ld ***\n"
++                "        exc: %s\n        FREE=%.3f GiB / TOTAL=%.3f GiB  "
++                "IBGDA doorbell_writes=%llu\n",
++                my_pe, it, e.what(), freem / (1024.0 * 1024.0 * 1024.0),
++                total_mem / (1024.0 * 1024.0 * 1024.0),
++                (unsigned long long) (dctx ? dctx->stats_doorbell_writes : 0));
++            std::fflush(stderr);
++            for (void *p : batch) if (p) sycl::free(p, q);
++            exit_code = is_oom_exception(e) ? 39 : 2;
++            reproduced = true;
++            break;
++        }
++
++        prev_batch = batch;
++
++        if (heartbeat > 0 && (it % heartbeat) == 0) {
++            std::fprintf(stderr,
++                "[pe=%d] iter=%ld OK  free=%.3f GiB  db_writes=%llu\n",
++                my_pe, it, query_free_mem(dev) / (1024.0 * 1024.0 * 1024.0),
++                (unsigned long long) (dctx ? dctx->stats_doorbell_writes : 0));
++            std::fflush(stderr);
++        }
++    }
++
++    for (void *p : prev_batch) if (p) sycl::free(p, q);
++    sycl::free(host_stage, q);
++
++    if (reproduced) {
++        std::fprintf(stderr,
++            "[pe=%d] RESULT: REPRODUCED device error (exit=%d) — see above.\n",
++            my_pe, exit_code);
++    } else {
++        std::fprintf(stderr,
++            "[pe=%d] RESULT: completed %ld iters with NO OOM (did not reproduce). "
++            "free=%.3f GiB\n",
++            my_pe, iters, query_free_mem(dev) / (1024.0 * 1024.0 * 1024.0));
++    }
++    std::fprintf(stderr, "[pe=%d] DONE (no ishmem_finalize)\n", my_pe);
++    std::fflush(stderr);
++    return exit_code;
++}
+diff --git a/test/unit/oom_probe_wrapper.sh b/test/unit/oom_probe_wrapper.sh
+new file mode 100755
+index 00000000..64f49f9d
+--- /dev/null
++++ b/test/unit/oom_probe_wrapper.sh
+@@ -0,0 +1,40 @@
++#!/bin/bash
++# Copyright (C) 2026 Intel Corporation
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# Per-rank wrapper for oom_copy_engine_probe, run inside the deepep-ll-v2
++# 2-node docker sim (node0: GPUs 0,1 + mlx5_0,1 ; node1: GPUs 2,3 + mlx5_2,3).
++# Pins each MPI rank to a SINGLE GPU + its same-PCIe-switch NIC, mirroring the
++# DeepEP LL per-rank layout that reproduces the OOM.
++set -uo pipefail
++
++# SIM_NODE_RANK (0 or 1) is written to /run/deepep_node_env by the container
++# PID1 (docker-compose per-node `environment:`), because mpirun's SSH-launched
++# ranks do NOT inherit the compose env.
++if [ -f /run/deepep_node_env ]; then
++    set +u; source /run/deepep_node_env; set -u
++fi
++NODE_RANK=${SIM_NODE_RANK:-0}
++LOCAL_RANK=${MPI_LOCALRANKID:-0}
++
++# Absolute GPU index + matching NIC on THIS 4-GPU host.
++GPU=$(( NODE_RANK * 2 + LOCAL_RANK ))
++export ZE_AFFINITY_MASK=$GPU
++export ISHMEM_IBGDA_NIC=mlx5_${GPU}
++export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
++export ZES_ENABLE_SYSMAN=1          # enable free-VRAM query in the probe
++
++# In-image oneAPI (2025.3) only.
++if [ -f /opt/intel/oneapi/setvars.sh ]; then
++    set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
++fi
++
++export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}
++export LD_LIBRARY_PATH=${ISHMEM_DIR}/lib:${LD_LIBRARY_PATH:-}
++if [ -f /usr/lib/x86_64-linux-gnu/libhwloc.so ]; then
++    export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"
++fi
++
++echo "[$(hostname) node_rank=$NODE_RANK lr=$LOCAL_RANK] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK NIC=$ISHMEM_IBGDA_NIC" >&2
++ulimit -c unlimited
++exec "$@"
+diff --git a/test/unit/run_ibgda_doorbell_proof_local_g0.sh b/test/unit/run_ibgda_doorbell_proof_local_g0.sh
+new file mode 100755
+index 00000000..ee75bebd
+--- /dev/null
++++ b/test/unit/run_ibgda_doorbell_proof_local_g0.sh
+@@ -0,0 +1,70 @@
++#!/bin/bash
++# Copyright (C) 2026 Intel Corporation
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# Single-host faithful GPU-direct-doorbell reproducer for THIS 4-GPU box
++# (GPUs 0..3 = 0000:1f/23/42/46, NICs mlx5_0..3 = 0000:25:00.0/.1, 48:00.0/.1).
++# Same per-rank GPU/NIC pairing as tests/docker-2node-ll-v2 but in one host.
++#
++#   rank 0 -> GPU 0 (0000:1f:00.0) + mlx5_0 (0000:25:00.0)   [RC 0x1c]
++#   rank 1 -> GPU 1 (0000:23:00.0) + mlx5_1 (0000:25:00.1)   [RC 0x1c]
++#   rank 2 -> GPU 2 (0000:42:00.0) + mlx5_2 (0000:48:00.0)   [RC 0x3f]
++#   rank 3 -> GPU 3 (0000:46:00.0) + mlx5_3 (0000:48:00.1)   [RC 0x3f]
++#
++# Pass criteria per PE (from ibgda_doorbell_proof.cpp):
++#   - flags=0x3f (direct-doorbell path armed)
++#   - doorbells_delta >= N_PUTS (GPU actually issued doorbells)
++#   - data errors == 0
++#
++# Env overridable: NPES (default 4), DB_MODE, QPS_PER_PE, ISHMEM_DEBUG.
++
++set -e
++SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
++ISHMEM_BUILD=${ISHMEM_BUILD:-$SELF_DIR/../../build2026}
++BIN=$ISHMEM_BUILD/test/unit/ibgda_doorbell_proof
++
++if [ ! -x "$BIN" ]; then
++    echo "ERROR: $BIN not found.  Build first:"
++    echo "  cd $SELF_DIR/../..; cmake --build build2026 --target ibgda_doorbell_proof -j"
++    exit 2
++fi
++
++source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
++
++NPES=${NPES:-4}
++
++cat > /tmp/ibgda_proof_wrapper_g0.sh <<'WRAP'
++#!/bin/bash
++LR=${MPI_LOCALRANKID:-0}
++case "$LR" in
++    0) export ZE_AFFINITY_MASK=0 ; export ISHMEM_IBGDA_NIC=mlx5_0 ;;
++    1) export ZE_AFFINITY_MASK=1 ; export ISHMEM_IBGDA_NIC=mlx5_1 ;;
++    2) export ZE_AFFINITY_MASK=2 ; export ISHMEM_IBGDA_NIC=mlx5_2 ;;
++    3) export ZE_AFFINITY_MASK=3 ; export ISHMEM_IBGDA_NIC=mlx5_3 ;;
++esac
++export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
++echo "[lr=$LR] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK ISHMEM_IBGDA_NIC=$ISHMEM_IBGDA_NIC" >&2
++exec "$@"
++WRAP
++chmod +x /tmp/ibgda_proof_wrapper_g0.sh
++
++ISHMEM_DEBUG=${ISHMEM_DEBUG:-0}
++DB_MODE=${DB_MODE:-0}
++QPS_PER_PE=${QPS_PER_PE:-1}
++
++set -x
++timeout 120 mpiexec.hydra -n "$NPES" \
++    -genv ISHMEM_IB_ENABLE_IBGDA 1 \
++    -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
++    -genv ISHMEM_IBGDA_DB_MODE "$DB_MODE" \
++    -genv ISHMEM_ENABLE_GPU_IPC 0 \
++    -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
++    -genv ISHMEM_SYMMETRIC_SIZE 67108864 \
++    -genv ISHMEM_IBGDA_QPS_PER_PE "$QPS_PER_PE" \
++    -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
++    -genv ISHMEM_IBGDA_BAR_BACKEND igub \
++    -genv ISHMEM_DEBUG "$ISHMEM_DEBUG" \
++    -genv I_MPI_FABRICS shm \
++    -genv FI_PROVIDER tcp \
++    /tmp/ibgda_proof_wrapper_g0.sh \
++    "$BIN"
+diff --git a/test/unit/run_ibgda_doorbell_stress_local_g0.sh b/test/unit/run_ibgda_doorbell_stress_local_g0.sh
+new file mode 100755
+index 00000000..3be7fd75
+--- /dev/null
++++ b/test/unit/run_ibgda_doorbell_stress_local_g0.sh
+@@ -0,0 +1,74 @@
++#!/bin/bash
++# Copyright (C) 2026 Intel Corporation
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# Single-host faithful GPU-direct-doorbell reproducer for THIS 4-GPU box
++# (GPUs 0..3 = 0000:1f/23/42/46, NICs mlx5_0..3 = 0000:25:00.0/.1, 48:00.0/.1).
++# Same per-rank GPU/NIC pairing as tests/docker-2node-ll-v2 but in one host.
++#
++#   rank 0 -> GPU 0 (0000:1f:00.0) + mlx5_0 (0000:25:00.0)   [RC 0x1c]
++#   rank 1 -> GPU 1 (0000:23:00.0) + mlx5_1 (0000:25:00.1)   [RC 0x1c]
++#   rank 2 -> GPU 2 (0000:42:00.0) + mlx5_2 (0000:48:00.0)   [RC 0x3f]
++#   rank 3 -> GPU 3 (0000:46:00.0) + mlx5_3 (0000:48:00.1)   [RC 0x3f]
++#
++# Pass criteria per PE (from ibgda_doorbell_stress.cpp):
++#   - flags=0x3f (direct-doorbell path armed)
++#   - doorbells_delta >= N_PUTS (GPU actually issued doorbells)
++#   - data errors == 0
++#
++# Env overridable: NPES (default 4), DB_MODE, QPS_PER_PE, ISHMEM_DEBUG.
++
++set -e
++SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
++ISHMEM_BUILD=${ISHMEM_BUILD:-$SELF_DIR/../../build2026}
++BIN=$ISHMEM_BUILD/test/unit/ibgda_doorbell_stress
++
++if [ ! -x "$BIN" ]; then
++    echo "ERROR: $BIN not found.  Build first:"
++    echo "  cd $SELF_DIR/../..; cmake --build build2026 --target ibgda_doorbell_stress -j"
++    exit 2
++fi
++
++source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
++
++NPES=${NPES:-4}
++
++cat > /tmp/ibgda_stress_wrapper_g0.sh <<'WRAP'
++#!/bin/bash
++LR=${MPI_LOCALRANKID:-0}
++case "$LR" in
++    0) export ZE_AFFINITY_MASK=0 ; export ISHMEM_IBGDA_NIC=mlx5_0 ;;
++    1) export ZE_AFFINITY_MASK=1 ; export ISHMEM_IBGDA_NIC=mlx5_1 ;;
++    2) export ZE_AFFINITY_MASK=2 ; export ISHMEM_IBGDA_NIC=mlx5_2 ;;
++    3) export ZE_AFFINITY_MASK=3 ; export ISHMEM_IBGDA_NIC=mlx5_3 ;;
++esac
++export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
++echo "[lr=$LR] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK ISHMEM_IBGDA_NIC=$ISHMEM_IBGDA_NIC" >&2
++exec "$@"
++WRAP
++chmod +x /tmp/ibgda_stress_wrapper_g0.sh
++
++ISHMEM_DEBUG=${ISHMEM_DEBUG:-0}
++DB_MODE=${DB_MODE:-0}
++QPS_PER_PE=${QPS_PER_PE:-1}
++
++set -x
++timeout 120 mpiexec.hydra -n "$NPES" \
++    -genv ISHMEM_IB_ENABLE_IBGDA 1 \
++    -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
++    -genv ISHMEM_IBGDA_DB_MODE "$DB_MODE" \
++    -genv ISHMEM_ENABLE_GPU_IPC 0 \
++    -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
++    -genv ISHMEM_SYMMETRIC_SIZE 67108864 \
++    -genv ISHMEM_IBGDA_QPS_PER_PE "$QPS_PER_PE" \
++    -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
++    -genv ISHMEM_IBGDA_BAR_BACKEND igub \
++    -genv ISHMEM_PROOF_NPUTS "${ISHMEM_PROOF_NPUTS:-64}" \
++    -genv ISHMEM_PROOF_ELEMS "${ISHMEM_PROOF_ELEMS:-1}" \
++    -genv ISHMEM_PROOF_WORKITEMS "${ISHMEM_PROOF_WORKITEMS:-1}" \
++    -genv ISHMEM_PROOF_KITERS "${ISHMEM_PROOF_KITERS:-1}" \
++    -genv ISHMEM_DEBUG "$ISHMEM_DEBUG" \
++    -genv I_MPI_FABRICS shm \
++    -genv FI_PROVIDER tcp \
++    /tmp/ibgda_stress_wrapper_g0.sh \
++    "$BIN"
+diff --git a/test/unit/run_oom_copy_engine_probe.sh b/test/unit/run_oom_copy_engine_probe.sh
+new file mode 100755
+index 00000000..365f61e1
+--- /dev/null
++++ b/test/unit/run_oom_copy_engine_probe.sh
+@@ -0,0 +1,180 @@
++#!/bin/bash
++# Copyright (C) 2026 Intel Corporation
++# SPDX-License-Identifier: BSD-3-Clause
++#
++# run_oom_copy_engine_probe.sh
++#
++# Build + run the STANDALONE iSHMEM-only reproducer oom_copy_engine_probe across
++# the deepep-ll-v2 2-node docker sim (the SAME containers / GPUs / NICs that
++# reproduce the residual DeepEP-LL mid-test UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY,
++# err 39). No DeepEP, no torch, no python -- just iSHMEM + IBGDA + igub.
++#
++#   node0 (deepep-ll-v2-node0): GPUs 0,1 + mlx5_0,1
++#   node1 (deepep-ll-v2-node1): GPUs 2,3 + mlx5_2,3
++#   -> 2 nodes x 2 ranks = 4 PEs, each pinned 1 GPU + its NIC (2-PE also works
++#      via NRANKS=2 PPN=1).
++#
++# Usage:
++#   ./run_oom_copy_engine_probe.sh                 # build + 1 run (4 PEs)
++#   LOOPS=10 ./run_oom_copy_engine_probe.sh        # 10 warm back-to-back runs
++#   ITERS=200 NUM_ALLOCS=48 DO_DOORBELL=0 ./run_oom_copy_engine_probe.sh
++#   NOBUILD=1 ./run_oom_copy_engine_probe.sh       # skip the in-container build
++#
++# Env knobs forwarded to the probe (see oom_copy_engine_probe.cpp):
++#   ITERS NUM_ALLOCS ALLOC_BYTES PUTS_PER_ITER DO_DOORBELL COPY_PRESSURE
++#   D2H_ITERS STOP_ON_OOM HEARTBEAT
++set -uo pipefail
++
++SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ISHMEM_REPO="$(cd "$SELF_DIR/../.." && pwd)"                 # .../ishmem_ibgda
++LL_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/docker-2node-ll-v2"
++NODE0="deepep-ll-v2-node0"
++NODE1="deepep-ll-v2-node1"
++BIN="$ISHMEM_REPO/build/test/unit/oom_copy_engine_probe"
++WRAP="$ISHMEM_REPO/test/unit/oom_probe_wrapper.sh"
++ISHMEM_DIR="${ISHMEM_DIR:-$ISHMEM_REPO/build/_install}"
++
++NRANKS="${NRANKS:-4}"
++PPN="${PPN:-2}"
++TIMEOUT_SEC="${TIMEOUT_SEC:-180}"
++LOOPS="${LOOPS:-1}"
++
++# --- probe knobs (defaults chosen to mimic the LL dispatch shape) ---
++export ITERS="${ITERS:-80}"
++export NUM_ALLOCS="${NUM_ALLOCS:-32}"
++export ALLOC_BYTES="${ALLOC_BYTES:-262144}"
++export PUTS_PER_ITER="${PUTS_PER_ITER:-64}"
++export DO_DOORBELL="${DO_DOORBELL:-1}"
++export COPY_PRESSURE="${COPY_PRESSURE:-1}"
++export D2H_ITERS="${D2H_ITERS:-8}"
++export STOP_ON_OOM="${STOP_ON_OOM:-1}"
++export HEARTBEAT="${HEARTBEAT:-10}"
++export OVERLAP_KERNEL="${OVERLAP_KERNEL:-0}"
++export OVERLAP_SPIN="${OVERLAP_SPIN:-2000000}"
++ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}"
++
++# --- ensure containers are up (reuse the DeepEP LL harness compose) ---
++ensure_up() {
++    if docker ps --format '{{.Names}}' | grep -q "$NODE0" \
++       && docker ps --format '{{.Names}}' | grep -q "$NODE1"; then
++        install_ssh_config
++        return 0
++    fi
++    echo "===== bringing up deepep-ll-v2 containers via DeepEP LL compose ====="
++    ( cd "$LL_DIR" && ISHMEM_DIR="$ISHMEM_DIR" docker compose up -d ) 2>&1 | tail -3
++    sleep 5
++    install_ssh_config
++    for i in 1 2 3 4 5; do
++        if docker exec "$NODE0" ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
++              -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa "$NODE1" true 2>/dev/null; then
++            echo "Containers ready."
++            return 0
++        fi
++        sleep 2
++    done
++    echo "WARNING: node0->node1 SSH not confirmed ready (continuing)"
++}
++
++# The shared /tmp/deepep-docker-ssh dir may hold a config from the *normal* sim
++# (deepep-v2, ports 2320/2321). Regenerate it for THIS sim (ports 2330/2331) and
++# push it into the running containers (they only copy it at container start).
++install_ssh_config() {
++    local dir=/tmp/deepep-docker-ssh
++    mkdir -p "$dir"
++    [ -f "$dir/id_rsa" ] || ssh-keygen -t rsa -N "" -f "$dir/id_rsa" -q
++    cat > "$dir/config" <<EOF
++Host $NODE0
++    HostName 127.0.0.1
++    Port 2330
++    User root
++    IdentityFile /root/.ssh/id_rsa
++    StrictHostKeyChecking no
++    UserKnownHostsFile /dev/null
++Host $NODE1
++    HostName 127.0.0.1
++    Port 2331
++    User root
++    IdentityFile /root/.ssh/id_rsa
++    StrictHostKeyChecking no
++    UserKnownHostsFile /dev/null
++EOF
++    for c in "$NODE0" "$NODE1"; do
++        docker exec "$c" cp /tmp/ssh-keys/config /root/.ssh/config 2>/dev/null || true
++    done
++}
++
++build_probe() {
++    [ "${NOBUILD:-0}" = "1" ] && { echo "NOBUILD=1: skip build"; return 0; }
++    echo "===== building oom_copy_engine_probe inside $NODE0 (oneAPI 2025.3) ====="
++    docker exec "$NODE0" bash -lc "
++        set -e
++        source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
++        cd $ISHMEM_REPO/build
++        cmake .. -DBUILD_UNIT_TESTS=ON >/tmp/oom_probe_cmake.log 2>&1
++        cmake --build . --target oom_copy_engine_probe -j\$(nproc) 2>&1 | tail -15
++        test -x $BIN && echo 'BUILD_OK' || { echo 'BUILD_FAILED'; tail -30 /tmp/oom_probe_cmake.log; exit 3; }
++    "
++}
++
++run_once() {
++    local tag="$1"
++    docker exec "$NODE0" chmod +x "$WRAP" 2>/dev/null || true
++    set +e
++    docker exec \
++        -e ITERS="$ITERS" -e NUM_ALLOCS="$NUM_ALLOCS" -e ALLOC_BYTES="$ALLOC_BYTES" \
++        -e PUTS_PER_ITER="$PUTS_PER_ITER" -e DO_DOORBELL="$DO_DOORBELL" \
++        -e COPY_PRESSURE="$COPY_PRESSURE" -e D2H_ITERS="$D2H_ITERS" \
++        -e STOP_ON_OOM="$STOP_ON_OOM" -e HEARTBEAT="$HEARTBEAT" \
++        -e ISHMEM_DEBUG="$ISHMEM_DEBUG" \
++        "$NODE0" bash -lc "
++            source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
++            export ISHMEM_DIR=$ISHMEM_DIR
++            export LD_LIBRARY_PATH=\$ISHMEM_DIR/lib:\${LD_LIBRARY_PATH:-}
++            timeout $TIMEOUT_SEC mpirun \
++                -n $NRANKS -ppn $PPN \
++                -hosts $NODE0,$NODE1 \
++                -genv ISHMEM_IB_ENABLE_IBGDA 1 \
++                -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
++                -genv ISHMEM_ENABLE_GPU_IPC 0 \
++                -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
++                -genv ISHMEM_SYMMETRIC_SIZE 268435456 \
++                -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
++                -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
++                -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
++                -genv ISHMEM_IBGDA_BAR_BACKEND igub \
++                -genv I_MPI_FABRICS shm:ofi \
++                -genv FI_PROVIDER tcp \
++                -genv ISHMEM_DIR $ISHMEM_DIR \
++                -genv ISHMEM_DEBUG $ISHMEM_DEBUG \
++                -genv ITERS $ITERS -genv NUM_ALLOCS $NUM_ALLOCS \
++                -genv ALLOC_BYTES $ALLOC_BYTES -genv PUTS_PER_ITER $PUTS_PER_ITER \
++                -genv DO_DOORBELL $DO_DOORBELL -genv COPY_PRESSURE $COPY_PRESSURE \
++                -genv D2H_ITERS $D2H_ITERS -genv STOP_ON_OOM $STOP_ON_OOM \
++                -genv HEARTBEAT $HEARTBEAT -genv OVERLAP_KERNEL $OVERLAP_KERNEL -genv OVERLAP_SPIN $OVERLAP_SPIN -genv ZES_ENABLE_SYSMAN 1 \
++                -launcher ssh \
++                -bootstrap-exec-args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_rsa' \
++                $WRAP $BIN
++        "
++    local rc=$?
++    set -e
++    echo "===== $tag rc=$rc ====="
++    return $rc
++}
++
++ensure_up
++build_probe
++
++rm -f /dev/shm/sem.psm3* /dev/shm/psm3_* /dev/shm/sem.ishmem* /dev/shm/*ishmem* /tmp/deep_ep_xpu_ipc_*.sock 2>/dev/null || true
++
++pass=0; oom=0; other=0
++for l in $(seq 1 "$LOOPS"); do
++    run_once "LOOP $l/$LOOPS"
++    rc=$?
++    if   [ $rc -eq 0  ]; then pass=$((pass+1))
++    elif [ $rc -eq 39 ]; then oom=$((oom+1))
++    else other=$((other+1)); fi
++    sleep 2
++done
++echo ""
++echo "===== SUMMARY: $LOOPS runs -> no-repro(pass)=$pass  OOM(39)=$oom  other=$other ====="
++[ $oom -gt 0 ] && exit 39 || exit 0
+-- 
+2.43.0
+
