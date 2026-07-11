@@ -1,0 +1,91 @@
+pe=1
+ibgda_state.enabled=1
+ibgda_state.direct_doorbell_enabled=1
+device_ctx_addr=0x7a67f6403000
+device_ctx.flags=0x3f
+device_ctx.nic_uar_addr=0xffff81ffff800800
+stats_post_put_nbi_calls=18300
+stats_doorbell_writes=18300
+db_mode=0 stats_cq_completed=0 stats_cq_target=0
+stats_direct_hit=0
+stats_staged_hit=0
+direct_inflight=0
+n_pes=4 num_qps_per_pe=1
+heap_base=0xffff81ab62e00000
+wqe_log: 64 entries (head=18300 cap=64)
+  log[0]: pe=3 wqe_idx=5379 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a60f00 laddr=0xffff81ab638a0a80
+  log[1]: pe=3 wqe_idx=5380 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a70f00 laddr=0xffff81ab638b0a80
+  log[2]: pe=3 wqe_idx=5381 opcode=0x8 nbytes=12288 raddr=0xffff81ab63a80f00 laddr=0xffff81ab638c0a80
+  log[3]: pe=0 wqe_idx=6578 opcode=0x8 nbytes=4 raddr=0xffff8156b8b89a04 laddr=0xffff81ab63909e80
+  log[4]: pe=0 wqe_idx=6579 opcode=0x8 nbytes=20 raddr=0xffff8156b8b89680 laddr=0xffff81ab63909a80
+  log[5]: pe=0 wqe_idx=6580 opcode=0x8 nbytes=65536 raddr=0xffff8156b8879600 laddr=0xffff81ab63589a80
+  log[6]: pe=0 wqe_idx=6581 opcode=0x8 nbytes=6144 raddr=0xffff8156b8889600 laddr=0xffff81ab63599a80
+  log[7]: pe=0 wqe_idx=6582 opcode=0x8 nbytes=4 raddr=0xffff8156b8b89a14 laddr=0xffff81ab63909e84
+  log[8]: pe=0 wqe_idx=6583 opcode=0x8 nbytes=32 raddr=0xffff8156b8b89880 laddr=0xffff81ab63909b00
+  log[9]: pe=0 wqe_idx=6584 opcode=0x8 nbytes=65536 raddr=0xffff8156b8a39600 laddr=0xffff81ab635f9a80
+  log[10]: pe=0 wqe_idx=6585 opcode=0x8 nbytes=49152 raddr=0xffff8156b8a49600 laddr=0xffff81ab63609a80
+  log[11]: pe=2 wqe_idx=6279 opcode=0x8 nbytes=4 raddr=0xffff8156b8b89a04 laddr=0xffff81ab63909e90
+  log[12]: pe=2 wqe_idx=6280 opcode=0x8 nbytes=36 raddr=0xffff8156b8b89680 laddr=0xffff81ab63909c80
+  log[13]: pe=2 wqe_idx=6281 opcode=0x8 nbytes=65536 raddr=0xffff8156b8879600 laddr=0xffff81ab63749a80
+  log[14]: pe=2 wqe_idx=6282 opcode=0x8 nbytes=63488 raddr=0xffff8156b8889600 laddr=0xffff81ab63759a80
+  log[15]: pe=2 wqe_idx=6283 opcode=0x8 nbytes=4 raddr=0xffff8156b8b89a14 laddr=0xffff81ab63909e94
+  log[16]: pe=2 wqe_idx=6284 opcode=0x8 nbytes=28 raddr=0xffff8156b8b89880 laddr=0xffff81ab63909d00
+  log[17]: pe=2 wqe_idx=6285 opcode=0x8 nbytes=65536 raddr=0xffff8156b8a39600 laddr=0xffff81ab637b9a80
+  log[18]: pe=2 wqe_idx=6286 opcode=0x8 nbytes=34816 raddr=0xffff8156b8a49600 laddr=0xffff81ab637c9a80
+  log[19]: pe=3 wqe_idx=5382 opcode=0x8 nbytes=4 raddr=0xffff81ab63589a04 laddr=0xffff81ab63909e98
+  log[20]: pe=3 wqe_idx=5383 opcode=0x8 nbytes=40 raddr=0xffff81ab63589680 laddr=0xffff81ab63909d80
+  log[21]: pe=3 wqe_idx=5384 opcode=0x8 nbytes=65536 raddr=0xffff81ab63279600 laddr=0xffff81ab63829a80
+  log[22]: pe=3 wqe_idx=5385 opcode=0x8 nbytes=65536 raddr=0xffff81ab63289600 laddr=0xffff81ab63839a80
+  log[23]: pe=3 wqe_idx=5386 opcode=0x8 nbytes=12288 raddr=0xffff81ab63299600 laddr=0xffff81ab63849a80
+  log[24]: pe=3 wqe_idx=5387 opcode=0x8 nbytes=4 raddr=0xffff81ab63589a14 laddr=0xffff81ab63909e9c
+  log[25]: pe=3 wqe_idx=5388 opcode=0x8 nbytes=32 raddr=0xffff81ab63589880 laddr=0xffff81ab63909e00
+  log[26]: pe=3 wqe_idx=5389 opcode=0x8 nbytes=65536 raddr=0xffff81ab63439600 laddr=0xffff81ab63899a80
+  log[27]: pe=3 wqe_idx=5390 opcode=0x8 nbytes=49152 raddr=0xffff81ab63449600 laddr=0xffff81ab638a9a80
+  log[28]: pe=0 wqe_idx=6586 opcode=0x8 nbytes=65536 raddr=0xffff8156b8ff0f00 laddr=0xffff81ab63590a80
+  log[29]: pe=0 wqe_idx=6587 opcode=0x8 nbytes=65536 raddr=0xffff8156b9000f00 laddr=0xffff81ab635a0a80
+  log[30]: pe=0 wqe_idx=6588 opcode=0x8 nbytes=65536 raddr=0xffff8156b9010f00 laddr=0xffff81ab635b0a80
+  log[31]: pe=0 wqe_idx=6589 opcode=0x8 nbytes=65536 raddr=0xffff8156b9020f00 laddr=0xffff81ab635c0a80
+  log[32]: pe=0 wqe_idx=6590 opcode=0x8 nbytes=65536 raddr=0xffff8156b9030f00 laddr=0xffff81ab635d0a80
+  log[33]: pe=0 wqe_idx=6591 opcode=0x8 nbytes=65536 raddr=0xffff8156b9040f00 laddr=0xffff81ab635e0a80
+  log[34]: pe=0 wqe_idx=6592 opcode=0x8 nbytes=22528 raddr=0xffff8156b9050f00 laddr=0xffff81ab635f0a80
+  log[35]: pe=0 wqe_idx=6593 opcode=0x8 nbytes=65536 raddr=0xffff8156b9064700 laddr=0xffff81ab63604280
+  log[36]: pe=0 wqe_idx=6594 opcode=0x8 nbytes=65536 raddr=0xffff8156b9074700 laddr=0xffff81ab63614280
+  log[37]: pe=0 wqe_idx=6595 opcode=0x8 nbytes=65536 raddr=0xffff8156b9084700 laddr=0xffff81ab63624280
+  log[38]: pe=0 wqe_idx=6596 opcode=0x8 nbytes=65536 raddr=0xffff8156b9094700 laddr=0xffff81ab63634280
+  log[39]: pe=0 wqe_idx=6597 opcode=0x8 nbytes=65536 raddr=0xffff8156b90a4700 laddr=0xffff81ab63644280
+  log[40]: pe=0 wqe_idx=6598 opcode=0x8 nbytes=65536 raddr=0xffff8156b90b4700 laddr=0xffff81ab63654280
+  log[41]: pe=0 wqe_idx=6599 opcode=0x8 nbytes=8192 raddr=0xffff8156b90c4700 laddr=0xffff81ab63664280
+  log[42]: pe=2 wqe_idx=6287 opcode=0x8 nbytes=65536 raddr=0xffff8156b8fed700 laddr=0xffff81ab6374d280
+  log[43]: pe=2 wqe_idx=6288 opcode=0x8 nbytes=65536 raddr=0xffff8156b8ffd700 laddr=0xffff81ab6375d280
+  log[44]: pe=2 wqe_idx=6289 opcode=0x8 nbytes=65536 raddr=0xffff8156b900d700 laddr=0xffff81ab6376d280
+  log[45]: pe=2 wqe_idx=6290 opcode=0x8 nbytes=65536 raddr=0xffff8156b901d700 laddr=0xffff81ab6377d280
+  log[46]: pe=2 wqe_idx=6291 opcode=0x8 nbytes=65536 raddr=0xffff8156b902d700 laddr=0xffff81ab6378d280
+  log[47]: pe=2 wqe_idx=6292 opcode=0x8 nbytes=2048 raddr=0xffff8156b903d700 laddr=0xffff81ab6379d280
+  log[48]: pe=2 wqe_idx=6293 opcode=0x8 nbytes=65536 raddr=0xffff8156b9059f00 laddr=0xffff81ab637b9a80
+  log[49]: pe=2 wqe_idx=6294 opcode=0x8 nbytes=65536 raddr=0xffff8156b9069f00 laddr=0xffff81ab637c9a80
+  log[50]: pe=2 wqe_idx=6295 opcode=0x8 nbytes=65536 raddr=0xffff8156b9079f00 laddr=0xffff81ab637d9a80
+  log[51]: pe=2 wqe_idx=6296 opcode=0x8 nbytes=65536 raddr=0xffff8156b9089f00 laddr=0xffff81ab637e9a80
+  log[52]: pe=2 wqe_idx=6297 opcode=0x8 nbytes=65536 raddr=0xffff8156b9099f00 laddr=0xffff81ab637f9a80
+  log[53]: pe=2 wqe_idx=6298 opcode=0x8 nbytes=65536 raddr=0xffff8156b90a9f00 laddr=0xffff81ab63809a80
+  log[54]: pe=2 wqe_idx=6299 opcode=0x8 nbytes=8192 raddr=0xffff8156b90b9f00 laddr=0xffff81ab63819a80
+  log[55]: pe=3 wqe_idx=5391 opcode=0x8 nbytes=65536 raddr=0xffff81ab639fb700 laddr=0xffff81ab6383b280
+  log[56]: pe=3 wqe_idx=5392 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a0b700 laddr=0xffff81ab6384b280
+  log[57]: pe=3 wqe_idx=5393 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a1b700 laddr=0xffff81ab6385b280
+  log[58]: pe=3 wqe_idx=5394 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a2b700 laddr=0xffff81ab6386b280
+  log[59]: pe=3 wqe_idx=5395 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a3b700 laddr=0xffff81ab6387b280
+  log[60]: pe=3 wqe_idx=5396 opcode=0x8 nbytes=59392 raddr=0xffff81ab63a4b700 laddr=0xffff81ab6388b280
+  log[61]: pe=3 wqe_idx=5397 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a60f00 laddr=0xffff81ab638a0a80
+  log[62]: pe=3 wqe_idx=5398 opcode=0x8 nbytes=65536 raddr=0xffff81ab63a70f00 laddr=0xffff81ab638b0a80
+  log[63]: pe=3 wqe_idx=5399 opcode=0x8 nbytes=12288 raddr=0xffff81ab63a80f00 laddr=0xffff81ab638c0a80
+peer[0]: lkey=0x4aca8 rkey=0xf7ba sq_num=0x81a wq_slots=16384 num_cqe=256 uar=0xffff81ffff800800 wq_base=0xffff81569e390000 cq_buf=0xffff81569e370000 remote_vaddr=0xffff8156b8400000 last_wqe_idx=0 last_opcode=0 last_prod=0
+  cq_copy_failed
+  wq_copy_failed
+peer[1]: lkey=0x4aca8 rkey=0x4aca8 sq_num=0x81b wq_slots=16384 num_cqe=256 uar=0xffff81ffff600a00 wq_base=0xffff81569e260000 cq_buf=0xffff81569e240000 remote_vaddr=0xffff81ab62e00000 last_wqe_idx=0 last_opcode=0 last_prod=0
+  cq_copy_failed
+  wq_copy_failed
+peer[2]: lkey=0x4aca8 rkey=0xf7b5 sq_num=0x81c wq_slots=16384 num_cqe=256 uar=0xffff81ffff400800 wq_base=0xffff81569e130000 cq_buf=0xffff81569e110000 remote_vaddr=0xffff8156b8400000 last_wqe_idx=0 last_opcode=0 last_prod=0
+  cq_copy_failed
+  wq_copy_failed
+peer[3]: lkey=0x4aca8 rkey=0x4b7b5 sq_num=0x81d wq_slots=16384 num_cqe=256 uar=0xffff81ffff200a00 wq_base=0xffff81569e000000 cq_buf=0xffff81569dfe0000 remote_vaddr=0xffff81ab62e00000 last_wqe_idx=0 last_opcode=0 last_prod=0
+  cq_copy_failed
+  wq_copy_failed

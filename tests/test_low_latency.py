@@ -413,71 +413,101 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                  seed=seed) == ref_hash, f'Error: seed={seed}'
         completed = True
     finally:
-        if completed and is_xpu_direct_doorbell_run():
+        if is_xpu_direct_doorbell_run():
             # CRITICAL (XPU LL lifecycle): drain all in-flight GPU work (long-running
-            # IBGDA poll/quiet exec queues) + outbound RDMA BEFORE the hard os._exit,
+            # IBGDA poll/quiet exec queues) + outbound RDMA BEFORE the process exits,
             # otherwise the GuC cannot preempt the still-submitted long-running exec
             # queue at process teardown ("Schedule disable failed to respond" ->
             # xe_guc_exec_queue_lr_cleanup -> GT reset), wedging the NEXT process's
             # first GPU submission (Buffer ctor memset) -> init hang / DEVICE_LOST.
+            #
+            # This drain MUST run on FAILURE too, not just on success: a failed run
+            # (soft data-mismatch, poll-cap "0 tokens", or a caught exception on a
+            # still-healthy GPU) that skips the drain leaves the long-running exec
+            # queue submitted -> GT reset -> the *next* run inherits a wedged GT and
+            # hard-DEVICE_LOSTs. That is precisely the "one failure cascades into the
+            # following runs" amplifier. Draining here converts an isolated soft
+            # failure into an isolated soft failure (no cascade). It is best-effort:
+            # if the GPU is already DEVICE_LOST the stream syncs simply throw and are
+            # swallowed, and quiesce() is already watchdog-guarded internally.
             if os.getenv('DEEP_EP_LL_QUIESCE', '1') != '0':
                 try:
-                    torch.xpu.synchronize()
+                    try:
+                        torch.xpu.synchronize()
+                    except Exception as e:
+                        print(f'[rank {rank}] quiesce: torch.xpu.synchronize raised {e}', flush=True)
+                    print(f'[rank {rank}] quiesce: draining GPU/NIC before exit '
+                          f'(completed={completed}) ...', flush=True)
+                    buffer.quiesce()
+                    print(f'[rank {rank}] quiesce: done', flush=True)
                 except Exception as e:
-                    print(f'[rank {rank}] quiesce: torch.xpu.synchronize raised {e}', flush=True)
-                print(f'[rank {rank}] quiesce: draining GPU/NIC before exit ...', flush=True)
-                buffer.quiesce()
-                print(f'[rank {rank}] quiesce: done', flush=True)
-            # Default teardown mode = 2 (minimal orderly): quiesce (drain the
-            # long-running IBGDA exec queue) + stop the iSHMEM host proxy, then
-            # destroy_process_group + MPI_Finalize + NORMAL process exit so
-            # libze runs zeCommandQueueDestroy/zeContextDestroy in order. This
-            # ELIMINATES the LL init-hang (rc=124 in Buffer ctor memset) that the
-            # old os._exit(0) fast-teardown (mode 0) caused by leaving the LR exec
-            # queue's GuC registration pending -> next same-affinity submission
-            # never signals. See csrc/xpu/deep_ep_xpu.cpp quiesce()/stop_proxy().
-            _orderly = os.getenv('DEEP_EP_LL_ORDERLY_EXIT', '2')
-            if _orderly == '0':
-                finalize_mpi_and_exit()
-            elif _orderly == '2':
-                # MINIMAL orderly teardown: skip buffer.destroy()/dist.barrier()
-                # (which re-activate the iSHMEM host proxy + XCCL collectives and
-                # race the Level-Zero context destroy -> UNINITIALIZED copy errors
-                # + teardown GT reset). Just close the process group, MPI_Finalize,
-                # and let normal interpreter shutdown run libze's static destructors
-                # (zeCommandQueueDestroy/zeContextDestroy) so the next process's
-                # same-affinity exec queue does not collide -> no init hang.
-                print(f'[rank {rank}] orderly-exit(min): destroy_pg + MPI_Finalize + normal exit', flush=True)
-                try:
-                    dist.destroy_process_group()
-                except Exception as e:
-                    print(f'[rank {rank}] orderly-exit(min): destroy_pg raised {e}', flush=True)
-                # Settle: let the iSHMEM host proxy thread drain any in-flight device
-                # copy requests and go idle *before* the interpreter's libze static
-                # destructors tear down the Level-Zero context. Without this window
-                # the proxy can be mid-zeCommandListAppendMemoryCopy when the context
-                # is destroyed -> ishmemi_copy ZE_RESULT_ERROR_UNINITIALIZED storm ->
-                # teardown GT reset. quiesce() already idled the GPU/NIC; this just
-                # widens the gap so the proxy is provably idle at context destroy.
-                try:
-                    _settle = float(os.getenv('DEEP_EP_LL_EXIT_SETTLE_SEC', '0'))
-                except Exception:
-                    _settle = 2.0
-                if _settle > 0:
-                    time.sleep(_settle)
-                try:
-                    libmpi = ctypes.CDLL('libmpi.so')
-                    initialized = ctypes.c_int(); finalized = ctypes.c_int()
-                    libmpi.MPI_Initialized(ctypes.byref(initialized))
-                    libmpi.MPI_Finalized(ctypes.byref(finalized))
-                    if initialized.value and not finalized.value:
-                        libmpi.MPI_Finalize()
-                except Exception as e:
-                    print(f'[rank {rank}] orderly-exit(min): MPI_Finalize raised {e}', flush=True)
-                return
+                    print(f'[rank {rank}] quiesce: raised {e} (continuing teardown)', flush=True)
+            # The orderly-EXIT handling below returns / exits 0 and would mask a
+            # test failure, so it only runs when the test actually completed. On
+            # FAILURE we have already drained the GPU/NIC above (breaking the
+            # cascade); we then fall through so the original exception propagates
+            # and the run is correctly reported as failed (non-zero exit). Normal
+            # interpreter shutdown still runs libze's static destructors in order.
+            if not completed:
+                print(f'[rank {rank}] teardown: run FAILED; GPU/NIC drained, '
+                      f'propagating failure without orderly-exit masking.', flush=True)
+                # GPU/NIC already drained above (breaking the cascade). Do NOT call
+                # buffer.destroy()/dist.barrier() -- on a wedged/DEVICE_LOST device
+                # those can hang (rc=124) and mask the real failure. Re-raise the
+                # original exception for a clean non-zero exit; normal interpreter
+                # shutdown still runs libze's static destructors in order.
+                raise
             else:
-                # Full orderly teardown: buffer.destroy() + dist teardown then exit.
-                print(f'[rank {rank}] orderly-exit: destroy() + dist teardown ...', flush=True)
+                # Default teardown mode = 2 (minimal orderly): quiesce (drain the
+                # long-running IBGDA exec queue) + stop the iSHMEM host proxy, then
+                # destroy_process_group + MPI_Finalize + NORMAL process exit so
+                # libze runs zeCommandQueueDestroy/zeContextDestroy in order. This
+                # ELIMINATES the LL init-hang (rc=124 in Buffer ctor memset) that the
+                # old os._exit(0) fast-teardown (mode 0) caused by leaving the LR exec
+                # queue's GuC registration pending -> next same-affinity submission
+                # never signals. See csrc/xpu/deep_ep_xpu.cpp quiesce()/stop_proxy().
+                _orderly = os.getenv('DEEP_EP_LL_ORDERLY_EXIT', '2')
+                if _orderly == '0':
+                    finalize_mpi_and_exit()
+                elif _orderly == '2':
+                    # MINIMAL orderly teardown: skip buffer.destroy()/dist.barrier()
+                    # (which re-activate the iSHMEM host proxy + XCCL collectives and
+                    # race the Level-Zero context destroy -> UNINITIALIZED copy errors
+                    # + teardown GT reset). Just close the process group, MPI_Finalize,
+                    # and let normal interpreter shutdown run libze's static destructors
+                    # (zeCommandQueueDestroy/zeContextDestroy) so the next process's
+                    # same-affinity exec queue does not collide -> no init hang.
+                    print(f'[rank {rank}] orderly-exit(min): destroy_pg + MPI_Finalize + normal exit', flush=True)
+                    try:
+                        dist.destroy_process_group()
+                    except Exception as e:
+                        print(f'[rank {rank}] orderly-exit(min): destroy_pg raised {e}', flush=True)
+                    # Settle: let the iSHMEM host proxy thread drain any in-flight device
+                    # copy requests and go idle *before* the interpreter's libze static
+                    # destructors tear down the Level-Zero context. Without this window
+                    # the proxy can be mid-zeCommandListAppendMemoryCopy when the context
+                    # is destroyed -> ishmemi_copy ZE_RESULT_ERROR_UNINITIALIZED storm ->
+                    # teardown GT reset. quiesce() already idled the GPU/NIC; this just
+                    # widens the gap so the proxy is provably idle at context destroy.
+                    try:
+                        _settle = float(os.getenv('DEEP_EP_LL_EXIT_SETTLE_SEC', '0'))
+                    except Exception:
+                        _settle = 2.0
+                    if _settle > 0:
+                        time.sleep(_settle)
+                    try:
+                        libmpi = ctypes.CDLL('libmpi.so')
+                        initialized = ctypes.c_int(); finalized = ctypes.c_int()
+                        libmpi.MPI_Initialized(ctypes.byref(initialized))
+                        libmpi.MPI_Finalized(ctypes.byref(finalized))
+                        if initialized.value and not finalized.value:
+                            libmpi.MPI_Finalize()
+                    except Exception as e:
+                        print(f'[rank {rank}] orderly-exit(min): MPI_Finalize raised {e}', flush=True)
+                    return
+                else:
+                    # Full orderly teardown: buffer.destroy() + dist teardown then exit.
+                    print(f'[rank {rank}] orderly-exit: destroy() + dist teardown ...', flush=True)
         # Destroy the buffer runtime and communication group
         buffer.destroy()
         dist.barrier()

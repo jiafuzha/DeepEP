@@ -1,0 +1,21 @@
+run1: PASS resets=0 avg_t=1169.82 us
+run2: PASS resets=0 avg_t=1172.22 us
+run3: PASS resets=0 avg_t=1242.26 us
+run4: PASS resets=0 avg_t=1171.62 us
+run5: PASS resets=0 avg_t=1169.91 us
+run6: PASS resets=0 avg_t=1333.14 us
+run7: PASS resets=0 avg_t=1166.66 us
+run8: PASS resets=0 avg_t=1292.91 us
+run9: PASS resets=0 avg_t=1168.94 us
+run10: PASS resets=0 avg_t=1170.28 us
+run11: PASS resets=0 avg_t=1175.57 us
+run12: PASS resets=0 avg_t=1176.45 us
+run13: PASS resets=0 avg_t=1184.15 us
+run14: PASS resets=0 avg_t=1172.30 us
+run15: PASS resets=0 avg_t=1322.49 us
+run16: PASS resets=0 avg_t=1169.87 us
+run17: PASS resets=0 avg_t=1236.47 us
+run18: PASS resets=0 avg_t=1165.39 us
+run19: PASS resets=0 avg_t=1175.11 us
+run20: PASS resets=0 avg_t=1177.52 us
+=== TOTAL: PASS=20 FAIL=0 / 20 ===

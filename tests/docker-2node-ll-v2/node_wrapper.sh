@@ -62,5 +62,51 @@ export MASTER_ADDR=${MASTER_ADDR:-deepep-ll-v2-node0}
 
 echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-unset} IFACE=${FI_VERBS_IFACE:-unset}" >&2
 
+# --- FAULT-MODE VM (root-cause fix for the LL DEVICE_LOST) ------------------
+# ROOT CAUSE (proven by DEBUG xe CONFIG_DRM_XE_DEBUG_VM + clean A/B):
+#   The DeepEP process VM is a preempt-fence (long-running) VM because IBGDA
+#   runs a persistent long-running poll/quiet exec queue on it. Any BO
+#   bind/rebind/eviction/migration on that VM during the run triggers xe's
+#   preempt_rebind_work_func, which must SUSPEND the busy-spinning IBGDA LR
+#   queue and migrate BOs via the bcs copy engine. Under contention that
+#   returns -16 (EBUSY) -> xe calls xe_vm_kill(vm) -> resets ALL exec queues on
+#   the VM (incl. bcs) -> "engine_class=bcs" reset -> UR_RESULT_ERROR_DEVICE_LOST.
+# FIX: run the DeepEP XPU process on a FAULT-MODE VM (recoverable page faults).
+#   Fault-mode binds pages on demand via the pagefault handler and NEVER runs a
+#   preempt-rebind (never suspends the LR IBGDA queue) -> the kill can't happen.
+#   Verified 100% pass (8/8 no-reset; OFF/ON/OFF/ON clean-reset A/B all flip) at
+#   FULL performance (~1171 us @ H7168, == the good baseline). This is standard
+#   GPU on-demand paging (NOT a CPU proxy). Opt out with DEEP_EP_XPU_FAULT_MODE=0.
+if [ "${DEEP_EP_XPU_FAULT_MODE:-1}" != "0" ]; then
+    export NEOReadDebugKeys=1
+    export EnableRecoverablePageFaults=1
+fi
+
+# --- L0/UR/NEO debug instrumentation (Stage 1, no rebuild) ---
+# Enabled by touching .l0debug in this dir (bind-mounted, visible in both
+# containers). Captures the exact failing ze/UR call + faulting VA per rank.
+_DBGDIR=/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/docker-2node-ll-v2
+if [ -f "${_DBGDIR}/.l0debug" ]; then
+    # Light, low-overhead instrumentation so the timing race still reproduces.
+    # NEO prints the faulting VA/context on a GPU page fault instead of an opaque
+    # DEVICE_LOST; recoverable faults keep the context alive long enough to report.
+    export NEOReadDebugKeys=1
+    export PrintDebugMessages=1
+    if [ -f "${_DBGDIR}/.no_recoverable" ]; then
+        export EnableRecoverablePageFaults=0
+    else
+        export EnableRecoverablePageFaults=1
+    fi
+    export PrintDeviceAndDriverInfo=0
+    export ZE_ENABLE_VALIDATION_LAYER="${DEEP_EP_L0_VALLAYER:-0}"
+    export ZE_ENABLE_PARAMETER_VALIDATION="${DEEP_EP_L0_VALLAYER:-0}"
+    [ -n "${DEEP_EP_L0_URTRACE:-}" ] && export UR_L0_DEBUG=-1 && export ZE_DEBUG=4
+    _GR=${PMI_RANK:-${RANK:-0}}_${LOCAL_RANK}
+    mkdir -p "${_DBGDIR}/debuglogs" 2>/dev/null || true
+    echo "[node_wrapper] L0 DEBUG ENABLED, rank=$_GR -> debuglogs/l0_${_GR}.log" >&2
+    ulimit -c unlimited
+    exec "$@" 2> >(tee "${_DBGDIR}/debuglogs/l0_${_GR}.log" >&2)
+fi
+
 ulimit -c unlimited
 exec "$@"
