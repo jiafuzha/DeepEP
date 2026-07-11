@@ -1,0 +1,15 @@
+# AUTO-LOADED by `docker compose up` (no -f used in run.sh).
+# Re-adds the patched-NEO (UC-honoring) libze_intel_gpu.so over the container's
+# stock distro build, to pair with the patched xe.ko (NEEDS_UC / force-UC on P2P
+# MMIO import) for the true-UC UAR A/B of design-(b).
+#
+# This is the mount that was REMOVED on 2026-07-08. It is ONLY correct when the
+# host is booted into the PATCHED xe (xe.ko.zst.PATCHED-NEEDS_UC). On stock xe,
+# DELETE this file (or `mv` it aside) to run the stock-kernel config.
+services:
+  node0:
+    volumes:
+      - /root/jiafuzha/code-repo/neo-build/compute-runtime/build/bin/libze_intel_gpu.so.1.14.36300:/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.36300:ro
+  node1:
+    volumes:
+      - /root/jiafuzha/code-repo/neo-build/compute-runtime/build/bin/libze_intel_gpu.so.1.14.36300:/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.36300:ro

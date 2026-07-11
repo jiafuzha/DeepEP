@@ -391,14 +391,18 @@ run_test() {
         -e ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}" \
         -e ISHMEM_DIR="$ISHMEM_DIR" \
         -e ISHMEM_IBGDA_DB_MODE="${ISHMEM_IBGDA_DB_MODE:-0}" \
+        -e ISHMEM_IBGDA_QPS_PER_PE="${ISHMEM_IBGDA_QPS_PER_PE:-1}" \
+        -e ISHMEM_IBGDA_DB_BATCH_SIZE="${ISHMEM_IBGDA_DB_BATCH_SIZE:-0}" \
         -e ISHMEM_IBGDA_STATS_DIR="${ISHMEM_IBGDA_STATS_DIR:-}" \
         -e DEEP_EP_TEST_DEBUG="${DEEP_EP_TEST_DEBUG:-0}" \
+        -e DEEP_EP_SYNC_DBG="${DEEP_EP_SYNC_DBG:-0}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
         -e DEEP_EP_SKIP_WARMUP="${DEEP_EP_SKIP_WARMUP:-}" \
         -e DEEP_EP_LL_QUIESCE="${DEEP_EP_LL_QUIESCE:-1}" \
         -e DEEP_EP_LL_ORDERLY_EXIT="${DEEP_EP_LL_ORDERLY_EXIT:-2}" \
+        -e DEEP_EP_XPU_FAULT_MODE="${DEEP_EP_XPU_FAULT_MODE:-1}" \
         -e DEEP_EP_LL_PERSIST_BUFFERS="${DEEP_EP_LL_PERSIST_BUFFERS:-}" \
         -e DEEP_EP_LL_ALLOC_RETRIES="${DEEP_EP_LL_ALLOC_RETRIES:-}" \
         -e REPRO_COMBINE_PERSIST="${REPRO_COMBINE_PERSIST:-}" \
@@ -423,13 +427,13 @@ run_test() {
                 -n $TOTAL_RANKS -ppn $NUM_PROCESSES \
                 -hosts $NODE0_CONTAINER,$NODE1_CONTAINER \
                 -genv ISHMEM_IB_ENABLE_IBGDA 1 \
-                -genv ISHMEM_IBGDA_DIRECT_DOORBELL 1 \
+                -genv ISHMEM_IBGDA_DIRECT_DOORBELL ${ISHMEM_IBGDA_DIRECT_DOORBELL:-1} \
                 -genv ISHMEM_ENABLE_GPU_IPC 0 \
                 -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
-                -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
-                -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+                -genv ISHMEM_IBGDA_QPS_PER_PE ${ISHMEM_IBGDA_QPS_PER_PE:-1} \
+                -genv ISHMEM_IBGDA_DB_BATCH_SIZE ${ISHMEM_IBGDA_DB_BATCH_SIZE:-0} \
                 -genv ISHMEM_IBGDA_DB_MODE \"\${ISHMEM_IBGDA_DB_MODE:-0}\" \
                 -genv ISHMEM_IBGDA_STATS_DIR \"\${ISHMEM_IBGDA_STATS_DIR:-}\" \
                 -genv REPRO_MODE \"\${REPRO_MODE:-}\" \
@@ -443,6 +447,7 @@ run_test() {
                 -genv EMPTY_CACHE_EVERY \"\${EMPTY_CACHE_EVERY:-}\" \
                 -genv GUARD_ALLOC \"\${GUARD_ALLOC:-}\" \
                 -genv DEEP_EP_TEST_DEBUG \"\${DEEP_EP_TEST_DEBUG:-0}\" \
+                -genv DEEP_EP_SYNC_DBG \"\${DEEP_EP_SYNC_DBG:-0}\" \
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
                 -genv FI_PROVIDER tcp \
@@ -463,6 +468,8 @@ run_test() {
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
                 -genv DEEP_EP_LL_FLAG_RECV_ACQ \"\${DEEP_EP_LL_FLAG_RECV_ACQ:-1}\" \
                 -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-1000000}\" \
+                -genv DEEP_EP_LL_COOP_PUT \"\${DEEP_EP_LL_COOP_PUT:-1}\" \
+                -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \

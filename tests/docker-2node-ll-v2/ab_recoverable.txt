@@ -1,0 +1,4 @@
+recoverable=OFF -> FAIL (dmesg_resets=4)
+recoverable=ON -> PASS (dmesg_resets=0)
+recoverable=OFF -> FAIL (dmesg_resets=3)
+recoverable=ON -> PASS (dmesg_resets=0)
