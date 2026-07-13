@@ -73,5 +73,16 @@ export MASTER_ADDR=${MASTER_ADDR:-deepep-v2-node0}
 
 echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-unset} NIC=$ISHMEM_IBGDA_NIC IFACE=${FI_VERBS_IFACE:-unset}" >&2
 
+# --- FAULT-MODE VM (root-cause fix for the internode DEVICE_LOST) -----------
+# Run the DeepEP XPU process on a FAULT-MODE VM (recoverable page faults) so the
+# IBGDA long-running poll/quiet queue never triggers a preempt-rebind that can
+# EBUSY -> xe_vm_kill -> engine reset -> UR_RESULT_ERROR_DEVICE_LOST. Fault-mode
+# binds pages on demand via the pagefault handler and never suspends the LR
+# queue. Opt out with DEEP_EP_XPU_FAULT_MODE=0. (Mirrors docker-2node-ll-v2.)
+if [ "${DEEP_EP_XPU_FAULT_MODE:-1}" != "0" ]; then
+    export NEOReadDebugKeys=1
+    export EnableRecoverablePageFaults=1
+fi
+
 ulimit -c unlimited
 exec "$@"
