@@ -1,0 +1,83 @@
+# Compose topology for simulating two RDMA-capable XPU nodes on one host.
+#
+# Usage:
+#   1. python3 scripts/pcie_topology.py discover-env --output .env.compose
+#   2. docker compose --env-file .env.compose -f docker-compose.yml up -d --build
+#   3. scripts/run_pytorch_distributed.sh
+#
+# Host networking is intentional here: it keeps the physical RDMA interfaces
+# visible inside both containers, which is required for verbs/RDMA CM on the
+# shared host while still letting us split the visible XPUs and HCAs per node.
+
+x-node-common: &node-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ${IMAGE_NAME:-deepep_jiafuzha}
+  privileged: true
+  network_mode: host
+  cap_add:
+    - IPC_LOCK
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  shm_size: ${SHM_SIZE:-32g}
+  working_dir: /root/jiafuzha
+  volumes:
+    - ${WORKSPACE_ROOT:-/root/jiafuzha}:/root/jiafuzha
+    - /sys/bus/pci/devices:/sys/bus/pci/devices:ro
+    - /sys/class/drm:/sys/class/drm:ro
+    - /sys/class/infiniband:/sys/class/infiniband:ro
+  devices:
+    - /dev/dri:/dev/dri
+    - /dev/infiniband:/dev/infiniband
+  environment: &common-env
+    no_proxy: ${NO_PROXY:-localhost,127.0.0.1}
+    http_proxy: ${http_proxy:-}
+    https_proxy: ${https_proxy:-}
+    MASTER_ADDR: ${MASTER_ADDR:-127.0.0.1}
+    MASTER_PORT: ${MASTER_PORT:-29500}
+    NNODES: ${NNODES:-2}
+    NPROC_PER_NODE: ${NPROC_PER_NODE:-4}
+    EXPECTED_RENDER_PER_NODE: ${EXPECTED_RENDER_PER_NODE:-4}
+    EXPECTED_MLX5_PER_NODE: ${EXPECTED_MLX5_PER_NODE:-4}
+    TORCH_BACKEND: ${TORCH_BACKEND:-ccl}
+    DIST_SCRIPT: ${DIST_SCRIPT:-/root/jiafuzha/docker/scripts/pytorch_collectives.py}
+    CCL_ATL_TRANSPORT: ${CCL_ATL_TRANSPORT:-ofi}
+    CCL_LOG_LEVEL: ${CCL_LOG_LEVEL:-info}
+    FI_PROVIDER: ${FI_PROVIDER:-verbs;ofi_rxm}
+    FI_LOG_LEVEL: ${FI_LOG_LEVEL:-warn}
+    TORCH_CPP_LOG_LEVEL: ${TORCH_CPP_LOG_LEVEL:-INFO}
+  command: >
+    bash -lc '/root/jiafuzha/docker/scripts/container_preflight.sh &&
+              exec sleep infinity'
+
+services:
+  node0:
+    <<: *node-common
+    container_name: ${NODE0_CONTAINER_NAME:-sim-node0}
+    hostname: ${NODE0_HOSTNAME:-sim-node0}
+    environment:
+      <<: *common-env
+      SIM_NODE_NAME: ${NODE0_HOSTNAME:-sim-node0}
+      SIM_NODE_RANK: "0"
+      XPU_RENDER_NODES: ${NODE0_RENDER_NODES:-}
+      ZE_AFFINITY_MASK: ${NODE0_ZE_AFFINITY_MASK:-}
+      RDMA_MLX5_HCAS: ${NODE0_MLX5_HCAS:-}
+      UCX_NET_DEVICES: ${NODE0_UCX_NET_DEVICES:-}
+      EXPECTED_PCIE_SWITCH: ${NODE0_SWITCH_ANCHOR:-}
+
+  node1:
+    <<: *node-common
+    container_name: ${NODE1_CONTAINER_NAME:-sim-node1}
+    hostname: ${NODE1_HOSTNAME:-sim-node1}
+    environment:
+      <<: *common-env
+      SIM_NODE_NAME: ${NODE1_HOSTNAME:-sim-node1}
+      SIM_NODE_RANK: "1"
+      XPU_RENDER_NODES: ${NODE1_RENDER_NODES:-}
+      ZE_AFFINITY_MASK: ${NODE1_ZE_AFFINITY_MASK:-}
+      RDMA_MLX5_HCAS: ${NODE1_MLX5_HCAS:-}
+      UCX_NET_DEVICES: ${NODE1_UCX_NET_DEVICES:-}
+      EXPECTED_PCIE_SWITCH: ${NODE1_SWITCH_ANCHOR:-}

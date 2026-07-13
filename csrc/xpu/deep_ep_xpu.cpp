@@ -1464,10 +1464,9 @@ struct Buffer {
         pybind11::gil_scoped_release release;
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
         TORCH_CHECK(!low_latency_mode, "XPU internode_dispatch requires a high-throughput buffer, not a low-latency buffer");
-        const bool nvl_only_mode = num_nvl_bytes > 0 && num_rdma_ranks == 1;
         const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
-        TORCH_CHECK(nvl_only_mode || combined_nvl_rdma_mode || (num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr),
-                    "XPU internode_dispatch requires an iSHMEM RDMA buffer, NVL-only, or combined NVL+RDMA mode");
+        TORCH_CHECK(combined_nvl_rdma_mode || (num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr),
+                    "XPU internode_dispatch requires an iSHMEM RDMA buffer or combined NVL+RDMA mode");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat8_e4m3fn,
                     "XPU internode_dispatch currently supports BF16 and FP8 tensors only");
         TORCH_CHECK(x_scales.has_value() == (x.scalar_type() == torch::kFloat8_e4m3fn),
@@ -1557,7 +1556,7 @@ struct Buffer {
             : std::optional<torch::Tensor>(torch::empty({num_ranks, num_channels}, int_options));
         auto send_rdma_head = cached_mode
             ? std::optional<torch::Tensor>()
-            : std::optional<torch::Tensor>(torch::empty({num_tokens, nvl_only_mode ? num_ranks : num_rdma_ranks}, int_options));
+            : std::optional<torch::Tensor>(torch::empty({num_tokens, num_rdma_ranks}, int_options));
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty(
@@ -1570,43 +1569,7 @@ struct Buffer {
             comm_stream.queue().memcpy(recv_x.data_ptr(), x.data_ptr(), copy_rows * hidden * x.element_size());
         }
 
-        if (nvl_only_mode) {
-            TORCH_CHECK(!cached_mode, "NVL-only internode dispatch does not support cached mode yet");
-            internode::dispatch_nvl(recv_x.data_ptr(),
-                                    recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
-                                    recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                    recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
-                                    recv_src_meta->data_ptr(),
-                                    x.data_ptr(),
-                                    x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
-                                    topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                    topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
-                                    send_rdma_head->data_ptr<int>(),
-                                    send_nvl_head->data_ptr<int>(),
-                                    recv_rdma_channel_prefix_matrix->data_ptr<int>(),
-                                    recv_gbl_channel_prefix_matrix->data_ptr<int>(),
-                                    rdma_channel_prefix_matrix.data_ptr<int>(),
-                                    recv_rdma_rank_prefix_sum.data_ptr<int>(),
-                                    gbl_channel_prefix_matrix.data_ptr<int>(),
-                                    recv_gbl_rank_prefix_sum.data_ptr<int>(),
-                                    num_tokens_per_rank->data_ptr<int>(),
-                                    is_token_in_rank.data_ptr<bool>(),
-                                    num_tokens,
-                                    num_recv_tokens,
-                                    hidden,
-                                    static_cast<int>(x.element_size()),
-                                    num_topk,
-                                    num_scales,
-                                    num_channels,
-                                    buffer_ptrs_gpu,
-                                    barrier_signal_ptrs_gpu,
-                                    nvl_rank,
-                                    num_nvl_ranks,
-                                    reserve_barrier_signals(2),
-                                    rank,
-                                    num_ranks,
-                                    comm_stream.queue());
-        } else if (combined_nvl_rdma_mode) {
+        if (combined_nvl_rdma_mode) {
             internode::dispatch_nvl_rdma(recv_x.data_ptr(),
                                          recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
                                          recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
@@ -1804,37 +1767,9 @@ struct Buffer {
         }
 
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
-        const bool nvl_only_mode = num_nvl_bytes > 0 && num_rdma_ranks == 1;
         const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
 
-        if (nvl_only_mode) {
-            internode::combine_nvl(scalar_type_to_data_type(x.scalar_type()),
-                                   combined_x.data_ptr(),
-                                   combined_topk_weights_ptr,
-                                   is_combined_token_in_rank.data_ptr<bool>(),
-                                   x.data_ptr(),
-                                   topk_weights_ptr,
-                                   bias_ptrs[0],
-                                   bias_ptrs[1],
-                                   combined_rdma_head.data_ptr<int>(),
-                                   combined_nvl_head.data_ptr<int>(),
-                                   src_meta.data_ptr(),
-                                   rdma_channel_prefix_matrix.data_ptr<int>(),
-                                   rdma_rank_prefix_sum.data_ptr<int>(),
-                                   gbl_channel_prefix_matrix.data_ptr<int>(),
-                                   num_tokens,
-                                   num_combined_tokens,
-                                   hidden,
-                                   num_topk,
-                                   buffer_ptrs_gpu,
-                                   barrier_signal_ptrs_gpu,
-                                   nvl_rank,
-                                   num_nvl_ranks,
-                                   reserve_barrier_signals(1),
-                                   rank,
-                                   num_ranks,
-                                   comm_stream.queue());
-        } else if (combined_nvl_rdma_mode) {
+        if (combined_nvl_rdma_mode) {
             internode::combine_nvl_rdma(scalar_type_to_data_type(x.scalar_type()),
                                         combined_x.data_ptr(),
                                         combined_topk_weights_ptr,
@@ -2217,18 +2152,6 @@ struct Buffer {
             false,
             "XPU get_next_low_latency_combine_buffer zero-copy path is not implemented; call low_latency_combine with zero_copy=False");
     }
-
-    torch::Tensor debug_ishmem_channel_put(int row_ints, int num_channels, int queue_stride) {
-        TORCH_CHECK(is_available(), "XPU Buffer must be synced before debug_ishmem_channel_put");
-        TORCH_CHECK(!low_latency_mode, "debug_ishmem_channel_put requires a high-throughput RDMA buffer");
-        TORCH_CHECK(rdma_buffer_ptr != nullptr && num_rdma_bytes > 0, "debug_ishmem_channel_put requires an iSHMEM RDMA buffer");
-        auto options = torch::TensorOptions().device(torch::kXPU, device_id).dtype(torch::kInt32);
-        auto output = torch::empty({num_channels, 8}, options);
-        internode::debug_channel_put(
-            output.data_ptr<int>(), rdma_buffer_ptr, row_ints, num_channels, queue_stride, rank, num_ranks, comm_stream.queue());
-        comm_stream.queue().wait_and_throw();
-        return output;
-    }
 };
 
 bool is_sm90_compiled() {
@@ -2281,8 +2204,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer)
-        .def("debug_ishmem_channel_put", &Buffer::debug_ishmem_channel_put);
+        .def("get_next_low_latency_combine_buffer", &Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", is_sm90_compiled);
     m.attr("topk_idx_t") = py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<topk_idx_t>::value));
