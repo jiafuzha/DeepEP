@@ -52,5 +52,23 @@ export MASTER_ADDR=${MASTER_ADDR:-b70-hq-1}
 
 echo "[$(hostname) lr=$LOCAL_RANK gr=${PMI_RANK:-?}] ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK NIC=$SEL_NIC IFACE=$FI_VERBS_IFACE" >&2
 
+# --- FAULT-MODE VM (root-cause fix for the LL DEVICE_LOST) ------------------
+# ROOT CAUSE (proven by DEBUG xe CONFIG_DRM_XE_DEBUG_VM + clean A/B):
+#   The DeepEP process VM is a preempt-fence (long-running) VM because IBGDA
+#   runs a persistent long-running poll/quiet exec queue on it. Any BO
+#   bind/rebind/eviction/migration on that VM during the run triggers xe's
+#   preempt_rebind_work_func, which must SUSPEND the busy-spinning IBGDA LR
+#   queue and migrate BOs via the bcs copy engine. Under contention that
+#   returns -16 (EBUSY) -> xe calls xe_vm_kill(vm) -> resets ALL exec queues on
+#   the VM (incl. bcs) -> "engine_class=bcs" reset -> UR_RESULT_ERROR_DEVICE_LOST.
+# FIX: run the DeepEP XPU process on a FAULT-MODE VM (recoverable page faults).
+#   Fault-mode binds pages on demand via the pagefault handler and NEVER runs a
+#   preempt-rebind (never suspends the LR IBGDA queue) -> the kill can't happen.
+#   This is standard GPU on-demand paging. Opt out with DEEP_EP_XPU_FAULT_MODE=0.
+if [ "${DEEP_EP_XPU_FAULT_MODE:-1}" != "0" ]; then
+    export NEOReadDebugKeys=1
+    export EnableRecoverablePageFaults=1
+fi
+
 ulimit -c unlimited
 exec "$@"
