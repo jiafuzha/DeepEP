@@ -152,6 +152,8 @@ def test_main(num_tokens: int,
 
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device_type) * (rank - rank_offset)
     x[:, -128:] = torch.arange(num_tokens, device=device_type).to(torch.bfloat16).view(-1, 1)
+    if os.getenv('DEEP_EP_TEST_DEBUG', '0') == '1':
+        torch.xpu.synchronize(); debug_print(rank, 'after x ones/arange sync')
     x_list = [x]
     for _ in range(4 if use_logfmt else 0):
         # NOTES: make more LogFMT casts and also with some BF16
@@ -164,14 +166,27 @@ def test_main(num_tokens: int,
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device=device_type).abs()
+    if os.getenv('DEEP_EP_TEST_DEBUG', '0') == '1':
+        torch.xpu.synchronize(); debug_print(rank, 'after randn/topk sync')
 
     # Randomly mask some positions
     for _ in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
+    if os.getenv('DEEP_EP_TEST_DEBUG', '0') == '1':
+        torch.xpu.synchronize(); debug_print(rank, 'after mask sync (about to all_gather)')
     debug_print(rank, 'before topk all_gather')
-    all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device=device_type)
-    dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
+    if os.getenv('DEEP_EP_TEST_ALLGATHER_CPU', '0') == '1':
+        # On real multi-node runs, routing this control-plane all_gather through
+        # xccl contends with iSHMEM/IBGDA for the same NIC/Level-Zero device and
+        # can hang. Route it through CPU (gloo) instead, which uses the TCP
+        # rendezvous fabric and never touches the iSHMEM NIC.
+        all_topk_idx_cpu = torch.empty((num_ranks * num_tokens, num_topk), dtype=topk_idx.dtype, device='cpu')
+        dist.all_gather_into_tensor(all_topk_idx_cpu, topk_idx.cpu(), group=group)
+        all_topk_idx = all_topk_idx_cpu.view(num_ranks, num_tokens, num_topk).to(device_type)
+    else:
+        all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device=device_type)
+        dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
     debug_print(rank, 'after topk all_gather')
 
     # For failure simulation and shrink testing
@@ -412,6 +427,13 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                  use_logfmt=args.use_logfmt,
                                  seed=seed) == ref_hash, f'Error: seed={seed}'
         completed = True
+    except Exception as _test_exc:
+        import traceback as _tb
+        print(f'[rank {rank}] TEST_MAIN EXCEPTION: {type(_test_exc).__name__}: {_test_exc}', flush=True)
+        _tb.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
     finally:
         if is_xpu_direct_doorbell_run():
             # CRITICAL (XPU LL lifecycle): drain all in-flight GPU work (long-running
