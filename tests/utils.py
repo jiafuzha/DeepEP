@@ -59,6 +59,16 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_device(device_type)
     accelerator.set_device(local_rank)
 
+    # Warm up the accelerator runtime (SYCL/L0 context + command queues) BEFORE
+    # any iSHMEM/IBGDA init grabs device resources. On real multi-node XPU runs
+    # the non-master ranks otherwise hit UR_RESULT_ERROR_OUT_OF_RESOURCES on the
+    # first XPU op because iSHMEM has already consumed the L0 resource budget.
+    if device_type == 'xpu' and os.getenv('DEEP_EP_XPU_WARMUP', '1') == '1':
+        _w = torch.ones((1, ), device=device_type)
+        _w = _w + 1
+        accelerator.synchronize()
+        del _w
+
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 

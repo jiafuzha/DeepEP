@@ -30,8 +30,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEEP_EP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-NODE0=b70-hq-1
-NODE1=b70-hq-2
+NODE0="${NODE0:-b70-hq-1}"
+NODE1="${NODE1:-b70-hq-2}"
 
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_low_latency.py}"
 ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/zjf2012/ishmem_ibgda/build/_install}"
@@ -201,10 +201,14 @@ run_test() {
         -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
         -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
         -genv ISHMEM_IBGDA_BAR_BACKEND igub \
+        -genv ISHMEM_IBGDA_SHARED_UAR "${ISHMEM_IBGDA_SHARED_UAR:-0}" \
         -genv I_MPI_FABRICS shm:ofi \
         -genv FI_PROVIDER tcp \
         -genv ISHMEM_DEBUG "${ISHMEM_DEBUG:-0}" \
         -genv DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN 1 \
+        -genv DEEP_EP_TEST_DEBUG "${DEEP_EP_TEST_DEBUG:-0}" \
+        -genv DEEP_EP_TEST_ALLGATHER_CPU "${DEEP_EP_TEST_ALLGATHER_CPU:-0}" \
+        -genv DEEP_EP_XPU_FAULT_MODE "${DEEP_EP_XPU_FAULT_MODE:-1}" \
         -genv DEEP_EP_LL_FLAG_PROGRESS "${DEEP_EP_LL_FLAG_PROGRESS:-0}" \
         -genv DEEP_EP_LL_FLAG_LSC "${DEEP_EP_LL_FLAG_LSC:-0}" \
         -genv DEEP_EP_LL_FLAG_SENDER_FENCE "${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}" \
