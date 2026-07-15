@@ -280,6 +280,13 @@ void stop_proxy() {
     }
 }
 
+// The DeepEP iSHMEM fork exposes ishmem_finalize_ibgda_resources() (releases
+// NIC/BAR/IBGDA resources without finalizing the shared MPI/oneCCL runtime);
+// upstream iSHMEM (int_UTs) does not. Declare it weak so DeepEP links against
+// either iSHMEM archive: when the symbol is absent it resolves to nullptr and
+// the opt-in finalize path (DEEP_EP_XPU_ISHMEM_FINALIZE, default-OFF) is skipped.
+extern __attribute__((weak)) void ishmem_finalize_ibgda_resources(void);
+
 void finalize() {
     // Empirical finding on this Intel XPU + igub_vmem BAR-bridge stack:
     //   * There is NO resource leak on normal program/test exit. Process exit
@@ -302,6 +309,11 @@ void finalize() {
     // finalizing the shared MPI/oneCCL runtime) under a watchdog.
     const char* env = std::getenv("DEEP_EP_XPU_ISHMEM_FINALIZE");
     if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+        return;
+    }
+    // Built against an iSHMEM archive without the fork's IBGDA-resource finalize
+    // API (e.g. upstream int_UTs): nothing to reclaim mid-process, skip.
+    if (reinterpret_cast<void*>(ishmem_finalize_ibgda_resources) == nullptr) {
         return;
     }
     int initialized = 0;
