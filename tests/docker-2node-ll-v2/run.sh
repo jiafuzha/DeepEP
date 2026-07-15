@@ -396,6 +396,10 @@ run_test() {
         -e ISHMEM_IBGDA_STATS_DIR="${ISHMEM_IBGDA_STATS_DIR:-}" \
         -e DEEP_EP_TEST_DEBUG="${DEEP_EP_TEST_DEBUG:-0}" \
         -e DEEP_EP_SYNC_DBG="${DEEP_EP_SYNC_DBG:-0}" \
+        -e DEEP_EP_LL_MAX_PUT_KB="${DEEP_EP_LL_MAX_PUT_KB:-}" \
+        -e DEEP_EP_LL_NUM_WGS="${DEEP_EP_LL_NUM_WGS:-}" \
+        -e DEEP_EP_LL_PUT_LANES="${DEEP_EP_LL_PUT_LANES:-}" \
+        -e DEEP_EP_LL_COOP_PUT="${DEEP_EP_LL_COOP_PUT:-0}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
@@ -468,6 +472,10 @@ run_test() {
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
                 -genv DEEP_EP_LL_FLAG_RECV_ACQ \"\${DEEP_EP_LL_FLAG_RECV_ACQ:-1}\" \
                 -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-1000000}\" \
+                -genv DEEP_EP_LL_MAX_PUT_KB \"\${DEEP_EP_LL_MAX_PUT_KB:-}\" \
+                -genv DEEP_EP_LL_NUM_WGS \"\${DEEP_EP_LL_NUM_WGS:-}\" \
+                -genv DEEP_EP_LL_PUT_LANES \"\${DEEP_EP_LL_PUT_LANES:-}\" \
+                -genv DEEP_EP_LL_COOP_PUT \"\${DEEP_EP_LL_COOP_PUT:-0}\" \
                 -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \

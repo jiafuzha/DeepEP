@@ -65,11 +65,15 @@ class LowLatencyCombineMergedKernel;
 // reference / fallback; the active dispatch/combine paths now use these.
 class LowLatencyDispatchRouteKernel;
 class LowLatencyDispatchPutKernel;
+class LowLatencyDispatchCoopPutKernel;
+class LowLatencyDispatchCoopFlagKernel;
 class LowLatencyDispatchBarrierKernel;
 class LowLatencyDispatchWaitKernel;
 class LowLatencyDispatchPackKernel;
 class LowLatencyCombineScatterKernel;
 class LowLatencyCombinePutKernel;
+class LowLatencyCombineCoopPutKernel;
+class LowLatencyCombineCoopFlagKernel;
 class LowLatencyCombineBarrierKernel;
 class LowLatencyCombineWaitKernel;
 class LowLatencyCombineReduceKernel;
@@ -171,6 +175,14 @@ constexpr int kLLMaxWGs = 256;  // cap on grid size for grid-stride phases
 // slow transport path (RERING / landing-spin) that costs a fixed ~0.5 s per
 // call regardless of size. Splitting large puts into <=192 KiB chunks keeps
 // every put on the fast path. Overridable via DEEP_EP_LL_MAX_PUT_KB.
+//
+// DEFAULT = 192 KiB. Measured (2-node, HIDDEN=7168, 2048 tokens, barrier path):
+// 64 KiB -> 1.67 GB/s (53.2 ms/iter), 128 KiB -> 1.85 GB/s, 192 KiB -> 2.00 GB/s
+// (44.4 ms/iter, ~17% faster), 256 KiB -> 1.83 GB/s (regresses, nearing the slow
+// path). Larger chunks post fewer WQEs per channel, and since Stage 2 issues the
+// remote puts from a single work-item per channel, WQE-posting overhead is on the
+// critical path. 192 KiB is the measured sweet spot below the slow-path cliff.
+// Small token counts fit in one put regardless, so this never hurts them.
 inline size_t ll_max_put_bytes() {
     const char* env = std::getenv("DEEP_EP_LL_MAX_PUT_KB");
     if (env != nullptr && env[0] != '\0') {
@@ -178,7 +190,7 @@ inline size_t ll_max_put_bytes() {
         if (v > 0)
             return static_cast<size_t>(v) * 1024;
     }
-    return static_cast<size_t>(64) * 1024;
+    return static_cast<size_t>(192) * 1024;
 }
 
 inline int ll_num_wgs(size_t work_units, int wg_size, int cap) {
@@ -293,6 +305,37 @@ inline int ll_flag_sender_fence() {
             return v;
     }
     return 1;
+}
+
+// CUDA warp-parity cooperative NBI put path (opt-in, DEEP_EP_LL_COOP_PUT=1,
+// default 0). When enabled (and flag_progress is on) the dispatch/combine remote
+// payload + flags are issued by dedicated warp-cooperative kernels: MANY
+// co-resident sub-groups grid-stride the per-token messages and issue them via
+// ishmemx_putmem_nbi_warp (lane i writes WQE i, leader publishes SND_DBR ONCE
+// under a monotonic commit gate), on qp = local_expert. This is a faithful port
+// of CUDA nvshmemi_ibgda_put_nbi_warp + the LL send loop (token-parallel across
+// SMs), replacing the old one-work-item-per-channel serial issue that collapsed
+// remote RDMA to ~num_channels producers. Requires the ishmem build that exports
+// ishmemx_putmem_nbi_warp.
+inline bool ll_coop_put() {
+    const char* env = std::getenv("DEEP_EP_LL_COOP_PUT");
+    return env != nullptr && env[0] == '1';
+}
+
+// Number of work-groups for the coop warp-put payload kernel. The ordered
+// commit gate in ishmemx_putmem_nbi_warp requires the producing sub-groups to be
+// CO-RESIDENT (CUDA sizes its grid to num_sms for the same reason). Default to
+// the device compute-unit count; override with DEEP_EP_LL_PUT_WGS.
+inline int ll_put_wgs(sycl::queue& q) {
+    const char* env = std::getenv("DEEP_EP_LL_PUT_WGS");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0)
+            return v;
+    }
+    int cu = static_cast<int>(q.get_device().get_info<sycl::info::device::max_compute_units>());
+    if (cu < 1) cu = 1;
+    return cu;
 }
 
 // Device-side flag read used by the flag path. lsc_mode 0 = hint-based uc_load
@@ -579,6 +622,7 @@ void dispatch_bf16(void* packed_recv_x,
     const int flag_recv_acq = ll_flag_recv_acq();
     // When the receiver does a single acquire/invalidate up front, the bulk payload
     // is read with CACHED loads instead of per-byte uncached uc_load.
+    const bool coop_put = ll_coop_put();
     const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
     auto* combine_flag = base + layout.combine_flag_offset;
 
@@ -726,7 +770,13 @@ void dispatch_bf16(void* packed_recv_x,
                         }
                     }
 
-                    // Remote NBI puts: one work-item per channel.
+                    // Remote NBI puts (non-cooperative per-channel path). When
+                    // coop_put && flag_progress, the remote payload and flags are
+                    // issued by dedicated warp-cooperative kernels submitted AFTER
+                    // this one (see below); this kernel then only does the local
+                    // self-copy above.
+                    if (!(coop_put && flag_progress)) {
+                    // one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                         if (dst_rank == rank) {
@@ -785,6 +835,111 @@ void dispatch_bf16(void* packed_recv_x,
                             ch++;
                         }
                     }
+                    }  // end if (non-cooperative per-channel path)
+                });
+        });
+    }
+
+    // --- Stage 2b (coop): warp-cooperative remote payload + flags. Faithful port
+    // of the CUDA LL send: MANY co-resident sub-groups issue per-token warp puts
+    // (ishmemx_putmem_nbi_warp) spread grid-strided across all channels, on
+    // qp = local_expert (like CUDA qp_id = dst_expert_local_idx). A SEPARATE flag
+    // kernel runs after the payload kernel: kernel ordering on the in-order queue
+    // guarantees every flag WQE is claimed AFTER all payload WQEs of its channel,
+    // so same-QP in-order RC delivery lands the flag after the payload.
+    if (coop_put && flag_progress) {
+        const int num_channels = (num_ranks - 1) * num_local_experts;
+        // Co-resident grid: CUDA sizes its grid to num_sms so the ordered commit
+        // gate never starves. Default to the device's compute-unit count; allow
+        // override via DEEP_EP_LL_PUT_WGS.
+        const int put_wgs = ll_put_wgs(queue);
+        const size_t put_chunk_host = static_cast<size_t>(ll_max_put_bytes());
+        // Payload kernel.
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyDispatchCoopPutKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(put_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    // Global sub-group id + total number of sub-groups in the grid.
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
+                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
+                                          static_cast<int>(sg.get_group_linear_id());
+                    const int num_sgs = put_wgs * sgs_per_wg;
+                    const bool leader = (sg.get_local_id()[0] == 0);
+
+                    // Iterate channels; grid-stride the per-channel token messages
+                    // across all sub-groups. Each sub-group sends one token (src idx
+                    // + hidden data) per warp put, on qp = local_expert.
+                    // Iterate channels; grid-stride each channel's CONTIGUOUS payload
+                    // block (send_data slots are packed, so the whole channel is one
+                    // contiguous src->dst region) as large byte-chunks across all
+                    // sub-groups. Large chunks (put_chunk, default 192 KiB) mean FEW
+                    // messages / commit-gate ops (each warp put internally fans a
+                    // chunk into <=sz 64 KiB WQEs), while grid-striding many chunks
+                    // keeps all sub-groups busy. This beats per-token puts because the
+                    // staged buffer is contiguous (CUDA must go per-token only because
+                    // its source x[token] is scattered).
+                    const size_t put_chunk = put_chunk_host;
+                    for (int ch = 0; ch < num_channels; ++ch) {
+                        const int dr = ch / num_local_experts;
+                        const int le = ch % num_local_experts;
+                        const int dst_rank = (dr < rank) ? dr : dr + 1;   // skip self
+                        const int sc_idx = dst_rank * num_local_experts + le;
+                        int count = 0;
+                        if (leader) count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
+                        count = sycl::group_broadcast(sg, count, 0);
+                        if (count <= 0) continue;
+                        const size_t src_slot = static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
+                        const size_t dst_slot = (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                        // Bulk source-index array (contiguous count*int) once per channel
+                        // on qp = le, issued by the first sub-group.
+                        if (global_sg == 0) {
+                            ishmemx_putmem_nbi_warp(dispatch_src + dst_slot, send_src + src_slot,
+                                                    static_cast<size_t>(count) * sizeof(int), dst_rank,
+                                                    static_cast<unsigned int>(le), true, sg);
+                        }
+                        // Contiguous payload, grid-strided in large byte-chunks.
+                        const size_t total = static_cast<size_t>(count) * hidden_bytes;
+                        const size_t nchunks = (total + put_chunk - 1) / put_chunk;
+                        uint8_t* src_base = send_data + src_slot * hidden_bytes;
+                        uint8_t* dst_base = dispatch_data + dst_slot * hidden_bytes;
+                        for (size_t c = global_sg; c < nchunks; c += num_sgs) {
+                            const size_t off = c * put_chunk;
+                            const size_t this_bytes = sycl::min(put_chunk, total - off);
+                            ishmemx_putmem_nbi_warp(dst_base + off, src_base + off, this_bytes,
+                                                    dst_rank, static_cast<unsigned int>(le), true, sg);
+                        }
+                    }
+                });
+        });
+        // Flag kernel: one sub-group per channel sends the completion flag on
+        // qp = local_expert, AFTER all payload puts (kernel ordering).
+        queue.submit([&](sycl::handler& cgh) {
+            const int flag_wgs = sycl::max(1, (num_channels + (kLLWGSize / 32) - 1) / (kLLWGSize / 32));
+            cgh.parallel_for<LowLatencyDispatchCoopFlagKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
+                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
+                                          static_cast<int>(sg.get_group_linear_id());
+                    const bool active = (global_sg < num_channels);
+                    int dst_rank = 0, le = 0, sc_idx = 0, count = 0;
+                    if (active) {
+                        const int dr = global_sg / num_local_experts;
+                        le = global_sg % num_local_experts;
+                        dst_rank = (dr < rank) ? dr : dr + 1;
+                        sc_idx = dst_rank * num_local_experts + le;
+                        if (sg.get_local_id()[0] == 0) {
+                            count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
+                            // encode -count-1 (0 tokens -> -1, distinct from not-arrived 0)
+                            uc_store(&send_count[sc_idx], -count - 1);
+                        }
+                    }
+                    ll_sender_flush(flag_sender_fence);
+                    ishmemx_putmem_nbi_warp(dispatch_count + le * num_ranks + rank,
+                                            send_count + sc_idx, sizeof(int), dst_rank,
+                                            static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
                 });
         });
     }
@@ -1037,6 +1192,7 @@ void combine_bf16(void* combined_x,
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
+    const bool coop_put = ll_coop_put();
     const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
 
     // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
@@ -1168,7 +1324,12 @@ void combine_bf16(void* combined_x,
                         }
                     }
 
-                    // Step 2: remote NBI puts, one work-item per channel.
+                    // Step 2: remote NBI puts (non-cooperative per-channel path).
+                    // When coop_put && flag_progress, the remote payload and flags
+                    // are issued by dedicated warp-cooperative kernels submitted
+                    // AFTER this one; this kernel then only does the self-copy above.
+                    if (!(coop_put && flag_progress)) {
+                    // one work-item per channel.
                     int ch = 0;
                     for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
                         if (dst_rank == rank) {
@@ -1222,6 +1383,96 @@ void combine_bf16(void* combined_x,
                             ch++;
                         }
                     }
+                    }  // end if (non-cooperative per-channel path)
+                });
+        });
+    }
+
+    // --- Stage 2b (coop): warp-cooperative remote combine payload + flags.
+    // Mirrors the dispatch coop path. MANY co-resident sub-groups grid-stride the
+    // per-channel contiguous [min_token, max_token] payload span (one warp put per
+    // token, on qp = local_expert), then a SEPARATE flag kernel sets each remote
+    // combine_flag AFTER all payload WQEs (kernel ordering + same-QP RC order).
+    if (coop_put && flag_progress) {
+        const int num_channels = (num_ranks - 1) * num_local_experts;
+        const int put_wgs = ll_put_wgs(queue);
+        const size_t put_chunk_host = static_cast<size_t>(ll_max_put_bytes());
+        // Payload kernel.
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyCombineCoopPutKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(put_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
+                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
+                                          static_cast<int>(sg.get_group_linear_id());
+                    const int num_sgs = put_wgs * sgs_per_wg;
+                    const bool leader = (sg.get_local_id()[0] == 0);
+                    const size_t put_chunk = put_chunk_host;
+
+                    for (int ch = 0; ch < num_channels; ++ch) {
+                        const int dr = ch / num_local_experts;
+                        const int le = ch % num_local_experts;
+                        const int dst_rank = (dr < rank) ? dr : dr + 1;
+                        const int global_expert = rank * num_local_experts + le;
+                        // Compute the contiguous [min_token, max_token] span (same as
+                        // the non-coop path). Cheap scan of src_info (local memory).
+                        int count = 0, begin = 0;
+                        unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
+                        const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
+                        int min_token = num_max_dispatch_tokens_per_rank;
+                        int max_token = -1;
+                        for (int slot = 0; slot < clamped_count; ++slot) {
+                            const int original_token =
+                                src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
+                            if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                                min_token = sycl::min(min_token, original_token);
+                                max_token = sycl::max(max_token, original_token);
+                            }
+                        }
+                        if (max_token < min_token) continue;
+                        const int span = max_token - min_token + 1;
+                        uint8_t* src_base = send_data +
+                            (static_cast<size_t>(dst_rank * num_local_experts + le) * num_max_dispatch_tokens_per_rank + min_token) *
+                            hidden_bytes;
+                        uint8_t* dst_base = combine_data +
+                            (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
+                        const size_t total = static_cast<size_t>(span) * hidden_bytes;
+                        const size_t nchunks = (total + put_chunk - 1) / put_chunk;
+                        for (size_t c = global_sg; c < nchunks; c += num_sgs) {
+                            const size_t off = c * put_chunk;
+                            const size_t this_bytes = sycl::min(put_chunk, total - off);
+                            ishmemx_putmem_nbi_warp(dst_base + off, src_base + off, this_bytes,
+                                                    dst_rank, static_cast<unsigned int>(le), true, sg);
+                        }
+                        (void)leader;
+                    }
+                });
+        });
+        // Flag kernel: one sub-group per channel sets the remote combine_flag.
+        queue.submit([&](sycl::handler& cgh) {
+            const int flag_wgs = sycl::max(1, (num_channels + (kLLWGSize / 32) - 1) / (kLLWGSize / 32));
+            cgh.parallel_for<LowLatencyCombineCoopFlagKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    auto sg = item.get_sub_group();
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
+                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
+                                          static_cast<int>(sg.get_group_linear_id());
+                    const bool active = (global_sg < num_channels);
+                    int dst_rank = 0, le = 0, global_expert = 0, sc_idx = 0;
+                    if (active) {
+                        const int dr = global_sg / num_local_experts;
+                        le = global_sg % num_local_experts;
+                        dst_rank = (dr < rank) ? dr : dr + 1;
+                        global_expert = rank * num_local_experts + le;
+                        sc_idx = dst_rank * num_local_experts + le;
+                        if (sg.get_local_id()[0] == 0) uc_store(&send_count[sc_idx], 1);
+                    }
+                    ll_sender_flush(flag_sender_fence);
+                    ishmemx_putmem_nbi_warp(combine_flag_i + global_expert * 2,
+                                            send_count + sc_idx, sizeof(int), dst_rank,
+                                            static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
                 });
         });
     }
