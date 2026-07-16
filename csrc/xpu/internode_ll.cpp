@@ -8,45 +8,36 @@
 #endif
 
 // ============================================================================
-// Two receiver-progress paths (dispatch & combine). Both move the same data via
-// ishmem_putmem_nbi over RDMA; they differ ONLY in how the receiver learns the
-// RDMA writes have landed before reading them. Selected by ll_flag_progress()
-// (env DEEP_EP_LL_FLAG_PROGRESS, default 0 = barrier path).
+// Low-latency dispatch & combine: a SINGLE fused kernel each (CUDA-parity with
+// the one-kernel LL design). There is no longer a runtime-selectable "barrier"
+// vs "flag" path -- the earlier two-path split (env DEEP_EP_LL_FLAG_PROGRESS,
+// selected by a now-removed ll_flag_progress()) is gone; only the fused kernel
+// remains.
 //
-//   1. BARRIER PATH  (DEFAULT, DEEP_EP_LL_FLAG_PROGRESS unset/0)
-//      - Sync: one global ishmemx_barrier_all_work_group between the put stage
-//        and the pack/reduce stage.
-//      - The barrier doubles as a system-scope acquire/invalidate, making GPU L2
-//        coherent with NIC RDMA writes -> receiver reads delivered data with
-//        FAST CACHED loads.
-//      - Latency is gated by the slowest peer (all-to-all sync); cheap at low PE
-//        counts, grows with scale. Proven-stable, including true 2-node.
+// Each fused kernel does put -> grid-sync -> recv in ONE launch (see the detailed
+// per-phase comment at each parallel_for below). Synchronization is:
+//   - ONE device-side GridBarrier == CUDA cg::this_grid().sync(), standing in for
+//     the single grid barrier the CUDA LL kernel uses between the put and recv
+//     phases. It syncs only the co-resident work-groups, NOT remote PEs.
+//   - ONE cross-PE host ishmem_barrier_all() issued right before the launch. It
+//     (a) supplies a cross-PCIe acquire so peer RDMA writes are observed and
+//     (b) forces global iteration alignment (the count flags are NOT epoch-tagged,
+//     so a stale flag from a prior iteration must not race a fresh one).
+//   - Payload-before-flag ordering INSIDE the kernel is enforced without an extra
+//     grid barrier via a per-send-channel atomic finish-counter (CUDA parity with
+//     atomic_finish_counter_per_expert); the receiver spin-polls a per-channel
+//     cross-PE arrival flag (bounded by DEEP_EP_LL_POLL_CAP).
 //
-//   2. FLAG PATH  (opt-in, DEEP_EP_LL_FLAG_PROGRESS=1)
-//      - Sync: NO global barrier. Instead (a) a LOCAL ishmemx_quiet_work_group
-//        drains only this PE's outbound NBI puts, then (b) per-expert completion
-//        flags/counts that the receiver SPIN-POLLS (bounded by DEEP_EP_LL_POLL_CAP).
-//      - With no barrier there is no acquire/invalidate and BMG's L2 is NOT
-//        coherent with NIC RDMA writes, so EVERY delivered byte (flag + payload)
-//        must be read with L2-bypassing uncached uc_load (RECEIVER side).
-//      - SENDER side: the flag VALUE is staged via uc_store then RDMA-WRITE-put;
-//        uc_store's write-through hint only bypasses L1, so the NIC could DMA-read
-//        a STALE L3-resident 0 and transmit it -> receiver spins forever ->
-//        watchdog DEVICE_LOST on 2-node. A sender-side release/flush fence between
-//        the uc_store and the put (ll_sender_flush, DEEP_EP_LL_FLAG_SENDER_FENCE,
-//        DEFAULT 1 = sycl::atomic_fence(release,system); 2 = LSC evict.sysrel)
-//        evicts the value to the memory domain the NIC reads. With this flush the
-//        flag path PASSES true 2-node (avg ~1.15-1.24 ms, no DEVICE_LOST); it was
-//        the missing piece (NOT the receiver read primitive, NOT the NIC PCIe
-//        domain, NOT transport latency).
-//      - Removes the all-to-all sync so latency no longer tracks the slowest peer
-//        (mirrors CUDA's amo_nonfetch_add + receiver-poll). Still pays an
-//        uncached-read tax per byte (loopback ~1861 vs barrier ~1130 us/iter).
-//
-// uc_load is confirmed to be a genuine uncached load (equivalent to explicit LSC
-// .uc.uc asm and the only correct way to read post-RDMA data without a barrier);
-// see ll_flag_progress() below for the full rationale and the flip-to-flags
-// criteria. Tier-2's job is to close the flag path's per-byte read-cost gap.
+// Fine-grained memory-ordering of the RDMA flag/payload traffic is tunable inside
+// the fused kernel (these are knobs, NOT separate paths):
+//   - DEEP_EP_LL_FLAG_SENDER_FENCE : flush uc_store-d flag bytes out to the domain
+//     the NIC DMA-reads, so it never transmits a stale value (ll_flag_sender_fence).
+//   - DEEP_EP_LL_FLAG_RECV_ACQ     : receiver acquire mode -- one system-scope
+//     acquire + cached bulk reads vs per-byte uncached reads (ll_flag_recv_acq).
+//   - DEEP_EP_LL_FLAG_LSC          : flag-read primitive, hint-based uc_load vs
+//     explicit LSC uncached load (ll_flag_lsc_mode / ll_read_flag).
+// uc_load is a genuine uncached load (equivalent to explicit LSC .uc.uc asm), the
+// correct way to read a freshly RDMA-delivered flag without relying on the barrier.
 // ============================================================================
 
 namespace deep_ep {
@@ -57,26 +48,14 @@ class CleanLowLatencyBufferKernel;
 class UpdateMaskBufferKernel;
 class QueryMaskBufferKernel;
 class CleanMaskBufferKernel;
-class LowLatencyDispatchMergedKernel;
-class LowLatencyCombineMergedKernel;
 
 // Tier-1 multi-work-group low-latency kernels (multi-WG grid + sub-group
 // collectives). The merged single-256-WI-work-group kernels above are kept for
 // reference / fallback; the active dispatch/combine paths now use these.
 class LowLatencyDispatchRouteKernel;
-class LowLatencyDispatchPutKernel;
-class LowLatencyDispatchCoopPutKernel;
-class LowLatencyDispatchCoopFlagKernel;
-class LowLatencyDispatchBarrierKernel;
-class LowLatencyDispatchWaitKernel;
-class LowLatencyDispatchPackKernel;
+class LowLatencyDispatchFusedKernel;
 class LowLatencyCombineScatterKernel;
-class LowLatencyCombinePutKernel;
-class LowLatencyCombineCoopPutKernel;
-class LowLatencyCombineCoopFlagKernel;
-class LowLatencyCombineBarrierKernel;
-class LowLatencyCombineWaitKernel;
-class LowLatencyCombineReduceKernel;
+class LowLatencyCombineFusedKernel;
 class LowLatencyDispatchCleanFlagKernel;
 class LowLatencyCombineCleanCountKernel;
 
@@ -101,6 +80,11 @@ struct LowLatencyLayout {
     size_t combine_flag_offset;
     size_t mask_offset;
     size_t sync_offset;
+    size_t barrier_offset;  // 2 x uint32_t: GridBarrier {counter, sense} scratch
+    size_t finish_offset;   // 2*(num_ranks-1)*num_local_experts ints: per-send-channel
+                            // atomic finish-counter + uc_store ready flag (CUDA
+                            // atomic_finish_counter_per_expert parity). Shared by
+                            // dispatch & combine (separate launches).
     size_t total_bytes;
 };
 
@@ -137,6 +121,21 @@ inline LowLatencyLayout make_layout(int num_max_dispatch_tokens_per_rank, int hi
     l.combine_flag_offset = add(l.combine_flag_bytes);
     l.mask_offset = add(l.mask_bytes);
     l.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
+    // GridBarrier scratch: 2 zero-initialized uint32_t (counter + sense) used by
+    // the DEEP_EP_LL_FUSED single-kernel dispatch. Must mirror the identical
+    // add() in deep_ep_xpu.cpp::get_low_latency_buffer_layout so total_bytes (and
+    // therefore every offset) stays consistent between the allocator and here.
+    l.barrier_offset = add(2 * sizeof(uint32_t));
+    // Per-send-channel finish-counter (CUDA parity for atomic_finish_counter_per_expert):
+    // TWO ints per remote send channel = 2*(num_ranks-1)*num_local_experts. The
+    // first n ints are the atomic post-counter; the next n are a uc_store'd
+    // "ready" flag (set by the last incrementer, uc_load-polled by the flag
+    // sender) -- mirroring GridBarrier's atomic-count-then-uc-publish pattern so
+    // the completion is observed cross-work-group on BMG (a plain/atomic load of
+    // the counter is NOT cross-WG coherent for spinning). Lets the fused kernels
+    // order payload-before-flag WITHOUT a grid barrier. Must mirror the identical
+    // add() in deep_ep_xpu.cpp::get_low_latency_buffer_layout.
+    l.finish_offset = add(static_cast<size_t>(2 * (num_ranks - 1) * num_local_experts) * sizeof(int));
     l.total_bytes = offset;
     return l;
 }
@@ -176,7 +175,7 @@ constexpr int kLLMaxWGs = 256;  // cap on grid size for grid-stride phases
 // call regardless of size. Splitting large puts into <=192 KiB chunks keeps
 // every put on the fast path. Overridable via DEEP_EP_LL_MAX_PUT_KB.
 //
-// DEFAULT = 192 KiB. Measured (2-node, HIDDEN=7168, 2048 tokens, barrier path):
+// DEFAULT = 192 KiB. Measured (2-node, HIDDEN=7168, 2048 tokens):
 // 64 KiB -> 1.67 GB/s (53.2 ms/iter), 128 KiB -> 1.85 GB/s, 192 KiB -> 2.00 GB/s
 // (44.4 ms/iter, ~17% faster), 256 KiB -> 1.83 GB/s (regresses, nearing the slow
 // path). Larger chunks post fewer WQEs per channel, and since Stage 2 issues the
@@ -208,68 +207,7 @@ inline int ll_num_wgs(size_t work_units, int wg_size, int cap) {
     return static_cast<int>(n);
 }
 
-// Tier-2: flag-based asynchronous progress. When enabled (default), the global
-// `ishmemx_barrier_all_work_group` between the put and pack/reduce stages is
-// replaced by (a) a local `ishmemx_quiet_work_group` to drain this PE's outbound
-// NBI puts (keeps the shared send_data staging safe to reuse) plus (b) per-expert
-// RDMA completion flags that the receiver spin-polls. This mirrors the CUDA
-// internode_ll design (amo_nonfetch_add completion signal + receiver poll) and
-// removes the all-to-all synchronization point so latency no longer grows with
-// the slowest peer.
-//
-// DEFAULT: OFF (opt-in via DEEP_EP_LL_FLAG_PROGRESS=1). The flag path is
-// validated-correct on single-node loopback, but on this BMG+mlx5 stack it is
-// NOT a net win and is unstable at multi-node scale:
-//   * Small-scale loopback: ~1861 us/iter vs the barrier path's ~1130 us/iter.
-//     BMG's GPU L2 is not coherent with NIC RDMA writes, so the flag path must
-//     use L2-bypassing uncached (uc_load) reads for every RDMA-delivered byte.
-//     The removed global barrier_all previously supplied the acquire/invalidate
-//     that enabled fast CACHED reads, and at low PE counts that barrier is cheap
-//     -- so the uncached-read cost dominates and the flag path is slower. There
-//     is no portable BMG L2-invalidate primitive to permit cached post-RDMA
-//     reads (confirmed: only uc_load/uc_store work; fences do not).
-//   * True 2-node: the flag path COULD hit UR_RESULT_ERROR_DEVICE_LOST. When a
-//     cross-node flag was delayed, the bounded uncached spin ran long enough
-//     (with the old 2e9 / 50M cap) to trip the GPU hang-check watchdog before
-//     the poll cap was reached -> hard device wedge. FIXED by lowering the
-//     default poll cap to 1,000,000 (see ll_poll_cap() below): the worst-case
-//     spin is now a few ms, safely under the watchdog, so a delayed flag
-//     degrades to "0 tokens" (a soft, test-caught failure) instead of a wedge.
-//     With a CLEAN driver/env, the flag path is reliable at 32 & 64 tokens; the
-//     residual DEVICE_LOST seen historically was accumulated NIC/QP wedge state
-//     across runs, not a flag-path bug (reset the igub driver between runs to
-//     avoid it -- DEEP_EP_LL_RESET_DRIVER=1 in the docker-2node-ll harness).
-// The barrier path (this default) is the proven-stable route. Flip to flags only
-// once scale makes the all-to-all barrier the dominant cost AND the cross-node
-// flag-landing/transport stability is resolved.
-inline bool ll_flag_progress() {
-    const char* env = std::getenv("DEEP_EP_LL_FLAG_PROGRESS");
-    if (env != nullptr && env[0] != '\0') {
-        return std::atoi(env) != 0;
-    }
-    return false;
-}
-
-// Independent combine-side toggle (defaults to the dispatch setting). Lets us A/B
-// isolate a fault to the dispatch vs combine flag path: DEEP_EP_LL_COMBINE_FLAG=0
-// forces combine back onto the proven barrier path while dispatch stays on flags.
-inline bool ll_flag_progress_combine() {
-    const char* env = std::getenv("DEEP_EP_LL_COMBINE_FLAG");
-    if (env != nullptr && env[0] != '\0') {
-        return std::atoi(env) != 0;
-    }
-    return ll_flag_progress();
-}
-
-// DIAGNOSTIC: when set, the flag-path Stage-3 WaitKernel does a global
-// ishmemx_barrier_all_work_group before the spin (isolates "SET flag lands" from
-// "quiet+spin waits correctly"). Remove after debugging.
-inline bool ll_flag_diag_barrier() {
-    const char* env = std::getenv("DEEP_EP_LL_FLAG_DIAG_BARRIER");
-    return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
-}
-
-// A/B toggle for the flag-path dispatch_count read primitive. Default 0 keeps
+// A/B toggle for the fused kernel's dispatch_count flag read primitive. Default 0 keeps
 // the hint-based uc_load (sycl-cache-read-hint 0x7, L1-uncached). Set
 // DEEP_EP_LL_FLAG_LSC=1 to read the per-expert flag via explicit LSC
 // `lsc_load.ugm.uc.uc` (L1+L3 uncached at the GenISA message level) to test
@@ -285,7 +223,7 @@ inline int ll_flag_lsc_mode() {
     return 0;
 }
 
-// Sender-side flush fence mode for the flag path. After uc_store-ing the encoded
+// Sender-side flush fence mode (fused kernel). After uc_store-ing the encoded
 // flag value into the symmetric send staging, the NIC DMA-reads that staging to
 // RDMA-WRITE it into the receiver's slot. If the GPU has not flushed the store
 // past L3 to the system memory domain the NIC reads, the NIC can transmit a STALE
@@ -294,7 +232,7 @@ inline int ll_flag_lsc_mode() {
 // between the uc_store and the flag put:
 //   0 = none   1 = sycl::atomic_fence(release, system) [DEFAULT, portable]
 //   2 = LSC lsc_fence.ugm.evict.sysrel (explicit L3 evict to memory, ~1% faster)
-// DEFAULT 1: the flag path is INCORRECT on 2-node without this flush (empirically
+// DEFAULT 1: dispatch/combine are INCORRECT on 2-node without this flush (empirically
 // the NIC reads a stale 0); set DEEP_EP_LL_FLAG_SENDER_FENCE=0 only to reproduce
 // the broken behavior, =2 to use the explicit LSC evict.
 inline int ll_flag_sender_fence() {
@@ -305,21 +243,6 @@ inline int ll_flag_sender_fence() {
             return v;
     }
     return 1;
-}
-
-// CUDA warp-parity cooperative NBI put path (opt-in, DEEP_EP_LL_COOP_PUT=1,
-// default 0). When enabled (and flag_progress is on) the dispatch/combine remote
-// payload + flags are issued by dedicated warp-cooperative kernels: MANY
-// co-resident sub-groups grid-stride the per-token messages and issue them via
-// ishmemx_putmem_nbi_warp (lane i writes WQE i, leader publishes SND_DBR ONCE
-// under a monotonic commit gate), on qp = local_expert. This is a faithful port
-// of CUDA nvshmemi_ibgda_put_nbi_warp + the LL send loop (token-parallel across
-// SMs), replacing the old one-work-item-per-channel serial issue that collapsed
-// remote RDMA to ~num_channels producers. Requires the ishmem build that exports
-// ishmemx_putmem_nbi_warp.
-inline bool ll_coop_put() {
-    const char* env = std::getenv("DEEP_EP_LL_COOP_PUT");
-    return env != nullptr && env[0] == '1';
 }
 
 // Number of work-groups for the coop warp-put payload kernel. The ordered
@@ -338,7 +261,31 @@ inline int ll_put_wgs(sycl::queue& q) {
     return cu;
 }
 
-// Device-side flag read used by the flag path. lsc_mode 0 = hint-based uc_load
+// Grid size (work-groups) for the fused dispatch kernel. GridBarrier DEADLOCKS
+// unless every launched work-group is concurrently resident, so this is bounded
+// to the empirically-determined max co-resident count for a 256-work-item WG on
+// this BMG. The header documents G=24 WGs of 256 as validated co-resident; the
+// fused kernel is heavier (registers/SLM) than a trivial barrier probe, so we
+// keep the default at the validated-safe 24 (>= any test's recv-channel count)
+// rather than ll_put_wgs' 160 (which is NOT all co-resident and would hang).
+// Override with DEEP_EP_LL_FUSED_WGS. Must be >= num_local_experts*num_ranks.
+constexpr int kLLFusedMaxCoresidentWGs = 24;
+inline int ll_fused_wgs(sycl::queue& q, int min_wgs) {
+    int wgs;
+    const char* env = std::getenv("DEEP_EP_LL_FUSED_WGS");
+    if (env != nullptr && env[0] != '\0' && std::atoi(env) > 0) {
+        wgs = std::atoi(env);
+    } else {
+        wgs = std::min(ll_put_wgs(q), kLLFusedMaxCoresidentWGs);
+    }
+    // Recv phase needs one WG per (local_expert, src_rank) channel.
+    if (wgs < min_wgs) {
+        wgs = min_wgs;
+    }
+    return wgs;
+}
+
+// Device-side flag read used by the fused kernel. lsc_mode 0 = hint-based uc_load
 // (L1 uncached); 1 = explicit LSC `lsc_load.ugm.uc.uc` (L1+L3 uncached); >=2 =
 // LSC load preceded by an `invalidate.sysacq` cache-invalidate fence.
 inline int ll_read_flag(const int* p, int lsc_mode) {
@@ -366,18 +313,18 @@ inline void ll_sender_flush(int mode) {
     (void)mode;
 }
 
-// Receiver-side bulk-read acquire mode for the flag path. The default flag path
-// USED to read EVERY delivered payload byte with an uncached uc_load (L2-bypassing),
+// Receiver-side bulk-read acquire mode (fused kernel). The receiver originally
+// read EVERY delivered payload byte with an uncached uc_load (L2-bypassing),
 // so each byte paid a memory round-trip. Better: once the per-expert flags confirm
 // the RDMA payload has landed, issue a SINGLE system-scope acquire / cache-invalidate
-// at the start of the read kernel so the GPU L2 becomes coherent with the NIC writes,
-// then read the bulk payload with FAST CACHED loads (the same mechanism the barrier
-// path relies on). Trades a per-byte uncached tax for one invalidate + cached reads.
+// at the start of the read phase so the GPU L2 becomes coherent with the NIC writes,
+// then read the bulk payload with FAST CACHED loads. Trades a per-byte uncached tax
+// for one invalidate + cached reads.
 //   0 = per-byte uncached uc_load (fallback; ~15% slower on loopback)
 //   1 = one sycl::atomic_fence(acquire, system) at kernel entry + cached reads (DEFAULT)
 //   2 = one LSC lsc_fence.ugm.invalidate.sysacq at kernel entry + cached reads
 //       (UNSTABLE on 2-node: reproducibly trips UR_RESULT_ERROR_DEVICE_LOST; do NOT use)
-// Measured (flag path on): loopback ~1581 us (mode 1) vs ~1870 us (mode 0); true 2-node
+// Measured: loopback ~1581 us (mode 1) vs ~1870 us (mode 0); true 2-node
 // is transport-bound so all modes ~1150 us. Mode 1 is correct on both and faster on
 // loopback, so it is the default; mode 0 stays as an opt-out fallback.
 inline int ll_flag_recv_acq() {
@@ -419,7 +366,7 @@ inline void ll_recv_acquire(int mode) {
 // also corrupts NIC/QP state and cascades into later iterations). With the low
 // cap the same delayed flag instead breaks out and degrades to "0 tokens" -- a
 // soft, recoverable failure the test's correctness check catches, never a wedge.
-// This is the flag-path DEVICE_LOST fix: bound the spin below the watchdog.
+// This bounds the receiver spin-poll below the watchdog to avoid DEVICE_LOST.
 inline uint64_t ll_poll_cap() {
     const char* env = std::getenv("DEEP_EP_LL_POLL_CAP");
     if (env != nullptr && env[0] != '\0') {
@@ -614,16 +561,16 @@ void dispatch_bf16(void* packed_recv_x,
     const size_t slot_elems = send_count_elems * num_max_dispatch_tokens_per_rank;
     const size_t recv_src_elems = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
     const size_t max_put = ll_max_put_bytes();
-    const bool flag_progress = ll_flag_progress();
     const uint64_t poll_cap = ll_poll_cap();
-    const bool flag_diag_barrier = ll_flag_diag_barrier();
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
     // When the receiver does a single acquire/invalidate up front, the bulk payload
     // is read with CACHED loads instead of per-byte uncached uc_load.
-    const bool coop_put = ll_coop_put();
-    const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
+    const bool recv_uncached = (flag_recv_acq == 0);
+    // GridBarrier scratch: {counter, sense} live at layout.barrier_offset. Zeroed
+    // right before the fused kernel launches (below); reusable across barriers.
+    auto* barrier_scratch = reinterpret_cast<uint32_t*>(base + layout.barrier_offset);
     auto* combine_flag = base + layout.combine_flag_offset;
 
     // --- Stage 0: zero LOCAL staging + output tensors (multi-WG via memset).
@@ -633,13 +580,12 @@ void dispatch_bf16(void* packed_recv_x,
     queue.memset(packed_recv_count, 0, static_cast<size_t>(num_local_experts) * sizeof(int));
     queue.memset(send_src, 0xFF, slot_elems * sizeof(int));
     queue.memset(packed_recv_src_info, 0xFF, recv_src_elems * sizeof(int));
-    // Flag-progress cross-cleaning: this dispatch zeros the LOCAL combine_flag
-    // buffer (the slot combine RECEIVES completion signals into), so the next
-    // combine starts from a clean flag state without a global clean_low_latency
-    // barrier on the perf path. Mirrors CUDA's next_clean (dispatch clears the
-    // combine flag region). dispatch_count (this stage's receive slot) is zeroed
-    // by the prior combine's Stage 0.
-    if (flag_progress) {
+    // Cross-cleaning: this dispatch zeros the LOCAL combine_flag buffer (the slot
+    // combine RECEIVES completion signals into), so the next combine starts from a
+    // clean flag state. Mirrors CUDA's next_clean (dispatch clears the combine flag
+    // region). dispatch_count (this stage's receive slot) is zeroed by the prior
+    // combine's Stage 0.
+    {
         // Write-through zero of the LOCAL combine_flag slots (the region combine
         // RECEIVES completion signals into). A cached queue.memset would leave the
         // zeros in L2; the combine receiver reads these via uc_load (bypassing L2),
@@ -718,172 +664,122 @@ void dispatch_bf16(void* packed_recv_x,
         });
     }
 
-    // --- Stage 2: local self-copy + remote NBI puts (multi-WG).
-    // Local self-copy is heavily data-parallel across the whole grid; the remote
-    // NBI put issuing is intentionally bounded to one work-item per channel
-    // (num_experts channels) to avoid oversubscribing the single QP per PE.
+    // --- FUSED single-kernel dispatch. CUDA-parity for the one-kernel LL dispatch:
+    // send-put phase -> cg::this_grid().sync() -> recv. CoopPut + CoopFlag + quiet
+    // + Recv are ONE launch, with a single GridBarrier standing in for CUDA's one
+    // cg::this_grid().sync(). Grid = fused_wgs WGs of 256, fused_wgs co-residency-
+    // bounded (see ll_fused_wgs) and >= num_recv_channels.
+    //
+    // Phases (per work-item) -- exactly ONE grid barrier (CUDA parity):
+    //   0. Self-copy      : local (dst_rank==rank) send_*->dispatch_* copy + self
+    //                       count flag (the receiver reads its own slot directly).
+    //   1. Payload put    : coop warp-put of every remote channel's contiguous
+    //                       payload block, grid-strided over all sub-groups. After
+    //                       each put the sub-group leader bumps a per-channel atomic
+    //                       finish-counter (CUDA atomic_finish_counter_per_expert).
+    //   2. Flag put       : one sub-group per send channel spins on its finish-
+    //                       counter "ready" flag (payload-before-flag ordering, no
+    //                       grid barrier) then emits the count flag on qp=le.
+    //   3. Quiet          : WG0 drains this PE's outbound NBI puts (send_data reuse).
+    //   4. GridBarrier    : THE single grid sync (== CUDA this_grid().sync()).
+    //   5. Recv/pack      : WG c owns recv channel c (< num_recv_channels); it
+    //                       spin-polls its cross-PE arrival flag (GridBarrier does
+    //                       NOT sync remote PEs, so the poll MUST stay), reserves an
+    //                       output range, and packs the payload. Extra WGs return.
     {
-        const size_t self_bytes = static_cast<size_t>(num_local_experts) * num_max_dispatch_tokens_per_rank * hidden_bytes;
-        const int num_wgs = ll_num_wgs(self_bytes >> 4, kLLWGSize, kLLMaxWGs);
+        const int num_send_channels = (num_ranks - 1) * num_local_experts;
+        const int num_recv_channels = num_local_experts * num_ranks;
+        const int fused_wgs = ll_fused_wgs(queue, num_recv_channels);
+        const size_t put_chunk_host = static_cast<size_t>(max_put);
+        const int num_scales = (hidden % 128 == 0) ? hidden / 128 : 0;
+        const int scale_packs = use_ue8m0 ? (num_scales + 3) / 4 : num_scales;
+        auto* dst_fp8 = static_cast<uint8_t*>(packed_recv_x);
+        auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
+        auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
+        auto* barrier_counter = barrier_scratch;
+        auto* barrier_sense = barrier_scratch + 1;
+        // Per-send-channel atomic finish-counter (CUDA atomic_finish_counter_per_expert
+        // parity): orders payload-before-flag WITHOUT a grid barrier. See Phase 1/2.
+        // 2 ints/channel: [0..n) atomic post-counter, [n..2n) uc_store ready flag.
+        auto* finish_counter = reinterpret_cast<int*>(base + layout.finish_offset);
+        auto* finish_ready = finish_counter + num_send_channels;
+
+        // Zero the {counter, sense} GridBarrier scratch + the finish counter/ready
+        // arrays before the launch. memset on the in-order queue completes first.
+        queue.memset(barrier_scratch, 0, 2 * sizeof(uint32_t));
+        queue.memset(finish_counter, 0, static_cast<size_t>(2 * num_send_channels) * sizeof(int));
+
+        // Cross-PE pre-send HOST barrier. Two roles: (a) supplies a cross-PCIe
+        // acquire so peer RDMA writes are observed; (b) forces GLOBAL iteration
+        // alignment. (b) is required because the dispatch/combine flags are NOT
+        // epoch-tagged (dispatch encodes -count-1, combine a constant 1 -- both
+        // identical every iteration since routing is fixed), so a stale flag from a
+        // prior iteration landing after this PE's cross-clean is indistinguishable
+        // from a fresh one and would clobber the count. Pure barrier-free transitive
+        // ordering undercounts at 32 tok; a device-only ishmemx_barrier_all_work_group
+        // is flaky (line-253 data race) at 256 tok. The host barrier is the only
+        // variant proven correct at 32 AND 256, and it is NOT the dominant cost (the
+        // GridBarrier fused_wgs co-residency bound is) -- revisit with epoch-tagged
+        // flags + a co-residency fix before removing this.
+        queue.wait();
+        ishmem_barrier_all();
+
         queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchPutKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+            sycl::local_accessor<int, 1> shared(sycl::range<1>(2), cgh);  // [0]=count, [1]=begin
+            cgh.parallel_for<LowLatencyDispatchFusedKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(fused_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
                 [=](sycl::nd_item<1> item) {
-                    const int gid = static_cast<int>(item.get_global_id(0));
-                    const int gsize = static_cast<int>(item.get_global_range(0));
-
-                    // Local (self) copy of dispatch_count / dispatch_src / dispatch_data.
-                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                        const size_t src_slot =
-                            (static_cast<size_t>(rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank;
-                        const size_t dst_slot = (static_cast<size_t>(local_expert) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        const int count = sycl::min(send_count[rank * num_local_experts + local_expert], num_max_dispatch_tokens_per_rank);
-                        if (gid == 0) {
-                            if (flag_progress) {
-                                // Self path: encode as -count-1 so 0 tokens (-1) is
-                                // distinguishable from not-arrived (0). Written via
-                                // uc_store so the Wait/Pack uc_load reader observes it.
-                                uc_store(&dispatch_count[local_expert * num_ranks + rank], -count - 1);
-                            } else {
-                                dispatch_count[local_expert * num_ranks + rank] = count;
-                            }
-                        }
-                        for (int slot = gid; slot < num_max_dispatch_tokens_per_rank; slot += gsize) {
-                            if (flag_progress) {
-                                uc_store(&dispatch_src[dst_slot + slot], send_src[src_slot + slot]);
-                            } else {
-                                dispatch_src[dst_slot + slot] = send_src[src_slot + slot];
-                            }
-                        }
-                        if (flag_progress) {
-                            coop_copy_bytes_store_uc(dispatch_data + dst_slot * hidden_bytes,
-                                                     send_data + src_slot * hidden_bytes,
-                                                     static_cast<size_t>(count) * hidden_bytes,
-                                                     gid,
-                                                     gsize);
-                        } else {
-                            coop_copy_bytes(dispatch_data + dst_slot * hidden_bytes,
-                                            send_data + src_slot * hidden_bytes,
-                                            static_cast<size_t>(count) * hidden_bytes,
-                                            gid,
-                                            gsize);
-                        }
-                    }
-
-                    // Remote NBI puts (non-cooperative per-channel path). When
-                    // coop_put && flag_progress, the remote payload and flags are
-                    // issued by dedicated warp-cooperative kernels submitted AFTER
-                    // this one (see below); this kernel then only does the local
-                    // self-copy above.
-                    if (!(coop_put && flag_progress)) {
-                    // one work-item per channel.
-                    int ch = 0;
-                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) {
-                            continue;
-                        }
-                        for (int le = 0; le < num_local_experts; ++le) {
-                            if (ch == gid) {
-                                const int sc_idx = dst_rank * num_local_experts + le;
-                                send_count[sc_idx] = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
-                                const int count = send_count[sc_idx];
-                                const size_t src_slot = static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
-                                const size_t dst_slot = (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                                if (flag_progress) {
-                                    // Send payload first, then the per-expert completion flag via a
-                                    // 4-byte RDMA WRITE (SET semantics) of the encoded value -count-1
-                                    // into the receiver's count slot. SET (not atomic-add) is required
-                                    // because with GPU_IPC=0 every peer goes over the NIC: the test may
-                                    // issue two identical dispatches back-to-back without an intervening
-                                    // combine (which would reset the slot), so an accumulating add would
-                                    // double the count. A WRITE overwrites, matching CUDA's intra-node
-                                    // st_release SET path. With QPS_PER_PE=1 the payload puts and this
-                                    // WRITE share the same RC QP, so in-order delivery guarantees the
-                                    // flag lands AFTER the payload. 0 tokens -> -1 (still != 0).
-                                    if (count > 0) {
-                                        ishmem_putmem_nbi(dispatch_src + dst_slot,
-                                                          send_src + src_slot,
-                                                          static_cast<size_t>(count) * sizeof(int),
-                                                          dst_rank);
-                                        chunked_put_nbi(dispatch_data + dst_slot * hidden_bytes,
-                                                        send_data + src_slot * hidden_bytes,
-                                                        static_cast<size_t>(count) * hidden_bytes,
-                                                        dst_rank,
-                                                        max_put);
-                                    }
-                                    uc_store(&send_count[sc_idx], -count - 1);  // write-through so NIC reads fresh
-                                    // Optional sender-side release/flush so the NIC DMA-reads the
-                                    // freshly-stored flag (not a stale cached value). See
-                                    // ll_flag_sender_fence / DEEP_EP_LL_FLAG_SENDER_FENCE.
-                                    ll_sender_flush(flag_sender_fence);
-                                    ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank, send_count + sc_idx, sizeof(int), dst_rank);
-                                } else {
-                                    ishmem_putmem_nbi(dispatch_count + le * num_ranks + rank, send_count + sc_idx, sizeof(int), dst_rank);
-                                    if (count > 0) {
-                                        ishmem_putmem_nbi(dispatch_src + dst_slot,
-                                                          send_src + src_slot,
-                                                          static_cast<size_t>(count) * sizeof(int),
-                                                          dst_rank);
-                                        chunked_put_nbi(dispatch_data + dst_slot * hidden_bytes,
-                                                        send_data + src_slot * hidden_bytes,
-                                                        static_cast<size_t>(count) * hidden_bytes,
-                                                        dst_rank,
-                                                        max_put);
-                                    }
-                                }
-                            }
-                            ch++;
-                        }
-                    }
-                    }  // end if (non-cooperative per-channel path)
-                });
-        });
-    }
-
-    // --- Stage 2b (coop): warp-cooperative remote payload + flags. Faithful port
-    // of the CUDA LL send: MANY co-resident sub-groups issue per-token warp puts
-    // (ishmemx_putmem_nbi_warp) spread grid-strided across all channels, on
-    // qp = local_expert (like CUDA qp_id = dst_expert_local_idx). A SEPARATE flag
-    // kernel runs after the payload kernel: kernel ordering on the in-order queue
-    // guarantees every flag WQE is claimed AFTER all payload WQEs of its channel,
-    // so same-QP in-order RC delivery lands the flag after the payload.
-    if (coop_put && flag_progress) {
-        const int num_channels = (num_ranks - 1) * num_local_experts;
-        // Co-resident grid: CUDA sizes its grid to num_sms so the ordered commit
-        // gate never starves. Default to the device's compute-unit count; allow
-        // override via DEEP_EP_LL_PUT_WGS.
-        const int put_wgs = ll_put_wgs(queue);
-        const size_t put_chunk_host = static_cast<size_t>(ll_max_put_bytes());
-        // Payload kernel.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchCoopPutKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(put_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
+                    GridBarrier gb(barrier_counter, barrier_sense, static_cast<uint32_t>(fused_wgs));
+                    auto group = item.get_group();
                     auto sg = item.get_sub_group();
-                    // Global sub-group id + total number of sub-groups in the grid.
+                    const int local_id = static_cast<int>(item.get_local_id(0));
+                    const int local_size = static_cast<int>(item.get_local_range(0));
+                    const int wg = static_cast<int>(item.get_group_linear_id());
                     const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
-                                          static_cast<int>(sg.get_group_linear_id());
-                    const int num_sgs = put_wgs * sgs_per_wg;
+                    const int global_sg = wg * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
+                    const int num_sgs = fused_wgs * sgs_per_wg;
                     const bool leader = (sg.get_local_id()[0] == 0);
+                    const int global_id = static_cast<int>(item.get_global_id(0));
+                    const int global_size = static_cast<int>(item.get_global_range(0));
 
-                    // Iterate channels; grid-stride the per-channel token messages
-                    // across all sub-groups. Each sub-group sends one token (src idx
-                    // + hidden data) per warp put, on qp = local_expert.
-                    // Iterate channels; grid-stride each channel's CONTIGUOUS payload
-                    // block (send_data slots are packed, so the whole channel is one
-                    // contiguous src->dst region) as large byte-chunks across all
-                    // sub-groups. Large chunks (put_chunk, default 192 KiB) mean FEW
-                    // messages / commit-gate ops (each warp put internally fans a
-                    // chunk into <=sz 64 KiB WQEs), while grid-striding many chunks
-                    // keeps all sub-groups busy. This beats per-token puts because the
-                    // staged buffer is contiguous (CUDA must go per-token only because
-                    // its source x[token] is scattered).
+                    // -------- Phase 0: local self-copy (dst_rank == rank) ----------
+                    // The remote send loop below skips self; the receiver reads its
+                    // OWN slot from dispatch_* directly. Copy send_* -> dispatch_* for
+                    // the self slot and set the self count flag (encoded -count-1),
+                    // grid-parallel. uc_store so the recv-phase uc_load observes it.
+                    // (This is the self-copy that used to live in Stage 2's
+                    // LowLatencyDispatchPutKernel, now folded into the fused kernel.)
+                    for (int le = 0; le < num_local_experts; ++le) {
+                        const int self_count = sycl::min(send_count[rank * num_local_experts + le],
+                                                         num_max_dispatch_tokens_per_rank);
+                        const size_t self_src_slot =
+                            (static_cast<size_t>(rank) * num_local_experts + le) * num_max_dispatch_tokens_per_rank;
+                        const size_t self_dst_slot =
+                            (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                        if (global_id == 0) {
+                            uc_store(&dispatch_count[le * num_ranks + rank], -self_count - 1);
+                        }
+                        for (int slot = global_id; slot < self_count; slot += global_size) {
+                            uc_store(&dispatch_src[self_dst_slot + slot], send_src[self_src_slot + slot]);
+                        }
+                        coop_copy_bytes_store_uc(dispatch_data + self_dst_slot * hidden_bytes,
+                                                 send_data + self_src_slot * hidden_bytes,
+                                                 static_cast<size_t>(self_count) * hidden_bytes,
+                                                 global_id, global_size);
+                    }
+
+                    // -------- Phase 1: payload put (CoopPut logic) ---------------
+                    // Confine the payload SEND to WG0 so the pre-flag WG0 quiet
+                    // definitively drains EVERY posted payload WQE before any flag is
+                    // posted (a multi-WG send + WG0-only quiet leaves other WGs' posts
+                    // undrained at higher token counts -> line-253 data races). WG0's
+                    // sub-groups grid-stride the chunks; recv still uses all WGs.
                     const size_t put_chunk = put_chunk_host;
-                    for (int ch = 0; ch < num_channels; ++ch) {
+                    if (wg == 0) {
+                    for (int ch = 0; ch < num_send_channels; ++ch) {
                         const int dr = ch / num_local_experts;
                         const int le = ch % num_local_experts;
-                        const int dst_rank = (dr < rank) ? dr : dr + 1;   // skip self
+                        const int dst_rank = (dr < rank) ? dr : dr + 1;  // skip self
                         const int sc_idx = dst_rank * num_local_experts + le;
                         int count = 0;
                         if (leader) count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
@@ -891,259 +787,257 @@ void dispatch_bf16(void* packed_recv_x,
                         if (count <= 0) continue;
                         const size_t src_slot = static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
                         const size_t dst_slot = (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        // Bulk source-index array (contiguous count*int) once per channel
-                        // on qp = le, issued by the first sub-group.
+                        const size_t total = static_cast<size_t>(count) * hidden_bytes;
+                        const size_t nchunks = (total + put_chunk - 1) / put_chunk;
+                        // expected posts for this channel = nchunks payload chunks + 1
+                        // src-index put. The incrementer whose post makes the counter
+                        // reach `expected` publishes the ready flag via uc_store so the
+                        // flag-sender observes completion cross-work-group (mirrors
+                        // GridBarrier's atomic-count-then-uc-publish; an atomic/plain
+                        // load of the counter is NOT cross-WG coherent for spinning).
+                        const int expected = static_cast<int>(nchunks + 1);
                         if (global_sg == 0) {
                             ishmemx_putmem_nbi_warp(dispatch_src + dst_slot, send_src + src_slot,
                                                     static_cast<size_t>(count) * sizeof(int), dst_rank,
-                                                    static_cast<unsigned int>(le), true, sg);
+                                                    static_cast<unsigned int>(le), true, sg, /*force_db=*/true);
+                            // Finish-counter: +1 for the src-index put (once per channel).
+                            if (leader) {
+                                const int prev = atomic_add_global(&finish_counter[ch], 1);
+                                if (prev + 1 == expected) {
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    uc_store(&finish_ready[ch], 1);
+                                }
+                            }
                         }
-                        // Contiguous payload, grid-strided in large byte-chunks.
-                        const size_t total = static_cast<size_t>(count) * hidden_bytes;
-                        const size_t nchunks = (total + put_chunk - 1) / put_chunk;
                         uint8_t* src_base = send_data + src_slot * hidden_bytes;
                         uint8_t* dst_base = dispatch_data + dst_slot * hidden_bytes;
-                        for (size_t c = global_sg; c < nchunks; c += num_sgs) {
+                        for (size_t c = global_sg; c < nchunks; c += sgs_per_wg) {
                             const size_t off = c * put_chunk;
                             const size_t this_bytes = sycl::min(put_chunk, total - off);
                             ishmemx_putmem_nbi_warp(dst_base + off, src_base + off, this_bytes,
-                                                    dst_rank, static_cast<unsigned int>(le), true, sg);
+                                                    dst_rank, static_cast<unsigned int>(le), true, sg, /*force_db=*/true);
+                            // Finish-counter: +1 per posted payload chunk (CUDA parity).
+                            if (leader) {
+                                const int prev = atomic_add_global(&finish_counter[ch], 1);
+                                if (prev + 1 == expected) {
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    uc_store(&finish_ready[ch], 1);
+                                }
+                            }
                         }
                     }
-                });
-        });
-        // Flag kernel: one sub-group per channel sends the completion flag on
-        // qp = local_expert, AFTER all payload puts (kernel ordering).
-        queue.submit([&](sycl::handler& cgh) {
-            const int flag_wgs = sycl::max(1, (num_channels + (kLLWGSize / 32) - 1) / (kLLWGSize / 32));
-            cgh.parallel_for<LowLatencyDispatchCoopFlagKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto sg = item.get_sub_group();
-                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
-                                          static_cast<int>(sg.get_group_linear_id());
-                    const bool active = (global_sg < num_channels);
-                    int dst_rank = 0, le = 0, sc_idx = 0, count = 0;
-                    if (active) {
-                        const int dr = global_sg / num_local_experts;
-                        le = global_sg % num_local_experts;
-                        dst_rank = (dr < rank) ? dr : dr + 1;
-                        sc_idx = dst_rank * num_local_experts + le;
-                        if (sg.get_local_id()[0] == 0) {
-                            count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
-                            // encode -count-1 (0 tokens -> -1, distinct from not-arrived 0)
-                            uc_store(&send_count[sc_idx], -count - 1);
-                        }
+                    }  // end if (wg == 0) payload-send guard
+
+                    // -------- Phase 2: flag put --------------------------------------
+                    // Payload-before-flag ordering. The PART-B atomic finish-counter
+                    // (post-return ordering) proved INSUFFICIENT on this IBGDA stack:
+                    // ishmemx_putmem_nbi_warp returning does NOT guarantee the WQE has
+                    // reached the QP ring, so a same-QP flag could overtake payload
+                    // (line-253 data races). The reliable ordering is a DRAIN: the
+                    // payload SEND is confined to WG0 (above) and WG0 quiets here so
+                    // every posted payload WQE is DELIVERED before any flag is posted.
+                    // NOTE: this requires ISHMEM_IBGDA_DB_BATCH_SIZE=1 -- with doorbell
+                    // batching (>1) the quiet does not reliably drain batched-but-
+                    // un-rung WQEs and the race returns at higher token counts. The
+                    // finish-counter/uc_store(finish_ready) is retained as a secondary
+                    // post-order guard. (The pre-fused split design tolerated batching
+                    // because the kernel boundary between put and flag drained the QP.)
+                    if (wg == 0) {
+                        ishmemx_quiet_work_group(group);
                     }
-                    ll_sender_flush(flag_sender_fence);
-                    ishmemx_putmem_nbi_warp(dispatch_count + le * num_ranks + rank,
-                                            send_count + sc_idx, sizeof(int), dst_rank,
-                                            static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
-                });
-        });
-    }
+                    {
+                        const bool active = (global_sg < num_send_channels);
+                        int dst_rank = 0, le = 0, sc_idx = 0, count = 0;
+                        if (active) {
+                            const int dr = global_sg / num_local_experts;
+                            le = global_sg % num_local_experts;
+                            dst_rank = (dr < rank) ? dr : dr + 1;
+                            sc_idx = dst_rank * num_local_experts + le;
+                            if (sg.get_local_id()[0] == 0) {
+                                count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
+                                // For count>0 channels, spin on the uc_store'd ready flag
+                                // (set by the last payload-post incrementer) so every
+                                // payload WQE of ch is posted before this flag WQE on the
+                                // same QP=le (RC in-order => flag lands after payload).
+                                // count<=0 channels post nothing (ready stays 0) and skip
+                                // the spin -- the flag is still sent, encoding -count-1.
+                                if (count > 0) {
+                                    while (uc_load(&finish_ready[global_sg]) == 0) {
+                                        visa_spin_hint();
+                                    }
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                }
+                                uc_store(&send_count[sc_idx], -count - 1);  // encode -count-1
+                            }
+                            // Hold the whole (active) sub-group until the leader's spin +
+                            // -count-1 store completes, so the collective flag put below
+                            // reads the freshly-encoded value.
+                            sycl::group_barrier(sg);
+                        }
+                        // Post the flag UNCONDITIONALLY from every sub-group (matching
+                        // HEAD's proven CoopFlag): ishmemx_putmem_nbi_warp is a
+                        // sub-group collective whose `active` bool arg no-ops inactive
+                        // warps -- guarding the call itself with if(active) breaks the
+                        // collective contract (data corruption / hangs).
+                        ll_sender_flush(flag_sender_fence);
+                        ishmemx_putmem_nbi_warp(dispatch_count + le * num_ranks + rank,
+                                                send_count + sc_idx, sizeof(int), dst_rank,
+                                                static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
+                    }
 
-    // --- Stage 3: synchronize PEs before the receive/pack stage. Runs after
-    // Stage 2 completes on the in-order queue, so all puts have been issued.
-    if (flag_progress) {
-        // Flag-based progress: NO global all-to-all barrier. Each PE (a) drains its
-        // own outbound NBI puts via ishmemx_quiet_work_group (so the shared
-        // send_data staging is safe to reuse next iter), then (b) spin-polls its OWN
-        // per-(local_expert, src_rank) dispatch_count flag slots until the remote
-        // RDMA atomic-add lands (slot != 0), with a bounded spin cap. Mirrors the
-        // CUDA receiver poll; latency no longer grows with the slowest peer.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchWaitKernel>(sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
-                                                           [=](sycl::nd_item<1> item) {
-                                                               auto group = item.get_group();
-                                                               if (flag_diag_barrier) {
-                                                                   // DIAGNOSTIC: proven barrier sync only (no quiet, no spin).
-                                                                   // Tests SET-flag landing + uc_load decode in isolation.
-                                                                   ishmemx_barrier_all_work_group(group);
-                                                                   return;
-                                                               }
-                                                               ishmemx_quiet_work_group(group);
-                                                               sycl::group_barrier(group);
-                                                               const int local_id = static_cast<int>(item.get_local_id(0));
-                                                               const int local_size = static_cast<int>(item.get_local_range(0));
-                                                               const int num_slots = num_local_experts * num_ranks;
-                                                               for (int s = local_id; s < num_slots; s += local_size) {
-                                                                   const int le = s / num_ranks;
-                                                                   const int src_rank = s - le * num_ranks;
-                                                                   if (src_rank == rank) {
-                                                                       continue;  // self slot written locally (uc_store)
-                                                                   }
-                                                                   if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
-                                                                       continue;  // masked peer never sends; leave 0 -> 0 tokens
-                                                                   }
-                                                                   uint64_t spins = 0;
-                                                                   while (ll_read_flag(&dispatch_count[le * num_ranks + src_rank], flag_lsc_mode) == 0) {
-                                                                       if (++spins >= poll_cap) {
-                                                                           break;  // timeout -> leave 0 -> treated as 0 tokens
-                                                                       }
-                                                                   }
-                                                               }
-                                                           });
-        });
-    } else {
-        // Barrier path: single-WG cross-PE barrier drains the NBI puts (quiet) and
-        // synchronizes all PEs before the receive/pack stage.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchBarrierKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) { ishmemx_barrier_all_work_group(item.get_group()); });
-        });
-    }
+                    // -------- Phase 3: quiet (drain this PE's outbound puts) ------
+                    // WG0-only: concurrent multi-WG ishmemx_quiet_work_group is
+                    // unstable on this stack (hangs / dropped completions). quiet is
+                    // per-PE (drains the shared QP state), so WG0 alone drains every
+                    // WG's outbound puts; the grid barrier then makes it visible.
+                    if (wg == 0) {
+                        ishmemx_quiet_work_group(group);
+                    }
 
-    // --- Stage 4: pack received data. Each local expert is handled by a cohort of
-    // `pack_wgs_per_expert` work-groups; the per-rank prefix (begin offsets) is
-    // recomputed (cheaply) by every work-group, only the cohort leader writes the
-    // per-channel layout/stats, and the payload copy / src_info / FP8 conversion are
-    // partitioned across the whole cohort for parallelism.
-    // When use_fp8 is set, the BF16 payload from the RDMA staging is converted to
-    // FP8 (with per-128-channel scales) directly here — the FP8 cast is fused into
-    // dispatch rather than performed as a separate pass over the packed output.
-    {
-        const int num_scales = (hidden % 128 == 0) ? hidden / 128 : 0;
-        const int scale_packs = use_ue8m0 ? (num_scales + 3) / 4 : num_scales;
-        auto* dst_fp8 = static_cast<uint8_t*>(packed_recv_x);
-        auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
-        auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
-        const int local_experts = num_local_experts > 0 ? num_local_experts : 1;
-        const int pack_wgs_per_expert = sycl::max(1, sycl::min(kLLMaxWGs / local_experts, 32));
-        const int num_wgs = local_experts * pack_wgs_per_expert;
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchPackKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    const int local_id = static_cast<int>(item.get_local_id(0));
-                    const int local_size = static_cast<int>(item.get_local_range(0));
-                    const int wg = static_cast<int>(item.get_group_linear_id());
-                    const int local_expert = wg / pack_wgs_per_expert;
-                    const int sub = wg % pack_wgs_per_expert;
-                    if (local_expert >= num_local_experts) {
+                    // -------- Phase 4: THE SINGLE grid-sync (== CUDA this_grid().sync)
+                    gb.arrive_and_wait(item);
+
+                    // -------- Phase 5: recv/pack (RecvKernel logic) ---------------
+                    // WGs beyond the recv-channel count did their share of the send
+                    // and both barriers; they have nothing to receive.
+                    if (wg >= num_recv_channels) {
                         return;
                     }
-                    const bool leader = (sub == 0 && local_id == 0);
-                    // Cooperating-lane identity across the whole cohort for this expert.
-                    const int cohort_id = sub * local_size + local_id;
-                    const int cohort_size = pack_wgs_per_expert * local_size;
+                    const int local_expert = wg / num_ranks;
+                    const int src_rank = wg % num_ranks;
+                    const int sg_id = static_cast<int>(sg.get_group_linear_id());
 
-                    // Flag path: the per-expert flags already confirmed (Stage 3) that
-                    // the RDMA payload has landed in memory. Issue a SINGLE system-scope
-                    // acquire/invalidate here so the subsequent CACHED payload reads see
-                    // the NIC-delivered bytes (when flag_recv_acq != 0). No-op otherwise.
-                    if (flag_progress && flag_recv_acq != 0) {
+                    if (sg_id == 0) {
+                        int count = 0;
+                        if (local_id == 0) {
+                            if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
+                                count = 0;
+                            } else if (src_rank == rank) {
+                                const int raw = ll_read_flag(&dispatch_count[local_expert * num_ranks + src_rank], flag_lsc_mode);
+                                count = (raw == 0) ? 0 : sycl::min(-raw - 1, num_max_dispatch_tokens_per_rank);
+                            } else {
+                                // Cross-PE arrival poll. Follow the documented Intranode
+                                // IPC polling rule: system-scope ACQUIRE fence + fresh
+                                // uncached load + spin hint each iteration, so the
+                                // RDMA-delivered flag is observed (a bare uncached load
+                                // without a per-iteration acquire can keep observing a
+                                // stale value on BMG).
+                                uint64_t spins = 0;
+                                int raw = 0;
+                                while (true) {
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    raw = ll_read_flag(&dispatch_count[local_expert * num_ranks + src_rank], flag_lsc_mode);
+                                    if (raw != 0) {
+                                        break;
+                                    }
+                                    if (++spins >= poll_cap) {
+                                        break;
+                                    }
+                                    visa_spin_hint();
+                                }
+                                count = (raw == 0) ? 0 : sycl::min(-raw - 1, num_max_dispatch_tokens_per_rank);
+                            }
+                            int begin = 0;
+                            {
+                                sycl::atomic_ref<int,
+                                                 sycl::memory_order::relaxed,
+                                                 sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space>
+                                    recv_count(packed_recv_count[local_expert]);
+                                begin = (count > 0) ? recv_count.fetch_add(count) : recv_count.load();
+                            }
+                            packed_recv_layout_range[local_expert * num_ranks + src_rank] =
+                                static_cast<int64_t>(pack_range(count, begin));
+                            if (cumulative_local_expert_recv_stats != nullptr && count > 0) {
+                                sycl::atomic_ref<int,
+                                                 sycl::memory_order::relaxed,
+                                                 sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space>
+                                    stat(cumulative_local_expert_recv_stats[local_expert]);
+                                stat.fetch_add(count);
+                            }
+                            shared[0] = count;
+                            shared[1] = begin;
+                        }
+                    }
+                    sycl::group_barrier(group);
+                    const int count = shared[0];
+                    const int begin = shared[1];
+                    if (count <= 0) {
+                        return;
+                    }
+                    if (flag_recv_acq != 0) {
                         ll_recv_acquire(flag_recv_acq);
                     }
-
-                    int begin = 0;
-                    int total = 0;
-                    for (int src_rank = 0; src_rank < num_ranks; ++src_rank) {
-                        int clamped_count;
-                        if (flag_progress) {
-                            // Flag encoding: 0 = not-arrived/timeout -> 0 tokens;
-                            // otherwise raw = -count-1 -> count = -raw-1. uc_load
-                            // forces a fetch of the RDMA-delivered (NIC-written) slot.
-                            const int raw = ll_read_flag(&dispatch_count[local_expert * num_ranks + src_rank], flag_lsc_mode);
-                            clamped_count = (raw == 0) ? 0 : sycl::min(-raw - 1, num_max_dispatch_tokens_per_rank);
-                        } else {
-                            clamped_count =
-                                sycl::min(dispatch_count[local_expert * num_ranks + src_rank], num_max_dispatch_tokens_per_rank);
-                        }
-                        if (leader) {
-                            packed_recv_layout_range[local_expert * num_ranks + src_rank] =
-                                static_cast<int64_t>(pack_range(clamped_count, begin));
-                            if (cumulative_local_expert_recv_stats != nullptr) {
-                                cumulative_local_expert_recv_stats[local_expert] += clamped_count;
+                    const int cohort_id = local_id;
+                    const int cohort_size = local_size;
+                    const size_t src_base =
+                        (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
+                    const size_t dst_base =
+                        static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
+                    if (use_fp8) {
+                        const size_t work = static_cast<size_t>(count) * num_scales;
+                        for (size_t w = cohort_id; w < work; w += cohort_size) {
+                            const int local_row = static_cast<int>(w / num_scales);
+                            const int scale_idx = static_cast<int>(w % num_scales);
+                            const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                                dispatch_data + (src_base + local_row) * hidden_bytes);
+                            const size_t dst_row = dst_base + local_row;
+                            const int base_h = scale_idx * 128;
+                            float blk[128];
+                            float amax = 1.0e-4f;
+                            for (int i = 0; i < 128; ++i) {
+                                const float fv = recv_uncached ? static_cast<float>(uc_load(&src_bf16[base_h + i]))
+                                                               : static_cast<float>(src_bf16[base_h + i]);
+                                blk[i] = fv;
+                                amax = sycl::fmax(amax, sycl::fabs(fv));
                             }
-                            if (dispatch_wait_recv_cost_stats != nullptr && local_expert == 0) {
-                                dispatch_wait_recv_cost_stats[src_rank] += 0;
-                            }
-                        }
-                        if (clamped_count > 0) {
-                            const size_t src_base =
-                                (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
-                            const size_t dst_base =
-                                static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
-                            if (use_fp8) {
-                                // Per-(row, 128-channel block) BF16->FP8 conversion. Each lane
-                                // owns one (row, scale block): compute amax, scale, write 128 FP8
-                                // values and the per-block scale (float, or packed UE8M0 byte).
-                                const size_t work = static_cast<size_t>(clamped_count) * num_scales;
-                                for (size_t w = cohort_id; w < work; w += cohort_size) {
-                                    const int local_row = static_cast<int>(w / num_scales);
-                                    const int scale_idx = static_cast<int>(w % num_scales);
-                                    const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
-                                        dispatch_data + (src_base + local_row) * hidden_bytes);
-                                    const size_t dst_row = dst_base + local_row;
-                                    const int base_h = scale_idx * 128;
-                                    // Read the 128-channel block ONCE (uncached on the flag path so the
-                                    // RDMA-delivered payload is observed, not a stale L2 line) into a
-                                    // local buffer, then run the amax and scale passes from the local
-                                    // copy. Avoids a second uncached pass over the same data.
-                                    float blk[128];
-                                    float amax = 1.0e-4f;
-                                    for (int i = 0; i < 128; ++i) {
-                                        const float fv = recv_uncached ? static_cast<float>(uc_load(&src_bf16[base_h + i]))
-                                                                       : static_cast<float>(src_bf16[base_h + i]);
-                                        blk[i] = fv;
-                                        amax = sycl::fmax(amax, sycl::fabs(fv));
-                                    }
-                                    float scale;
-                                    float scale_inv;
-                                    if (round_scale) {
-                                        const float exp_scale_inv = sycl::ceil(sycl::log2(amax / 448.0f));
-                                        scale = sycl::exp2(-exp_scale_inv);
-                                        scale_inv = sycl::exp2(exp_scale_inv);
-                                    } else {
-                                        scale_inv = amax / 448.0f;
-                                        scale = 448.0f / amax;
-                                    }
-                                    for (int i = 0; i < 128; ++i) {
-                                        const float value = blk[i] * scale;
-                                        dst_fp8[dst_row * hidden + base_h + i] = c10::Float8_e4m3fn(value).x;
-                                    }
-                                    if (use_ue8m0) {
-                                        const int pack_idx = scale_idx / 4;
-                                        const int pack_shift = (scale_idx % 4) * 8;
-                                        const int32_t scale_byte = static_cast<int32_t>(ue8m0_from_float(scale_inv)) << pack_shift;
-                                        sycl::atomic_ref<int32_t,
-                                                         sycl::memory_order::relaxed,
-                                                         sycl::memory_scope::device,
-                                                         sycl::access::address_space::global_space>
-                                            scale_pack(dst_scale_int[dst_row * scale_packs + pack_idx]);
-                                        scale_pack.fetch_or(scale_byte);
-                                    } else {
-                                        dst_scale_float[dst_row * num_scales + scale_idx] = scale_inv;
-                                    }
-                                }
+                            float scale;
+                            float scale_inv;
+                            if (round_scale) {
+                                const float exp_scale_inv = sycl::ceil(sycl::log2(amax / 448.0f));
+                                scale = sycl::exp2(-exp_scale_inv);
+                                scale_inv = sycl::exp2(exp_scale_inv);
                             } else {
-                                if (recv_uncached) {
-                                    coop_copy_bytes_uc(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
-                                                       dispatch_data + src_base * hidden_bytes,
-                                                       static_cast<size_t>(clamped_count) * hidden_bytes,
-                                                       cohort_id,
-                                                       cohort_size);
-                                } else {
-                                    coop_copy_bytes(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
-                                                    dispatch_data + src_base * hidden_bytes,
-                                                    static_cast<size_t>(clamped_count) * hidden_bytes,
-                                                    cohort_id,
-                                                    cohort_size);
-                                }
+                                scale_inv = amax / 448.0f;
+                                scale = 448.0f / amax;
                             }
-                            for (int slot = cohort_id; slot < clamped_count; slot += cohort_size) {
-                                packed_recv_src_info[dst_base + slot] =
-                                    recv_uncached ? uc_load(&dispatch_src[src_base + slot]) : dispatch_src[src_base + slot];
+                            for (int i = 0; i < 128; ++i) {
+                                const float value = blk[i] * scale;
+                                dst_fp8[dst_row * hidden + base_h + i] = c10::Float8_e4m3fn(value).x;
+                            }
+                            if (use_ue8m0) {
+                                const int pack_idx = scale_idx / 4;
+                                const int pack_shift = (scale_idx % 4) * 8;
+                                const int32_t scale_byte = static_cast<int32_t>(ue8m0_from_float(scale_inv)) << pack_shift;
+                                sycl::atomic_ref<int32_t,
+                                                 sycl::memory_order::relaxed,
+                                                 sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space>
+                                    scale_pack(dst_scale_int[dst_row * scale_packs + pack_idx]);
+                                scale_pack.fetch_or(scale_byte);
+                            } else {
+                                dst_scale_float[dst_row * num_scales + scale_idx] = scale_inv;
                             }
                         }
-                        begin += clamped_count;
-                        total += clamped_count;
+                    } else {
+                        if (recv_uncached) {
+                            coop_copy_bytes_uc(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
+                                               dispatch_data + src_base * hidden_bytes,
+                                               static_cast<size_t>(count) * hidden_bytes,
+                                               cohort_id,
+                                               cohort_size);
+                        } else {
+                            coop_copy_bytes(static_cast<uint8_t*>(packed_recv_x) + dst_base * hidden_bytes,
+                                            dispatch_data + src_base * hidden_bytes,
+                                            static_cast<size_t>(count) * hidden_bytes,
+                                            cohort_id,
+                                            cohort_size);
+                        }
                     }
-                    if (leader) {
-                        packed_recv_count[local_expert] = total;
+                    for (int slot = cohort_id; slot < count; slot += cohort_size) {
+                        packed_recv_src_info[dst_base + slot] =
+                            recv_uncached ? uc_load(&dispatch_src[src_base + slot]) : dispatch_src[src_base + slot];
                     }
                 });
         });
@@ -1186,24 +1080,24 @@ void combine_bf16(void* combined_x,
 
     const size_t send_elems = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
     const size_t max_put = ll_max_put_bytes();
-    const bool flag_progress = ll_flag_progress_combine();
     const uint64_t poll_cap = ll_poll_cap();
-    const bool flag_diag_barrier = ll_flag_diag_barrier();
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
-    const bool coop_put = ll_coop_put();
-    const bool recv_uncached = flag_progress && (flag_recv_acq == 0);
+    const bool recv_uncached = (flag_recv_acq == 0);
+    // GridBarrier scratch (reuses the same layout.barrier_offset added for the
+    // fused dispatch). Re-zeroed right before the fused combine launch below.
+    auto* barrier_scratch = reinterpret_cast<uint32_t*>(base + layout.barrier_offset);
 
     // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
     // combine_flag are already zeroed by clean_low_latency_buffer (cross-PE barrier).
     queue.memset(send_data, 0, send_elems * hidden_bytes);
-    // Flag-progress cross-cleaning: this combine zeros the LOCAL dispatch_count
-    // buffer (the slot the NEXT dispatch receives its per-expert count flags into),
-    // so the next dispatch starts clean without a global clean_low_latency barrier.
-    // Mirrors CUDA's next_clean (combine clears the dispatch count region).
-    // combine_flag (this stage's receive slot) was zeroed by this iter's dispatch.
-    if (flag_progress) {
+    // Cross-cleaning: this combine zeros the LOCAL dispatch_count buffer (the slot
+    // the NEXT dispatch receives its per-expert count flags into), so the next
+    // dispatch starts clean. Mirrors CUDA's next_clean (combine clears the dispatch
+    // count region). combine_flag (this stage's receive slot) was zeroed by this
+    // iter's dispatch.
+    {
         // Write-through zero of the LOCAL dispatch_count slots (the region the NEXT
         // dispatch RECEIVES its per-expert count flags into). See the matching
         // rationale in dispatch Stage 0: cached memset zeros may not reach memory
@@ -1273,150 +1167,116 @@ void combine_bf16(void* combined_x,
         });
     }
 
-    // --- Stage 2: combine put — local self-copy (grid-parallel) + bounded remote
-    // NBI puts (one work-item per channel) of the per-destination min/max token span.
+
+
+    // --- FUSED single-kernel combine (DEEP_EP_LL_FUSED). CUDA-parity for the
+    // one-kernel LL combine: send-put -> cg::this_grid().sync() -> reduce. Here
+    // CombineCoopPut + CombineCoopFlag + quiet + flag-poll + Reduce are ONE launch
+    // with a GridBarrier standing in for CUDA's this_grid().sync(). Grid =
+    // fused_wgs WGs of 256, co-residency-bounded (ll_fused_wgs).
+    //
+    // Phases (per work-item):
+    //   1. Payload put   : coop warp-put of each channel's contiguous token span,
+    //                      per-channel atomic finish-counter + uc_store ready flag.
+    //   2. Flag put      : one sub-group per send channel spins on its ready flag
+    //                      (payload-before-flag ordering, no grid barrier) then
+    //                      sets the remote flag.
+    //   3. Quiet         : every WG drains this PE's outbound NBI puts.
+    //   4. Flag poll     : grid-strided spin-poll of every remote-owned expert flag
+    //                      (cross-PE arrival sync -- GridBarrier does NOT sync PEs,
+    //                      so the poll is mandatory before the reduce).
+    //   5. GridBarrier    : THE single grid-sync (== CUDA this_grid().sync()) --
+    //                      every expert flag observed grid-wide before ANY reduce.
+    //   6. Reduce        : grid-strided weighted top-k reduction into combined_x.
     {
-        const size_t self_bytes = static_cast<size_t>(num_local_experts) * num_max_dispatch_tokens_per_rank * hidden_bytes;
-        const int num_wgs = ll_num_wgs(self_bytes >> 4, kLLWGSize, kLLMaxWGs);
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombinePutKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    const int gid = static_cast<int>(item.get_global_id(0));
-                    const int gsize = static_cast<int>(item.get_global_range(0));
-
-                    // Step 1: local self-copy (dst_rank == rank), grid-parallel.
-                    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                        const int global_expert = rank * num_local_experts + local_expert;
-                        int count = 0, begin = 0;
-                        unpack_range(layout_range[local_expert * num_ranks + rank], count, begin);
-                        const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                        int min_token = num_max_dispatch_tokens_per_rank;
-                        int max_token = -1;
-                        for (int slot = 0; slot < clamped_count; ++slot) {
-                            const int original_token =
-                                src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                            if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                                min_token = sycl::min(min_token, original_token);
-                                max_token = sycl::max(max_token, original_token);
-                            }
-                        }
-                        if (max_token >= min_token) {
-                            auto* src_ptr = send_data +
-                                (static_cast<size_t>(rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
-                                 min_token) *
-                                    hidden_bytes;
-                            auto* dst_ptr = combine_data +
-                                (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
-                            const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                            if (flag_progress) {
-                                coop_copy_bytes_store_uc(dst_ptr, src_ptr, bytes, gid, gsize);
-                            } else {
-                                coop_copy_bytes(dst_ptr, src_ptr, bytes, gid, gsize);
-                            }
-                        }
-                        if (flag_progress && gid == 0) {
-                            // Self-owned expert: set the local completion flag (UNCONDITIONALLY,
-                            // even 0 tokens). Written via uc_store so the Reduce/Wait uc_load
-                            // reader observes it. combine_flag is uint64_t[num_experts]; the int*
-                            // alias indexes the little-endian low word at [global_expert*2].
-                            uc_store(&combine_flag_i[global_expert * 2], 1);
-                        }
-                    }
-
-                    // Step 2: remote NBI puts (non-cooperative per-channel path).
-                    // When coop_put && flag_progress, the remote payload and flags
-                    // are issued by dedicated warp-cooperative kernels submitted
-                    // AFTER this one; this kernel then only does the self-copy above.
-                    if (!(coop_put && flag_progress)) {
-                    // one work-item per channel.
-                    int ch = 0;
-                    for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                        if (dst_rank == rank) {
-                            continue;
-                        }
-                        for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
-                            if (ch == gid) {
-                                const int global_expert = rank * num_local_experts + local_expert;
-                                int count = 0, begin = 0;
-                                unpack_range(layout_range[local_expert * num_ranks + dst_rank], count, begin);
-                                const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                                int min_token = num_max_dispatch_tokens_per_rank;
-                                int max_token = -1;
-                                for (int slot = 0; slot < clamped_count; ++slot) {
-                                    const int original_token =
-                                        src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin +
-                                                 slot];
-                                    if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                                        min_token = sycl::min(min_token, original_token);
-                                        max_token = sycl::max(max_token, original_token);
-                                    }
-                                }
-                                if (max_token >= min_token) {
-                                    auto* src_ptr = send_data +
-                                        (static_cast<size_t>(dst_rank * num_local_experts + local_expert) *
-                                             num_max_dispatch_tokens_per_rank +
-                                         min_token) *
-                                            hidden_bytes;
-                                    auto* dst_ptr = combine_data +
-                                        (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
-                                    const size_t bytes = static_cast<size_t>(max_token - min_token + 1) * hidden_bytes;
-                                    chunked_put_nbi(dst_ptr, src_ptr, bytes, dst_rank, max_put);
-                                }
-                                if (flag_progress) {
-                                    // Per-expert completion flag SET (not atomic-add) via a 4-byte
-                                    // RDMA WRITE of 1 into the receiver's combine_flag slot for this
-                                    // global_expert. Each global_expert is owned by exactly ONE rank,
-                                    // so SET (overwrite) is sufficient and avoids the atomic-add path
-                                    // (which faults on this BMG+mlx5 IBGDA stack). The value 1 is
-                                    // staged via uc_store into send_count[sc_idx] (one scratch int per
-                                    // channel, unused by combine) so the NIC reads a fresh source.
-                                    // Same-QP RC ordering (QPS_PER_PE=1) lands it after the payload put.
-                                    const int sc_idx = dst_rank * num_local_experts + local_expert;
-                                    uc_store(&send_count[sc_idx], 1);
-                                    // Flush the staged flag past L3 so the NIC DMA-reads the fresh
-                                    // value (same hazard as dispatch; see ll_flag_sender_fence).
-                                    ll_sender_flush(flag_sender_fence);
-                                    ishmem_putmem_nbi(combine_flag_i + global_expert * 2, send_count + sc_idx, sizeof(int), dst_rank);
-                                }
-                            }
-                            ch++;
-                        }
-                    }
-                    }  // end if (non-cooperative per-channel path)
-                });
-        });
-    }
-
-    // --- Stage 2b (coop): warp-cooperative remote combine payload + flags.
-    // Mirrors the dispatch coop path. MANY co-resident sub-groups grid-stride the
-    // per-channel contiguous [min_token, max_token] payload span (one warp put per
-    // token, on qp = local_expert), then a SEPARATE flag kernel sets each remote
-    // combine_flag AFTER all payload WQEs (kernel ordering + same-QP RC order).
-    if (coop_put && flag_progress) {
         const int num_channels = (num_ranks - 1) * num_local_experts;
-        const int put_wgs = ll_put_wgs(queue);
-        const size_t put_chunk_host = static_cast<size_t>(ll_max_put_bytes());
-        // Payload kernel.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineCoopPutKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(put_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto sg = item.get_sub_group();
-                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
-                                          static_cast<int>(sg.get_group_linear_id());
-                    const int num_sgs = put_wgs * sgs_per_wg;
-                    const bool leader = (sg.get_local_id()[0] == 0);
-                    const size_t put_chunk = put_chunk_host;
+        const int num_send_channels = num_channels;
+        const int fused_wgs = ll_fused_wgs(queue, num_local_experts * num_ranks);
+        const size_t put_chunk_host = static_cast<size_t>(max_put);
+        const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
+        auto* barrier_counter = barrier_scratch;
+        auto* barrier_sense = barrier_scratch + 1;
+        // Per-send-channel atomic finish-counter (CUDA parity for
+        // atomic_finish_counter_per_expert): orders payload-before-flag per channel
+        // WITHOUT a grid barrier. Reuses the same layout.finish_offset as dispatch
+        // (both are separate in-order launches, sized identically). 2 ints/channel:
+        // [0..n) atomic post-counter, [n..2n) uc_store ready flag. Re-zeroed here.
+        auto* finish_counter = reinterpret_cast<int*>(base + layout.finish_offset);
+        auto* finish_ready = finish_counter + num_send_channels;
 
+        // Zero the {counter, sense} GridBarrier scratch + finish arrays before the
+        // launch (dispatch and combine are separate calls, so re-zero fresh).
+        queue.memset(barrier_scratch, 0, 2 * sizeof(uint32_t));
+        queue.memset(finish_counter, 0, static_cast<size_t>(2 * num_send_channels) * sizeof(int));
+        // Cross-PE pre-send HOST barrier (see dispatch for full rationale): (a) cross-
+        // PCIe acquire, (b) global iteration alignment. Required because combine_flag
+        // (constant 1, cleaned by the prior dispatch's Stage-0) is not epoch-tagged,
+        // so without global alignment a stale flag would clobber. Only variant proven
+        // correct at 32 AND 256; not the dominant cost (fused_wgs co-residency is).
+        queue.wait();
+        ishmem_barrier_all();
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<LowLatencyCombineFusedKernel>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(fused_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
+                [=](sycl::nd_item<1> item) {
+                    GridBarrier gb(barrier_counter, barrier_sense, static_cast<uint32_t>(fused_wgs));
+                    auto group = item.get_group();
+                    auto sg = item.get_sub_group();
+                    const int wg = static_cast<int>(item.get_group_linear_id());
+                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
+                    const int global_sg = wg * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
+                    const int num_sgs = fused_wgs * sgs_per_wg;
+                    const int global_id = static_cast<int>(item.get_global_id(0));
+                    const int global_size = static_cast<int>(item.get_global_range(0));
+
+                    // -------- Phase 0: local self-copy (dst_rank == rank) ----------
+                    // The remote send loop skips self-owned experts; the reduce reads
+                    // self combine_data directly and the flag poll skips self owners.
+                    // Copy the self min/max token span send_data -> combine_data and
+                    // set the self combine flag (=1) locally, grid-parallel via
+                    // uc_store. (Folds in Stage 2's LowLatencyCombinePutKernel self-copy.)
+                    const size_t put_chunk = put_chunk_host;
+                    const bool leader = (sg.get_local_id()[0] == 0);
+                    for (int le = 0; le < num_local_experts; ++le) {
+                        const int self_ge = rank * num_local_experts + le;
+                        int scount = 0, sbegin = 0;
+                        unpack_range(layout_range[le * num_ranks + rank], scount, sbegin);
+                        const int sclamped = sycl::min(scount, num_max_dispatch_tokens_per_rank);
+                        int smin = num_max_dispatch_tokens_per_rank;
+                        int smax = -1;
+                        for (int slot = 0; slot < sclamped; ++slot) {
+                            const int ot =
+                                src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + sbegin + slot];
+                            if (ot >= 0 && ot < num_max_dispatch_tokens_per_rank) {
+                                smin = sycl::min(smin, ot);
+                                smax = sycl::max(smax, ot);
+                            }
+                        }
+                        if (smax >= smin) {
+                            auto* s_src = send_data +
+                                (static_cast<size_t>(rank * num_local_experts + le) * num_max_dispatch_tokens_per_rank + smin) *
+                                hidden_bytes;
+                            auto* s_dst = combine_data +
+                                (static_cast<size_t>(self_ge) * num_max_dispatch_tokens_per_rank + smin) * hidden_bytes;
+                            coop_copy_bytes_store_uc(s_dst, s_src,
+                                                     static_cast<size_t>(smax - smin + 1) * hidden_bytes,
+                                                     global_id, global_size);
+                        }
+                        if (global_id == 0) {
+                            uc_store(&combine_flag_i[self_ge * 2], 1);
+                        }
+                    }
+
+                    // -------- Phase 1: payload put (CombineCoopPut logic) ---------
+                    // Confine the payload SEND to WG0 (see dispatch) so the pre-flag
+                    // WG0 quiet drains every posted payload WQE before any flag.
+                    if (wg == 0) {
                     for (int ch = 0; ch < num_channels; ++ch) {
                         const int dr = ch / num_local_experts;
                         const int le = ch % num_local_experts;
                         const int dst_rank = (dr < rank) ? dr : dr + 1;
                         const int global_expert = rank * num_local_experts + le;
-                        // Compute the contiguous [min_token, max_token] span (same as
-                        // the non-coop path). Cheap scan of src_info (local memory).
                         int count = 0, begin = 0;
                         unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
                         const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
@@ -1439,106 +1299,129 @@ void combine_bf16(void* combined_x,
                             (static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + min_token) * hidden_bytes;
                         const size_t total = static_cast<size_t>(span) * hidden_bytes;
                         const size_t nchunks = (total + put_chunk - 1) / put_chunk;
-                        for (size_t c = global_sg; c < nchunks; c += num_sgs) {
+                        // expected posts = nchunks (combine has no src-index put).
+                        const int expected = static_cast<int>(nchunks);
+                        for (size_t c = global_sg; c < nchunks; c += sgs_per_wg) {
                             const size_t off = c * put_chunk;
                             const size_t this_bytes = sycl::min(put_chunk, total - off);
                             ishmemx_putmem_nbi_warp(dst_base + off, src_base + off, this_bytes,
-                                                    dst_rank, static_cast<unsigned int>(le), true, sg);
+                                                    dst_rank, static_cast<unsigned int>(le), true, sg, /*force_db=*/true);
+                            // Finish-counter: +1 per posted payload chunk; the last
+                            // incrementer publishes the ready flag via uc_store.
+                            if (leader) {
+                                const int prev = atomic_add_global(&finish_counter[ch], 1);
+                                if (prev + 1 == expected) {
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    uc_store(&finish_ready[ch], 1);
+                                }
+                            }
                         }
-                        (void)leader;
                     }
-                });
-        });
-        // Flag kernel: one sub-group per channel sets the remote combine_flag.
-        queue.submit([&](sycl::handler& cgh) {
-            const int flag_wgs = sycl::max(1, (num_channels + (kLLWGSize / 32) - 1) / (kLLWGSize / 32));
-            cgh.parallel_for<LowLatencyCombineCoopFlagKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto sg = item.get_sub_group();
-                    const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = static_cast<int>(item.get_group_linear_id()) * sgs_per_wg +
-                                          static_cast<int>(sg.get_group_linear_id());
-                    const bool active = (global_sg < num_channels);
-                    int dst_rank = 0, le = 0, global_expert = 0, sc_idx = 0;
-                    if (active) {
-                        const int dr = global_sg / num_local_experts;
-                        le = global_sg % num_local_experts;
-                        dst_rank = (dr < rank) ? dr : dr + 1;
-                        global_expert = rank * num_local_experts + le;
-                        sc_idx = dst_rank * num_local_experts + le;
-                        if (sg.get_local_id()[0] == 0) uc_store(&send_count[sc_idx], 1);
+                    }  // end if (wg == 0) payload-send guard
+
+                    // -------- Phase 2: flag put with per-channel finish-counter ----
+                    // No grid barrier (unlike CUDA's single this_grid().sync()):
+                    // per-channel finish-counter orders payload-before-flag. The
+                    // flag-sender for channel ch (== global_sg) spins until every
+                    // payload WQE of ch is posted, then posts the flag on the SAME
+                    // QP=le (RC in-order => flag lands after payload).
+                    // Drain posted payloads (WG0 quiet) before any flag is posted --
+                    // on IBGDA post-return order != WQE delivery order, so the drain
+                    // (not the finish-counter alone) is what guarantees payload
+                    // DELIVERED before flag POSTED. WG0 quiet is per-PE (drains all).
+                    if (wg == 0) {
+                        ishmemx_quiet_work_group(group);
                     }
-                    ll_sender_flush(flag_sender_fence);
-                    ishmemx_putmem_nbi_warp(combine_flag_i + global_expert * 2,
-                                            send_count + sc_idx, sizeof(int), dst_rank,
-                                            static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
-                });
-        });
-    }
+                    {
+                        const bool active = (global_sg < num_send_channels);
+                        int dst_rank = 0, le = 0, global_expert = 0, sc_idx = 0;
+                        if (active) {
+                            const int dr = global_sg / num_local_experts;
+                            le = global_sg % num_local_experts;
+                            dst_rank = (dr < rank) ? dr : dr + 1;
+                            global_expert = rank * num_local_experts + le;
+                            sc_idx = dst_rank * num_local_experts + le;
+                            if (sg.get_local_id()[0] == 0) {
+                                // Determine whether this channel has any payload (span>0).
+                                // If so, spin on the uc_store'd ready flag (set by the
+                                // last payload-post incrementer) so all payload WQEs of
+                                // ch are posted before this flag WQE on the same QP=le.
+                                // Empty-span channels post nothing (ready stays 0) and
+                                // skip the spin -- the flag is still sent (encodes 1).
+                                int count = 0, begin = 0;
+                                unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
+                                const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
+                                int min_token = num_max_dispatch_tokens_per_rank;
+                                int max_token = -1;
+                                for (int slot = 0; slot < clamped_count; ++slot) {
+                                    const int original_token =
+                                        src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
+                                    if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
+                                        min_token = sycl::min(min_token, original_token);
+                                        max_token = sycl::max(max_token, original_token);
+                                    }
+                                }
+                                if (max_token >= min_token) {
+                                    while (uc_load(&finish_ready[global_sg]) == 0) {
+                                        visa_spin_hint();
+                                    }
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                }
+                                uc_store(&send_count[sc_idx], 1);
+                            }
+                            // Hold the whole (active) sub-group until the leader's spin
+                            // + store completes before the collective flag put below.
+                            sycl::group_barrier(sg);
+                        }
+                        // Post the flag UNCONDITIONALLY from every sub-group (matching
+                        // HEAD's proven CombineCoopFlag): the `active` bool arg no-ops
+                        // inactive warps; guarding the call with if(active) breaks the
+                        // sub-group collective contract (data corruption / hangs).
+                        ll_sender_flush(flag_sender_fence);
+                        ishmemx_putmem_nbi_warp(combine_flag_i + global_expert * 2,
+                                                send_count + sc_idx, sizeof(int), dst_rank,
+                                                static_cast<unsigned int>(le), active, sg, /*force_db=*/true);
+                    }
 
-    // --- Stage 3: synchronize PEs before the reduction stage.
-    if (flag_progress) {
-        // Flag-based progress: drain outbound puts (quiet), then spin-poll the
-        // per-global-expert combine_flag slots until each owner's RDMA atomic-add
-        // lands. Skip self-owned experts (set locally) and masked owners. No global
-        // all-to-all barrier.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineWaitKernel>(sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
-                                                          [=](sycl::nd_item<1> item) {
-                                                              auto group = item.get_group();
-                                                              if (flag_diag_barrier) {
-                                                                  ishmemx_barrier_all_work_group(group);
-                                                                  return;
-                                                              }
-                                                              ishmemx_quiet_work_group(group);
-                                                              sycl::group_barrier(group);
-                                                              const int local_id = static_cast<int>(item.get_local_id(0));
-                                                              const int local_size = static_cast<int>(item.get_local_range(0));
-                                                              for (int ge = local_id; ge < num_experts; ge += local_size) {
-                                                                  const int owner = ge / num_local_experts;
-                                                                  if (owner == rank) {
-                                                                      continue;  // self-owned: flag set locally
-                                                                  }
-                                                                  if (ll_rank_masked(mask_buffer_ptr, owner)) {
-                                                                      continue;  // masked owner never sends
-                                                                  }
-                                                                  uint64_t spins = 0;
-                                                                  while (ll_read_flag(&combine_flag_i[ge * 2], flag_lsc_mode) == 0) {
-                                                                      if (++spins >= poll_cap) {
-                                                                          break;  // timeout -> proceed; Reduce reads zeros
-                                                                      }
-                                                                  }
-                                                              }
-                                                          });
-        });
-    } else {
-        // Barrier path: single-WG cross-PE barrier drains NBI puts (quiet) + syncs PEs.
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineBarrierKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) { ishmemx_barrier_all_work_group(item.get_group()); });
-        });
-    }
+                    // -------- Phase 3: quiet (drain this PE's outbound puts) ------
+                    // WG0-only (see dispatch): concurrent multi-WG quiet is unstable.
+                    if (wg == 0) {
+                        ishmemx_quiet_work_group(group);
+                    }
 
-    // --- Stage 4: weighted reduction over top-k into combined_x (grid-parallel).
-    {
-        const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
-        const int num_wgs = ll_num_wgs(reduce_work, kLLWGSize, kLLMaxWGs);
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineReduceKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    const int gid = static_cast<int>(item.get_global_id(0));
-                    const int gsize = static_cast<int>(item.get_global_range(0));
+                    // -------- Phase 4: flag poll (CombineWait logic, grid-strided) -
+                    // Cross-PE arrival sync spread across ALL work-items of ALL WGs.
+                    for (int ge = global_id; ge < num_experts; ge += global_size) {
+                        const int owner = ge / num_local_experts;
+                        if (owner == rank) {
+                            continue;  // self-owned: flag set locally
+                        }
+                        if (ll_rank_masked(mask_buffer_ptr, owner)) {
+                            continue;  // masked owner never sends
+                        }
+                        uint64_t spins = 0;
+                        while (true) {
+                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                            if (ll_read_flag(&combine_flag_i[ge * 2], flag_lsc_mode) != 0) {
+                                break;
+                            }
+                            if (++spins >= poll_cap) {
+                                break;  // timeout -> proceed; Reduce reads zeros
+                            }
+                            visa_spin_hint();
+                        }
+                    }
+
+                    // -------- Phase 5: THE SINGLE grid-sync (== CUDA this_grid().sync)
+                    // Ensure every expert flag observed grid-wide before ANY reduce.
+                    gb.arrive_and_wait(item);
+
+                    // -------- Phase 6: reduce (CombineReduce logic) ---------------
                     auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
-                    // Flag path: one acquire/invalidate up front (Stage 3 confirmed the
-                    // combine payload landed) so the reduction reads CACHED instead of
-                    // per-byte uncached, when flag_recv_acq != 0.
-                    if (flag_progress && flag_recv_acq != 0) {
+                    if (flag_recv_acq != 0) {
                         ll_recv_acquire(flag_recv_acq);
                     }
-                    for (size_t idx = gid; idx < reduce_work; idx += gsize) {
+                    for (size_t idx = global_id; idx < reduce_work; idx += global_size) {
                         const int token_idx = static_cast<int>(idx / hidden);
                         const int h = static_cast<int>(idx % hidden);
                         float acc = 0.0f;
@@ -1558,8 +1441,8 @@ void combine_bf16(void* combined_x,
                         }
                         out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
                     }
-                    if (combine_wait_recv_cost_stats != nullptr && gid < num_ranks) {
-                        combine_wait_recv_cost_stats[gid] += 0;
+                    if (combine_wait_recv_cost_stats != nullptr && global_id < num_ranks) {
+                        combine_wait_recv_cost_stats[global_id] += 0;
                     }
                 });
         });

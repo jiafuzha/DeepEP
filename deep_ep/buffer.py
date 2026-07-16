@@ -3,6 +3,9 @@ import socket
 import struct
 import tempfile
 import time
+import glob as _glob
+import signal as _signal
+import weakref as _weakref
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -14,6 +17,131 @@ import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
+
+
+_ORPHAN_REAP_DONE = False
+
+# --- Abnormal-exit GPU/NIC drain on external termination signals ---------------
+#
+# A run can die from an external SIGTERM/SIGINT (an orchestrator killing a slow
+# job, ``timeout(1)``, ``docker stop``, Ctrl-C) that does NOT flow through the
+# caller's try/finally teardown. On the Intel BMG + mlx5/IBGDA stack, if the
+# process dies while a long-running IBGDA poll/quiet exec queue is still merely
+# *submitted* on the GT, the Xe GuC cannot preempt it at teardown -> GT reset ->
+# the next run inherits a wedged GT (init hang / DEVICE_LOST). Draining the GPU
+# streams (retiring that exec queue) before exit prevents this.
+#
+# CRITICAL DESIGN NOTE: the drain MUST run from a NORMAL Python context, never
+# from a C signal handler. A C ``sigaction`` handler that calls into SYCL/L0 to
+# drain DEADLOCKS, because the signal almost always interrupts the process while
+# it is inside a driver call holding an internal lock, and the drain re-enters the
+# same locked runtime. A Python ``signal`` handler runs between bytecodes -- i.e.
+# only AFTER the interrupted native call has returned -- so re-entering the driver
+# to drain is safe. We therefore reuse the proven ``Buffer.quiesce()`` here.
+#
+# SIGKILL/SIGSEGV cannot be handled this way (uncatchable / not deliverable to
+# Python); those rely on the startup orphan reaper plus the optional driver reset.
+# Opt out with ``DEEP_EP_XPU_SIGNAL_CLEANUP=0``.
+_LIVE_BUFFERS = _weakref.WeakSet()
+_SIGNAL_CLEANUP_INSTALLED = False
+_PREV_SIGNAL_HANDLERS = {}
+
+
+def _signal_cleanup_handler(signum, frame):
+    # Runs in normal Python context (between bytecodes) -> safe to call into the
+    # driver. Drain every live buffer's GPU/NIC before the process terminates.
+    print(f'[DeepEP] signal {signum}: draining GPU/NIC of {len(_LIVE_BUFFERS)} '
+          f'live buffer(s) before exit', flush=True)
+    for buf in list(_LIVE_BUFFERS):
+        with suppress(Exception):
+            buf.quiesce()
+    print(f'[DeepEP] signal {signum}: drain done, chaining to previous handler', flush=True)
+    # Chain to the previous disposition so the exit code / KeyboardInterrupt
+    # semantics are preserved.
+    prev = _PREV_SIGNAL_HANDLERS.get(signum, _signal.SIG_DFL)
+    if callable(prev):
+        prev(signum, frame)
+        return
+    if prev == _signal.SIG_IGN:
+        return
+    # SIG_DFL: restore default and re-raise so the process terminates normally.
+    with suppress(Exception):
+        _signal.signal(signum, _signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_signal_cleanup():
+    global _SIGNAL_CLEANUP_INSTALLED
+    if _SIGNAL_CLEANUP_INSTALLED:
+        return
+    _SIGNAL_CLEANUP_INSTALLED = True
+    if os.environ.get('DEEP_EP_XPU_SIGNAL_CLEANUP', '1') == '0':
+        return
+    armed = []
+    for signum in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _PREV_SIGNAL_HANDLERS[signum] = _signal.getsignal(signum)
+            _signal.signal(signum, _signal_cleanup_handler)
+            armed.append(int(signum))
+        except (ValueError, OSError):
+            # signal.signal() only works on the main thread; skip otherwise.
+            _PREV_SIGNAL_HANDLERS.pop(signum, None)
+    print(f'[DeepEP] signal cleanup armed for {armed} (pid {os.getpid()})', flush=True)
+
+
+def _reap_orphan_xpu_ipc():
+    """Best-effort removal of PID-tagged IPC sockets left behind by DEAD runs.
+
+    A run killed by an uncatchable SIGKILL (``docker rm -f``, ``timeout -s KILL``)
+    or a hard crash cannot run any in-process cleanup, so its PID-tagged UNIX
+    domain sockets survive. Accumulated stale IPC state is a prime trigger for the
+    next run's init hang / DEVICE_LOST cascade on the Intel BMG + mlx5/IBGDA stack.
+
+    This reaps ONLY files whose embedded PID is provably dead, so it never touches
+    a concurrently-live run's resources (multiple ranks on the same node share
+    /tmp). Non-PID-tagged shared memory (PSM3/oneCCL/gloo sems in /dev/shm) is left
+    to the external node reset ritual. Runs once per process; opt out with
+    ``DEEP_EP_XPU_REAP_ORPHANS=0``.
+    """
+    global _ORPHAN_REAP_DONE
+    if _ORPHAN_REAP_DONE:
+        return
+    _ORPHAN_REAP_DONE = True
+    if os.environ.get('DEEP_EP_XPU_REAP_ORPHANS', '1') == '0':
+        return
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but owned by another user
+        except OSError:
+            return True  # be conservative: assume alive
+        return True
+
+    tmp = tempfile.gettempdir()
+    # (glob pattern, function extracting the owner PID from the basename)
+    reapers = [
+        # deep_ep_xpu_ipc_<pid>_<rank>_<id>.sock  (created in Buffer._exchange_xpu_ipc_fds)
+        (os.path.join(tmp, 'deep_ep_xpu_ipc_*.sock'),
+         lambda base: base[len('deep_ep_xpu_ipc_'):].split('_')[0]),
+        # ishmem-ipc-fd-sock-<pid>:<pe>  (created in ishmem_ibgda/src/ipc.cpp)
+        (os.path.join(tmp, 'ishmem-ipc-fd-sock-*'),
+         lambda base: base[len('ishmem-ipc-fd-sock-'):].split(':')[0]),
+    ]
+    my_pid = os.getpid()
+    for pattern, pid_of in reapers:
+        for path in _glob.glob(pattern):
+            try:
+                pid = int(pid_of(os.path.basename(path)))
+            except (ValueError, IndexError):
+                continue
+            if pid == my_pid or _pid_alive(pid):
+                continue
+            with suppress(OSError):
+                os.unlink(path)
 
 
 class Buffer:
@@ -109,8 +237,19 @@ class Buffer:
         self._xpu_low_latency_mask_status = None
         if enable_shrink:
             self._xpu_low_latency_mask_status = torch.zeros((self.group_size, ), dtype=torch.int32, device='xpu')
+        # Reap PID-dead orphaned IPC sockets from previously SIGKILLed/crashed runs
+        # BEFORE the C++ runtime re-creates iSHMEM IPC sockets under the same /tmp
+        # namespace, so accumulated stale state cannot wedge this run's init.
+        _reap_orphan_xpu_ipc()
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
+        # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a
+        # killed run retires its long-running IBGDA exec queue instead of leaving it
+        # submitted (which would GT-reset and wedge the next run). See the module
+        # docstring near _signal_cleanup_handler for why this must be a PYTHON
+        # signal handler (normal context), not a C sigaction handler (deadlocks).
+        _LIVE_BUFFERS.add(self)
+        _install_signal_cleanup()
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
