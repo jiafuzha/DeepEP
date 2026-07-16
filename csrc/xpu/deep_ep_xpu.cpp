@@ -138,6 +138,14 @@ LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens
     LowLatencyBufferLayout layout;
     layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
     layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
+    // GridBarrier scratch for DEEP_EP_LL_FUSED (2 x uint32_t). MUST mirror the
+    // identical add() in internode_ll.cpp::make_layout so both layouts agree on
+    // total_bytes and all offsets.
+    add(2 * sizeof(uint32_t));
+    // Per-send-channel finish-counter (2 ints/channel: atomic counter + uc_store
+    // ready flag) for the fused kernels' payload-before-flag ordering. MUST
+    // mirror internode_ll.cpp::make_layout.
+    add(static_cast<size_t>(2 * (num_ranks - 1) * num_local_experts) * sizeof(int));
     layout.total_bytes = offset;
     return layout;
 }
