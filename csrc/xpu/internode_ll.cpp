@@ -52,12 +52,10 @@ class CleanMaskBufferKernel;
 // Tier-1 multi-work-group low-latency kernels (multi-WG grid + sub-group
 // collectives). The merged single-256-WI-work-group kernels above are kept for
 // reference / fallback; the active dispatch/combine paths now use these.
-class LowLatencyDispatchRouteKernel;
+// CUDA parity: exactly ONE fused kernel per collective (the former separate
+// route/scatter/clean pre-kernels are folded into these two).
 class LowLatencyDispatchFusedKernel;
-class LowLatencyCombineScatterKernel;
 class LowLatencyCombineFusedKernel;
-class LowLatencyDispatchCleanFlagKernel;
-class LowLatencyCombineCleanCountKernel;
 
 struct LowLatencyLayout {
     size_t dispatch_data_bytes;
@@ -598,121 +596,51 @@ void dispatch_bf16(void* packed_recv_x,
     (void)combine_flag;
     const int dispatch_parity = cur_parity & 1;
 
-    // --- Stage 0: zero LOCAL staging + output tensors (multi-WG via memset).
-    // Symmetric receive buffers (dispatch_*) are zeroed by clean_low_latency_buffer
-    // with cross-PE barriers. send_src / packed_recv_src_info use -1 (0xFF bytes).
-    queue.memset(send_count, 0, send_count_elems * sizeof(int));
+    // --- Stage 0: zero output tensors only (multi-WG via memset). Symmetric receive
+    // buffers (dispatch_*) are zeroed by clean_low_latency_buffer with cross-PE
+    // barriers. The send staging (send_data/send_src/send_count) is no longer a
+    // separate route pass -- it is populated JUST-IN-TIME per channel inside the
+    // single fused kernel (see below) -- so it needs no pre-launch memset. Only the
+    // output tensors visible to the caller are pre-cleared here.
     queue.memset(packed_recv_count, 0, static_cast<size_t>(num_local_experts) * sizeof(int));
-    queue.memset(send_src, 0xFF, slot_elems * sizeof(int));
     queue.memset(packed_recv_src_info, 0xFF, recv_src_elems * sizeof(int));
+    (void)send_count;
+    (void)send_count_elems;
+    (void)slot_elems;
     // NOTE: dispatch_count is double-buffered (2 parity slots per (le, src)). The flag
     // for THIS call lives at slot cur_parity; the OPPOSITE slot (1-cur_parity) is
     // cross-cleaned at the fused kernel's send-start (CUDA next_clean parity) so the
     // barrier-free atomic-add is epoch-safe for back-to-back dispatch. Both slots are
     // zeroed together only by clean_low_latency_buffer.
 
-    // Pre-launch next_clean (double-buffer): zero the OPPOSITE parity slot of every
-    // dispatch_count receive slot (all le x src). Runs as its own kernel on the in-order
-    // queue, so it fully retires BEFORE the fused kernel's flag send -- giving the
-    // causality (my clean < my flag send < peer recv < peer next-call add into this
-    // slot) that makes the barrier-free atomic-add epoch-safe. Written via uc_store so
-    // the peer's later RDMA add lands on a deterministically-zeroed slot.
-    {
-        const int n = num_local_experts * num_ranks;
-        const int wg = 256;
-        const int wgs = (n + wg - 1) / wg > 0 ? (n + wg - 1) / wg : 1;
-        const int clean_parity = (cur_parity & 1) ^ 1;
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchCleanFlagKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(wgs) * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> item) {
-                    const int i = static_cast<int>(item.get_global_linear_id());
-                    if (i < n) {
-                        uc_store<long>(&dispatch_count[i * 2 + clean_parity], 0L);
-                    }
-                });
-        });
-    }
-
-    // --- Stage 1: route tokens into local send staging (multi-WG, one sub-group
-    // per (token, k) pair; the sub-group cooperatively copies the token payload).
-    {
-        const size_t num_pairs = static_cast<size_t>(num_tokens) * num_topk;
-        const int num_wgs = ll_num_wgs(num_pairs, kLLWGSize, kLLMaxWGs);
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyDispatchRouteKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto sg = item.get_sub_group();
-                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
-                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
-                    const int sgs_per_wg = static_cast<int>(sg.get_group_range()[0]);
-                    const int global_sg =
-                        static_cast<int>(item.get_group_linear_id()) * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
-                    const int num_global_sgs = static_cast<int>(item.get_group_range(0)) * sgs_per_wg;
-
-                    for (int p = global_sg; p < static_cast<int>(num_pairs); p += num_global_sgs) {
-                        const int token_idx = p / num_topk;
-                        const int k = p - token_idx * num_topk;
-                        const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
-                        if (expert < 0 || expert >= num_experts) {
-                            continue;
-                        }
-                        const int dst_rank = expert / num_local_experts;
-                        if (ll_rank_masked(mask_buffer_ptr, dst_rank)) {
-                            continue;
-                        }
-                        const int local_expert = expert - dst_rank * num_local_experts;
-                        // Single lane reserves the slot; broadcast to the sub-group.
-                        int slot = -1;
-                        if (sg_local == 0) {
-                            sycl::atomic_ref<int,
-                                             sycl::memory_order::relaxed,
-                                             sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space>
-                                count_ref(send_count[dst_rank * num_local_experts + local_expert]);
-                            slot = count_ref.fetch_add(1);
-                        }
-                        slot = sycl::group_broadcast(sg, slot, 0);
-                        if (slot >= num_max_dispatch_tokens_per_rank) {
-                            continue;
-                        }
-                        const size_t packed_slot =
-                            (static_cast<size_t>(dst_rank) * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank + slot;
-                        coop_copy_bytes(send_data + packed_slot * hidden_bytes,
-                                        static_cast<const uint8_t*>(x) + static_cast<size_t>(token_idx) * hidden_bytes,
-                                        hidden_bytes,
-                                        sg_local,
-                                        sg_size);
-                        if (sg_local == 0) {
-                            send_src[packed_slot] = token_idx;
-                        }
-                    }
-                });
-        });
-    }
-
-    // --- FUSED single-kernel dispatch. CUDA-parity for the one-kernel LL dispatch:
-    // send-put phase -> cg::this_grid().sync() -> recv. CoopPut + CoopFlag + quiet
-    // + Recv are ONE launch, with a single GridBarrier standing in for CUDA's one
-    // cg::this_grid().sync(). Grid = fused_wgs WGs of 256, fused_wgs co-residency-
-    // bounded (see ll_fused_wgs) and >= num_recv_channels.
+    // --- FUSED single-kernel dispatch (CUDA-parity ONE `__global__ void dispatch`).
+    // send-put phase -> cg::this_grid().sync() -> recv are ONE launch, with a single
+    // GridBarrier standing in for CUDA's one cg::this_grid().sync(). Grid = fused_wgs
+    // WGs of 256, fused_wgs co-residency-bounded (see ll_fused_wgs) and >=
+    // num_recv_channels. The route/clean passes that used to be separate retired
+    // kernels are folded IN here: each WG scans `topk_idx` for the channels it owns,
+    // populates its send staging just-in-time in SLM-tracked slots, and immediately
+    // delivers it (write+put overlap across channels; NO cold global route reload).
     //
     // Phases (per work-item) -- exactly ONE grid barrier (CUDA parity):
-    //   0. Self-copy      : local (dst_rank==rank) send_*->dispatch_* copy + self
-    //                       count flag (the receiver reads its own slot directly).
-    //   1. Payload put    : coop warp-put of every remote channel's contiguous
-    //                       payload block, grid-strided over all sub-groups. After
-    //                       each put the sub-group leader bumps a per-channel atomic
-    //                       finish-counter (CUDA atomic_finish_counter_per_expert).
-    //   2. Flag put       : one sub-group per send channel spins on its finish-
-    //                       counter "ready" flag (payload-before-flag ordering, no
-    //                       grid barrier) then emits the count flag on qp=le.
-    //   3. Quiet          : WG0 drains this PE's outbound NBI puts (send_data reuse).
+    //   pre. Clean        : grid-strided zero of the OPPOSITE-parity dispatch_count
+    //                       receive slots (folded CUDA next_clean; before any flag).
+    //   0. Route+deliver  : WG owns a stride of channels. For a self channel it scans
+    //                       `topk_idx`, assigns SLM-counter slots and copies x ->
+    //                       dispatch_* locally + sets the self count flag. For a
+    //                       remote channel it scans, populates send_* staging in
+    //                       SLM-counter slots, coop warp-puts the contiguous payload
+    //                       on QP=le, drains ONLY that QP (ishmemx_quiet_qp), and
+    //                       posts the count flag (-count-1) on the SAME QP (RC
+    //                       in-order => flag after payload). The per-channel SLM
+    //                       send-count is CUDA's shared_num_tokens_sent_per_expert.
     //   4. GridBarrier    : THE single grid sync (== CUDA this_grid().sync()).
     //   5. Recv/pack      : WG c owns recv channel c (< num_recv_channels); it
     //                       spin-polls its cross-PE arrival flag (GridBarrier does
     //                       NOT sync remote PEs, so the poll MUST stay), reserves an
-    //                       output range, and packs the payload. Extra WGs return.
+    //                       output range (SLM broadcast of count/begin ==
+    //                       shared_num_recv_tokens / shared_recv_token_begin_idx),
+    //                       and packs the payload. Extra WGs return.
     {
         const int num_send_channels = (num_ranks - 1) * num_local_experts;
         const int num_recv_channels = num_local_experts * num_ranks;
@@ -747,7 +675,11 @@ void dispatch_bf16(void* packed_recv_x,
         // by the Python signal-handler resource cleanup.
 
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int, 1> shared(sycl::range<1>(2), cgh);  // [0]=count, [1]=begin
+            // SLM (== CUDA __shared__): [0]=recv num_tokens (shared_num_recv_tokens),
+            // [1]=recv begin (shared_recv_token_begin_idx), [2]=per-channel send slot
+            // counter (shared_num_tokens_sent_per_expert). Send & recv phases are
+            // separated by the single GridBarrier so the slots are safely reused.
+            sycl::local_accessor<int, 1> shared(sycl::range<1>(4), cgh);
             cgh.parallel_for<LowLatencyDispatchFusedKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(fused_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
                 [=](sycl::nd_item<1> item) {
@@ -758,63 +690,118 @@ void dispatch_bf16(void* packed_recv_x,
                     const int local_size = static_cast<int>(item.get_local_range(0));
                     const int wg = static_cast<int>(item.get_group_linear_id());
                     const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = wg * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
-                    const int num_sgs = fused_wgs * sgs_per_wg;
+                    const int sg_in_wg = static_cast<int>(sg.get_group_linear_id());
+                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
+                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
                     const bool leader = (sg.get_local_id()[0] == 0);
                     const int global_id = static_cast<int>(item.get_global_id(0));
                     const int global_size = static_cast<int>(item.get_global_range(0));
+                    const size_t put_chunk = put_chunk_host;
 
-                    // -------- Phase 0: local self-copy (dst_rank == rank) ----------
-                    // The remote send loop below skips self; the receiver reads its
-                    // OWN slot from dispatch_* directly. Copy send_* -> dispatch_* for
-                    // the self slot and set the self count flag (encoded -count-1),
-                    // grid-parallel. uc_store so the recv-phase uc_load observes it.
-                    // (This is the self-copy that used to live in Stage 2's
-                    // LowLatencyDispatchPutKernel, now folded into the fused kernel.)
-                    for (int le = 0; le < num_local_experts; ++le) {
-                        const int self_count = sycl::min(send_count[rank * num_local_experts + le],
-                                                         num_max_dispatch_tokens_per_rank);
-                        const size_t self_src_slot =
-                            (static_cast<size_t>(rank) * num_local_experts + le) * num_max_dispatch_tokens_per_rank;
-                        const size_t self_dst_slot =
-                            (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        if (global_id == 0) {
-                            uc_store<long>(&dispatch_count[(le * num_ranks + rank) * 2 + dispatch_parity], static_cast<long>(-self_count - 1));
+                    // SLM slot counter helper (CUDA shared_num_tokens_sent_per_expert).
+                    auto slot_ref = [&]() {
+                        return sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                sycl::access::address_space::local_space>(shared[2]);
+                    };
+
+                    // -------- Phase pre: fold CUDA next_clean --------------------
+                    // Grid-strided zero of the OPPOSITE-parity dispatch_count receive
+                    // slots. A peer only atomic-adds into these on its NEXT (opposite-
+                    // parity) dispatch, which is causally after this whole kernel
+                    // completes, so cleaning them anywhere before this kernel returns
+                    // (uc_store, write-through) preserves the double-buffer epoch
+                    // causality without a second grid barrier.
+                    {
+                        const int nslots = num_local_experts * num_ranks;
+                        const int clean_parity = dispatch_parity ^ 1;
+                        for (int i = global_id; i < nslots; i += global_size) {
+                            uc_store<long>(&dispatch_count[i * 2 + clean_parity], 0L);
                         }
-                        for (int slot = global_id; slot < self_count; slot += global_size) {
-                            uc_store(&dispatch_src[self_dst_slot + slot], send_src[self_src_slot + slot]);
-                        }
-                        coop_copy_bytes_store_uc(dispatch_data + self_dst_slot * hidden_bytes,
-                                                 send_data + self_src_slot * hidden_bytes,
-                                                 static_cast<size_t>(self_count) * hidden_bytes,
-                                                 global_id, global_size);
                     }
 
-                    // -------- Phase 1-3: per-channel payload + per-QP drain + flag ---
-                    // Barrier-free CUDA-parity send. Each work-group owns a stride of
-                    // channels (ch = wg, wg+fused_wgs, ...). For its channel it posts the
-                    // payload on QP=le (batched, force_db=false), then the leader drains
-                    // ONLY that QP with ishmemx_quiet_qp (concurrent-safe across work-
-                    // groups -- unlike the old WG0-confined ishmemx_quiet_work_group) so
-                    // every payload WQE has landed on the peer, and finally posts the
-                    // count flag with ishmemx_int_atomic_add_qp on the SAME QP. RC in-
-                    // order delivery on QP=le => the flag lands after the payload, with
-                    // no host barrier, no WG0 confinement, and no finish-counter spin.
-                    // The atomic-add lands on the send-start-cleaned dispatch_count slot
-                    // (CUDA next_clean parity) so the receiver decodes -value-1 == count.
-                    const size_t put_chunk = put_chunk_host;
-                    const int sg_in_wg = static_cast<int>(sg.get_group_linear_id());
+                    // -------- Phase 0: self channels (dst_rank == rank) ------------
+                    // Handled by WG0 only (one writer per self slot). WG0 scans
+                    // `topk_idx` for (rank, le), assigns SLM-counter slots, and copies
+                    // x -> dispatch_* LOCALLY (write-through uc_store so the recv-phase
+                    // uc_load observes it), then sets the self count flag (-count-1).
+                    if (wg == 0) {
+                        for (int le = 0; le < num_local_experts; ++le) {
+                            const size_t self_dst_slot =
+                                (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
+                            if (local_id == 0) shared[2] = 0;
+                            sycl::group_barrier(group);
+                            for (int t = sg_in_wg; t < num_tokens; t += sgs_per_wg) {
+                                for (int k = 0; k < num_topk; ++k) {
+                                    int e = leader ? static_cast<int>(topk_idx[t * num_topk + k]) : -1;
+                                    e = sycl::group_broadcast(sg, e, 0);
+                                    if (e < 0 || e >= num_experts) continue;
+                                    if (e / num_local_experts != rank || e % num_local_experts != le) continue;
+                                    int slot = leader ? slot_ref().fetch_add(1) : 0;
+                                    slot = sycl::group_broadcast(sg, slot, 0);
+                                    if (slot >= num_max_dispatch_tokens_per_rank) continue;
+                                    coop_copy_bytes_store_uc(dispatch_data + (self_dst_slot + slot) * hidden_bytes,
+                                                             static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes,
+                                                             hidden_bytes, sg_local, sg_size);
+                                    if (leader) uc_store(&dispatch_src[self_dst_slot + slot], t);
+                                }
+                            }
+                            sycl::group_barrier(group);
+                            const int self_count = sycl::min(shared[2], num_max_dispatch_tokens_per_rank);
+                            if (local_id == 0) {
+                                uc_store<long>(&dispatch_count[(le * num_ranks + rank) * 2 + dispatch_parity],
+                                               static_cast<long>(-self_count - 1));
+                            }
+                            sycl::group_barrier(group);
+                        }
+                    }
+
+                    // -------- Phase 0/1-3: remote channels (route + deliver) --------
+                    // Each work-group owns a stride of send channels (ch = wg,
+                    // wg+fused_wgs, ...); with fused_wgs >= num_recv_channels there is
+                    // exactly ONE writer per channel, so the just-in-time send staging
+                    // populate is race-free without a global atomic. The WG scans
+                    // `topk_idx` for (dst_rank, le), assigns SLM-counter slots, copies
+                    // x -> send_* staging (write-through so the NIC DMA reads fresh
+                    // bytes), then coop warp-puts the contiguous payload on QP=le,
+                    // drains ONLY that QP (ishmemx_quiet_qp), and posts the count flag
+                    // (-count-1) on the SAME QP (RC in-order => flag after payload).
+                    // The atomic-add lands on the send-start-cleaned dispatch_count
+                    // slot (CUDA next_clean parity) so the receiver decodes -value-1.
                     for (int ch = wg; ch < num_send_channels; ch += fused_wgs) {
                         const int dr = ch / num_local_experts;
                         const int le = ch % num_local_experts;
                         const int dst_rank = (dr < rank) ? dr : dr + 1;  // skip self
                         const int sc_idx = dst_rank * num_local_experts + le;
-                        int count = 0;
-                        if (leader) count = sycl::min(send_count[sc_idx], num_max_dispatch_tokens_per_rank);
-                        count = sycl::group_broadcast(sg, count, 0);
                         const size_t src_slot = static_cast<size_t>(sc_idx) * num_max_dispatch_tokens_per_rank;
                         const size_t dst_slot = (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank;
-                        if (count > 0) {
+                        const bool masked = ll_rank_masked(mask_buffer_ptr, dst_rank);
+
+                        if (local_id == 0) shared[2] = 0;
+                        sycl::group_barrier(group);
+                        if (!masked) {
+                            for (int t = sg_in_wg; t < num_tokens; t += sgs_per_wg) {
+                                for (int k = 0; k < num_topk; ++k) {
+                                    int e = leader ? static_cast<int>(topk_idx[t * num_topk + k]) : -1;
+                                    e = sycl::group_broadcast(sg, e, 0);
+                                    if (e < 0 || e >= num_experts) continue;
+                                    if (e / num_local_experts != dst_rank || e % num_local_experts != le) continue;
+                                    int slot = leader ? slot_ref().fetch_add(1) : 0;
+                                    slot = sycl::group_broadcast(sg, slot, 0);
+                                    if (slot >= num_max_dispatch_tokens_per_rank) continue;
+                                    coop_copy_bytes(send_data + (src_slot + slot) * hidden_bytes,
+                                                    static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes,
+                                                    hidden_bytes, sg_local, sg_size);
+                                    if (leader) send_src[src_slot + slot] = t;
+                                }
+                            }
+                        }
+                        sycl::group_barrier(group);
+                        const int count = sycl::min(shared[2], num_max_dispatch_tokens_per_rank);
+
+                        if (count > 0 && !masked) {
+                            // Ensure the write-through staging is globally visible to the
+                            // NIC before the DMA-read WQEs are posted.
+                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             // src-index put: one sub-group per channel posts it.
                             if (sg_in_wg == 0) {
                                 ishmemx_putmem_nbi_warp(dispatch_src + dst_slot, send_src + src_slot,
@@ -838,8 +825,8 @@ void dispatch_bf16(void* packed_recv_x,
                         // Leader drains QP=le (payload delivered) then posts the count
                         // flag atomic-add on the SAME QP (RC in-order => flag after
                         // payload). count<=0 still posts the flag (encodes -1) so the
-                        // receiver observes an arrival.
-                        if (local_id == 0) {
+                        // receiver observes an arrival. Masked dst never sends.
+                        if (local_id == 0 && !masked) {
                             ishmemx_quiet_qp(dst_rank, static_cast<unsigned int>(le));
                             ll_sender_flush(flag_sender_fence);
                             ishmemx_long_atomic_add_qp(dispatch_count + (le * num_ranks + rank) * 2 + dispatch_parity,
@@ -1052,83 +1039,17 @@ void combine_bf16(void* combined_x,
     // fused dispatch). Re-zeroed right before the fused combine launch below.
     auto* barrier_scratch = reinterpret_cast<uint32_t*>(base + layout.barrier_offset);
 
-    // --- Stage 0: zero local send staging (bf16 zero == 0x0000). combine_data and
-    // combine_flag are already zeroed by clean_low_latency_buffer (cross-PE barrier).
+    // --- Stage 0: zero local send staging (bf16 zero == 0x0000) so that gap slots
+    // inside a channel's [min,max] put span are deterministically zero. combine_data
+    // and combine_flag are zeroed by clean_low_latency_buffer (cross-PE barrier). The
+    // scatter/clean passes that used to be separate retired kernels are folded into
+    // the single fused combine kernel below (each WG populates its channel's staging
+    // just-in-time and immediately delivers it -- no cold global scatter reload).
     queue.memset(send_data, 0, send_elems * hidden_bytes);
-    // Pre-launch next_clean (double-buffer): zero the OPPOSITE parity slot of every
-    // combine_flag receive slot (all global experts). combine_flag has 2 ints/expert,
-    // used as the 2 parity slots [ge*2+p]. Runs as its own kernel on the in-order queue
-    // so it retires before the fused flag send (same causality as dispatch).
-    {
-        const int n = num_experts;
-        const int wg = 256;
-        const int wgs = (n + wg - 1) / wg > 0 ? (n + wg - 1) / wg : 1;
-        const int clean_parity = (cur_parity & 1) ^ 1;
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineCleanCountKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(wgs) * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> item) {
-                    const int ge = static_cast<int>(item.get_global_linear_id());
-                    if (ge < n) {
-                        uc_store<long>(&combine_flag_i[ge * 2 + clean_parity], 0L);
-                    }
-                });
-        });
-    }
-
-    // --- Stage 1: scatter the received expert payload (x) into the per-source send
-    // staging slots indexed by (src_rank, local_expert, original_token). One
-    // sub-group per (local_expert, src_rank, slot) triple cooperatively copies a row.
-    {
-        const size_t num_rows = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
-        const int num_wgs = ll_num_wgs(num_rows, kLLWGSize, kLLMaxWGs);
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LowLatencyCombineScatterKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto sg = item.get_sub_group();
-                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
-                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
-                    const int sgs_per_wg = static_cast<int>(sg.get_group_range()[0]);
-                    const int global_sg =
-                        static_cast<int>(item.get_group_linear_id()) * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
-                    const int num_global_sgs = static_cast<int>(item.get_group_range(0)) * sgs_per_wg;
-                    const size_t rows_per_expert = static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
-
-                    for (size_t r = global_sg; r < num_rows; r += num_global_sgs) {
-                        const int local_expert = static_cast<int>(r / rows_per_expert);
-                        const int rem = static_cast<int>(r % rows_per_expert);
-                        const int src_rank = rem / num_max_dispatch_tokens_per_rank;
-                        const int slot = rem % num_max_dispatch_tokens_per_rank;
-                        if (ll_rank_masked(mask_buffer_ptr, src_rank)) {
-                            continue;
-                        }
-                        int count = 0, begin = 0;
-                        unpack_range(layout_range[local_expert * num_ranks + src_rank], count, begin);
-                        const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                        if (slot >= clamped_count) {
-                            continue;
-                        }
-                        const int original_token =
-                            src_info[static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                        if (original_token < 0 || original_token >= num_max_dispatch_tokens_per_rank) {
-                            continue;
-                        }
-                        auto* staged_dst = send_data +
-                            (static_cast<size_t>(src_rank * num_local_experts + local_expert) * num_max_dispatch_tokens_per_rank +
-                             original_token) *
-                                hidden_bytes;
-                        auto* src = static_cast<const uint8_t*>(x) +
-                            (static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot) *
-                                hidden_bytes;
-                        coop_copy_bytes(staged_dst, src, hidden_bytes, sg_local, sg_size);
-                    }
-                });
-        });
-    }
 
 
 
-    // --- FUSED single-kernel combine (DEEP_EP_LL_FUSED). CUDA-parity for the
+    // --- FUSED single-kernel combine (CUDA-parity ONE `__global__ void combine`). The
     // one-kernel LL combine: send-put -> cg::this_grid().sync() -> reduce. Here
     // CombineCoopPut + CombineCoopFlag + quiet + flag-poll + Reduce are ONE launch
     // with a GridBarrier standing in for CUDA's this_grid().sync(). Grid =
@@ -1175,6 +1096,9 @@ void combine_bf16(void* combined_x,
         // call is never mistaken for a fresh arrival.
 
         queue.submit([&](sycl::handler& cgh) {
+            // SLM (== CUDA __shared__): [0]=channel min original_token, [1]=channel max
+            // original_token, used to bound the contiguous [min,max] put span.
+            sycl::local_accessor<int, 1> shared(sycl::range<1>(2), cgh);
             cgh.parallel_for<LowLatencyCombineFusedKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(fused_wgs) * kLLWGSize), sycl::range<1>(kLLWGSize)),
                 [=](sycl::nd_item<1> item) {
@@ -1183,66 +1107,75 @@ void combine_bf16(void* combined_x,
                     auto sg = item.get_sub_group();
                     const int wg = static_cast<int>(item.get_group_linear_id());
                     const int sgs_per_wg = static_cast<int>(sg.get_group_linear_range());
-                    const int global_sg = wg * sgs_per_wg + static_cast<int>(sg.get_group_linear_id());
+                    const int sg_in_wg = static_cast<int>(sg.get_group_linear_id());
+                    const int global_sg = wg * sgs_per_wg + sg_in_wg;
                     const int num_sgs = fused_wgs * sgs_per_wg;
+                    const int sg_local = static_cast<int>(sg.get_local_linear_id());
+                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
+                    const int local_id = static_cast<int>(item.get_local_id(0));
+                    const bool leader = (sg.get_local_id()[0] == 0);
                     const int global_id = static_cast<int>(item.get_global_id(0));
                     const int global_size = static_cast<int>(item.get_global_range(0));
-
-                    // NOTE: no send-start next_clean of combine_flag. Flags are now
-                    // MONOTONIC atomic-add counters; the receiver decodes arrival from a
-                    // LOCAL per-slot baseline (see the flag poll below), and the total is
-                    // zeroed only by clean_low_latency_buffer (together with the baseline).
-
-                    // -------- Phase 0: local self-copy (dst_rank == rank) ----------
-                    // The remote send loop skips self-owned experts; the reduce reads
-                    // self combine_data directly and the flag poll skips self owners.
-                    // Copy the self min/max token span send_data -> combine_data and
-                    // set the self combine flag (=1) locally, grid-parallel via
-                    // uc_store. (Folds in Stage 2's LowLatencyCombinePutKernel self-copy.)
                     const size_t put_chunk = put_chunk_host;
-                    const bool leader = (sg.get_local_id()[0] == 0);
+
+                    // SLM min/max helpers for the per-channel put span.
+                    auto min_ref = [&]() {
+                        return sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                sycl::access::address_space::local_space>(shared[0]);
+                    };
+                    auto max_ref = [&]() {
+                        return sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                sycl::access::address_space::local_space>(shared[1]);
+                    };
+
+                    // -------- Phase pre: fold CUDA next_clean --------------------
+                    // Grid-strided zero of the OPPOSITE-parity combine_flag receive
+                    // slots (same double-buffer epoch causality as dispatch).
+                    {
+                        const int clean_parity = combine_parity ^ 1;
+                        for (int ge = global_id; ge < num_experts; ge += global_size) {
+                            uc_store<long>(&combine_flag_i[ge * 2 + clean_parity], 0L);
+                        }
+                    }
+
+                    // -------- Phase 0: self experts (owner == rank) ----------------
+                    // The reduce reads self combine_data directly and the flag poll
+                    // skips self owners. Copy each self-received token's x row DIRECTLY
+                    // into combine_data[self_ge][original_token] (write-through, no
+                    // send_data staging) grid-strided over (le, slot), then set the
+                    // self combine flag (=1). Distinct original_tokens => no conflict.
                     for (int le = 0; le < num_local_experts; ++le) {
                         const int self_ge = rank * num_local_experts + le;
                         int scount = 0, sbegin = 0;
                         unpack_range(layout_range[le * num_ranks + rank], scount, sbegin);
                         const int sclamped = sycl::min(scount, num_max_dispatch_tokens_per_rank);
-                        int smin = num_max_dispatch_tokens_per_rank;
-                        int smax = -1;
-                        for (int slot = 0; slot < sclamped; ++slot) {
+                        for (int slot = global_sg; slot < sclamped; slot += num_sgs) {
                             const int ot =
                                 src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + sbegin + slot];
-                            if (ot >= 0 && ot < num_max_dispatch_tokens_per_rank) {
-                                smin = sycl::min(smin, ot);
-                                smax = sycl::max(smax, ot);
-                            }
-                        }
-                        if (smax >= smin) {
-                            auto* s_src = send_data +
-                                (static_cast<size_t>(rank * num_local_experts + le) * num_max_dispatch_tokens_per_rank + smin) *
-                                hidden_bytes;
-                            auto* s_dst = combine_data +
-                                (static_cast<size_t>(self_ge) * num_max_dispatch_tokens_per_rank + smin) * hidden_bytes;
-                            coop_copy_bytes_store_uc(s_dst, s_src,
-                                                     static_cast<size_t>(smax - smin + 1) * hidden_bytes,
-                                                     global_id, global_size);
+                            if (ot < 0 || ot >= num_max_dispatch_tokens_per_rank) continue;
+                            coop_copy_bytes_store_uc(
+                                combine_data + (static_cast<size_t>(self_ge) * num_max_dispatch_tokens_per_rank + ot) * hidden_bytes,
+                                static_cast<const uint8_t*>(x) +
+                                    (static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + sbegin + slot) *
+                                        hidden_bytes,
+                                hidden_bytes, sg_local, sg_size);
                         }
                         if (global_id == 0) {
                             uc_store<long>(&combine_flag_i[self_ge * 2 + combine_parity], 1L);
                         }
                     }
 
-                    // -------- Phase 1-3: per-channel payload + per-QP drain + flag ---
-                    // Barrier-free CUDA-parity (see dispatch). Each work-group owns a
-                    // stride of channels (ch = wg, wg+fused_wgs, ...), posts that
-                    // channel's reduced payload span on QP=le (batched, force_db=false),
-                    // drains ONLY that QP with ishmemx_quiet_qp (concurrent-safe across
-                    // work-groups, unlike the old WG0-confined quiet_work_group), then
-                    // the leader posts the arrival flag with ishmemx_int_atomic_add_qp
-                    // (+1) on the SAME QP (RC in-order => flag after payload). The flag
-                    // lands on the send-start-cleaned combine_flag slot so the receiver
-                    // reads nonzero == arrived-this-call.
-                    const int local_id = static_cast<int>(item.get_local_id(0));
-                    const int sg_in_wg = static_cast<int>(sg.get_group_linear_id());
+                    // -------- Phase 1-3: remote channels (scatter + deliver) --------
+                    // Each work-group owns a stride of channels (ch = wg, wg+fused_wgs,
+                    // ...); with fused_wgs >= num_recv_channels there is exactly ONE
+                    // writer per channel, so the just-in-time send staging populate is
+                    // race-free. The WG copies each received token's x row into
+                    // send_* staging at its original_token index (write-through), tracks
+                    // the [min,max] token span in SLM, coop warp-puts the contiguous
+                    // span on QP=le, drains ONLY that QP (ishmemx_quiet_qp), then posts
+                    // the arrival flag (+1) on the SAME QP (RC in-order => flag after
+                    // payload). Gap slots inside the span are 0 (send_data memset) and
+                    // are never read by the receiver's topk-guarded reduce.
                     for (int ch = wg; ch < num_channels; ch += fused_wgs) {
                         const int dr = ch / num_local_experts;
                         const int le = ch % num_local_experts;
@@ -1251,17 +1184,41 @@ void combine_bf16(void* combined_x,
                         int count = 0, begin = 0;
                         unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
                         const int clamped_count = sycl::min(count, num_max_dispatch_tokens_per_rank);
-                        int min_token = num_max_dispatch_tokens_per_rank;
-                        int max_token = -1;
-                        for (int slot = 0; slot < clamped_count; ++slot) {
-                            const int original_token =
-                                src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot];
-                            if (original_token >= 0 && original_token < num_max_dispatch_tokens_per_rank) {
-                                min_token = sycl::min(min_token, original_token);
-                                max_token = sycl::max(max_token, original_token);
+                        const bool masked = ll_rank_masked(mask_buffer_ptr, dst_rank);
+
+                        if (local_id == 0) {
+                            shared[0] = num_max_dispatch_tokens_per_rank;
+                            shared[1] = -1;
+                        }
+                        sycl::group_barrier(group);
+                        if (!masked) {
+                            for (int slot = sg_in_wg; slot < clamped_count; slot += sgs_per_wg) {
+                                int ot = leader ? src_info[static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank +
+                                                           begin + slot]
+                                                : -1;
+                                ot = sycl::group_broadcast(sg, ot, 0);
+                                if (ot < 0 || ot >= num_max_dispatch_tokens_per_rank) continue;
+                                coop_copy_bytes(
+                                    send_data +
+                                        (static_cast<size_t>(dst_rank * num_local_experts + le) * num_max_dispatch_tokens_per_rank + ot) *
+                                            hidden_bytes,
+                                    static_cast<const uint8_t*>(x) +
+                                        (static_cast<size_t>(le) * num_ranks * num_max_dispatch_tokens_per_rank + begin + slot) *
+                                            hidden_bytes,
+                                    hidden_bytes, sg_local, sg_size);
+                                if (leader) {
+                                    min_ref().fetch_min(ot);
+                                    max_ref().fetch_max(ot);
+                                }
                             }
                         }
-                        if (max_token >= min_token) {
+                        sycl::group_barrier(group);
+                        const int min_token = shared[0];
+                        const int max_token = shared[1];
+
+                        if (max_token >= min_token && !masked) {
+                            // Flush the write-through staging so the NIC DMA reads fresh.
+                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             const int span = max_token - min_token + 1;
                             uint8_t* src_base = send_data +
                                 (static_cast<size_t>(dst_rank * num_local_experts + le) * num_max_dispatch_tokens_per_rank + min_token) *
@@ -1280,9 +1237,9 @@ void combine_bf16(void* combined_x,
                         // All sub-groups of this WG have posted their puts on QP=le.
                         sycl::group_barrier(group);
                         // Leader drains QP=le then posts the arrival flag atomic-add on
-                        // the SAME QP. Empty-span channels still post the flag (+1) so
-                        // the receiver observes an arrival.
-                        if (local_id == 0) {
+                        // the SAME QP. Non-masked channels always post (+1) so the
+                        // receiver observes an arrival even for an empty span.
+                        if (local_id == 0 && !masked) {
                             ishmemx_quiet_qp(dst_rank, static_cast<unsigned int>(le));
                             ll_sender_flush(flag_sender_fence);
                             ishmemx_long_atomic_add_qp(combine_flag_i + global_expert * 2 + combine_parity,
