@@ -307,6 +307,7 @@ void dispatch_bf16(void* packed_recv_x,
                    bool use_fp8,
                    bool round_scale,
                    bool use_ue8m0,
+                   int cur_parity,
                    sycl::queue& queue);
 
 void combine_bf16(void* combined_x,
@@ -325,6 +326,7 @@ void combine_bf16(void* combined_x,
                   int num_experts,
                   int rank,
                   int num_ranks,
+                  int cur_parity,
                   sycl::queue& queue,
                   bool zero_copy);
 
