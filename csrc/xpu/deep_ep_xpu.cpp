@@ -129,12 +129,12 @@ LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens
     };
     add(num_dispatch_slots * hidden_bytes);
     add(num_dispatch_slots * sizeof(int));
-    add(static_cast<size_t>(num_local_experts) * num_ranks * sizeof(int));
+    add(static_cast<size_t>(num_local_experts) * num_ranks * 2 * sizeof(long));  // dispatch_count: 2 parity slots (int64/long)
     add(num_send_slots * hidden_bytes);
     add(num_send_slots * sizeof(int));
     add(static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int));
     add(num_combine_slots * hidden_bytes);
-    add(static_cast<size_t>(num_experts) * sizeof(uint64_t));
+    add(static_cast<size_t>(num_experts) * 2 * sizeof(long));  // combine_flag: 2 parity slots (int64/long)
     LowLatencyBufferLayout layout;
     layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
     layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
@@ -505,6 +505,12 @@ struct Buffer {
     torch::Tensor ll_dispatch_src_info[2];
     torch::Tensor ll_dispatch_layout_range[2];
     torch::Tensor ll_combine_out;
+    // Double-buffer parity for the barrier-free atomic-add LL flags. Rotated per call
+    // so back-to-back dispatch/combine use distinct flag slots (the opposite slot is
+    // cross-cleaned at send-start). Reset to 0 by clean_low_latency_buffer (which zeros
+    // both slots), keeping all PEs' parity in lock-step.
+    int ll_dispatch_parity = 0;
+    int ll_combine_parity = 0;
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
     volatile int* moe_recv_rdma_counter = nullptr;
@@ -1891,6 +1897,10 @@ struct Buffer {
                                                low_latency_sync_buffer_ptr,
                                                comm_stream.queue());
         comm_stream.queue().wait_and_throw();
+        // Both flag slots are now zeroed; reset parity so the next call uses slot 0
+        // in lock-step across all PEs.
+        ll_dispatch_parity = 0;
+        ll_combine_parity = 0;
     }
 
     void low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
@@ -2060,7 +2070,9 @@ struct Buffer {
             use_fp8,
             round_scale,
             use_ue8m0,
+            ll_dispatch_parity,
             comm_stream.queue());
+        ll_dispatch_parity ^= 1;
 
         EventHandle event(comm_stream);
         if (!async_finish && comm_stream != compute_stream) {
@@ -2141,8 +2153,10 @@ struct Buffer {
                                    num_experts,
                                    rank,
                                    num_ranks,
+                                   ll_combine_parity,
                                    comm_stream.queue(),
                                    zero_copy);
+        ll_combine_parity ^= 1;
         EventHandle event(comm_stream);
         if (!async_finish && comm_stream != compute_stream) {
             stream_wait(compute_stream, comm_stream);

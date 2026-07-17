@@ -396,6 +396,7 @@ run_test() {
         -e ISHMEM_IBGDA_STATS_DIR="${ISHMEM_IBGDA_STATS_DIR:-}" \
         -e DEEP_EP_TEST_DEBUG="${DEEP_EP_TEST_DEBUG:-0}" \
         -e DEEP_EP_SYNC_DBG="${DEEP_EP_SYNC_DBG:-0}" \
+        -e DEEP_EP_LL_POLL_CAP="${DEEP_EP_LL_POLL_CAP:-}" \
         -e DEEP_EP_LL_MAX_PUT_KB="${DEEP_EP_LL_MAX_PUT_KB:-}" \
         -e DEEP_EP_LL_NUM_WGS="${DEEP_EP_LL_NUM_WGS:-}" \
         -e DEEP_EP_LL_FUSED_WGS="${DEEP_EP_LL_FUSED_WGS:-}" \
@@ -469,7 +470,7 @@ run_test() {
                 -genv DEEP_EP_LL_FLAG_LSC \"\${DEEP_EP_LL_FLAG_LSC:-0}\" \
                 -genv DEEP_EP_LL_FLAG_SENDER_FENCE \"\${DEEP_EP_LL_FLAG_SENDER_FENCE:-1}\" \
                 -genv DEEP_EP_LL_FLAG_RECV_ACQ \"\${DEEP_EP_LL_FLAG_RECV_ACQ:-1}\" \
-                -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-1000000}\" \
+                -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
                 -genv DEEP_EP_LL_MAX_PUT_KB \"\${DEEP_EP_LL_MAX_PUT_KB:-}\" \
                 -genv DEEP_EP_LL_NUM_WGS \"\${DEEP_EP_LL_NUM_WGS:-}\" \
                 -genv DEEP_EP_LL_FUSED_WGS \"\${DEEP_EP_LL_FUSED_WGS:-}\" \
