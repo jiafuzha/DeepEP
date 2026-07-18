@@ -118,6 +118,12 @@ LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens
     TORCH_CHECK(num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks");
     const int num_local_experts = num_experts / num_ranks;
     const size_t hidden_bytes = static_cast<size_t>(hidden) * sizeof(sycl::ext::oneapi::bfloat16);
+    const int num_scales = (hidden % 128 == 0) ? hidden / 128 : 0;
+    // CUDA-parity unified message: [int4 header][payload (fp8|bf16)][fp8 scales]. Sized at
+    // the bf16 max so one allocation serves both dtypes. MUST match ll_num_bytes_per_msg().
+    const size_t msg_bytes = sizeof(int) * 4 +
+        std::max<size_t>(static_cast<size_t>(hidden) * sizeof(sycl::ext::oneapi::bfloat16),
+                         static_cast<size_t>(hidden) + static_cast<size_t>(num_scales) * sizeof(float));
     const size_t num_dispatch_slots = static_cast<size_t>(num_local_experts) * num_ranks * num_max_dispatch_tokens_per_rank;
     const size_t num_send_slots = static_cast<size_t>(num_ranks) * num_local_experts * num_max_dispatch_tokens_per_rank;
     const size_t num_combine_slots = static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank;
@@ -127,25 +133,21 @@ LowLatencyBufferLayout get_low_latency_buffer_layout(int num_max_dispatch_tokens
         offset = align_up<size_t>(offset + bytes, NUM_BUFFER_ALIGNMENT_BYTES);
         return old;
     };
-    add(num_dispatch_slots * hidden_bytes);
-    add(num_dispatch_slots * sizeof(int));
-    add(static_cast<size_t>(num_local_experts) * num_ranks * 2 * sizeof(long));  // dispatch_count: 2 parity slots (int64/long)
-    add(num_send_slots * hidden_bytes);
-    add(num_send_slots * sizeof(int));
-    add(static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int));
-    add(num_combine_slots * hidden_bytes);
-    add(static_cast<size_t>(num_experts) * 2 * sizeof(long));  // combine_flag: 2 parity slots (int64/long)
+    // Order MUST match internode_ll.cpp::make_layout exactly.
+    add(num_dispatch_slots * msg_bytes);                                                 // dispatch_data (rdma_recv_x)
+    add(static_cast<size_t>(num_max_dispatch_tokens_per_rank) * msg_bytes);              // rdma_x (send staging)
+    add(static_cast<size_t>(num_local_experts) * num_ranks * 2 * sizeof(long));          // dispatch_count (rdma_recv_count)
+    add(num_send_slots * hidden_bytes);                                                  // send_data (combine staging)
+    add(static_cast<size_t>(num_ranks) * num_local_experts * sizeof(int));               // send_count (combine)
+    add(num_combine_slots * hidden_bytes);                                               // combine_data
+    add(static_cast<size_t>(num_experts) * 2 * sizeof(long));                            // combine_flag: 2 parity slots
     LowLatencyBufferLayout layout;
-    layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
-    layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));
-    // GridBarrier scratch for DEEP_EP_LL_FUSED (2 x uint32_t). MUST mirror the
-    // identical add() in internode_ll.cpp::make_layout so both layouts agree on
-    // total_bytes and all offsets.
-    add(2 * sizeof(uint32_t));
-    // Per-send-channel finish-counter (2 ints/channel: atomic counter + uc_store
-    // ready flag) for the fused kernels' payload-before-flag ordering. MUST
-    // mirror internode_ll.cpp::make_layout.
-    add(static_cast<size_t>(2 * (num_ranks - 1) * num_local_experts) * sizeof(int));
+    layout.mask_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));              // mask
+    layout.sync_offset = add(static_cast<size_t>(num_ranks) * sizeof(int));             // sync
+    add(2 * sizeof(uint32_t));                                                           // barrier (GridBarrier scratch)
+    add(static_cast<size_t>(num_experts) * sizeof(int));                                 // slot_counter (atomic_counter_per_expert)
+    add(static_cast<size_t>(num_experts) * sizeof(int));                                 // finish_counter (atomic_finish_counter_per_expert)
+    add(static_cast<size_t>(num_experts) * sizeof(int));                                 // finish_ready (uc-published target flag)
     layout.total_bytes = offset;
     return layout;
 }
