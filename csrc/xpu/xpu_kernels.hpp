@@ -8,6 +8,18 @@
 
 #define EP_HOST_ASSERT(condition) TORCH_CHECK((condition), "DeepEP XPU assertion failed: " #condition)
 
+// SPIR-V NamedBarrier builtins (cl_khr_subgroup_named_barrier). These MUST be
+// declared at GLOBAL scope: IGC resolves them at JIT/AOT time by their exact
+// global mangled names (_Z18named_barrier_initi /
+// _Z24work_group_named_barrierPU3AS314__namedBarrierj). Declaring them inside
+// `namespace deep_ep` mangles them as deep_ep::... and leaves them Unresolved.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+struct __namedBarrier;
+extern SYCL_EXTERNAL __namedBarrier __attribute__((opencl_local)) *
+named_barrier_init(int count);
+extern SYCL_EXTERNAL void work_group_named_barrier(__namedBarrier __attribute__((opencl_local)) *, unsigned int);
+#endif
+
 namespace deep_ep {
 
 template <typename dtype_t>
@@ -51,13 +63,8 @@ SYCL_EXTERNAL inline void visa_spin_hint() {}
 // Validated on Arc Pro B60 (BMG): a 3-of-4 sub-group subset barrier synchronizes
 // the 3 participants while the 4th bypasses. The link-time "undefined function"
 // warnings for these two symbols are EXPECTED -- they are SPIR-V builtins IGC
-// resolves at JIT, not at LLVM link time.
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-struct __namedBarrier;
-extern SYCL_EXTERNAL __namedBarrier __attribute__((opencl_local)) *
-named_barrier_init(int count);
-extern SYCL_EXTERNAL void work_group_named_barrier(__namedBarrier __attribute__((opencl_local)) *, unsigned int);
-#endif
+// resolves at JIT, not at LLVM link time. The builtin declarations live at GLOBAL
+// scope (top of this file) so they mangle to the exact names IGC expects.
 
 // Memory-fence flags accepted by work_group_named_barrier (OpenCL semantics).
 constexpr unsigned int kNamedBarrierLocalFence = 0x1;   // CLK_LOCAL_MEM_FENCE
@@ -65,7 +72,7 @@ constexpr unsigned int kNamedBarrierGlobalFence = 0x2;  // CLK_GLOBAL_MEM_FENCE
 
 class NamedBarrier {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-    __namedBarrier __attribute__((opencl_local)) * handle_ = nullptr;
+    ::__namedBarrier __attribute__((opencl_local)) * handle_ = nullptr;
 #endif
 
 public:
@@ -73,13 +80,13 @@ public:
     // arrive-count / 32). Must be called uniformly by all participants.
     SYCL_EXTERNAL inline void init([[maybe_unused]] int num_subgroups) {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-        handle_ = named_barrier_init(num_subgroups);
+        handle_ = ::named_barrier_init(num_subgroups);
 #endif
     }
 
     SYCL_EXTERNAL inline void sync([[maybe_unused]] unsigned int flags = kNamedBarrierGlobalFence) {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-        work_group_named_barrier(handle_, flags);
+        ::work_group_named_barrier(handle_, flags);
 #endif
     }
 };
