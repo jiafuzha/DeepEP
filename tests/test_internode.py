@@ -368,15 +368,28 @@ def test_main(args: argparse.Namespace,
     # latency and effective RDMA/NVL bandwidth without the fragile profiler path.
     if os.getenv('DEEP_EP_PERF'):
         perf_dispatch_args = {'x': x, 'handle': handle, 'config': config}
-        d_avg, d_min, d_max = bench(lambda: buffer.dispatch(**perf_dispatch_args), num_warmups=10, num_tests=20)
         perf_combine_args = {'x': recv_x, 'handle': handle, 'config': config}
+        # Round-trip (dispatch -> combine) is the representative measurement: it
+        # matches real usage (combine always follows dispatch) and, for the faithful
+        # path, each op's deferred-doorbell AMO flag is flushed by the following op's
+        # doorbell, so it does NOT suffer the isolated-repetition artifact (an
+        # isolated dispatch/combine loop leaves the AMO egress lazy -> receiver poll
+        # stalls). Isolated dispatch/combine are still reported below for reference.
+        def _round_trip():
+            buffer.dispatch(**perf_dispatch_args)
+            buffer.combine(**perf_combine_args)
+        rt_avg, rt_min, rt_max = bench(_round_trip, num_warmups=10, num_tests=20)
+        d_avg, d_min, d_max = bench(lambda: buffer.dispatch(**perf_dispatch_args), num_warmups=10, num_tests=20)
         c_avg, c_min, c_max = bench(lambda: buffer.combine(**perf_combine_args), num_warmups=10, num_tests=20)
+        rt_bytes = dispatch_bf16_rdma_send_bytes + combine_bf16_rdma_recv_bytes
         print(
             f'[PERF rank={rank}] num_tokens={num_tokens} hidden={hidden} '
-            f'dispatch: {d_avg * 1e6:.1f} us (min {d_min * 1e6:.1f}, max {d_max * 1e6:.1f}), '
+            f'round_trip: {rt_avg * 1e6:.1f} us (min {rt_min * 1e6:.1f}, max {rt_max * 1e6:.1f}), '
+            f'rdma_rt={rt_bytes / 1e6:.3f} MB @ {rt_bytes / 1e9 / rt_avg:.4f} GB/s | '
+            f'dispatch(iso): {d_avg * 1e6:.1f} us (min {d_min * 1e6:.1f}, max {d_max * 1e6:.1f}), '
             f'rdma_send={dispatch_bf16_rdma_send_bytes / 1e6:.3f} MB @ {dispatch_bf16_rdma_send_bytes / 1e9 / d_avg:.4f} GB/s, '
             f'nvl_recv={dispatch_bf16_nvl_recv_bytes / 1e6:.3f} MB @ {dispatch_bf16_nvl_recv_bytes / 1e9 / d_avg:.4f} GB/s | '
-            f'combine: {c_avg * 1e6:.1f} us (min {c_min * 1e6:.1f}, max {c_max * 1e6:.1f}), '
+            f'combine(iso): {c_avg * 1e6:.1f} us (min {c_min * 1e6:.1f}, max {c_max * 1e6:.1f}), '
             f'rdma_recv={combine_bf16_rdma_recv_bytes / 1e6:.3f} MB @ {combine_bf16_rdma_recv_bytes / 1e9 / c_avg:.4f} GB/s, '
             f'nvl_send={combine_bf16_nvl_send_bytes / 1e6:.3f} MB @ {combine_bf16_nvl_send_bytes / 1e9 / c_avg:.4f} GB/s',
             flush=True)
@@ -499,6 +512,35 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             explicitly_destroy=True)
     print(f'[rank {rank}] Buffer created successfully', flush=True)
     assert num_local_ranks >= 2 and num_ranks >= num_local_ranks
+
+    # DEEP_EP_PERF_TOKENS: single-launch perf sweep. Reuse ONE iSHMEM init +
+    # buffer across a list of token counts (comma-separated), calling the proven
+    # test_main + DEEP_EP_PERF path for each. This avoids relaunching (and the
+    # associated DEVICE_LOST-accumulation risk) once per token count. A single
+    # deterministic correctness config runs first (via DEEP_EP_MIN) as a sanity
+    # check, then the accelerator-Event bench() reports latency + throughput.
+    _perf_tokens_env = os.getenv('DEEP_EP_PERF_TOKENS')
+    if _perf_tokens_env:
+        os.environ.setdefault('DEEP_EP_MIN', '1')
+        os.environ['DEEP_EP_PERF'] = '1'
+        token_list = [int(t) for t in _perf_tokens_env.replace(',', ' ').split()]
+        for tk in token_list:
+            args.num_tokens = tk
+            torch.manual_seed(rank)
+            if local_rank == 0:
+                print(f'===== [perf-sweep] num_tokens={tk} =====', flush=True)
+            test_main(args, num_sms, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, True)
+            if group is not None:
+                try:
+                    group.barrier()
+                except Exception:
+                    pass
+        buffer.destroy()
+        try:
+            dist.barrier(group=group)
+        except Exception:
+            pass
+        return
 
     for seed in range(int(1e9)):
         if local_rank == 0:
