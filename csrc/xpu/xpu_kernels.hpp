@@ -29,6 +29,61 @@ SYCL_EXTERNAL inline void plain_store(T* ptr, T value) {
 
 SYCL_EXTERNAL inline void visa_spin_hint() {}
 
+// ---------------------------------------------------------------------------
+// SPMD named barrier (parity for CUDA `bar.sync <id>, <count>`).
+//
+// CUDA warp specialization uses `bar.sync <id>, <count>` to synchronize a NAMED
+// SUBSET of the thread block (e.g. only the worker warps, or one warp group)
+// while other warps run ahead. Plain SYCL only offers whole-work-group
+// (group_barrier(work_group)) or single-sub-group (group_barrier(sub_group))
+// barriers -- neither can sync an arbitrary subset of sub-groups within a
+// work-group. The SPIR-V NamedBarrier builtins (cl_khr_subgroup_named_barrier)
+// provide exactly this and, unlike ESIMD named_barrier, are usable directly in
+// an ordinary SPMD nd_range kernel alongside sub_group shuffles, atomic_ref and
+// iSHMEM device calls.
+//
+// named_barrier_init(count): `count` is the number of PARTICIPATING SUB-GROUPS
+//   (NOT work-items); returns a per-work-group named-barrier handle.
+// work_group_named_barrier(handle, flags): subset barrier; must be entered
+//   UNIFORMLY by every work-item of each participating sub-group. Sub-groups that
+//   do not call it proceed freely (a true subset barrier).
+//
+// Validated on Arc Pro B60 (BMG): a 3-of-4 sub-group subset barrier synchronizes
+// the 3 participants while the 4th bypasses. The link-time "undefined function"
+// warnings for these two symbols are EXPECTED -- they are SPIR-V builtins IGC
+// resolves at JIT, not at LLVM link time.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+struct __namedBarrier;
+extern SYCL_EXTERNAL __namedBarrier __attribute__((opencl_local)) *
+named_barrier_init(int count);
+extern SYCL_EXTERNAL void work_group_named_barrier(__namedBarrier __attribute__((opencl_local)) *, unsigned int);
+#endif
+
+// Memory-fence flags accepted by work_group_named_barrier (OpenCL semantics).
+constexpr unsigned int kNamedBarrierLocalFence = 0x1;   // CLK_LOCAL_MEM_FENCE
+constexpr unsigned int kNamedBarrierGlobalFence = 0x2;  // CLK_GLOBAL_MEM_FENCE
+
+class NamedBarrier {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+    __namedBarrier __attribute__((opencl_local)) * handle_ = nullptr;
+#endif
+
+public:
+    // `num_subgroups` = number of participating sub-groups (matches the CUDA
+    // arrive-count / 32). Must be called uniformly by all participants.
+    SYCL_EXTERNAL inline void init([[maybe_unused]] int num_subgroups) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+        handle_ = named_barrier_init(num_subgroups);
+#endif
+    }
+
+    SYCL_EXTERNAL inline void sync([[maybe_unused]] unsigned int flags = kNamedBarrierGlobalFence) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+        work_group_named_barrier(handle_, flags);
+#endif
+    }
+};
+
 // Uncacheable (UC) load that bypasses GPU L1/L2/L3 caches, mirroring iSHMEM's
 // ishmemi_ibgda_uc_load*. NIC RDMA DMA writes land in VRAM/host memory but the
 // GPU caches are NOT coherent with external PCIe-P2P writes; since the iSHMEM
@@ -181,6 +236,120 @@ SYCL_EXTERNAL inline T atomic_add_global(T* ptr, T value) {
     sycl::atomic_ref<T, sycl::memory_order::acq_rel, sycl::memory_scope::system, sycl::access::address_space::global_space> ref(*ptr);
     return ref.fetch_add(value);
 }
+
+// ---------------------------------------------------------------------------
+// GridBarrier -- device-wide (all-work-groups) barrier for a SINGLE kernel
+// launch. This is the XPU/SYCL parity for CUDA cooperative-groups
+// `cg::this_grid().sync()` and is intended to replace it in the low-latency
+// internode kernel port.
+//
+// WHY A MEMORY-BASED BARRIER (NOT A HARDWARE BARRIER):
+//   Intel Xe barrier hardware (`sycl::group_barrier(work_group)`) only spans a
+//   SINGLE work-group. Empirically on Arc Pro B60 / BMG neither
+//   `ishmemx_barrier_all_work_group` (wrong scope) nor the SPIR-V
+//   `__spirv_ControlBarrierArriveINTEL` split barrier with `Device` execution
+//   scope produce any cross-work-group effect. So, exactly like CUDA's
+//   `this_grid().sync()`, a grid-wide barrier must be built from a
+//   GLOBAL-MEMORY counter + spin.
+//
+// WHY UNCACHED (UC) ACCESS IS MANDATORY:
+//   GPU L1/L2/L3 caches are NOT coherent for a plain spin-wait: a work-group
+//   spinning on a cached global flag may never observe another work-group's
+//   update. Therefore the published `sense` flag is written with `uc_store`
+//   and read with `uc_load`/`lsc_uc_load_i32` (both bypass L1/L2/L3), and
+//   system-scope acquire/release fences order the surrounding global writes.
+//
+// SENSE-REVERSING (PHASE) BARRIER:
+//   A naive "increment to N then reset to 0" barrier has a reset race (a fast
+//   work-group can re-enter the next barrier and see the not-yet-reset value).
+//   Instead each work-group keeps its OWN `local_sense` register that toggles
+//   0<->1 every call; the last arriver publishes the new sense to the global
+//   flag, and every other work-group spins until the global flag matches its
+//   freshly toggled local sense. This makes repeated barrier calls within one
+//   kernel correct without any reset window.
+//
+// *** CRITICAL CO-RESIDENCY CONSTRAINT -- READ THIS ***
+//   A global-memory grid barrier DEADLOCKS if the participating work-groups are
+//   not all CONCURRENTLY RESIDENT on the GPU: a work-group that is never
+//   scheduled never arrives, so the already-resident ones spin forever. It is
+//   therefore ONLY safe when
+//        (total launched work-groups) <= (max concurrently-resident work-groups
+//                                          for this kernel + WG size on the device)
+//   This mirrors CUDA requiring a *cooperative launch* + occupancy check for
+//   `this_grid().sync()`. To bound the grid: query the device
+//   (`max_compute_units`, threads-per-EU, WG size) or simply launch a fixed
+//   modest grid (e.g. a few work-groups per Xe-core) and have each work-group
+//   loop over the logical work. When in doubt, keep the grid small.
+//
+// SCRATCH REQUIREMENT:
+//   `counter` and `sense` must point to zero-initialized global memory (two
+//   uint32_t). Zero them (memset / a tiny init kernel) BEFORE the kernel that
+//   uses the barrier is launched. They are reusable across many barrier calls
+//   within that launch (counter self-resets; sense flips).
+struct GridBarrier {
+    uint32_t* counter;      // global, zero-initialized: arrival counter
+    uint32_t* sense;        // global, zero-initialized: published phase flag
+    uint32_t  num_groups;   // number of participating work-groups (grid size)
+    uint32_t  local_sense;  // per-work-group phase, starts at 0
+
+    // Construct once per work-item at kernel start. `n_groups` is the launch's
+    // work-group count, e.g. item.get_group_range(0).
+    GridBarrier() = default;
+    SYCL_EXTERNAL inline GridBarrier(uint32_t* counter_, uint32_t* sense_, uint32_t n_groups)
+        : counter(counter_), sense(sense_), num_groups(n_groups), local_sense(0) {}
+
+    // Grid-wide barrier: returns only after EVERY participating work-group has
+    // reached this call. Must be entered uniformly by all work-items of every
+    // participating work-group.
+    template <int Dim>
+    SYCL_EXTERNAL inline void arrive_and_wait(const sycl::nd_item<Dim>& item) {
+        auto wg = item.get_group();
+
+        // (1) Local barrier first: all work-items in this WG finish their
+        // pre-barrier work and their global writes are ordered before the
+        // leader arrives.
+        sycl::group_barrier(wg);
+
+        // Toggle this work-group's phase. Every work-item computes the same
+        // value; only the leader touches global state, but all work-items must
+        // agree on `new_sense` so the second group_barrier releases coherently.
+        const uint32_t new_sense = local_sense ^ 1u;
+        local_sense = new_sense;
+
+        if (item.get_local_linear_id() == 0) {
+            // (2) Release fence so this WG's prior global writes are visible to
+            // other WGs before we announce arrival, then atomically increment.
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel,
+                             sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                arrived(*counter);
+            uint32_t prev = arrived.fetch_add(1u);
+
+            if (prev == num_groups - 1) {
+                // (3a) Last arriver: reset the counter for the next phase (UC
+                // store, so no stale cached value survives) then publish the new
+                // sense with a release fence so waiters observe it.
+                uc_store<uint32_t>(counter, 0u);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                uc_store<uint32_t>(sense, new_sense);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            } else {
+                // (3b) Not last: spin on the UC-loaded global sense flag until it
+                // matches our new phase, then acquire so post-barrier reads see
+                // the freshly published global state.
+                while (uc_load<uint32_t>(sense) != new_sense) {
+                    visa_spin_hint();
+                }
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            }
+        }
+
+        // (4) Local barrier: release all work-items of this WG together so they
+        // all observe the post-barrier global state.
+        sycl::group_barrier(wg);
+    }
+};
 
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, int barrier_signal, sycl::nd_item<1> item) {

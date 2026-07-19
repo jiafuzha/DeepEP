@@ -3,6 +3,9 @@ import socket
 import struct
 import tempfile
 import time
+import glob as _glob
+import signal as _signal
+import weakref as _weakref
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -14,6 +17,131 @@ import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
+
+
+_ORPHAN_REAP_DONE = False
+
+# --- Abnormal-exit GPU/NIC drain on external termination signals ---------------
+#
+# A run can die from an external SIGTERM/SIGINT (an orchestrator killing a slow
+# job, ``timeout(1)``, ``docker stop``, Ctrl-C) that does NOT flow through the
+# caller's try/finally teardown. On the Intel BMG + mlx5/IBGDA stack, if the
+# process dies while a long-running IBGDA poll/quiet exec queue is still merely
+# *submitted* on the GT, the Xe GuC cannot preempt it at teardown -> GT reset ->
+# the next run inherits a wedged GT (init hang / DEVICE_LOST). Draining the GPU
+# streams (retiring that exec queue) before exit prevents this.
+#
+# CRITICAL DESIGN NOTE: the drain MUST run from a NORMAL Python context, never
+# from a C signal handler. A C ``sigaction`` handler that calls into SYCL/L0 to
+# drain DEADLOCKS, because the signal almost always interrupts the process while
+# it is inside a driver call holding an internal lock, and the drain re-enters the
+# same locked runtime. A Python ``signal`` handler runs between bytecodes -- i.e.
+# only AFTER the interrupted native call has returned -- so re-entering the driver
+# to drain is safe. We therefore reuse the proven ``Buffer.quiesce()`` here.
+#
+# SIGKILL/SIGSEGV cannot be handled this way (uncatchable / not deliverable to
+# Python); those rely on the startup orphan reaper plus the optional driver reset.
+# Opt out with ``DEEP_EP_XPU_SIGNAL_CLEANUP=0``.
+_LIVE_BUFFERS = _weakref.WeakSet()
+_SIGNAL_CLEANUP_INSTALLED = False
+_PREV_SIGNAL_HANDLERS = {}
+
+
+def _signal_cleanup_handler(signum, frame):
+    # Runs in normal Python context (between bytecodes) -> safe to call into the
+    # driver. Drain every live buffer's GPU/NIC before the process terminates.
+    print(f'[DeepEP] signal {signum}: draining GPU/NIC of {len(_LIVE_BUFFERS)} '
+          f'live buffer(s) before exit', flush=True)
+    for buf in list(_LIVE_BUFFERS):
+        with suppress(Exception):
+            buf.quiesce()
+    print(f'[DeepEP] signal {signum}: drain done, chaining to previous handler', flush=True)
+    # Chain to the previous disposition so the exit code / KeyboardInterrupt
+    # semantics are preserved.
+    prev = _PREV_SIGNAL_HANDLERS.get(signum, _signal.SIG_DFL)
+    if callable(prev):
+        prev(signum, frame)
+        return
+    if prev == _signal.SIG_IGN:
+        return
+    # SIG_DFL: restore default and re-raise so the process terminates normally.
+    with suppress(Exception):
+        _signal.signal(signum, _signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_signal_cleanup():
+    global _SIGNAL_CLEANUP_INSTALLED
+    if _SIGNAL_CLEANUP_INSTALLED:
+        return
+    _SIGNAL_CLEANUP_INSTALLED = True
+    if os.environ.get('DEEP_EP_XPU_SIGNAL_CLEANUP', '1') == '0':
+        return
+    armed = []
+    for signum in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _PREV_SIGNAL_HANDLERS[signum] = _signal.getsignal(signum)
+            _signal.signal(signum, _signal_cleanup_handler)
+            armed.append(int(signum))
+        except (ValueError, OSError):
+            # signal.signal() only works on the main thread; skip otherwise.
+            _PREV_SIGNAL_HANDLERS.pop(signum, None)
+    print(f'[DeepEP] signal cleanup armed for {armed} (pid {os.getpid()})', flush=True)
+
+
+def _reap_orphan_xpu_ipc():
+    """Best-effort removal of PID-tagged IPC sockets left behind by DEAD runs.
+
+    A run killed by an uncatchable SIGKILL (``docker rm -f``, ``timeout -s KILL``)
+    or a hard crash cannot run any in-process cleanup, so its PID-tagged UNIX
+    domain sockets survive. Accumulated stale IPC state is a prime trigger for the
+    next run's init hang / DEVICE_LOST cascade on the Intel BMG + mlx5/IBGDA stack.
+
+    This reaps ONLY files whose embedded PID is provably dead, so it never touches
+    a concurrently-live run's resources (multiple ranks on the same node share
+    /tmp). Non-PID-tagged shared memory (PSM3/oneCCL/gloo sems in /dev/shm) is left
+    to the external node reset ritual. Runs once per process; opt out with
+    ``DEEP_EP_XPU_REAP_ORPHANS=0``.
+    """
+    global _ORPHAN_REAP_DONE
+    if _ORPHAN_REAP_DONE:
+        return
+    _ORPHAN_REAP_DONE = True
+    if os.environ.get('DEEP_EP_XPU_REAP_ORPHANS', '1') == '0':
+        return
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but owned by another user
+        except OSError:
+            return True  # be conservative: assume alive
+        return True
+
+    tmp = tempfile.gettempdir()
+    # (glob pattern, function extracting the owner PID from the basename)
+    reapers = [
+        # deep_ep_xpu_ipc_<pid>_<rank>_<id>.sock  (created in Buffer._exchange_xpu_ipc_fds)
+        (os.path.join(tmp, 'deep_ep_xpu_ipc_*.sock'),
+         lambda base: base[len('deep_ep_xpu_ipc_'):].split('_')[0]),
+        # ishmem-ipc-fd-sock-<pid>:<pe>  (created in ishmem_ibgda/src/ipc.cpp)
+        (os.path.join(tmp, 'ishmem-ipc-fd-sock-*'),
+         lambda base: base[len('ishmem-ipc-fd-sock-'):].split(':')[0]),
+    ]
+    my_pid = os.getpid()
+    for pattern, pid_of in reapers:
+        for path in _glob.glob(pattern):
+            try:
+                pid = int(pid_of(os.path.basename(path)))
+            except (ValueError, IndexError):
+                continue
+            if pid == my_pid or _pid_alive(pid):
+                continue
+            with suppress(OSError):
+                os.unlink(path)
 
 
 class Buffer:
@@ -95,7 +223,6 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
-        self.is_xpu_runtime = hasattr(deep_ep_cpp, '_xpu_get_ipc_handle_fd')
         self._xpu_internode_handle_cache = {}
         self._xpu_low_latency_handle_cache = {}
         self._xpu_low_latency_combine_buffer_cache = {}
@@ -108,10 +235,21 @@ class Buffer:
         # honour the "cannot hold more than 2 low-latency results at once" contract.
         self._xpu_ll_persist = {}
         self._xpu_low_latency_mask_status = None
-        if self.is_xpu_runtime and enable_shrink:
+        if enable_shrink:
             self._xpu_low_latency_mask_status = torch.zeros((self.group_size, ), dtype=torch.int32, device='xpu')
+        # Reap PID-dead orphaned IPC sockets from previously SIGKILLed/crashed runs
+        # BEFORE the C++ runtime re-creates iSHMEM IPC sockets under the same /tmp
+        # namespace, so accumulated stale state cannot wedge this run's init.
+        _reap_orphan_xpu_ipc()
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
+        # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a
+        # killed run retires its long-running IBGDA exec queue instead of leaving it
+        # submitted (which would GT-reset and wedge the next run). See the module
+        # docstring near _signal_cleanup_handler for why this must be a PYTHON
+        # signal handler (normal context), not a C sigaction handler (deadlocks).
+        _LIVE_BUFFERS.add(self)
+        _install_signal_cleanup()
 
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
@@ -120,40 +258,17 @@ class Buffer:
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         ipc_handles = all_gather_object(local_ipc_handle)
-        if num_nvl_bytes > 0 and self.group_size > 1 and self.is_xpu_runtime:
+        if num_nvl_bytes > 0 and self.group_size > 1:
             ipc_handles = self._exchange_xpu_ipc_fds(ipc_handles, all_gather_object)
 
-        # Synchronize NVSHMEM unique IDs
+        # Synchronize iSHMEM unique IDs
         root_unique_id = None
         if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
-            if self.is_xpu_runtime:
-                os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-                master_port = os.environ.get('MASTER_PORT', '')
-                if master_port and os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == master_port:
-                    os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(master_port) + 1)
-                self.nvshmem_qp_depth = max(int(os.environ.get('ISHMEM_QP_DEPTH', '1024')), (num_qps_per_rank + 1) * 2)
-            else:
-                # Enable IBGDA
-                assert num_qps_per_rank > 0
-                os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-                os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-                os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
-
-                # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-                self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-                os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
-
-                # Reduce gpu memory usage
-                # 6 default teams + 1 extra team
-                os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-                # Disable NVLink SHArP
-                os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-                # NOTES: NVSHMEM initialization requires at least 256 MiB
-                os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
-
-                if not allow_mnnvl:
-                    # Disable multi-node NVLink detection
-                    os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+            os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+            master_port = os.environ.get('MASTER_PORT', '')
+            if master_port and os.environ.get('I_MPI_MPCP_SERVER_PORT', '') == master_port:
+                os.environ['I_MPI_MPCP_SERVER_PORT'] = str(int(master_port) + 1)
+            self.nvshmem_qp_depth = max(int(os.environ.get('ISHMEM_QP_DEPTH', '1024')), (num_qps_per_rank + 1) * 2)
 
             # Synchronize using the root ID — only one rank obtains the unique ID
             if self.rank == 0:
@@ -287,7 +402,7 @@ class Buffer:
     @staticmethod
     def capture() -> EventOverlap:
         """
-        Capture a CUDA event on the current stream, i.e. `torch.cuda.current_stream()`.
+        Capture an event on the current stream, i.e. `torch.xpu.current_stream()`.
 
         Returns:
             event: the captured event.
@@ -318,9 +433,7 @@ class Buffer:
             stream: the communication stream.
         """
         ts: torch.Stream = self.runtime.get_comm_stream()
-        if hasattr(torch, 'xpu') and torch.xpu.is_available() and ts.device_type == torch.xpu.current_stream().device_type:
-            return torch.xpu.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
-        return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
+        return torch.xpu.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
     def get_local_buffer_tensor(self,
                                 dtype: torch.dtype,
@@ -779,7 +892,7 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
-        if self.is_xpu_runtime and os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
+        if os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
             return self._xpu_internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                                 num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                                 async_finish)
@@ -831,7 +944,7 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
-        if self.is_xpu_runtime and os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
+        if os.environ.get('DEEP_EP_XPU_INTERNODE_HOST_FALLBACK') == '1':
             return self._xpu_internode_combine(x, handle, topk_weights, bias, async_finish)
 
         # Unpack handle and bias
@@ -862,19 +975,16 @@ class Buffer:
             hidden: the hidden dimension of each token.
             num_experts: the number of all experts.
         """
-        if self.is_xpu_runtime:
-            self._xpu_low_latency_handle_cache.clear()
-            self._xpu_low_latency_combine_buffer_cache.clear()
-            if self._xpu_low_latency_mask_status is not None:
-                gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
-                self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
-            self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
-            if self._xpu_low_latency_mask_status is not None:
-                for rank_to_mask, value in enumerate(self._xpu_low_latency_mask_status.cpu().tolist()):
-                    if value:
-                        self.runtime.low_latency_update_mask_buffer(rank_to_mask, True)
-            return
+        self._xpu_low_latency_handle_cache.clear()
+        self._xpu_low_latency_combine_buffer_cache.clear()
+        if self._xpu_low_latency_mask_status is not None:
+            gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
+            self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        if self._xpu_low_latency_mask_status is not None:
+            for rank_to_mask, value in enumerate(self._xpu_low_latency_mask_status.cpu().tolist()):
+                if value:
+                    self.runtime.low_latency_update_mask_buffer(rank_to_mask, True)
 
     def _xpu_alloc_retry(self, thunk: Callable[[], torch.Tensor]) -> torch.Tensor:
         """Transient-retry safety net for the LL comm path.
@@ -1080,20 +1190,6 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        if self.is_xpu_runtime:
-            packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
-                self.runtime.low_latency_dispatch(x, topk_idx,
-                                                  cumulative_local_expert_recv_stats,
-                                                  dispatch_wait_recv_cost_stats,
-                                                  num_max_dispatch_tokens_per_rank, num_experts,
-                                                  use_fp8, round_scale, use_ue8m0,
-                                                  async_finish, return_recv_hook)
-            handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
-            tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
-                                 packed_recv_layout_range, cumulative_local_expert_recv_stats)
-            return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
-                EventOverlap(event, tensors_to_record if async_finish else None), hook
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
@@ -1178,25 +1274,17 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        if self.is_xpu_runtime:
-            if id(handle) not in self._xpu_low_latency_handle_cache:
-                src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-                combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                           combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
-                                                                           num_experts, use_logfmt, zero_copy, async_finish,
-                                                                           return_recv_hook, out)
-                tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
-                return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
-            combined_x, event, hook = self._xpu_low_latency_combine(x, topk_idx, topk_weights, handle, async_finish, return_recv_hook, out)
-            tensors_to_record = (x, topk_idx, topk_weights, combined_x)
-            return combined_x, EventOverlap(event.event, tensors_to_record if async_finish else None), hook
-        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
-                                                                   num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
-        tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
-        return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+        if id(handle) not in self._xpu_low_latency_handle_cache:
+            src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+            combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
+                                                                       combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                                                                       num_experts, use_logfmt, zero_copy, async_finish,
+                                                                       return_recv_hook, out)
+            tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
+            return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+        combined_x, event, hook = self._xpu_low_latency_combine(x, topk_idx, topk_weights, handle, async_finish, return_recv_hook, out)
+        tensors_to_record = (x, topk_idx, topk_weights, combined_x)
+        return combined_x, EventOverlap(event.event, tensors_to_record if async_finish else None), hook
 
     def low_latency_update_mask_buffer(self, rank_to_mask: int, mask: bool = False):
         """
@@ -1207,12 +1295,9 @@ class Buffer:
             mask: if True, will mask the rank (do not recvfrom/sendto the rank), otherwise will unmask the rank.
 
         """
-        if self.is_xpu_runtime:
-            if self._xpu_low_latency_mask_status is None:
-                raise RuntimeError('XPU low-latency shrink mode is not enabled')
-            self._xpu_low_latency_mask_status[rank_to_mask] = 1 if mask else 0
-            return
-        self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)
+        if self._xpu_low_latency_mask_status is None:
+            raise RuntimeError('XPU low-latency shrink mode is not enabled')
+        self._xpu_low_latency_mask_status[rank_to_mask] = 1 if mask else 0
 
     def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
         """
@@ -1222,26 +1307,20 @@ class Buffer:
             mask_status: `[num_ranks]` with `torch.int`, the mask status of each rank. `1` means mask and `0` means unmasked.
 
         """
-        if self.is_xpu_runtime:
-            if self._xpu_low_latency_mask_status is None:
-                raise RuntimeError('XPU low-latency shrink mode is not enabled')
-            gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
-            self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
-            mask_status.copy_(self._xpu_low_latency_mask_status.to(mask_status.device))
-            return
-        self.runtime.low_latency_query_mask_buffer(mask_status)
+        if self._xpu_low_latency_mask_status is None:
+            raise RuntimeError('XPU low-latency shrink mode is not enabled')
+        gathered = self._xpu_all_gather_tensor(self._xpu_low_latency_mask_status)
+        self._xpu_low_latency_mask_status.copy_(torch.stack(gathered, dim=0).amax(dim=0))
+        mask_status.copy_(self._xpu_low_latency_mask_status.to(mask_status.device))
 
     def low_latency_clean_mask_buffer(self):
         """
         Clean the mask buffer
 
         """
-        if self.is_xpu_runtime:
-            if self._xpu_low_latency_mask_status is None:
-                raise RuntimeError('XPU low-latency shrink mode is not enabled')
-            self._xpu_low_latency_mask_status.zero_()
-            return
-        self.runtime.low_latency_clean_mask_buffer()
+        if self._xpu_low_latency_mask_status is None:
+            raise RuntimeError('XPU low-latency shrink mode is not enabled')
+        self._xpu_low_latency_mask_status.zero_()
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         """
@@ -1256,9 +1335,7 @@ class Buffer:
                 by yourself.
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        if self.is_xpu_runtime:
-            shape = (num_experts // self.group_size, self.group_size * num_max_dispatch_tokens_per_rank, hidden)
-            buffer = torch.empty(shape, dtype=torch.bfloat16, device=src_info.device)
-            self._xpu_low_latency_combine_buffer_cache[id(handle)] = buffer
-            return buffer
-        return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        shape = (num_experts // self.group_size, self.group_size * num_max_dispatch_tokens_per_rank, hidden)
+        buffer = torch.empty(shape, dtype=torch.bfloat16, device=src_info.device)
+        self._xpu_low_latency_combine_buffer_cache[id(handle)] = buffer
+        return buffer
