@@ -1079,7 +1079,6 @@ void combine_bf16(void* combined_x,
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
-    (void)flag_recv_acq;
 
     // --- PHASE-SPLIT combine (was a single fused kernel with cg::this_grid().sync()).
     // Geometry MIRRORS the faithful dispatch: grid = num_sms BIG blocks of
@@ -1290,6 +1289,20 @@ void combine_bf16(void* combined_x,
                     const size_t global_id = item.get_global_id(0);
                     const size_t global_size = item.get_global_range(0);
                     auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
+                    // combine_data's REMOTE expert rows are written by the peer NIC via
+                    // IBGDA RDMA. The GPU L2 is NOT coherent with external PCIe-P2P writes
+                    // and the symmetric-heap slots are reused every iteration, so a plain
+                    // cached read here can return stale L2 lines (prior iteration's data or
+                    // the zero-init bytes) even though the send/flag kernel's boundary
+                    // guarantees the bytes have LANDED in HBM. The send kernel's per-flag
+                    // acquire fence runs in a DIFFERENT kernel / different work-items, so it
+                    // does not make THIS kernel's caches coherent. Mirror the dispatch recv
+                    // path: either issue ONE system-scope acquire (L2 invalidate) per
+                    // work-item then read cached (flag_recv_acq>=1, default, faster), or read
+                    // every element uncached (flag_recv_acq==0 fallback).
+                    const bool recv_uncached = (flag_recv_acq == 0);
+                    if (!recv_uncached)
+                        ll_recv_acquire(flag_recv_acq);
                     for (size_t idx = global_id; idx < reduce_work; idx += global_size) {
                         const int token_idx = static_cast<int>(idx / hidden);
                         const int h = static_cast<int>(idx % hidden);
@@ -1302,9 +1315,9 @@ void combine_bf16(void* combined_x,
                             const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
                                 combine_data +
                                 (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
-                            // Kernel boundary already made combine_data globally visible, so a
-                            // plain cached read is safe and faster than the uncached flag path.
-                            const float fv = static_cast<float>(value[h]);
+                            const float fv = recv_uncached
+                                                 ? static_cast<float>(uc_load(value + h))
+                                                 : static_cast<float>(value[h]);
                             acc += fv * topk_weights[token_idx * num_topk + k];
                         }
                         out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
