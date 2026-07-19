@@ -260,12 +260,44 @@ scope only for genuine cross-PE/NIC paths (flag flush, `rdma_recv_count` /
 
 Governs the NIC path rather than the kernel shape but strongly affects LL latency:
 `ISHMEM_IB_ENABLE_IBGDA=1`, `ISHMEM_IBGDA_DIRECT_DOORBELL=1`,
-`ISHMEM_IBGDA_BAR_BACKEND=igub`, `ISHMEM_IBGDA_QPS_PER_PE=1`,
+`ISHMEM_IBGDA_BAR_BACKEND=igub`,
 `ISHMEM_IBGDA_DB_BATCH_SIZE`, `ISHMEM_IBGDA_NIC` (pin each rank to the NIC under
 its GPU's PCIe switch), `ISHMEM_SYMMETRIC_SIZE`, `ZE_AFFINITY_MASK`. The build-time
 `ISHMEM_DIR` (the statically linked `libishmem.a`) determines the barrier/RDMA
 implementation baked into `deep_ep_cpp.so` — a mismatched archive silently
 degrades the barrier (≈32 ms/iter) or crashes the device.
+
+**`ISHMEM_IBGDA_QPS_PER_PE` — the primary throughput lever.** Both LL send
+kernels key the destination QP by the LOCAL expert index (`qp_idx = le &
+(qps_per_pe - 1)`), so with `QPS_PER_PE=1` every expert's RDMA serializes through
+QP 0. Setting it to **`num_local_experts` (= `num_experts / num_ranks`, rounded up
+to a power of 2, clamped [1,16])** gives each expert an independent QP and lets the
+NIC drive them in parallel. DeepEP now auto-defaults this: `deep_ep/buffer.py`
+`os.environ.setdefault`s it from `num_qps_per_rank` for LL buffers, and the
+`docker-2node-ll-v2` harness derives it from `NUM_EXPERTS`/`NUM_PROCESSES`. A
+user-set value always wins. Beyond `num_local_experts` the extra QPs sit idle
+(combine payloads must ride their expert's own QP for RC flag-after-payload
+ordering), so that is the structural ceiling for a given expert count.
+
+### 5.5 Tuned high-token config & measured scaling (2-node BMG, H7168, TOPK2, 8 experts)
+
+Best config: `QPS_PER_PE = num_local_experts` (auto), `DEEP_EP_LL_REDUCE_WGS=2048`,
+`ISHMEM_IBGDA_DB_BATCH_SIZE=64` (required at ≥2048 tokens; `0` deadlocks at scale),
+`DEEP_EP_LL_POLL_CAP=500M`, `ISHMEM_SYMMETRIC_SIZE` sized to the RDMA hint.
+
+| tokens | QPS=1 baseline avg | QPS=`num_local_experts` avg | speedup |
+|---|---|---|---|
+| 512  | 11588 µs | 8148 µs  | −30% |
+| 1024 | 22241 µs | 15965 µs | −28% |
+| 2048 | 42600 µs | 31580 µs | −26% |
+| 4096 | 86257 µs | 63000 µs | −27% |
+
+Effective BW rises 2.07 → ~2.8 GB/s and tails tighten. Scaling is then a clean
+~1.98× per token-doubling (bandwidth-bound linear at fixed hidden); the remaining
+constant is capped by the `num_local_experts` combine-QP count — more experts (or
+a multi-QP combine with cross-QP quiet) would raise it further. `DEEP_EP_LL_SEND_WGS`
+and `DB_BATCH_SIZE>64` gave no further gain (dispatch-send and doorbell-rate are not
+the bottleneck at this scale).
 
 ---
 
