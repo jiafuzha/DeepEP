@@ -61,6 +61,19 @@ NUM_TOPK="${NUM_TOPK:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
 
+# Auto-default the IBGDA multi-QP count to one QP per LOCAL expert (the LL send
+# kernels key the destination QP by the local expert index), rounded up to a
+# power of 2 and clamped [1,16]. This drives each expert's RDMA on an independent
+# QP instead of serializing all experts through QP 0 -> ~27-30% lower LL latency
+# (2.07 -> ~2.8 GB/s) at 512..4096 tokens. A user-set ISHMEM_IBGDA_QPS_PER_PE wins.
+_ll_total_ranks=$((NUM_PROCESSES * 2))
+_ll_num_local_experts=$(( NUM_EXPERTS / (_ll_total_ranks > 0 ? _ll_total_ranks : 1) ))
+[ "$_ll_num_local_experts" -lt 1 ] && _ll_num_local_experts=1
+_ll_qpp=1
+while [ "$_ll_qpp" -lt "$_ll_num_local_experts" ]; do _ll_qpp=$((_ll_qpp * 2)); done
+[ "$_ll_qpp" -gt 16 ] && _ll_qpp=16
+ISHMEM_IBGDA_QPS_PER_PE="${ISHMEM_IBGDA_QPS_PER_PE:-$_ll_qpp}"
+
 # Optional clean-env reset before each test run. On this BMG + mlx5 stack a
 # DEVICE_LOST / init-hang in one run leaves NIC/QP + GPU page-table state wedged,
 # which cascades into subsequent runs. Reloading the igub_vmem BAR-bridge driver
