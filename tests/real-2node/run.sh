@@ -198,6 +198,8 @@ run_test() {
     _add_opt_genv() { if [ -n "${2:-}" ]; then OPT_GENV+=( -genv "$1" "$2" ); fi; }
     _add_opt_genv DEEP_EP_INTERNODE_FAITHFUL   "${DEEP_EP_INTERNODE_FAITHFUL:-}"
     _add_opt_genv DEEP_EP_INTERNODE_QP_CHANNELS "${DEEP_EP_INTERNODE_QP_CHANNELS:-}"
+    _add_opt_genv DEEP_EP_INTERNODE_PAR_GATHER "${DEEP_EP_INTERNODE_PAR_GATHER:-}"
+    _add_opt_genv DEEP_EP_INTERNODE_PER_GPU_RDMA "${DEEP_EP_INTERNODE_PER_GPU_RDMA:-}"
     _add_opt_genv DEEP_EP_INTERNODE_BLOCKING_PUT "${DEEP_EP_INTERNODE_BLOCKING_PUT:-}"
     _add_opt_genv DEEP_EP_INTERNODE_POLL_CAP   "${DEEP_EP_INTERNODE_POLL_CAP:-}"
     _add_opt_genv DEEP_EP_PERF                 "${DEEP_EP_PERF:-}"
