@@ -175,6 +175,26 @@ inline bool internode_par_gather() {
     return true;
 }
 
+// DEEP_EP_INTERNODE_PER_GPU_RDMA (default ON): CUDA-faithful per-GPU RDMA transport.
+// The legacy path funnels ALL local GPUs' inter-node tokens through the nvl_rank==0
+// "leader" GPU, which alone issues RDMA (dst_pe = dst_rdma*num_nvl_ranks, the remote
+// node's leader) — using only 1 NIC per node. CUDA internode.cu has NO leader: every
+// GPU runs kRDMASender and issues its OWN RDMA to the SAME-nvl-slot peer on the remote
+// node (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank), and the NVL all-to-all happens on
+// the RECEIVE side (kRDMAAndNVLForwarder pushes received tokens to the correct local
+// NVL peer, keyed by the source nvl-plane so concurrent forwarders don't collide).
+// When ON, each nvl_rank: (a) zeroes its own receive flags, (b) compacts ONLY its own
+// packed tokens per dst_rdma and RDMA-puts on its own NIC, (c) posts its own count
+// flag, and (d) polls its own received stream and forwards to local peers into a
+// per-source-plane fwd slice. This uses all num_nvl_ranks NICs per node. The
+// intra-node NVL gather (Pack + Assemble peer reads) is unchanged. Set =0 for the
+// legacy single-leader path (A/B fallback, byte-identical output).
+inline bool internode_per_gpu_rdma() {
+    const char* env = std::getenv("DEEP_EP_INTERNODE_PER_GPU_RDMA");
+    if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
+    return true;
+}
+
 // DEEP_EP_INTERNODE_QP_CHANNELS (default 1): number of RC QPs per PE to stripe the
 // RDMA payload put across (CUDA-faithful multi-QP; qp_id = channel, mirrors
 // internode.cu:818/835 where the put + tail AMO ride qp_id == channel_id). The
@@ -1363,15 +1383,22 @@ struct NvlBufferLayout {
 //   Region A: NVL-local tokens (NvlBufferLayout for same-node NVL-local tokens)
 //   Region B: RDMA-forwarded tokens
 struct NvlForwardLayout {
-    size_t fwd_x_offset = 0;     // uint8[max_fwd_tokens * row_bytes]
-    size_t fwd_meta_offset = 0;  // SourceMeta[max_fwd_tokens]
+    size_t fwd_x_offset = 0;     // uint8[num_planes * max_fwd_tokens * row_bytes]
+    size_t fwd_meta_offset = 0;  // SourceMeta[num_planes * max_fwd_tokens]
     size_t fwd_topk_idx_offset = 0;
     size_t fwd_topk_weights_offset = 0;
     size_t fwd_x_scales_offset = 0;
-    size_t fwd_count_offset = 0;  // int[num_rdma_ranks]: per-source-rdma-rank count
+    size_t fwd_count_offset = 0;  // int[num_planes * num_rdma_ranks]: per-(plane,src-rdma) count
     size_t total_bytes = 0;
+    int plane_tokens = 0;  // per-plane token capacity (== max_fwd_tokens)
 
-    NvlForwardLayout(int max_fwd_tokens, size_t row_bytes, int num_topk, int num_scales, int num_rdma_ranks) {
+    // num_planes: number of disjoint source-nvl-plane slices (per-GPU RDMA forward
+    // needs one slice per forwarding nvl_rank so concurrent forwarders don't collide;
+    // legacy single-leader forward uses num_planes==1 and is byte-for-byte unchanged).
+    NvlForwardLayout(int max_fwd_tokens, size_t row_bytes, int num_topk, int num_scales, int num_rdma_ranks,
+                     int num_planes = 1) {
+        plane_tokens = max_fwd_tokens;
+        const size_t slots = static_cast<size_t>(max_fwd_tokens) * static_cast<size_t>(num_planes);
         size_t off = 0;
         auto add_aligned = [&](size_t bytes, size_t align = 128) {
             off = align_offset(off, align);
@@ -1379,12 +1406,13 @@ struct NvlForwardLayout {
             off += bytes;
             return result;
         };
-        fwd_x_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * row_bytes, 128);
-        fwd_meta_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * sizeof(SourceMeta), alignof(SourceMeta));
-        fwd_topk_idx_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_topk * sizeof(topk_idx_t), alignof(topk_idx_t));
-        fwd_topk_weights_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_topk * sizeof(float), alignof(float));
-        fwd_x_scales_offset = add_aligned(static_cast<size_t>(max_fwd_tokens) * num_scales * sizeof(float), alignof(float));
-        fwd_count_offset = add_aligned(static_cast<size_t>(num_rdma_ranks) * sizeof(int), alignof(int));
+        fwd_x_offset = add_aligned(slots * row_bytes, 128);
+        fwd_meta_offset = add_aligned(slots * sizeof(SourceMeta), alignof(SourceMeta));
+        fwd_topk_idx_offset = add_aligned(slots * num_topk * sizeof(topk_idx_t), alignof(topk_idx_t));
+        fwd_topk_weights_offset = add_aligned(slots * num_topk * sizeof(float), alignof(float));
+        fwd_x_scales_offset = add_aligned(slots * num_scales * sizeof(float), alignof(float));
+        fwd_count_offset =
+            add_aligned(static_cast<size_t>(num_rdma_ranks) * static_cast<size_t>(num_planes) * sizeof(int), alignof(int));
         total_bytes = align_offset(off, 128);
     }
 };
@@ -1480,13 +1508,20 @@ void dispatch_nvl_rdma(void* recv_x,
     const int num_rdma_ranks = num_ranks / num_nvl_ranks;
     TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "dispatch_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
 
+    // CUDA-faithful per-GPU RDMA: every nvl_rank sends its own RDMA on its own NIC
+    // (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank) instead of funneling through the
+    // nvl_rank==0 leader. The receive-side forward buffer then needs one disjoint slice
+    // per source nvl-plane so concurrent forwarders don't collide (num_fwd_planes).
+    const bool per_gpu_rdma = internode_per_gpu_rdma();
+    const int num_fwd_planes = per_gpu_rdma ? num_nvl_ranks : 1;
+
     const auto* src = static_cast<const uint8_t*>(x);
     auto* dst = static_cast<uint8_t*>(recv_x);
     auto* meta = static_cast<SourceMeta*>(recv_src_meta);
     auto* rdma_base = static_cast<uint8_t*>(rdma_buffer_ptr);
 
     NvlBufferLayout layout(num_tokens, num_ranks, 1, row_bytes, num_topk, num_scales);
-    NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks);
+    NvlForwardLayout fwd_layout(num_recv_tokens, row_bytes, num_topk, num_scales, num_rdma_ranks, num_fwd_planes);
     const size_t fwd_base_offset = align_offset(layout.total_bytes, 128);
 
     // Push-staging region (fixes the racy cross-rank IPC READ in RdmaSend).
@@ -1783,8 +1818,10 @@ void dispatch_nvl_rdma(void* recv_x,
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
 
-                    // Zero MY receive-region flags so remote AMOs land onto 0 (leader only).
-                    if (nvl_rank == 0 && local_id == 0) {
+                    // Zero MY receive-region flags so remote AMOs land onto 0. Under
+                    // per-GPU RDMA every nvl_rank receives its own same-plane stream, so
+                    // every PE zeroes its own flags (legacy: leader only).
+                    if ((per_gpu_rdma || nvl_rank == 0) && local_id == 0) {
                         for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                             if (src_rdma == my_rdma_rank) continue;
                             auto* fl = reinterpret_cast<long*>(rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes +
@@ -1833,7 +1870,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank == 0) {
+                    if (per_gpu_rdma || nvl_rank == 0) {
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
                         // Optional entry drain of qp0 (A/B via DEEP_EP_INTERNODE_ENTRY_QUIET,
@@ -1842,11 +1879,16 @@ void dispatch_nvl_rdma(void* recv_x,
                         if (faithful_entry_quiet && local_id == 0) {
                             for (int dq = 0; dq < num_rdma_ranks; ++dq) {
                                 if (dq == my_rdma_rank) continue;
-                                ishmemx_quiet_qp(dq * num_nvl_ranks, 0u);
+                                ishmemx_quiet_qp(dq * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0), 0u);
                             }
                         }
                         sycl::group_barrier(group);
                         auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                        // Per-GPU RDMA: this GPU compacts ONLY its own packed tokens (single
+                        // plane == nvl_rank, read from its own NVL buffer, no leader staging).
+                        // Legacy leader: loop over all staged src_nvl planes.
+                        const int src_nvl_lo = per_gpu_rdma ? nvl_rank : 0;
+                        const int src_nvl_hi = per_gpu_rdma ? (nvl_rank + 1) : num_nvl_ranks;
                         for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                             if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                             if (dbg_buf && local_id == 0) {
@@ -1864,8 +1906,11 @@ void dispatch_nvl_rdma(void* recv_x,
                             // All lanes run identical control flow so `count` is coherent; the
                             // payload copy is split across lanes, scalar meta by WI0.
                             int count = 0;
-                            for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
-                                auto* peer_buf = leader_self_buf + stage_base_offset + static_cast<size_t>(src_nvl) * stage_stride;
+                            for (int src_nvl = src_nvl_lo; src_nvl < src_nvl_hi; ++src_nvl) {
+                                auto* peer_buf = per_gpu_rdma
+                                                     ? leader_self_buf  // own packed buffer (src_nvl == nvl_rank)
+                                                     : (leader_self_buf + stage_base_offset +
+                                                        static_cast<size_t>(src_nvl) * stage_stride);
                                 auto* peer_x = peer_buf + layout.send_x_offset;
                                 auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
                                 auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
@@ -1911,7 +1956,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             sycl::group_barrier(group);
                             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             lsc_fence_sysrel();
-                            const int dst_pe = dst_rdma * num_nvl_ranks;  // leader of the dst node
+                            const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
                             auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                             if (dbg_buf && local_id == 0) {
                                 sycl::ext::oneapi::experimental::printf(
@@ -1979,12 +2024,12 @@ void dispatch_nvl_rdma(void* recv_x,
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0 || local_id != 0) return;
+                    if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by F-K3a
-                        const int dst_pe = dst_rdma * num_nvl_ranks;
+                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
                         auto* dst_flag = reinterpret_cast<long*>(
                             rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
                         // CUDA-faithful multi-QP: per channel c, quiet qp c (flush F-K3a's
@@ -2016,7 +2061,14 @@ void dispatch_nvl_rdma(void* recv_x,
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0) return;
+                    if (!per_gpu_rdma && nvl_rank != 0) return;
+                    // Per-GPU RDMA: this GPU forwards its OWN received same-plane stream. It
+                    // writes into each local peer's fwd buffer at the disjoint slice reserved
+                    // for its source nvl-plane (== nvl_rank) so concurrent forwarders (one per
+                    // plane) never collide. Legacy leader uses plane 0.
+                    const int fwd_plane = per_gpu_rdma ? nvl_rank : 0;
+                    const int fwd_plane_token_base = fwd_plane * fwd_layout.plane_tokens;
+                    const int fwd_plane_count_base = fwd_plane * num_rdma_ranks;
                     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                     lsc_fence_sysacq();
                     int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
@@ -2025,7 +2077,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                             auto* fwd_base = peer_buf + fwd_base_offset;
                             auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                            for (int r = 0; r < num_rdma_ranks; ++r) fwd_counts[r] = 0;
+                            for (int r = 0; r < num_rdma_ranks; ++r) fwd_counts[fwd_plane_count_base + r] = 0;
                         }
                     }
                     sycl::group_barrier(group);
@@ -2105,9 +2157,11 @@ void dispatch_nvl_rdma(void* recv_x,
                                 auto* fwd_idx = reinterpret_cast<topk_idx_t*>(fwd_base + fwd_layout.fwd_topk_idx_offset);
                                 auto* fwd_wt = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
                                 auto* fwd_scales = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_x_scales_offset);
-                                const int dst_idx = peer_offsets[peer]++;
-                                if (dst_idx >= num_recv_tokens) continue;  // fwd-buffer capacity guard (uniform: all
-                                                                           // lanes track peer_offsets identically)
+                                const int local_idx = peer_offsets[peer]++;
+                                if (local_idx >= fwd_layout.plane_tokens) continue;  // per-plane fwd capacity guard
+                                                                                     // (uniform: all lanes track
+                                                                                     // peer_offsets identically)
+                                const int dst_idx = fwd_plane_token_base + local_idx;
                                 auto* src_row = rdma_x + static_cast<size_t>(i) * row_bytes;
                                 auto* dst_row = fwd_x + static_cast<size_t>(dst_idx) * row_bytes;
                                 // int4-vectorized copy: the lsc_fence_sysacq above already
@@ -2143,7 +2197,7 @@ void dispatch_nvl_rdma(void* recv_x,
                                 auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                                 auto* fwd_base = peer_buf + fwd_base_offset;
                                 auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                                fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
+                                fwd_counts[fwd_plane_count_base + src_rdma] = peer_offsets[peer] - before[peer];
                             }
                             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             lsc_fence_sysrel();
@@ -2660,18 +2714,25 @@ void dispatch_nvl_rdma(void* recv_x,
                 per_src_count[src_rank] += c;
                 intra_count += c;
             }
-            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                fwd_total += my_fwd_counts[src_rdma];
-            }
-            int fwd_off_scan = 0;
-            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                const int count = my_fwd_counts[src_rdma];
-                for (int i = 0; i < count; ++i) {
-                    const SourceMeta sm = my_fwd_m[fwd_off_scan + i];
-                    const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
-                    per_src_count[src_rank] += 1;
+            for (int p = 0; p < num_fwd_planes; ++p) {
+                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                    fwd_total += my_fwd_counts[p * num_rdma_ranks + src_rdma];
                 }
-                fwd_off_scan += count;
+            }
+            // Per-plane scan: plane p's forwarded tokens live in the disjoint slice
+            // [p*plane_tokens, ...), packed in src_rdma order (peer_offsets monotonic
+            // within a forwarder). num_fwd_planes==1 (leader) reduces to the flat scan.
+            for (int p = 0; p < num_fwd_planes; ++p) {
+                int fwd_off_scan = p * fwd_layout.plane_tokens;
+                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                    const int count = my_fwd_counts[p * num_rdma_ranks + src_rdma];
+                    for (int i = 0; i < count; ++i) {
+                        const SourceMeta sm = my_fwd_m[fwd_off_scan + i];
+                        const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
+                        per_src_count[src_rank] += 1;
+                    }
+                    fwd_off_scan += count;
+                }
             }
 
             // Build exclusive prefix into cursors[] and inclusive prefix into output prefix-sum arrays.
@@ -2749,35 +2810,37 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
             }
-            int fwd_offset = 0;
-            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                const int count = my_fwd_counts[src_rdma];
-                for (int i = 0; i < count; ++i) {
-                    const int idx = fwd_offset + i;
-                    const SourceMeta sm = my_fwd_m[idx];
-                    const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
-                    const int pos = cursors[src_rank]++;
-                    auto* src_row = my_fwd_x + static_cast<size_t>(idx) * row_bytes;
-                    auto* dst_row = dst + static_cast<size_t>(pos) * row_bytes;
-                    faithful_coop_copy(dst_row, src_row, row_bytes, local_id, kComputeWGSize);
-                    if (local_id == 0) {
-                        if (meta != nullptr) {
-                            meta[pos] = sm;
-                        }
-                        if (recv_topk_idx != nullptr) {
-                            for (int k = 0; k < num_topk; ++k) {
-                                recv_topk_idx[pos * num_topk + k] = my_fwd_idx[idx * num_topk + k];
-                                recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+            for (int p = 0; p < num_fwd_planes; ++p) {
+                int fwd_offset = p * fwd_layout.plane_tokens;
+                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                    const int count = my_fwd_counts[p * num_rdma_ranks + src_rdma];
+                    for (int i = 0; i < count; ++i) {
+                        const int idx = fwd_offset + i;
+                        const SourceMeta sm = my_fwd_m[idx];
+                        const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
+                        const int pos = cursors[src_rank]++;
+                        auto* src_row = my_fwd_x + static_cast<size_t>(idx) * row_bytes;
+                        auto* dst_row = dst + static_cast<size_t>(pos) * row_bytes;
+                        faithful_coop_copy(dst_row, src_row, row_bytes, local_id, kComputeWGSize);
+                        if (local_id == 0) {
+                            if (meta != nullptr) {
+                                meta[pos] = sm;
                             }
-                        }
-                        if (recv_x_scales != nullptr) {
-                            for (int s = 0; s < num_scales; ++s) {
-                                recv_x_scales[pos * num_scales + s] = my_fwd_scales[idx * num_scales + s];
+                            if (recv_topk_idx != nullptr) {
+                                for (int k = 0; k < num_topk; ++k) {
+                                    recv_topk_idx[pos * num_topk + k] = my_fwd_idx[idx * num_topk + k];
+                                    recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                                }
+                            }
+                            if (recv_x_scales != nullptr) {
+                                for (int s = 0; s < num_scales; ++s) {
+                                    recv_x_scales[pos * num_scales + s] = my_fwd_scales[idx * num_scales + s];
+                                }
                             }
                         }
                     }
+                    fwd_offset += count;
                 }
-                fwd_offset += count;
             }
 
             // Zero-fill leftover rows beyond the actual receive count (capacity may exceed actual).
@@ -2876,15 +2939,17 @@ void dispatch_nvl_rdma(void* recv_x,
                 auto* dst_fwd_base = dst_buf + fwd_base_offset;
                 auto* dst_fwd_m = reinterpret_cast<SourceMeta*>(dst_fwd_base + fwd_layout.fwd_meta_offset);
                 auto* dst_fwd_counts = reinterpret_cast<int*>(dst_fwd_base + fwd_layout.fwd_count_offset);
-                int scan = 0;
-                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                    const int n = dst_fwd_counts[src_rdma];
-                    for (int i = 0; i < n; ++i) {
-                        const SourceMeta sm = dst_fwd_m[scan + i];
-                        const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
-                        per_src_per_dst_count[src_rank][dst_nvl] += 1;
+                for (int p = 0; p < num_fwd_planes; ++p) {
+                    int scan = p * fwd_layout.plane_tokens;
+                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                        const int n = dst_fwd_counts[p * num_rdma_ranks + src_rdma];
+                        for (int i = 0; i < n; ++i) {
+                            const SourceMeta sm = dst_fwd_m[scan + i];
+                            const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
+                            per_src_per_dst_count[src_rank][dst_nvl] += 1;
+                        }
+                        scan += n;
                     }
-                    scan += n;
                 }
             }
             // Now build intra_base[src_nvl][dst_nvl] = sum over s < (my_rdma*num_nvl + src_nvl) of count[s][dst_nvl].
@@ -2926,10 +2991,22 @@ void dispatch_nvl_rdma(void* recv_x,
                         if (dst_rdma == my_rdma_rank || ((peer_rdma_bits[token] >> dst_rdma) & 1) == 0) {
                             continue;
                         }
-                        if (is_my_token && send_rdma_head != nullptr) {
-                            send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
+                        if (per_gpu_rdma) {
+                            // Per-GPU RDMA has one independent RDMA stream per nvl_rank.
+                            // The recv_pos stamped by F6 is the ordinal within this rank's
+                            // same-plane stream, so the handle must count only this nvl plane.
+                            if (is_my_token) {
+                                if (send_rdma_head != nullptr) {
+                                    send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
+                                }
+                                rdma_head[dst_rdma] += 1;
+                            }
+                        } else {
+                            if (is_my_token && send_rdma_head != nullptr) {
+                                send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
+                            }
+                            rdma_head[dst_rdma] += 1;
                         }
-                        rdma_head[dst_rdma] += 1;
                     }
                 }
             }
@@ -3029,6 +3106,12 @@ void combine_nvl_rdma(DataType type,
     // so a peer receiving contributions from multiple source RDMA ranks never
     // overruns its forward region. num_nvl_bytes is provisioned far above this.
     const int max_fwd_tokens = num_rdma_ranks * num_combined_tokens;
+    // Per-GPU RDMA combine: each nvl_rank RDMA-sends the tokens it holds whose original
+    // source nvl-plane == its own nvl_rank, back to (src_rdma, nvl_rank). The receiver
+    // (src_rdma, nvl_rank) therefore always forwards to ITSELF (rdma_src_nvl == its own
+    // nvl_rank), so unlike dispatch there is no concurrent forwarder and the fwd buffer
+    // stays single-plane (num_planes==1).
+    const bool per_gpu_rdma = internode_per_gpu_rdma();
     NvlForwardLayout fwd_layout(max_fwd_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
     // fwd_base_offset must be IDENTICAL across all ranks, otherwise a rank
     // writing into a peer's NVL buffer via IPC at its own offset will land at
@@ -3258,7 +3341,7 @@ void combine_nvl_rdma(DataType type,
                 [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank == 0 && local_id == 0) {
+                    if ((per_gpu_rdma || nvl_rank == 0) && local_id == 0) {
                         for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                             if (src_rdma == my_rdma_rank) continue;
                             auto* fl = reinterpret_cast<long*>(
@@ -3281,7 +3364,16 @@ void combine_nvl_rdma(DataType type,
         // into its LOCAL recv region (no put); remote dst_rdma puts data+count.
         // The compacted count is stashed in the send region's rdma_count field
         // for FC5c to post the flag (== dispatch F4a2 stash).
-        if (!faithful_par_gather) {
+        // The grid-parallel gather is unsafe for the tiny topk case on BMG:
+        // concurrent IPC reads of peer BF16 rows can return stale cache lines,
+        // which FP8-dequantized inputs expose as a systematic combine bias. This
+        // affects BOTH the leader and per-GPU paths (both read peer rows over
+        // IPC). Use the single-WG gather for that small case; at <=64 tokens the
+        // combine is barrier-bound, so the parallel gather gives no perf benefit
+        // anyway. Larger runs keep the fast path.
+        const bool use_par_gather =
+            faithful_par_gather && !(combined_topk_weights != nullptr && num_tokens <= 64);
+        if (!use_par_gather) {
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulCombineRdmaPutKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
@@ -3289,7 +3381,7 @@ void combine_nvl_rdma(DataType type,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0) return;  // only the leader puts (no cross-PE op)
+                    if (!per_gpu_rdma && nvl_rank != 0) return;  // leader-only unless per-GPU RDMA
                     auto peer_meta_off = [=](int peer_n) -> size_t {
                         size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
                         return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
@@ -3333,6 +3425,13 @@ void combine_nvl_rdma(DataType type,
                                     // same as the payload copy): the former per-token uncached
                                     // uc_load was issued redundantly by every work-item.
                                     if (peer_meta[t].src_rdma_rank != dst_rdma) {
+                                        continue;
+                                    }
+                                    // Per-GPU RDMA: this nvl_rank only handles tokens whose
+                                    // original source nvl-plane == its own nvl_rank (so it sends
+                                    // them back on RDMA plane nvl_rank). Planes partition tokens
+                                    // disjointly, replacing the leader funnel.
+                                    if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) {
                                         continue;
                                     }
                                     faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
@@ -3388,7 +3487,7 @@ void combine_nvl_rdma(DataType type,
                     sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
                     [=](sycl::nd_item<1> item) {
                         const int local_id = static_cast<int>(item.get_local_id(0));
-                        if (nvl_rank != 0 || local_id != 0) return;
+                        if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
                         auto peer_meta_off = [=](int peer_n) -> size_t {
                             size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
                             return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
@@ -3423,6 +3522,7 @@ void combine_nvl_rdma(DataType type,
                                 auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
                                 for (int t = 0; t < peer_count; ++t) {
                                     if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
@@ -3447,7 +3547,7 @@ void combine_nvl_rdma(DataType type,
                                       sycl::range<1>(kComputeWGSize)),
                     [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                         const int local_id = static_cast<int>(item.get_local_id(0));
-                        if (nvl_rank != 0) return;
+                        if (!per_gpu_rdma && nvl_rank != 0) return;
                         const size_t g = item.get_group(0);
                         const int peer = static_cast<int>(g / static_cast<size_t>(par_per_peer));
                         const int t = static_cast<int>(g % static_cast<size_t>(par_per_peer));
@@ -3465,6 +3565,7 @@ void combine_nvl_rdma(DataType type,
                         auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
                         const int dst_rdma = peer_meta[t].src_rdma_rank;
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
+                        if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3494,11 +3595,11 @@ void combine_nvl_rdma(DataType type,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0) return;  // only the leader puts
+                    if (!per_gpu_rdma && nvl_rank != 0) return;  // leader-only unless per-GPU RDMA
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // self: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int dst_pe = dst_rdma * num_nvl_ranks;
+                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                         // Payload put of the data region (length rdma_count_offset), matching
                         // dispatch F4a2. The count is carried by FC5c's -count-1 AMO flag, so
@@ -3550,12 +3651,12 @@ void combine_nvl_rdma(DataType type,
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) {
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0 || local_id != 0) return;
+                    if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
-                        const int dst_pe = dst_rdma * num_nvl_ranks;
+                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
                         auto* dst_flag = reinterpret_cast<long*>(
                             rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
                         // Multi-QP: per channel c, quiet qp c then post the tail AMO on qp c
@@ -3583,12 +3684,19 @@ void combine_nvl_rdma(DataType type,
                 [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (nvl_rank != 0) return;
+                    if (!per_gpu_rdma && nvl_rank != 0) return;
+                    // Per-GPU RDMA: this GPU only received tokens whose src_nvl == nvl_rank
+                    // (the sender filtered by plane), so every forwarded token targets the
+                    // local peer nvl_rank == self. Each GPU is therefore the SOLE writer of
+                    // its own fwd buffer -> touch only own plane (peer==nvl_rank) to avoid
+                    // cross-GPU fwd_count collisions. Leader model touches all peers.
+                    const int fwd_peer_lo = per_gpu_rdma ? nvl_rank : 0;
+                    const int fwd_peer_hi = per_gpu_rdma ? (nvl_rank + 1) : num_nvl_ranks;
                     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                     lsc_fence_sysacq();
                     int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
                     if (local_id == 0) {
-                        for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                        for (int peer = fwd_peer_lo; peer < fwd_peer_hi; ++peer) {
                             auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                             auto* fwd_base = peer_buf + fwd_base_offset;
                             auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
@@ -3681,7 +3789,7 @@ void combine_nvl_rdma(DataType type,
                         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                         sycl::group_barrier(group);
                         if (local_id == 0) {
-                            for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                            for (int peer = fwd_peer_lo; peer < fwd_peer_hi; ++peer) {
                                 auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                                 auto* fwd_base = peer_buf + fwd_base_offset;
                                 auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
