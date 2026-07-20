@@ -41,6 +41,103 @@ def _xpu_all_gather(output_list, input_tensor, group=None):
         out.copy_(cpu_out.to(out.device))
 
 
+# The most-recently-created Buffer, so the __main__ failure handler can drain the
+# GPU/NIC even when the test raised deep inside test_main (see teardown notes below).
+_active_buffer = None
+
+
+def _xpu_drain(buffer):
+    """Drain every XPU stream + stop the iSHMEM host proxy thread. Runs on BOTH the
+    success and failure paths. This is the fix for the two coupled XPU teardown bugs:
+
+      1. rc=255 SIGABRT at shutdown. iSHMEM's host ``proxy_thread`` (a static
+         ``std::thread`` in ishmem_ibgda/src/proxy.cpp) is joined only inside
+         ``ishmemi_proxy_fini()``, which is reached only via ``ishmem_finalize`` --
+         intentionally never called by DeepEP (it wedges this BMG/mlx5 stack). Left
+         joinable, its destructor at normal interpreter shutdown calls
+         ``std::terminate`` -> ``abort()`` -> SIGABRT, which mpirun reports as rc=255
+         even though the test passed. It is a normal-exit path (not a signal), so a
+         SIGABRT handler cannot intercept it and /dev/shm cleanup cannot prevent it.
+      2. "GPU wedge needs a driver reset" cascade. DeepEP submits long-running
+         IBGDA/comm exec queues; if the process tears down with one still submitted,
+         the Xe GuC cannot preempt it at Level-Zero context destroy ("Schedule disable
+         failed to respond" -> xe_guc_exec_queue_lr_cleanup -> GT reset), wedging the
+         NEXT run's first GPU submission -> DEVICE_LOST accumulation.
+
+    ``buffer.quiesce()`` fixes both: it drains all XPU streams (so the GuC retires the
+    exec queue cleanly -> no GT reset) and calls ``stop_proxy()`` ->
+    ``ishmemi_proxy_fini()`` which sets proxy_state=EXIT and JOINS ``proxy_thread``.
+    It does NO NIC-BAR unmap / heap free (the ops that destabilize this stack), so it is
+    safe even on a soft-failed device -- which is why it MUST also run on failure: a
+    failing run that skips the drain leaves the exec queue submitted and turns an
+    isolated soft failure into a wedge that cascades into every following run. See
+    csrc/xpu/deep_ep_xpu.cpp quiesce()/stop_proxy()."""
+    try:
+        buffer.quiesce()
+    except Exception as e:
+        print(f'[teardown] quiesce raised {e} (continuing)', flush=True)
+
+
+def _mpi_finalize():
+    try:
+        import ctypes
+        libmpi = ctypes.CDLL('libmpi.so')
+        initialized = ctypes.c_int()
+        finalized = ctypes.c_int()
+        libmpi.MPI_Initialized(ctypes.byref(initialized))
+        libmpi.MPI_Finalized(ctypes.byref(finalized))
+        if initialized.value and not finalized.value:
+            libmpi.MPI_Finalize()
+    except Exception as e:
+        print(f'[teardown] MPI_Finalize raised {e} (continuing)', flush=True)
+
+
+def teardown_success(buffer, group, local_rank, device_type):
+    """Graceful post-test teardown (success path).
+
+    XPU path mirrors the proven low-latency teardown (tests/test_low_latency.py,
+    DEEP_EP_LL_ORDERLY_EXIT=2): the rc=255 SIGABRT here is NOT only iSHMEM's proxy
+    thread -- with the XPU (oneCCL) process group, calling buffer.destroy()/dist.barrier()
+    at teardown RE-ACTIVATES the iSHMEM host proxy + XCCL collectives, which then race the
+    Level-Zero context destroy and leave oneCCL only partially finalized; a subsequent
+    MPI_Finalize warns 'MPI_Finalize has been called before CCL finalization' and oneCCL's
+    static destructors call std::terminate -> SIGABRT -> rc=255 even on a passing run.
+    The proven order is therefore:
+      1) buffer.quiesce() FIRST -- drain every XPU stream + ishmem_quiet + JOIN the iSHMEM
+         proxy thread (see _xpu_drain / csrc/xpu/deep_ep_xpu.cpp), as the LAST GPU/NIC op.
+      2) dist.destroy_process_group() -- fully finalize oneCCL. SKIP buffer.destroy() and
+         dist.barrier() (they re-activate proxy+XCCL and race the L0 context destroy).
+      3) settle so the (stopped) proxy is provably idle before libze's static dtors destroy
+         the L0 context.
+      4) MPI_Finalize, then let NORMAL interpreter shutdown run libze's destructors in order
+         (so the next process's same-affinity exec queue does not collide -> no init hang).
+    CUDA path keeps the original destroy()+barrier()+destroy_pg teardown."""
+    if device_type == 'xpu':
+        _xpu_drain(buffer)
+        try:
+            dist.destroy_process_group()
+        except Exception as e:
+            print(f'[teardown] destroy_process_group raised {e} (continuing)', flush=True)
+        try:
+            settle = float(os.getenv('DEEP_EP_XPU_EXIT_SETTLE_SEC', '2'))
+        except Exception:
+            settle = 2.0
+        if settle > 0:
+            time.sleep(settle)
+        _mpi_finalize()
+        if local_rank == 0:
+            print('[teardown] all done, exiting cleanly', flush=True)
+        return
+    buffer.destroy()
+    try:
+        dist.barrier(group=group)
+    except Exception:
+        pass
+    dist.destroy_process_group()
+    if local_rank == 0:
+        print('[teardown] all done, exiting cleanly', flush=True)
+
+
 # noinspection PyShadowingNames
 def test_main(args: argparse.Namespace,
               num_sms: int,
@@ -511,6 +608,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             num_qps_per_rank=num_qps_per_rank,
                             explicitly_destroy=True)
     print(f'[rank {rank}] Buffer created successfully', flush=True)
+    global _active_buffer
+    _active_buffer = buffer
     assert num_local_ranks >= 2 and num_ranks >= num_local_ranks
 
     # DEEP_EP_PERF_TOKENS: single-launch perf sweep. Reuse ONE iSHMEM init +
@@ -535,11 +634,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     group.barrier()
                 except Exception:
                     pass
-        buffer.destroy()
-        try:
-            dist.barrier(group=group)
-        except Exception:
-            pass
+        teardown_success(buffer, group, local_rank, device_type)
         return
 
     for seed in range(int(1e9)):
@@ -574,15 +669,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
 
-    # Destroy the buffer runtime and communication group
-    buffer.destroy()
-    try:
-        dist.barrier(group=group)
-    except Exception:
-        pass
-    dist.destroy_process_group()
-    if local_rank == 0:
-        print('[teardown] all done, exiting cleanly', flush=True)
+    # Destroy the buffer runtime and communication group. On XPU this drains the GPU/NIC
+    # and stops the iSHMEM proxy thread before a clean interpreter shutdown; see
+    # teardown_success()/_xpu_drain() for why this fixes both the rc=255 SIGABRT and the
+    # DEVICE_LOST wedge cascade. On failure, the __main__ handler runs _xpu_drain() too.
+    device_type = get_accelerator_device_type()
+    teardown_success(buffer, group, local_rank, device_type)
 
 
 if __name__ == '__main__':
@@ -617,6 +709,17 @@ if __name__ == '__main__':
     if mpi_local_rank is not None:
         # Running under mpirun: each MPI process calls test_loop directly
         local_rank = int(mpi_local_rank)
-        test_loop(local_rank, num_processes, args)
+        try:
+            test_loop(local_rank, num_processes, args)
+        except BaseException:
+            # Failure path. On XPU, drain the GPU/NIC and stop the iSHMEM proxy BEFORE the
+            # exception propagates: this idles the long-running exec queue (no GT reset ->
+            # the NEXT run is NOT wedged, breaking the DEVICE_LOST cascade) and joins
+            # ishmem's static proxy_thread (so shutdown does not std::terminate/SIGABRT,
+            # giving a real non-zero rc for the failure instead of masking it as rc=255).
+            # See _xpu_drain(). Best-effort; the original exception is always re-raised.
+            if get_accelerator_device_type() == 'xpu' and _active_buffer is not None:
+                _xpu_drain(_active_buffer)
+            raise
     else:
         torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
