@@ -175,25 +175,17 @@ inline bool internode_par_gather() {
     return true;
 }
 
-// DEEP_EP_INTERNODE_PER_GPU_RDMA (default ON): CUDA-faithful per-GPU RDMA transport.
-// The legacy path funnels ALL local GPUs' inter-node tokens through the nvl_rank==0
-// "leader" GPU, which alone issues RDMA (dst_pe = dst_rdma*num_nvl_ranks, the remote
-// node's leader) — using only 1 NIC per node. CUDA internode.cu has NO leader: every
-// GPU runs kRDMASender and issues its OWN RDMA to the SAME-nvl-slot peer on the remote
-// node (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank), and the NVL all-to-all happens on
-// the RECEIVE side (kRDMAAndNVLForwarder pushes received tokens to the correct local
-// NVL peer, keyed by the source nvl-plane so concurrent forwarders don't collide).
-// When ON, each nvl_rank: (a) zeroes its own receive flags, (b) compacts ONLY its own
-// packed tokens per dst_rdma and RDMA-puts on its own NIC, (c) posts its own count
-// flag, and (d) polls its own received stream and forwards to local peers into a
-// per-source-plane fwd slice. This uses all num_nvl_ranks NICs per node. The
-// intra-node NVL gather (Pack + Assemble peer reads) is unchanged. Set =0 for the
-// legacy single-leader path (A/B fallback, byte-identical output).
-inline bool internode_per_gpu_rdma() {
-    const char* env = std::getenv("DEEP_EP_INTERNODE_PER_GPU_RDMA");
-    if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
-    return true;
-}
+// CUDA-faithful per-GPU RDMA transport (the ONLY inter-node model). CUDA
+// internode.cu has NO leader: every GPU runs kRDMASender and issues its OWN RDMA to
+// the SAME-nvl-slot peer on the remote node (dst_pe = dst_rdma*num_nvl_ranks +
+// nvl_rank), and the NVL all-to-all happens on the RECEIVE side
+// (kRDMAAndNVLForwarder pushes received tokens to the correct local NVL peer, keyed
+// by the source nvl-plane so concurrent forwarders don't collide). Each nvl_rank:
+// (a) zeroes its own receive flags, (b) compacts ONLY its own packed tokens per
+// dst_rdma and RDMA-puts on its own NIC, (c) posts its own count flag, and (d) polls
+// its own received stream and forwards to local peers into a per-source-plane fwd
+// slice. This uses all num_nvl_ranks NICs per node. The intra-node NVL gather (Pack +
+// Assemble peer reads) is unchanged.
 
 // DEEP_EP_INTERNODE_QP_CHANNELS (default 1): number of RC QPs per PE to stripe the
 // RDMA payload put across (CUDA-faithful multi-QP; qp_id = channel, mirrors
@@ -1509,11 +1501,10 @@ void dispatch_nvl_rdma(void* recv_x,
     TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "dispatch_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
 
     // CUDA-faithful per-GPU RDMA: every nvl_rank sends its own RDMA on its own NIC
-    // (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank) instead of funneling through the
-    // nvl_rank==0 leader. The receive-side forward buffer then needs one disjoint slice
-    // per source nvl-plane so concurrent forwarders don't collide (num_fwd_planes).
-    const bool per_gpu_rdma = internode_per_gpu_rdma();
-    const int num_fwd_planes = per_gpu_rdma ? num_nvl_ranks : 1;
+    // (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank). The receive-side forward buffer
+    // needs one disjoint slice per source nvl-plane so concurrent forwarders don't
+    // collide (num_fwd_planes == num_nvl_ranks).
+    const int num_fwd_planes = num_nvl_ranks;
 
     const auto* src = static_cast<const uint8_t*>(x);
     auto* dst = static_cast<uint8_t*>(recv_x);
@@ -1678,7 +1669,6 @@ void dispatch_nvl_rdma(void* recv_x,
         return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
     }();
     if (kFaithful) {
-        const size_t stage_bytes = layout.total_bytes;
         const uint64_t rdma_poll_cap = internode_poll_cap();
         const int rdma_flag_lsc_mode = internode_flag_lsc_mode();
         const bool faithful_force_db = internode_force_db();          // F4a2 put doorbell
@@ -1773,19 +1763,9 @@ void dispatch_nvl_rdma(void* recv_x,
                         }
                     }
 
-                    // Flush own send buffer, then STAGE into the leader's slot with a
-                    // cross-device WRITE (producer-writes-into-peer; BMG P2P READ is
-                    // unstable, WRITE is stable) so RdmaSendPut reads coherent same-GPU data.
-                    sycl::group_barrier(group);
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                    lsc_fence_sysrel();
-                    auto* leader_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[0]);
-                    auto* stage_dst = leader_buf + stage_base_offset + static_cast<size_t>(nvl_rank) * stage_stride;
-                    // 16-byte-vectorized cross-device WRITE of ONLY the num_tokens-sized
-                    // send buffer (layout is built with real num_tokens, never the
-                    // worst-case num_recv_tokens). The prior byte-at-a-time IPC store of
-                    // this whole region was the multi-second F2 stall.
-                    faithful_coop_copy(stage_dst, my_buf, stage_bytes, local_id, kComputeWGSize);
+                    // Flush own send buffer so this GPU's own per-GPU RdmaSend (which
+                    // reads buffer_ptrs_gpu[nvl_rank] directly) observes settled data.
+                    // No leader staging: per-GPU RDMA never funnels through nvl_rank==0.
                     sycl::group_barrier(group);
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                     lsc_fence_sysrel();
@@ -1820,8 +1800,8 @@ void dispatch_nvl_rdma(void* recv_x,
 
                     // Zero MY receive-region flags so remote AMOs land onto 0. Under
                     // per-GPU RDMA every nvl_rank receives its own same-plane stream, so
-                    // every PE zeroes its own flags (legacy: leader only).
-                    if ((per_gpu_rdma || nvl_rank == 0) && local_id == 0) {
+                    // every PE zeroes its own flags.
+                    if (local_id == 0) {
                         for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                             if (src_rdma == my_rdma_rank) continue;
                             auto* fl = reinterpret_cast<long*>(rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes +
@@ -1870,7 +1850,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (per_gpu_rdma || nvl_rank == 0) {
+                    {  // per-GPU RDMA: every nvl_rank issues its own RDMA on its own NIC
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
                         // Optional entry drain of qp0 (A/B via DEEP_EP_INTERNODE_ENTRY_QUIET,
@@ -1879,16 +1859,15 @@ void dispatch_nvl_rdma(void* recv_x,
                         if (faithful_entry_quiet && local_id == 0) {
                             for (int dq = 0; dq < num_rdma_ranks; ++dq) {
                                 if (dq == my_rdma_rank) continue;
-                                ishmemx_quiet_qp(dq * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0), 0u);
+                                ishmemx_quiet_qp(dq * num_nvl_ranks + nvl_rank, 0u);
                             }
                         }
                         sycl::group_barrier(group);
                         auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
-                        // Per-GPU RDMA: this GPU compacts ONLY its own packed tokens (single
-                        // plane == nvl_rank, read from its own NVL buffer, no leader staging).
-                        // Legacy leader: loop over all staged src_nvl planes.
-                        const int src_nvl_lo = per_gpu_rdma ? nvl_rank : 0;
-                        const int src_nvl_hi = per_gpu_rdma ? (nvl_rank + 1) : num_nvl_ranks;
+                        // Per-GPU RDMA: this GPU compacts ONLY its own packed tokens
+                        // (single plane == nvl_rank, read from its own NVL buffer).
+                        const int src_nvl_lo = nvl_rank;
+                        const int src_nvl_hi = nvl_rank + 1;
                         for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                             if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                             if (dbg_buf && local_id == 0) {
@@ -1907,10 +1886,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             // payload copy is split across lanes, scalar meta by WI0.
                             int count = 0;
                             for (int src_nvl = src_nvl_lo; src_nvl < src_nvl_hi; ++src_nvl) {
-                                auto* peer_buf = per_gpu_rdma
-                                                     ? leader_self_buf  // own packed buffer (src_nvl == nvl_rank)
-                                                     : (leader_self_buf + stage_base_offset +
-                                                        static_cast<size_t>(src_nvl) * stage_stride);
+                                auto* peer_buf = leader_self_buf;  // own packed buffer (src_nvl == nvl_rank)
                                 auto* peer_x = peer_buf + layout.send_x_offset;
                                 auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
                                 auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
@@ -1956,7 +1932,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             sycl::group_barrier(group);
                             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             lsc_fence_sysrel();
-                            const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
+                            const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
                             auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                             if (dbg_buf && local_id == 0) {
                                 sycl::ext::oneapi::experimental::printf(
@@ -2024,12 +2000,12 @@ void dispatch_nvl_rdma(void* recv_x,
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
+                    if (local_id != 0) return;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by F-K3a
-                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
+                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
                         auto* dst_flag = reinterpret_cast<long*>(
                             rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
                         // CUDA-faithful multi-QP: per channel c, quiet qp c (flush F-K3a's
@@ -2061,12 +2037,11 @@ void dispatch_nvl_rdma(void* recv_x,
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (!per_gpu_rdma && nvl_rank != 0) return;
                     // Per-GPU RDMA: this GPU forwards its OWN received same-plane stream. It
                     // writes into each local peer's fwd buffer at the disjoint slice reserved
                     // for its source nvl-plane (== nvl_rank) so concurrent forwarders (one per
-                    // plane) never collide. Legacy leader uses plane 0.
-                    const int fwd_plane = per_gpu_rdma ? nvl_rank : 0;
+                    // plane) never collide.
+                    const int fwd_plane = nvl_rank;
                     const int fwd_plane_token_base = fwd_plane * fwd_layout.plane_tokens;
                     const int fwd_plane_count_base = fwd_plane * num_rdma_ranks;
                     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -2991,18 +2966,11 @@ void dispatch_nvl_rdma(void* recv_x,
                         if (dst_rdma == my_rdma_rank || ((peer_rdma_bits[token] >> dst_rdma) & 1) == 0) {
                             continue;
                         }
-                        if (per_gpu_rdma) {
-                            // Per-GPU RDMA has one independent RDMA stream per nvl_rank.
-                            // The recv_pos stamped by F6 is the ordinal within this rank's
-                            // same-plane stream, so the handle must count only this nvl plane.
-                            if (is_my_token) {
-                                if (send_rdma_head != nullptr) {
-                                    send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
-                                }
-                                rdma_head[dst_rdma] += 1;
-                            }
-                        } else {
-                            if (is_my_token && send_rdma_head != nullptr) {
+                        // Per-GPU RDMA has one independent RDMA stream per nvl_rank.
+                        // The recv_pos stamped by F6 is the ordinal within this rank's
+                        // same-plane stream, so the handle counts only this nvl plane.
+                        if (is_my_token) {
+                            if (send_rdma_head != nullptr) {
                                 send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
                             }
                             rdma_head[dst_rdma] += 1;
@@ -3111,7 +3079,6 @@ void combine_nvl_rdma(DataType type,
     // (src_rdma, nvl_rank) therefore always forwards to ITSELF (rdma_src_nvl == its own
     // nvl_rank), so unlike dispatch there is no concurrent forwarder and the fwd buffer
     // stays single-plane (num_planes==1).
-    const bool per_gpu_rdma = internode_per_gpu_rdma();
     NvlForwardLayout fwd_layout(max_fwd_tokens, row_bytes, num_topk, 0, num_rdma_ranks);
     // fwd_base_offset must be IDENTICAL across all ranks, otherwise a rank
     // writing into a peer's NVL buffer via IPC at its own offset will land at
@@ -3341,7 +3308,7 @@ void combine_nvl_rdma(DataType type,
                 [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if ((per_gpu_rdma || nvl_rank == 0) && local_id == 0) {
+                    if (local_id == 0) {
                         for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                             if (src_rdma == my_rdma_rank) continue;
                             auto* fl = reinterpret_cast<long*>(
@@ -3381,7 +3348,6 @@ void combine_nvl_rdma(DataType type,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (!per_gpu_rdma && nvl_rank != 0) return;  // leader-only unless per-GPU RDMA
                     auto peer_meta_off = [=](int peer_n) -> size_t {
                         size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
                         return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
@@ -3431,7 +3397,7 @@ void combine_nvl_rdma(DataType type,
                                     // original source nvl-plane == its own nvl_rank (so it sends
                                     // them back on RDMA plane nvl_rank). Planes partition tokens
                                     // disjointly, replacing the leader funnel.
-                                    if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) {
+                                    if (peer_meta[t].src_nvl_rank != nvl_rank) {
                                         continue;
                                     }
                                     faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
@@ -3487,7 +3453,7 @@ void combine_nvl_rdma(DataType type,
                     sycl::nd_range<1>(sycl::range<1>(32), sycl::range<1>(32)),
                     [=](sycl::nd_item<1> item) {
                         const int local_id = static_cast<int>(item.get_local_id(0));
-                        if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
+                        if (local_id != 0) return;
                         auto peer_meta_off = [=](int peer_n) -> size_t {
                             size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
                             return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
@@ -3522,7 +3488,7 @@ void combine_nvl_rdma(DataType type,
                                 auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
                                 for (int t = 0; t < peer_count; ++t) {
                                     if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
-                                    if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
@@ -3547,7 +3513,6 @@ void combine_nvl_rdma(DataType type,
                                       sycl::range<1>(kComputeWGSize)),
                     [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                         const int local_id = static_cast<int>(item.get_local_id(0));
-                        if (!per_gpu_rdma && nvl_rank != 0) return;
                         const size_t g = item.get_group(0);
                         const int peer = static_cast<int>(g / static_cast<size_t>(par_per_peer));
                         const int t = static_cast<int>(g % static_cast<size_t>(par_per_peer));
@@ -3565,7 +3530,7 @@ void combine_nvl_rdma(DataType type,
                         auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
                         const int dst_rdma = peer_meta[t].src_rdma_rank;
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
-                        if (per_gpu_rdma && peer_meta[t].src_nvl_rank != nvl_rank) return;
+                        if (peer_meta[t].src_nvl_rank != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3595,11 +3560,10 @@ void combine_nvl_rdma(DataType type,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (!per_gpu_rdma && nvl_rank != 0) return;  // leader-only unless per-GPU RDMA
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // self: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
+                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
                         auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
                         // Payload put of the data region (length rdma_count_offset), matching
                         // dispatch F4a2. The count is carried by FC5c's -count-1 AMO flag, so
@@ -3651,12 +3615,12 @@ void combine_nvl_rdma(DataType type,
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) {
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if ((!per_gpu_rdma && nvl_rank != 0) || local_id != 0) return;
+                    if (local_id != 0) return;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
                         auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                         const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
-                        const int dst_pe = dst_rdma * num_nvl_ranks + (per_gpu_rdma ? nvl_rank : 0);
+                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
                         auto* dst_flag = reinterpret_cast<long*>(
                             rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
                         // Multi-QP: per channel c, quiet qp c then post the tail AMO on qp c
@@ -3684,14 +3648,13 @@ void combine_nvl_rdma(DataType type,
                 [=](sycl::nd_item<1> item) {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    if (!per_gpu_rdma && nvl_rank != 0) return;
                     // Per-GPU RDMA: this GPU only received tokens whose src_nvl == nvl_rank
                     // (the sender filtered by plane), so every forwarded token targets the
                     // local peer nvl_rank == self. Each GPU is therefore the SOLE writer of
                     // its own fwd buffer -> touch only own plane (peer==nvl_rank) to avoid
-                    // cross-GPU fwd_count collisions. Leader model touches all peers.
-                    const int fwd_peer_lo = per_gpu_rdma ? nvl_rank : 0;
-                    const int fwd_peer_hi = per_gpu_rdma ? (nvl_rank + 1) : num_nvl_ranks;
+                    // cross-GPU fwd_count collisions.
+                    const int fwd_peer_lo = nvl_rank;
+                    const int fwd_peer_hi = nvl_rank + 1;
                     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                     lsc_fence_sysacq();
                     int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
