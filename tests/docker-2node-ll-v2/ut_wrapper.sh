@@ -11,7 +11,7 @@ if [ -f /opt/intel/oneapi/setvars.sh ]; then
     set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
 fi
 
-export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}
+export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
 export LD_LIBRARY_PATH=${ISHMEM_DIR}/lib:${LD_LIBRARY_PATH:-}
 if [ -f /usr/lib/x86_64-linux-gnu/libhwloc.so ]; then
     export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"

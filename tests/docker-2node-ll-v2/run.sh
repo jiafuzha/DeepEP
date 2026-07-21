@@ -38,7 +38,7 @@ cd "$SCRIPT_DIR"
 DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_low_latency.py}"
 SSH_DIR="/tmp/deepep-docker-ssh"
-ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 
 NODE0_CONTAINER="deepep-ll-v2-node0"
 NODE1_CONTAINER="deepep-ll-v2-node1"
