@@ -323,6 +323,18 @@ def test_main(args: argparse.Namespace,
                                 flush=True)
                     if device_type == 'xpu' and recv_gbl_rank_prefix_sum is not None:
                         actual_count = int(recv_gbl_rank_prefix_sum[-1].item())
+                        # Gap #7: validate `num_worst_tokens` padded-tail semantics on XPU
+                        # (the CUDA-only `num_worst_tokens != 0` block below is skipped on
+                        # XPU because XPU always dispatches padded). The rows beyond the
+                        # actual received count must be -1 (topk_idx) / 0 (weights), so a
+                        # consumer trimming by `recv_gbl_rank_prefix_sum` never reads stale
+                        # padding as a real expert selection.
+                        if with_topk and recv_topk_idx is not None:
+                            assert torch.all(recv_topk_idx[actual_count:] == -1).item(), \
+                                'padded recv_topk_idx tail must be -1 (num_worst_tokens semantics)'
+                            if recv_topk_weights is not None:
+                                assert torch.all(recv_topk_weights[actual_count:] == 0).item(), \
+                                    'padded recv_topk_weights tail must be 0 (num_worst_tokens semantics)'
                         if isinstance(recv_x, tuple):
                             recv_x = (recv_x[0][:actual_count], recv_x[1][:actual_count])
                         else:
