@@ -349,13 +349,12 @@ def test_main(args: argparse.Namespace,
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     recv_topk_weights_clone = None
                     if with_topk:
-                        # Check `topk_idx` - skip range check on XPU (no local remapping yet)
-                        if device_type != 'xpu':
-                            assert (recv_topk_idx.eq(-1) |
-                                    ((recv_topk_idx >= 0) &
-                                     (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
-                            for i, count in enumerate(recv_num_tokens_per_expert_list):
-                                assert recv_topk_idx.eq(i).sum().item() == count
+                        # Check `topk_idx`
+                        assert (recv_topk_idx.eq(-1) |
+                                ((recv_topk_idx >= 0) &
+                                 (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
+                        for i, count in enumerate(recv_num_tokens_per_expert_list):
+                            assert recv_topk_idx.eq(i).sum().item() == count
 
                         # Check `topk_weights`
                         recv_topk_weights_clone = recv_topk_weights.clone()

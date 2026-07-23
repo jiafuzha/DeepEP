@@ -1585,6 +1585,12 @@ struct Buffer {
             comm_stream.queue().memcpy(recv_x.data_ptr(), x.data_ptr(), copy_rows * hidden * x.element_size());
         }
 
+        // Number of experts for CUDA-faithful local-expert remapping of recv_topk_idx.
+        // Available only in non-cached mode via num_tokens_per_expert; 0 disables the remap.
+        const int num_experts = num_tokens_per_expert.has_value()
+                                    ? static_cast<int>(num_tokens_per_expert->size(0))
+                                    : 0;
+
         if (combined_nvl_rdma_mode) {
             internode::dispatch_nvl_rdma(recv_x.data_ptr(),
                                          recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
@@ -1622,6 +1628,7 @@ struct Buffer {
                                          reserve_barrier_signals(3),
                                          rank,
                                          num_ranks,
+                                         num_experts,
                                          comm_stream.queue());
         } else {
             internode::dispatch(recv_x.data_ptr(),
@@ -1655,6 +1662,7 @@ struct Buffer {
                                 config.num_max_rdma_chunked_recv_tokens,
                                 rank,
                                 num_ranks,
+                                num_experts,
                                 comm_stream.queue());
         }
 

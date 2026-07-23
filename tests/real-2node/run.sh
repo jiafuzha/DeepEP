@@ -196,8 +196,6 @@ run_test() {
     # list dynamically and skip any var whose value is empty.
     OPT_GENV=()
     _add_opt_genv() { if [ -n "${2:-}" ]; then OPT_GENV+=( -genv "$1" "$2" ); fi; }
-    _add_opt_genv DEEP_EP_INTERNODE_FAITHFUL   "${DEEP_EP_INTERNODE_FAITHFUL:-}"
-    _add_opt_genv DEEP_EP_INTERNODE_QP_CHANNELS "${DEEP_EP_INTERNODE_QP_CHANNELS:-}"
     _add_opt_genv DEEP_EP_INTERNODE_PAR_GATHER "${DEEP_EP_INTERNODE_PAR_GATHER:-}"
     _add_opt_genv DEEP_EP_INTERNODE_BLOCKING_PUT "${DEEP_EP_INTERNODE_BLOCKING_PUT:-}"
     _add_opt_genv DEEP_EP_INTERNODE_POLL_CAP   "${DEEP_EP_INTERNODE_POLL_CAP:-}"
@@ -208,6 +206,11 @@ run_test() {
     _add_opt_genv DEEP_EP_DBG_COMBINE          "${DEEP_EP_DBG_COMBINE:-}"
     _add_opt_genv DEEP_EP_TIME_WARMUP          "${DEEP_EP_TIME_WARMUP:-}"
     _add_opt_genv DEEP_EP_XPU_ISHMEM_FINALIZE  "${DEEP_EP_XPU_ISHMEM_FINALIZE:-}"
+    # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)
+    # inside deep_ep/buffer.py (CUDA-faithful multi-QP striping). Only forward an
+    # explicit user/env override here; forwarding a forced "1" would pin single-QP and
+    # defeat the auto-provisioning (mpirun -genv would win over buffer.py's setdefault).
+    _add_opt_genv ISHMEM_IBGDA_QPS_PER_PE      "${ISHMEM_IBGDA_QPS_PER_PE:-}"
 
     set +e
     timeout "$TIMEOUT_SEC" mpirun \
@@ -219,7 +222,6 @@ run_test() {
         -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
         -genv ISHMEM_SYMMETRIC_SIZE "$ISHMEM_SYMMETRIC_SIZE" \
         -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
-        -genv ISHMEM_IBGDA_QPS_PER_PE "${ISHMEM_IBGDA_QPS_PER_PE:-1}" \
         -genv ISHMEM_IBGDA_DB_BATCH_SIZE "${ISHMEM_IBGDA_DB_BATCH_SIZE:-0}" \
         -genv ISHMEM_IBGDA_BAR_BACKEND igub \
         -genv I_MPI_FABRICS shm:ofi \
