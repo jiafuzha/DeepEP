@@ -13,10 +13,10 @@ set -uo pipefail
 
 NODE0_CONTAINER=deepep-ll-v2-node0
 NODE1_CONTAINER=deepep-ll-v2-node1
-ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 DEEP_EP_DIR=/root/jiafuzha/code-repo/zjf2012/DeepEP
 WRAPPER_PATH="$DEEP_EP_DIR/tests/docker-2node-ll-v2/ut_wrapper.sh"
-UT_BIN="${UT_BIN:-/root/jiafuzha/code-repo/ishmem_ibgda/build/test/unit/ibgda_doorbell_stress}"
+UT_BIN="${UT_BIN:-/root/jiafuzha/ishmem_ibgda/build/test/unit/ibgda_doorbell_stress}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-120}"
 NUM_PROCESSES=2   # ranks per node
 TOTAL_RANKS=4
