@@ -1625,7 +1625,7 @@ struct Buffer {
                                          barrier_signal_ptrs_gpu,
                                          nvl_rank,
                                          num_nvl_ranks,
-                                         reserve_barrier_signals(3),
+                                         reserve_barrier_signals(4),  // base..base+3: Pack, Fwd, NvlPush, Counts barriers
                                          rank,
                                          num_ranks,
                                          num_experts,
@@ -1819,7 +1819,7 @@ struct Buffer {
                                         barrier_signal_ptrs_gpu,
                                         nvl_rank,
                                         num_nvl_ranks,
-                                        reserve_barrier_signals(1),
+                                        reserve_barrier_signals(3),  // base: Pack, base+1: NvlPush, base+2: Fwd
                                         rank,
                                         num_ranks,
                                         comm_stream.queue());
