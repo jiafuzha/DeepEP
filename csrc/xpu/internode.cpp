@@ -304,6 +304,8 @@ class CombinedCombineReduceKernel;
 // F4a2/F4b/F6). Init/Pack/PackBarrier/RdmaSend/FwdBarrier/Reduce are reused
 // verbatim so the reduce math (and thus the output) stays byte-identical.
 template <typename dtype_t>
+class CombineNvlPlaneInitKernel;
+template <typename dtype_t>
 class FaithfulCombineRdmaBarrierKernel;
 template <typename dtype_t>
 class FaithfulCombineRdmaPutKernel;
@@ -2998,6 +3000,37 @@ void combine_nvl_rdma(DataType type,
     if (wait_each) queue.wait();
     dbg_stage("2-Pack");
 
+    // GAP#8 perf: SELECTIVE producer-push invalidation. Each combine token is owned by
+    // exactly ONE consumer (its src_nvl_rank) -- both the reduce (reads plane[dst_nvl]
+    // [peer_recv_pos], and peer_recv_pos = combined_nvl_head[ct,P] is only set for the
+    // consumer that owns P's position p) and the RDMA gather (filters src_nvl_rank==nvl_rank)
+    // read a producer position from exactly one consumer. So the push routes each token to
+    // ONLY that consumer's plane (verbatim index p, ~num_nvl_ranks x less copy than the old
+    // broadcast-to-all-peers). Unwritten plane slots must be invalidated so the gather's
+    // src_nvl_rank filter rejects them: seed OUR OWN plane meta src_nvl_rank=-1 here, BEFORE
+    // the PackBarrier (which is a cross-rank nvl_barrier => it also orders this init before
+    // any producer's push into our plane; no extra barrier needed).
+    queue.submit([&](sycl::handler& cgh) {
+        const size_t total_slots = static_cast<size_t>(num_nvl_ranks) *
+                                   static_cast<size_t>(combine_stage_layout.plane_tokens);
+        const size_t init_range = ((total_slots + kComputeWGSize - 1) / kComputeWGSize) * kComputeWGSize;
+        cgh.parallel_for<CombineNvlPlaneInitKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max<size_t>(init_range, kComputeWGSize)),
+                              sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                const size_t i = item.get_global_linear_id();
+                if (i >= total_slots) return;
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* cs_meta = reinterpret_cast<SourceMeta*>(
+                    my_buf + combine_stage_base + combine_stage_layout.fwd_meta_offset);
+                cs_meta[i].src_nvl_rank = -1;  // sentinel: unwritten -> gather filter rejects
+                if (i == total_slots - 1)
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("2b-PlaneInit");
+
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
@@ -3006,14 +3039,16 @@ void combine_nvl_rdma(DataType type,
     if (wait_each) queue.wait();
     dbg_stage("3-PackBarrier");
 
-    // ===== Producer-PUSH intra-node NVL combine exchange (gap #2) =====
-    // CN-K1 CombineNvlPush: grid = 1 WG. Each rank reads its OWN Pack output (my_buf
-    // send_x/count/meta/topk_weights) and COPIES all `count` tokens VERBATIM (same
-    // indices 0..count) into EVERY peer's combine-staging plane[nvl_rank] (remote WRITE).
-    // WI0 publishes the plane count after a device/system release fence. The gather
-    // kernels then read their OWN plane locally (zero remote reads). Byte-identity holds
-    // because the copy is verbatim at identical indices: peer_recv_pos / t and peer_count
-    // semantics are unchanged.
+    // ===== Producer-PUSH intra-node NVL combine exchange (gap #2 + selective routing) =====
+    // CN-K1 CombineNvlPush: grid = 1 WG. Each rank reads its OWN Pack output and routes each
+    // token t to ONLY the consumer that owns it (C = my_meta[t].src_nvl_rank), writing at the
+    // VERBATIM index t in that consumer's plane[nvl_rank] (remote WRITE). Verbatim index is
+    // required because the reduce indexes plane[dst_nvl][peer_recv_pos] with the dispatch
+    // position; token t is owned by exactly one consumer, so writing it once (not to every
+    // peer) is ~num_nvl_ranks x less copy while keeping both the reduce and the gather correct.
+    // Unwritten slots were seeded to src_nvl_rank=-1 (CombineNvlPlaneInit) so the gather's
+    // filter skips them. WI0 publishes each producer's count into every consumer's plane after
+    // a release fence. Gather/reduce then read their OWN plane locally (zero remote reads).
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombineNvlPushKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
@@ -3031,36 +3066,42 @@ void combine_nvl_rdma(DataType type,
                 if (count < 0) count = 0;
                 if (count > combine_stage_layout.plane_tokens) count = combine_stage_layout.plane_tokens;
                 const int plane_base = nvl_rank * combine_stage_layout.plane_tokens;
-                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                for (int t = 0; t < count; ++t) {
+                    const int dst_c = my_meta[t].src_nvl_rank;  // owning consumer
+                    if (dst_c < 0 || dst_c >= num_nvl_ranks) continue;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_c]);
                     auto* cs_base = peer_buf + combine_stage_base;
                     auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
                     auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
                     auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
-                    auto* cs_counts = reinterpret_cast<int*>(cs_base + combine_stage_layout.fwd_count_offset);
-                    for (int t = 0; t < count; ++t) {
-                        const int dst_idx = plane_base + t;
-                        faithful_coop_copy(reinterpret_cast<uint8_t*>(&cs_x[static_cast<size_t>(dst_idx) * hidden]),
-                                           reinterpret_cast<const uint8_t*>(&my_x[static_cast<size_t>(t) * hidden]),
-                                           static_cast<size_t>(hidden) * sizeof(dtype_t), local_id, kComputeWGSize);
-                        if (local_id == 0) {
-                            cs_meta[dst_idx] = my_meta[t];
-                            if (num_topk > 0) {
-                                for (int k = 0; k < num_topk; ++k)
-                                    cs_topk[dst_idx * num_topk + k] = my_topk[t * num_topk + k];
-                            }
+                    const int dst_idx = plane_base + t;  // VERBATIM index (== peer_recv_pos read side)
+                    faithful_coop_copy(reinterpret_cast<uint8_t*>(&cs_x[static_cast<size_t>(dst_idx) * hidden]),
+                                       reinterpret_cast<const uint8_t*>(&my_x[static_cast<size_t>(t) * hidden]),
+                                       static_cast<size_t>(hidden) * sizeof(dtype_t), local_id, kComputeWGSize);
+                    if (local_id == 0) {
+                        cs_meta[dst_idx] = my_meta[t];  // valid meta (src_nvl_rank==dst_c) overrides -1 sentinel
+                        if (num_topk > 0) {
+                            for (int k = 0; k < num_topk; ++k)
+                                cs_topk[dst_idx * num_topk + k] = my_topk[t * num_topk + k];
                         }
+                    }
+                }
+                sycl::group_barrier(group);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                lsc_fence_sysrel();
+                // Publish our token count into EVERY consumer's plane (each consumer's gather
+                // bounds its plane[nvl_rank] iteration by cs_counts[nvl_rank]).
+                if (local_id == 0) {
+                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                        auto* cs_counts = reinterpret_cast<int*>(
+                            peer_buf + combine_stage_base + combine_stage_layout.fwd_count_offset);
+                        cs_counts[nvl_rank] = count;
                     }
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                     lsc_fence_sysrel();
-                    sycl::group_barrier(group);
-                    if (local_id == 0) {
-                        cs_counts[nvl_rank] = count;
-                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                        lsc_fence_sysrel();
-                    }
-                    sycl::group_barrier(group);
                 }
+                sycl::group_barrier(group);
             });
     });
     if (wait_each) queue.wait();
