@@ -2176,12 +2176,20 @@ void dispatch_nvl_rdma(void* recv_x,
                             // through the bounded poll cap => undercount, never a hang.
                             for (int c = 0; c < num_qp_ch; ++c) {
                                 uint64_t spins = 0;
-                                long raw = 0;
-                                while (true) {
-                                    raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
-                                    if (raw != 0) break;
+                                long raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
+                                while (raw == 0) {
                                     if (++spins >= rdma_poll_cap) break;
+                                    // Periodic (not per-spin) system acquire fence + cheap
+                                    // uncached re-read, mirroring internode_ll.cpp's mode-0 poll.
+                                    // A per-spin lsc_fence_sysacq() (mode 2) over the ~3-4M
+                                    // cold-start spins ran for seconds and tripped the 5 s Xe ccs
+                                    // job_timeout -> Engine reset (ccs). uc_load is L1/L3-uncached
+                                    // so it observes the NIC AMO without a per-spin fence.
+                                    if ((spins & 0x3FFF) == 0) {
+                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    }
                                     visa_spin_hint();
+                                    raw = internode_read_flag64(rdma_flag + c, 0);
                                 }
                                 if (c == 0) raw0 = raw;
                                 spins_total += spins;
@@ -3635,7 +3643,17 @@ void combine_nvl_rdma(DataType type,
                                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                                     }
                                     visa_spin_hint();
-                                    raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
+                                    // Cheap uncached re-read (mode 0, NO per-iteration system
+                                    // fence) mirroring internode_ll.cpp's ll_flag_lsc_mode=0 poll.
+                                    // The cold-start flag lands at ~3-4M spins; a system-scope
+                                    // lsc_fence_sysacq() per spin (mode 2) turned that busy-wait
+                                    // into multiple seconds and tripped the 5 s Xe ccs
+                                    // job_timeout -> Engine reset (ccs) -> UR_UNKNOWN. uc_load is
+                                    // L1/L3-uncached (cache-read-hint 0x7) so it already observes
+                                    // the NIC-delivered AMO without a per-spin fence; the periodic
+                                    // 0x3FFF acquire above plus the post-loop system acquire fence
+                                    // before decode/payload-read preserve coherence & ordering.
+                                    raw = internode_read_flag64(rdma_flag + c, 0);
                                 }
                                 if (c == 0) raw0 = raw;
                             }
