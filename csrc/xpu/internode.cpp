@@ -3405,93 +3405,89 @@ void combine_nvl_rdma(DataType type,
         // the local compaction are timed independently). Reads the region compacted
         // by FC5b above (visible across the kernel boundary) and puts [0,rdma_count_offset).
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8: TRUE CONCURRENT-WG combine send. One WG per (dst_rdma, channel c) so
+            // the C per-channel byte-chunk puts run on C Xe-cores CONCURRENTLY (was a single
+            // WG whose C sub-groups drove all qps from one Xe-core). Mirrors the stable
+            // dispatch concurrent send (F-K3a/F4b) and internode_ll.cpp LLCombineSendKernel:
+            // each qp is EXCLUSIVELY owned + quiesced by exactly one WG, so no cross-WG
+            // doorbell contention on a shared qp (the discipline that keeps LL's concurrent
+            // grid stable and avoids the doorbell-loss/quiet-spin hang).
+            const int send_wgs = num_rdma_ranks * num_qp_ch;
             cgh.parallel_for<FaithfulCombineRdmaPut2Kernel<dtype_t>>(
-                sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs) * kIshmemWGSize),
+                                  sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
-                    auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;  // self: no RDMA
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
-                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        // Payload put of the data region (length rdma_count_offset), matching
-                        // dispatch F4a2. The count is carried by FC5c's -count-1 AMO flag, so
-                        // (like dispatch) the count field itself is NOT transmitted. Default
-                        // path is the warp-collective NBI put with force_db: a BLOCKING
-                        // ishmem_putmem leaves qp0's nic_wq_commit lagging nic_wq_cnt (no gate
-                        // reconciles it in an ISOLATED, repeated combine), so FC5c's AMO never
-                        // egresses and the receiver poll spins to the cap. The forced-doorbell
-                        // warp-put advances the commit watermark in-call, so each combine is
-                        // self-contained. DEEP_EP_INTERNODE_BLOCKING_PUT keeps the old blocking
-                        // put as an A/B fallback.
-                        if (faithful_blocking_put) {
-                            if (local_id == 0) {
-                                ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                            }
-                            sycl::group_barrier(group);
-                        } else {
-                            // LL-faithful COUNT-SIZED multi-QP put. The prior version striped
-                            // the FIXED max-region [0,rdma_count_offset) so every qp always got
-                            // a nonzero force_db chunk (the per-QP commit-watermark invariant
-                            // internode_ll.cpp relies on). That transmits the full max-sized
-                            // region (x|wt|recv_pos|src_nvl for max_rdma_tokens) every combine,
-                            // ~2x the actual bytes. Here we ship only the count-sized VALID
-                            // slices (x + 3 small metadata) to ~halve combine bytes, while
-                            // still keeping EVERY qp busy with a forced doorbell + a device-
-                            // scope release fence (mirror LLDispatchSendKernel), so FC5c's
-                            // per-qp quiet+AMO never spins on an un-committed qp (the P4
-                            // empty-channel hang). sub-group c drives chunk c on qp=c.
-                            const int count_raw = reinterpret_cast<int*>(region + rdma_count_offset)[0];
-                            // Clamp against a stale/garbage count read (the pristine version sized
-                            // the put with the compile-time-constant rdma_count_offset and so could
-                            // never go OOB; a count-sized put MUST guard the length or a bad read
-                            // under fused timing sends L=count*row_bytes past the region -> ccs
-                            // wedge).
-                            const int count = (count_raw < 0) ? 0 : (count_raw > max_rdma_tokens ? max_rdma_tokens : count_raw);
-                            const int sgid = sg.get_group_id()[0];
-                            // Device-scope release: make the gathered bytes NIC-visible (HBM/L2
-                            // via PCIe P2P) before the doorbells (WG-scope barrier is not
-                            // enough; == internode_ll.cpp F2).
-                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                            if (sgid < num_qp_ch) {
-                                // Stripe the count-sized x payload [0,count*row_bytes) across
-                                // qps. A min length (num_qp_ch*16) keeps every qp's commit
-                                // watermark advanced even when count==0 (receiver ignores the
-                                // extra bytes: it reads only `count` rows).
-                                const size_t x_valid = static_cast<size_t>(count) * row_bytes;
-                                const size_t L = x_valid > 0 ? x_valid : static_cast<size_t>(num_qp_ch) * 16;
-                                const size_t s = internode_qp_chunk_start(L, sgid, num_qp_ch);
-                                const size_t e = internode_qp_chunk_start(L, sgid + 1, num_qp_ch);
-                                if (e > s) {
-                                    ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
-                                                            static_cast<unsigned>(sgid), true, sg,
-                                                            /*force_db=*/faithful_force_db);
-                                }
-                                // Channel 0 also ships the 3 small metadata slices (wt/recv_pos/
-                                // src_nvl) on qp 0; flag[0] (posted by FC5c after quiet(qp0))
-                                // therefore guards both chunk-0 and the metadata. Receiver waits
-                                // for ALL flags => x + metadata all landed before it reads.
-                                if (sgid == 0 && count > 0) {
-                                    const size_t w_len = static_cast<size_t>(count) * num_topk * sizeof(float);
-                                    const size_t rp_len = static_cast<size_t>(count) * sizeof(int);
-                                    const size_t sn_len = static_cast<size_t>(count) * sizeof(int);
-                                    ishmemx_putmem_nbi_warp(dst_region + rdma_topk_wt_offset,
-                                                            region + rdma_topk_wt_offset, w_len, dst_pe,
-                                                            0u, true, sg, /*force_db=*/faithful_force_db);
-                                    ishmemx_putmem_nbi_warp(dst_region + rdma_recv_pos_offset,
-                                                            region + rdma_recv_pos_offset, rp_len, dst_pe,
-                                                            0u, true, sg, /*force_db=*/faithful_force_db);
-                                    ishmemx_putmem_nbi_warp(dst_region + rdma_src_nvl_offset,
-                                                            region + rdma_src_nvl_offset, sn_len, dst_pe,
-                                                            0u, true, sg, /*force_db=*/faithful_force_db);
-                                }
-                                sycl::group_barrier(sg);
-                            }
-                            sycl::group_barrier(group);
+                    const int wg_id = static_cast<int>(item.get_group_linear_id());
+                    const int dst_rdma = wg_id / num_qp_ch;  // WG owns this destination
+                    const int c = wg_id % num_qp_ch;         // ... and EXCLUSIVELY this qp c
+                    if (dst_rdma == my_rdma_rank) return;    // self: no RDMA
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
+                    auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                    // Clamp against a stale/garbage count read (the pristine version sized the
+                    // put with the compile-time-constant rdma_count_offset and so could never
+                    // go OOB; a count-sized put MUST guard the length or a bad read under fused
+                    // timing sends L=count*row_bytes past the region -> ccs wedge).
+                    const int count_raw = reinterpret_cast<int*>(region + rdma_count_offset)[0];
+                    const int count = (count_raw < 0) ? 0 : (count_raw > max_rdma_tokens ? max_rdma_tokens : count_raw);
+                    // Payload put of the data region, matching dispatch F4a2. The count is
+                    // carried by FC5c's -count-1 AMO flag, so the count field itself is NOT
+                    // transmitted. Default path is the warp-collective NBI put with force_db:
+                    // a BLOCKING ishmem_putmem leaves the qp's nic_wq_commit lagging nic_wq_cnt
+                    // (no gate reconciles it in an ISOLATED, repeated combine), so FC5c's AMO
+                    // never egresses and the receiver poll spins to the cap. The forced-doorbell
+                    // warp-put advances the commit watermark in-call, so each combine is
+                    // self-contained. DEEP_EP_INTERNODE_BLOCKING_PUT keeps the old blocking put
+                    // as an A/B fallback (only the c==0 WG ships the whole region).
+                    if (faithful_blocking_put) {
+                        if (c == 0 && local_id == 0) {
+                            ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
                         }
+                        return;
                     }
+                    // LL-faithful COUNT-SIZED multi-QP put. Ship only the count-sized VALID
+                    // slices (x + 3 small metadata) to ~halve combine bytes, while keeping
+                    // EVERY qp busy with a forced doorbell + a device-scope release fence
+                    // (mirror LLCombineSendKernel), so FC5c's per-qp quiet+AMO never spins on
+                    // an un-committed qp (the P4 empty-channel hang). This WG drives chunk c on
+                    // its own qp=c.
+                    // Device-scope release: make the gathered bytes NIC-visible (HBM/L2 via
+                    // PCIe P2P) before the doorbells (== internode_ll.cpp F2).
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                    // Stripe the count-sized x payload [0,count*row_bytes) across qps. A min
+                    // length (num_qp_ch*16) keeps every qp's commit watermark advanced even
+                    // when count==0 (receiver ignores the extra bytes: it reads only `count`
+                    // rows).
+                    const size_t x_valid = static_cast<size_t>(count) * row_bytes;
+                    const size_t L = x_valid > 0 ? x_valid : static_cast<size_t>(num_qp_ch) * 16;
+                    const size_t s = internode_qp_chunk_start(L, c, num_qp_ch);
+                    const size_t e = internode_qp_chunk_start(L, c + 1, num_qp_ch);
+                    if (e > s) {
+                        ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
+                                                static_cast<unsigned>(c), true, sg,
+                                                /*force_db=*/faithful_force_db);
+                    }
+                    // Channel 0's WG also ships the 3 small metadata slices (wt/recv_pos/
+                    // src_nvl) on qp 0; flag[0] (posted by FC5c after quiet(qp0)) therefore
+                    // guards both chunk-0 and the metadata. Receiver waits for ALL flags =>
+                    // x + metadata all landed before it reads.
+                    if (c == 0 && count > 0) {
+                        const size_t w_len = static_cast<size_t>(count) * num_topk * sizeof(float);
+                        const size_t rp_len = static_cast<size_t>(count) * sizeof(int);
+                        const size_t sn_len = static_cast<size_t>(count) * sizeof(int);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_topk_wt_offset,
+                                                region + rdma_topk_wt_offset, w_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_recv_pos_offset,
+                                                region + rdma_recv_pos_offset, rp_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_src_nvl_offset,
+                                                region + rdma_src_nvl_offset, sn_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                    }
+                    sycl::group_barrier(sg);
                 });
         });
         if (wait_each) queue.wait();
@@ -3502,28 +3498,33 @@ void combine_nvl_rdma(DataType type,
         // quiet_qp flushes the QP, then the RC-ordered AMO posts -count-1 to the
         // receiver's recv-region flag. Posted for EVERY dst_rdma != self.
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8: TRUE CONCURRENT-WG per-channel quiet/AMO. One WG per (dst_rdma, c) so
+            // each qp is quiesced + flagged by EXACTLY its owning WG (mirrors dispatch F4b
+            // and internode_ll.cpp) -> no shared-qp doorbell contention.
+            const int flag_wgs = num_rdma_ranks * num_qp_ch;
             cgh.parallel_for<FaithfulCombineRdmaFlagKernel<dtype_t>>(
-                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) {
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kIshmemWGSize),
+                                  sycl::range<1>(kIshmemWGSize)),
+                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     if (local_id != 0) return;
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
-                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
-                        auto* dst_flag = reinterpret_cast<long*>(
-                            rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
-                        // Multi-QP: per channel c, quiet qp c then post the tail AMO on qp c
-                        // (every flag carries -count-1). Receiver waits for all num_qp_ch flags.
-                        for (int c = 0; c < num_qp_ch; ++c) {
-                            ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                            lsc_fence_sysrel();
-                            ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
-                                                       static_cast<unsigned>(c));
-                            if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                        }
-                    }
+                    const int wg_id = static_cast<int>(item.get_group_linear_id());
+                    const int dst_rdma = wg_id / num_qp_ch;
+                    const int c = wg_id % num_qp_ch;
+                    if (dst_rdma == my_rdma_rank) return;  // local node: no RDMA
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
+                    const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
+                    auto* dst_flag = reinterpret_cast<long*>(
+                        rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
+                    // Channel c on its OWN work-group/qp: quiet qp c (flush FC5b2's chunk-c
+                    // doorbell) then post the tail AMO on qp c (every flag carries -count-1).
+                    // Receiver waits for all num_qp_ch flags.
+                    ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    lsc_fence_sysrel();
+                    ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
+                                               static_cast<unsigned>(c));
+                    if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
                 });
         });
         if (wait_each) queue.wait();
