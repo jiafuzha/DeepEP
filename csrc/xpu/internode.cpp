@@ -292,6 +292,97 @@ inline void faithful_coop_copy(uint8_t* dst, const uint8_t* src, size_t n, int l
         dst[b] = src[b];
 }
 
+// Cooperative copy that reads the SOURCE through the hint-based uncached uc_load
+// (sycl-cache-read-hint 0x7) per work-item, and writes the destination with normal
+// stores. Used for the FaithfulCombineFwdWriteKernel (FC6) rdma_x(NIC-written) ->
+// fwd_x handoff.
+//
+// The combine RDMA receive region (rdma_x) is delivered by the peer NIC via PCIe
+// P2P into THIS GPU's HBM, which is NOT coherent with the GPU L1/L2, and the
+// symmetric-heap addresses are reused every iteration. A plain CACHED cooperative
+// copy (faithful_coop_copy) -- even after the kernel's lsc_fence_sysacq invalidate
+// -- can read a stale L2 line for a subset of the row on a racing rank, producing
+// gross combine corruption on exactly the "two same-node contributions summed via
+// one RDMA head" tokens. Reading through uc_load bypasses the cache so every lane
+// observes the NIC-delivered payload; this is the exact primitive
+// internode_ll.cpp::coop_copy_bytes_uc uses for its RDMA reduce input.
+//
+// NOTE (do NOT "optimize" this): a system-scope sycl::atomic_ref load vectorizes
+// into a VECTOR atomic message that does NOT honor the uncached path on this
+// BMG+mlx5 P2P-imported region (returns torn/stale bytes), and the explicit
+// lsc_load.ugm.uc.uc asm (lsc_uc_load_i32) is exec-size-1 SCALAR-ONLY (every SIMD
+// lane would read lane-0's address). The hint-based uc_load is the only primitive
+// that is BOTH genuinely uncached AND correctly vectorized per work-item.
+inline void faithful_coop_copy_ucsrc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            d8[j] = deep_ep::uc_load(&s8[j]);
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        dst[b] = deep_ep::uc_load(&src[b]);
+}
+
+// Cooperative copy that reads the SOURCE with normal (cache-coherent, local) loads
+// and WRITES the DESTINATION through the hint-based write-through uc_store
+// (sycl-cache-write-hint 0x7) per work-item. Used for the combine RDMA-send gather
+// (FC5b): the gathered rows land in the symmetric SEND staging region that the peer
+// NIC then DMA-reads via PCIe P2P.
+//
+// A plain CACHED cooperative store (faithful_coop_copy) leaves the bytes in this
+// GPU's L2; the pre-doorbell fence in FC5b2 is only DEVICE-scope (it orders GPU
+// agents, it does NOT flush L2 out to HBM for an external PCIe agent), so the NIC
+// DMA reads a STALE send buffer -> the receiver gets corrupt rows for exactly the
+// RDMA-forwarded tokens (deterministic on the sending rank). Writing through
+// uc_store publishes the bytes to the memory domain the NIC reads, so the
+// device-scope release before the doorbell is sufficient -- this is precisely the
+// internode_ll.cpp::coop_copy_bytes_store_uc pattern (uc_store staging + device
+// release fence + forced doorbell).
+inline void faithful_coop_copy_dstuc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            deep_ep::uc_store(&d8[j], s8[j]);
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        deep_ep::uc_store(&dst[b], src[b]);
+}
+
+// Cooperative copy that reads the SOURCE uncached (uc_load) AND writes the
+// DESTINATION write-through (uc_store). Used for the combine RDMA-send gather
+// (FC5b): the source is this GPU's combine-staging plane cs_x, which for the
+// "two same-node contributions" tokens was written by a PEER nvl_rank via a
+// cross-GPU IPC WRITE (CombineNvlPushKernel step 1). That cross-GPU write is NOT
+// coherent with this GPU's L1/L2, so a plain cached read of cs_x -- even after the
+// pre-loop lsc_fence_sysacq invalidate -- can return a stale L2 line for a subset
+// of the row on a racing rank. The corruption is then baked into rdma_x and
+// RDMA-shipped to the owner, appearing there as gross corruption of exactly the
+// RDMA-forwarded tokens (deterministic on the routing). Reading cs_x through
+// uc_load bypasses the cache so every lane observes the peer's pushed bytes; the
+// dst (symmetric SEND staging the NIC DMA-reads) is written write-through so the
+// device-scope pre-doorbell release in FC5b2 suffices (see faithful_coop_copy_dstuc).
+inline void faithful_coop_copy_ucsrc_dstuc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            deep_ep::uc_store(&d8[j], deep_ep::uc_load(&s8[j]));
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        deep_ep::uc_store(&dst[b], deep_ep::uc_load(&src[b]));
+}
+
 inline void faithful_coop_zero(uint8_t* dst, size_t n, int lane, int lanes) {
     size_t done = 0;
     if ((reinterpret_cast<uintptr_t>(dst) & 0xF) == 0) {
@@ -2947,6 +3038,7 @@ void combine_nvl_rdma(DataType type,
     const size_t init_range = std::max({total_combined, total_topk, total_recv_regions, static_cast<size_t>(1)});
 
     static const bool kDbgCombine = std::getenv("DEEP_EP_DBG_COMBINE") != nullptr;
+    static const int kDbgReduce = std::getenv("DEEP_EP_DBG_REDUCE") != nullptr ? 1 : 0;
     auto dbg_last = std::chrono::high_resolution_clock::now();
     auto dbg_stage = [&](const char* name) {
         if (kDbgCombine) {
@@ -3270,6 +3362,7 @@ void combine_nvl_rdma(DataType type,
             faithful_par_gather && !(combined_topk_weights != nullptr && num_tokens <= 64);
         if (!use_par_gather) {
         queue.submit([&](sycl::handler& cgh) {
+            const int dbgR = kDbgReduce;
             cgh.parallel_for<FaithfulCombineRdmaPutKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
@@ -3311,32 +3404,35 @@ void combine_nvl_rdma(DataType type,
                                 auto* peer_x = cs_x + plane_base * hidden;
                                 auto* peer_meta = cs_meta + plane_base;
                                 auto* peer_topk = cs_topk + plane_base * num_topk;
-                                int peer_count = cs_counts[peer];
+                                // cs_counts / cs_meta are published by the PEER nvl_rank via a
+                                // cross-GPU IPC WRITE (CombineNvlPushKernel); read them uncached
+                                // so a stale L2 line cannot mis-count or mis-filter rows.
+                                int peer_count = deep_ep::uc_load(&cs_counts[peer]);
                                 if (peer_count < 0) peer_count = 0;
                                 if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
                                 for (int t = 0; t < peer_count; ++t) {
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) {
+                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) {
                                         continue;
                                     }
                                     // Per-GPU RDMA: this nvl_rank only handles tokens whose
                                     // original source nvl-plane == its own nvl_rank (so it sends
                                     // them back on RDMA plane nvl_rank). Planes partition tokens
                                     // disjointly, replacing the leader funnel.
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) {
+                                    if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) {
                                         continue;
                                     }
-                                    faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
+                                    faithful_coop_copy_ucsrc_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
                                                        reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                                        static_cast<size_t>(hidden) * sizeof(dtype_t),
                                                        local_id, kComputeWGSize);
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = local_id; k < num_topk; k += kComputeWGSize) {
-                                            rdma_wt[count * num_topk + k] = peer_topk[t * num_topk + k];
+                                            uc_store(&rdma_wt[count * num_topk + k], deep_ep::uc_load(&peer_topk[t * num_topk + k]));
                                         }
                                     }
                                     if (local_id == 0) {
-                                        rdma_recv_pos[count] = peer_meta[t].is_token_in_nvl_rank_bits;
-                                        rdma_src_nvl[count] = peer_meta[t].src_nvl_rank;
+                                        uc_store(&rdma_recv_pos[count], deep_ep::uc_load(&peer_meta[t].is_token_in_nvl_rank_bits));
+                                        uc_store(&rdma_src_nvl[count], deep_ep::uc_load(&peer_meta[t].src_nvl_rank));
                                     }
                                     ++count;
                                 }
@@ -3346,6 +3442,15 @@ void combine_nvl_rdma(DataType type,
                                 *rdma_count = count;  // stashed for FC5c's -count-1 flag
                                 if (is_self_rdma) {
                                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                }
+                                if (dbgR && my_rdma_rank == 0 && nvl_rank == 0 && dst_rdma == 1) {
+                                    for (int r = 0; r < count; ++r) {
+                                        const uint16_t* row = reinterpret_cast<const uint16_t*>(&rdma_x[r * hidden]);
+                                        unsigned fold = 0;
+                                        for (int h = 0; h < hidden; ++h) fold ^= (static_cast<unsigned>(row[h]) << (h & 15));
+                                        sycl::ext::oneapi::experimental::printf("[GTHR2 rp=%d fold=%u]\n",
+                                            reinterpret_cast<int*>(region + rdma_recv_pos_offset)[r], fold);
+                                    }
                                 }
                             }
                         }
@@ -3414,10 +3519,10 @@ void combine_nvl_rdma(DataType type,
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
-                                            rdma_wt[count * num_topk + k] = peer_topk[t * num_topk + k];
+                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                     }
-                                    rdma_recv_pos[count] = peer_meta[t].is_token_in_nvl_rank_bits;
-                                    rdma_src_nvl[count] = peer_meta[t].src_nvl_rank;
+                                    uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
+                                    uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
                                     ++count;
                                 }
                             }
@@ -3467,7 +3572,10 @@ void combine_nvl_rdma(DataType type,
                         auto* rdma_x = reinterpret_cast<dtype_t*>(region);
                         // Only the bulk x row copy runs in the grid (topk/recv_pos/src_nvl were
                         // written serially in Pass 1). Full-GPU parallel over rows.
-                        faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
+                        // Write-through (uc_store) so the NIC DMA-reads the freshly gathered
+                        // send bytes from HBM rather than a stale cached line (see
+                        // faithful_coop_copy_dstuc / internode_ll coop_copy_bytes_store_uc).
+                        faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
                                            reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                            static_cast<size_t>(hidden) * sizeof(dtype_t),
                                            local_id, kComputeWGSize);
@@ -3611,6 +3719,7 @@ void combine_nvl_rdma(DataType type,
         // body is IDENTICAL to the serial FwdWrite (byte-identical output). Self
         // RDMA rank has no flag (count written locally by FC5b) -> read directly.
         queue.submit([&](sycl::handler& cgh) {
+            const int dbgR = kDbgReduce;
             cgh.parallel_for<FaithfulCombineFwdWriteKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) {
@@ -3693,10 +3802,11 @@ void combine_nvl_rdma(DataType type,
                                              // loads observe the NIC-delivered RDMA payload
 
                         for (int i = 0; i < count; ++i) {
-                            // Cached read (coherent after lsc_fence_sysacq, same as the payload
-                            // copy below): the former per-token uncached uc_load ran redundantly
-                            // on every work-item.
-                            const int target_nvl = rdma_src_nvl[i];
+                            // Uncached read of the NIC-written metadata: rdma_src_nvl is
+                            // delivered by the peer NIC via PCIe P2P into this GPU's HBM and is
+                            // NOT coherent with the GPU cache, so a plain cached load can return
+                            // a stale L2 line (same reason the payload copy below is uncached).
+                            const int target_nvl = uc_load(&rdma_src_nvl[i]);
                             if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
                                 continue;
                             }
@@ -3709,9 +3819,21 @@ void combine_nvl_rdma(DataType type,
                                 continue;
                             }
                             const int dst_idx = peer_offsets[target_nvl]++;
-                            // int4-vectorized copy of the row (post-invalidate cached loads),
-                            // replacing a per-element uncached uc_load loop.
-                            faithful_coop_copy(reinterpret_cast<uint8_t*>(&fwd_x[dst_idx * hidden]),
+                            // Re-invalidate the GPU cache immediately before EACH row's uncached
+                            // copy. The single pre-loop lsc_fence_sysacq can be defeated on a
+                            // heavily-loaded rank if a stale rdma_x L2 line (populated by a prior
+                            // dispatch/combine iteration that touched the reused symmetric receive
+                            // region) survives to when the hint-based uc_load is DROPPED by IGC on
+                            // some SIMD lane -> that lane reads the stale line, corrupting a subset
+                            // of the row (deterministic on the racing rank). A per-row invalidate
+                            // (no group_barrier -> no extra cross-WG latency) guarantees no stale
+                            // line precedes the copy.
+                            lsc_fence_sysacq();
+                            // UNCACHED-source cooperative copy of the row. rdma_x is NIC-delivered
+                            // (PCIe-P2P, not cache-coherent); read it uncached. fwd_x is a local
+                            // same-GPU buffer -> plain cached store (coherent with the reduce's
+                            // cached read).
+                            faithful_coop_copy_ucsrc(reinterpret_cast<uint8_t*>(&fwd_x[dst_idx * hidden]),
                                                reinterpret_cast<const uint8_t*>(&rdma_x[i * hidden]),
                                                static_cast<size_t>(hidden) * sizeof(dtype_t),
                                                local_id, kComputeWGSize);
@@ -3722,6 +3844,31 @@ void combine_nvl_rdma(DataType type,
                             }
                             if (local_id == 0) {
                                 fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), target_nvl};
+                            }
+                            if (dbgR && my_rdma_rank == 1 && src_rdma == 0) {
+                                sycl::group_barrier(group);
+                                if (local_id == 0) {
+                                    const uint16_t* sr = reinterpret_cast<const uint16_t*>(&rdma_x[i * hidden]);
+                                    const uint16_t* dr = reinterpret_cast<const uint16_t*>(&fwd_x[dst_idx * hidden]);
+                                    unsigned sf = 0, df = 0;
+                                    for (int h = 0; h < hidden; ++h) {
+                                        sf ^= (static_cast<unsigned>(deep_ep::uc_load(&sr[h])) << (h & 15));
+                                        df ^= (static_cast<unsigned>(dr[h]) << (h & 15));  // CACHED read (reduce's view)
+                                    }
+                                    sycl::ext::oneapi::experimental::printf(
+                                        "[FC6 nvl=%d i=%d dst=%d rp=%d rdmafold=%u fwdfold=%u]\n",
+                                        nvl_rank, i, dst_idx, uc_load(&rdma_recv_pos[i]), sf, df);
+                                    if (i == 0) {
+                                        sycl::ext::oneapi::experimental::printf(
+                                            "[FC6PTR nvl=%d selfbuf=%llu fwdx=%llu rdmax=%llu rdmabase=%llu]\n",
+                                            nvl_rank,
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(buffer_ptrs_gpu[nvl_rank]),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(fwd_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_base));
+                                    }
+                                }
+                                sycl::group_barrier(group);
                             }
                         }
 
@@ -3755,6 +3902,7 @@ void combine_nvl_rdma(DataType type,
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t rd_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
+        const int dbgR = kDbgReduce;
         cgh.parallel_for<CombinedCombineReduceKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(rd_groups * kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
             const int local_id = static_cast<int>(item.get_local_id(0));
@@ -3800,6 +3948,24 @@ void combine_nvl_rdma(DataType type,
                     }
                 }
                 if (is_first) {
+                    if (dbgR && local_id == 0 && my_rdma_rank == 1 && nvl_rank == 0) {
+                        int nmatch = 0;
+                        unsigned f0 = 0, f1 = 0;
+                        int rp0 = -999, rp1 = -999;
+                        for (int i = 0; i < count; ++i) {
+                            const int idx = fwd_offset + i;
+                            if (fwd_meta[idx].is_token_in_nvl_rank_bits != recv_pos_target) continue;
+                            const uint16_t* row = reinterpret_cast<const uint16_t*>(&fwd_x[idx * hidden]);
+                            unsigned fold = 0;
+                            for (int h = 0; h < hidden; ++h) fold ^= (static_cast<unsigned>(row[h]) << (h & 15));
+                            if (nmatch == 0) { f0 = fold; rp0 = idx; }
+                            else if (nmatch == 1) { f1 = fold; rp1 = idx; }
+                            ++nmatch;
+                        }
+                        sycl::ext::oneapi::experimental::printf(
+                            "[RED2 ct=%d src=%d cnt=%d rpt=%d nm=%d i0=%d f0=%u i1=%d f1=%u]\n",
+                            ct, src_rdma, count, recv_pos_target, nmatch, rp0, f0, rp1, f1);
+                    }
                     for (int i = 0; i < count; ++i) {
                         const int idx = fwd_offset + i;
                         if (fwd_meta[idx].is_token_in_nvl_rank_bits != recv_pos_target) {

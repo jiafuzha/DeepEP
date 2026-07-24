@@ -202,8 +202,11 @@ run_test() {
     _add_opt_genv DEEP_EP_PERF                 "${DEEP_EP_PERF:-}"
     _add_opt_genv DEEP_EP_PERF_TOKENS          "${DEEP_EP_PERF_TOKENS:-}"
     _add_opt_genv DEEP_EP_MIN                  "${DEEP_EP_MIN:-}"
+    _add_opt_genv DEEP_EP_MIN_RAND             "${DEEP_EP_MIN_RAND:-}"
     _add_opt_genv DEEP_EP_DBG_DISPATCH         "${DEEP_EP_DBG_DISPATCH:-}"
     _add_opt_genv DEEP_EP_DBG_COMBINE          "${DEEP_EP_DBG_COMBINE:-}"
+    _add_opt_genv DEEP_EP_DBG_GATHER           "${DEEP_EP_DBG_GATHER:-}"
+    _add_opt_genv DEEP_EP_DBG_REDUCE           "${DEEP_EP_DBG_REDUCE:-}"
     _add_opt_genv DEEP_EP_TIME_WARMUP          "${DEEP_EP_TIME_WARMUP:-}"
     _add_opt_genv DEEP_EP_XPU_ISHMEM_FINALIZE  "${DEEP_EP_XPU_ISHMEM_FINALIZE:-}"
     # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)
