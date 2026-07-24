@@ -433,8 +433,16 @@ def test_main(args: argparse.Namespace,
                             print(f'\n[x OK rank={rank}] all per-token x_err < 1e-3, global diff={x_diff:.6e}', flush=True)
                     assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
                     if with_topk:
+                        # For is_rand, each destination rank contributes only the weight of
+                        # the topk slot(s) whose expert it actually holds (non-local slots are
+                        # zeroed by the CUDA-faithful dispatch remap), so summing the dests
+                        # already reconstructs the original per-slot weight -> compare directly.
+                        # For the non-rand case the test fills the zeroed slots (so every dest
+                        # contributes the full row) and divides by dest_counts. This mirrors the
+                        # upstream check; dividing by dest_counts for is_rand is WRONG (yields a
+                        # spurious factor-dest_counts error).
                         dest_counts = is_token_in_rank.sum(dim=1).unsqueeze(1)
-                        check_topk_weights = combined_topk_weights / dest_counts
+                        check_topk_weights = combined_topk_weights if is_rand else (combined_topk_weights / dest_counts)
                         ref_topk_weights = topk_weights_pure_rand if is_rand else topk_weights
                         tw_diff = calc_diff(check_topk_weights, ref_topk_weights)
                         if tw_diff >= 1e-9 and local_rank == 0:
