@@ -431,7 +431,7 @@ def test_main(args: argparse.Namespace,
                                 flush=True)
                         else:
                             print(f'\n[x OK rank={rank}] all per-token x_err < 1e-3, global diff={x_diff:.6e}', flush=True)
-                    assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
+                    assert x_diff < (5e-4 if current_x is x_pure_rand_e4m3 else 5e-6)
                     if with_topk:
                         # For is_rand, each destination rank contributes only the weight of
                         # the topk slot(s) whose expert it actually holds (non-local slots are
