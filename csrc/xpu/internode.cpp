@@ -3510,19 +3510,24 @@ void combine_nvl_rdma(DataType type,
                                 const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
                                 auto* peer_meta = cs_meta + plane_base;
                                 auto* peer_topk = cs_topk + plane_base * num_topk;
-                                int peer_count = cs_counts[peer];
+                                // cs_counts + cs_meta were written by a PEER nvl_rank via
+                                // cross-GPU IPC WRITE (CombineNvlPushKernel step 1), which is
+                                // NOT coherent with this GPU's L1/L2. Read them UNCACHED (uc_load)
+                                // so a stale L2 line doesn't cause mis-filtering / under-counting
+                                // (the serial gather already has this exact fix).
+                                int peer_count = deep_ep::uc_load(&cs_counts[peer]);
                                 if (peer_count < 0) peer_count = 0;
                                 if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
                                 for (int t = 0; t < peer_count; ++t) {
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) continue;
+                                    if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
                                             uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                     }
-                                    uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
-                                    uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
+                                    uc_store(&rdma_recv_pos[count], deep_ep::uc_load(&peer_meta[t].is_token_in_nvl_rank_bits));
+                                    uc_store(&rdma_src_nvl[count], deep_ep::uc_load(&peer_meta[t].src_nvl_rank));
                                     ++count;
                                 }
                             }
@@ -3572,10 +3577,13 @@ void combine_nvl_rdma(DataType type,
                         auto* rdma_x = reinterpret_cast<dtype_t*>(region);
                         // Only the bulk x row copy runs in the grid (topk/recv_pos/src_nvl were
                         // written serially in Pass 1). Full-GPU parallel over rows.
-                        // Write-through (uc_store) so the NIC DMA-reads the freshly gathered
-                        // send bytes from HBM rather than a stale cached line (see
-                        // faithful_coop_copy_dstuc / internode_ll coop_copy_bytes_store_uc).
-                        faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
+                        // UNCACHED-source + write-through (uc_load src + uc_store dst): the
+                        // peer's cs_x was written via cross-GPU IPC WRITE (CombineNvlPushKernel
+                        // step 1), NOT coherent with this GPU's L1/L2; reading it cached (even
+                        // after lsc_fence_sysacq) can return a stale L2 line on a racing rank.
+                        // Writing through uc_store publishes the copy to the NIC's DMA domain
+                        // (matches the serial gather's faithful_coop_copy_ucsrc_dstuc).
+                        faithful_coop_copy_ucsrc_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
                                            reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                            static_cast<size_t>(hidden) * sizeof(dtype_t),
                                            local_id, kComputeWGSize);
