@@ -246,6 +246,31 @@ inline long internode_read_flag64(const long* p, int lsc_mode) {
     return deep_ep::uc_load<long>(p);
 }
 
+// GUARANTEED-uncached arrival probe for the 64-bit RDMA flag.
+//
+// The hint-based uc_load (sycl-cache-read-hint 0x7) is only a HINT that IGC MAY
+// drop; unlike internode_ll.cpp, the normal path zeroes the flag IN-PLACE (no
+// parity double-buffer) immediately before polling it on the SAME GPU, so that
+// flag's cache line is HOT in L1/L3 with the just-written 0. A dropped hint then
+// reads the stale cached 0 forever while the NIC-delivered AMO (a PCIe-P2P write
+// that is NOT coherent with the GPU L1/L3) updates only HBM -- so the poll spins
+// until some fence happens to invalidate the line. Fencing every spin (lsc_mode
+// 2) hides this but runs the busy-wait for seconds -> trips the 5 s Xe ccs
+// job_timeout -> Engine reset. lsc_uc_load_i32 emits an EXPLICIT
+// lsc_load.ugm.uc.uc that forces BOTH L1 and L3 uncached at the message
+// descriptor, so it observes the NIC write within microseconds of it landing
+// WITHOUT any per-spin fence. The flag is -count-1 on arrival (0 while pending);
+// for any count in [0, 2^31) the low 32 bits are non-zero (count==0 -> -1 ->
+// 0xFFFFFFFF), so a low-word uncached probe reliably detects arrival. The exact
+// 64-bit value is then re-read via the fenced path by the caller.
+inline int internode_probe_flag_lo(const long* p) {
+#ifdef __SYCL_DEVICE_ONLY__
+    return deep_ep::lsc_uc_load_i32(reinterpret_cast<const int*>(p));
+#else
+    return static_cast<int>(*reinterpret_cast<const volatile int*>(p));
+#endif
+}
+
 // Cooperative 16-byte-vectorized copy of `n` bytes across `lanes` cooperating
 // work-items (lane in [0, lanes)). The prior byte-at-a-time stage copy issued
 // ~n individual 1-byte P2P/IPC stores when staging a non-leader rank's send
@@ -2179,17 +2204,19 @@ void dispatch_nvl_rdma(void* recv_x,
                                 long raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
                                 while (raw == 0) {
                                     if (++spins >= rdma_poll_cap) break;
-                                    // Periodic (not per-spin) system acquire fence + cheap
-                                    // uncached re-read, mirroring internode_ll.cpp's mode-0 poll.
-                                    // A per-spin lsc_fence_sysacq() (mode 2) over the ~3-4M
-                                    // cold-start spins ran for seconds and tripped the 5 s Xe ccs
-                                    // job_timeout -> Engine reset (ccs). uc_load is L1/L3-uncached
-                                    // so it observes the NIC AMO without a per-spin fence.
-                                    if ((spins & 0x3FFF) == 0) {
-                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                                    }
+                                    // GUARANTEED-uncached (lsc_load.ugm.uc.uc) low-word probe:
+                                    // the hint-based uc_load can read a stale cached 0 (the flag
+                                    // is zeroed in-place on this GPU right before polling, so its
+                                    // line is hot in L1/L3 and NOT coherent with the NIC's P2P AMO
+                                    // write). Fencing every spin (mode 2) hides this but runs for
+                                    // seconds -> 5 s ccs watchdog -> Engine reset. The forced-
+                                    // uncached probe observes the NIC write within microseconds
+                                    // with NO per-spin fence. On arrival re-read the full 64-bit
+                                    // value via the fenced path (orders the subsequent payload).
                                     visa_spin_hint();
-                                    raw = internode_read_flag64(rdma_flag + c, 0);
+                                    if (internode_probe_flag_lo(rdma_flag + c) != 0) {
+                                        raw = internode_read_flag64(rdma_flag + c, 2);
+                                    }
                                 }
                                 if (c == 0) raw0 = raw;
                                 spins_total += spins;
@@ -3639,21 +3666,19 @@ void combine_nvl_rdma(DataType type,
                             for (int c = 0; c < num_qp_ch; ++c) {
                                 long raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
                                 for (uint64_t spins = 0; raw == 0 && spins < rdma_poll_cap; ++spins) {
-                                    if ((spins & 0x3FFF) == 0) {
-                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                                    }
+                                    // GUARANTEED-uncached low-word probe (see dispatch F-K4 and
+                                    // internode_probe_flag_lo): the hint-based uc_load can read a
+                                    // stale cached 0 because the flag is zeroed in-place on this
+                                    // GPU just before polling (no LL-style parity double-buffer),
+                                    // leaving its line hot in L1/L3 and incoherent with the NIC's
+                                    // P2P AMO write. lsc_load.ugm.uc.uc forces L1+L3 uncached so
+                                    // the NIC write is seen within microseconds WITHOUT a per-spin
+                                    // system fence (which would run for seconds and trip the 5 s
+                                    // ccs watchdog). Re-read the full 64-bit value fenced on hit.
                                     visa_spin_hint();
-                                    // Cheap uncached re-read (mode 0, NO per-iteration system
-                                    // fence) mirroring internode_ll.cpp's ll_flag_lsc_mode=0 poll.
-                                    // The cold-start flag lands at ~3-4M spins; a system-scope
-                                    // lsc_fence_sysacq() per spin (mode 2) turned that busy-wait
-                                    // into multiple seconds and tripped the 5 s Xe ccs
-                                    // job_timeout -> Engine reset (ccs) -> UR_UNKNOWN. uc_load is
-                                    // L1/L3-uncached (cache-read-hint 0x7) so it already observes
-                                    // the NIC-delivered AMO without a per-spin fence; the periodic
-                                    // 0x3FFF acquire above plus the post-loop system acquire fence
-                                    // before decode/payload-read preserve coherence & ordering.
-                                    raw = internode_read_flag64(rdma_flag + c, 0);
+                                    if (internode_probe_flag_lo(rdma_flag + c) != 0) {
+                                        raw = internode_read_flag64(rdma_flag + c, 2);
+                                    }
                                 }
                                 if (c == 0) raw0 = raw;
                             }
