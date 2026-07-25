@@ -3446,40 +3446,21 @@ void combine_nvl_rdma(DataType type,
                                 for (int t = 0; t < plane_tokens; ++t) {
                                     // Skip sentinel (src_rdma_rank < 0) early to avoid wasting
                                     // uc_load cycles on known-empty slots.
-                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0) {
-                                        continue;
-                                    }
-                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) {
-                                        continue;
-                                    }
-                                    // Per-GPU RDMA: this nvl_rank only handles tokens whose
-                                    // original source nvl-plane == its own nvl_rank (so it sends
-                                    // them back on RDMA plane nvl_rank). Planes partition tokens
-                                    // disjointly, replacing the leader funnel.
-                                    if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) {
-                                        continue;
-                                    }
-                                    // Per-row invalidation for non-local planes, placed AFTER
-                                    // metadata reads (which are small scalar uc_loads that
-                                    // don't trigger large L2 fills) and IMMEDIATELY BEFORE
-                                    // the row AND topk_weights copy (both read IPC data
-                                    // via uc_load which can observe stale L2 lines).
-                                    if (peer != nvl_rank) {
-                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                                        lsc_fence_sysacq();
-                                    }
-                                    faithful_coop_copy_ucsrc_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
+                                    if (peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
                                                        reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                                        static_cast<size_t>(hidden) * sizeof(dtype_t),
                                                        local_id, kComputeWGSize);
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = local_id; k < num_topk; k += kComputeWGSize) {
-                                            uc_store(&rdma_wt[count * num_topk + k], deep_ep::uc_load(&peer_topk[t * num_topk + k]));
+                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                         }
                                     }
                                     if (local_id == 0) {
-                                        uc_store(&rdma_recv_pos[count], deep_ep::uc_load(&peer_meta[t].is_token_in_nvl_rank_bits));
-                                        uc_store(&rdma_src_nvl[count], deep_ep::uc_load(&peer_meta[t].src_nvl_rank));
+                                        uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
+                                        uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
                                     }
                                     ++count;
                                 }
@@ -3568,16 +3549,16 @@ void combine_nvl_rdma(DataType type,
                                 // Iterate ALL plane_tokens rows and rely on the sentinel check
                                 // (empty slots have src_rdma_rank=-1 from CombineNvlPlaneInit).
                                 for (int t = 0; t < plane_tokens; ++t) {
-                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0) continue;
-                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) continue;
-                                    if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) continue;
+                                    if (peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
-                                            uc_store(&rdma_wt[count * num_topk + k], deep_ep::uc_load(&peer_topk[t * num_topk + k]));
+                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                     }
-                                    uc_store(&rdma_recv_pos[count], deep_ep::uc_load(&peer_meta[t].is_token_in_nvl_rank_bits));
-                                    uc_store(&rdma_src_nvl[count], deep_ep::uc_load(&peer_meta[t].src_nvl_rank));
+                                    uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
+                                    uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
                                     ++count;
                                 }
                             }
@@ -3617,9 +3598,9 @@ void combine_nvl_rdma(DataType type,
                         auto* peer_meta = cs_meta + plane_base;
                         // Read metadata uncached to avoid re-populating stale L2 lines
                         // before the row copy (same as the serial gather).
-                        const int dst_rdma = deep_ep::uc_load(&peer_meta[t].src_rdma_rank);
+                        const int dst_rdma = peer_meta[t].src_rdma_rank;
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
-                        if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) return;
+                        if (peer_meta[t].src_nvl_rank != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3637,13 +3618,13 @@ void combine_nvl_rdma(DataType type,
                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                             lsc_fence_sysacq();
                         }
-                        // UNCACHED-source + write-through (uc_load src + uc_store dst): the
-                        // peer's cs_x was written via cross-GPU IPC WRITE (CombineNvlPushKernel
-                        // step 1), NOT coherent with this GPU's L1/L2; reading it cached (even
-                        // after lsc_fence_sysacq) can return a stale L2 line on a racing rank.
-                        // Writing through uc_store publishes the copy to the NIC's DMA domain
-                        // (matches the serial gather's faithful_coop_copy_ucsrc_dstuc).
-                        faithful_coop_copy_ucsrc_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
+                        // Plain cooperative copy: the pre-kernel lsc_fence_sysacq
+                        // invalidates all L2, and the per-row fence re-invalidates.
+                        // After invalidation, cached reads should observe fresh HBM
+                        // data. The hint-based uc_load was IGC-droppable and caused
+                        // non-deterministic corruption.
+                        // uc_store dst: publish to NIC DMA domain.
+                        faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
                                            reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                            static_cast<size_t>(hidden) * sizeof(dtype_t),
                                            local_id, kComputeWGSize);
