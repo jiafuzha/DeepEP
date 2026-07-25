@@ -412,6 +412,7 @@ class CombinedCombineFwdWriteKernel;
 template <typename dtype_t>
 class CombinedCombineFwdBarrierKernel;
 template <typename dtype_t> class CombineNvlExchangeDataKernel;
+template <typename dtype_t> class CombineNvlExchangeDataKernel;
 template <typename dtype_t>
 class CombinedCombineReduceKernel;
 
@@ -2966,7 +2967,9 @@ void combine_nvl_rdma(DataType type,
     // rank now handled locally). Bound it by num_rdma_ranks * num_combined_tokens
     // so a peer receiving contributions from multiple source RDMA ranks never
     // overruns its forward region. num_nvl_bytes is provisioned far above this.
-    const int max_fwd_tokens = num_rdma_ranks * num_combined_tokens;
+    // With NVL exchange after FwdBarrier, each rank copies peer's remote
+    // fwd data into its own buffer. Capacity: own data + peer data.
+    const int max_fwd_tokens = num_nvl_ranks * num_rdma_ranks * num_combined_tokens;
     // Per-GPU RDMA combine: each nvl_rank RDMA-sends the tokens it holds whose original
     // source nvl-plane == its own nvl_rank, back to (src_rdma, nvl_rank). The receiver
     // (src_rdma, nvl_rank) therefore always forwards to ITSELF (rdma_src_nvl == its own
@@ -3952,12 +3955,19 @@ void combine_nvl_rdma(DataType type,
         dbg_stage("FC6-FwdWrite");
     }
 
-    // ---- FC6.5: Cross-GPU NVL data exchange. With per-GPU RDMA, each rank
-    // receives data from only ONE sender (rank0→rank2, rank1→rank3). The
-    // FwdBarrier synchronizes but does NOT exchange data. Copy each peer's
-    // fwd_x to our own buffer so the reduce sees ALL contributions.
+    // ---- FC6.5 FwdBarrier: synchronize all ranks. All FC6 writes are complete.
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineFwdBarrierKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("7-FwdBarrier");
+
+    // ---- FC7: NVL data exchange (after barrier). Each rank copies remote
+    // peer's fwd data to its own buffer so reduce sees ALL contributions.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombineNvlExchangeDataKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
             [=](sycl::nd_item<1> item) {
                 const int local_id = static_cast<int>(item.get_local_id(0));
@@ -3976,9 +3986,9 @@ void combine_nvl_rdma(DataType type,
                     auto* peer_fwd_counts = reinterpret_cast<int*>(peer_fwd_base + fwd_layout.fwd_count_offset);
                     auto* peer_fwd_topk = reinterpret_cast<float*>(peer_fwd_base + fwd_layout.fwd_topk_weights_offset);
                     for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                        if (src_rdma == my_rdma_rank) continue;  // skip local data
+                        if (src_rdma == my_rdma_rank) continue;
                         int peer_count = peer_fwd_counts[src_rdma];
-                        if (peer_count < 0) peer_count = 0;
+                        if (peer_count <= 0) continue;
                         if (peer_count > max_fwd_tokens) peer_count = max_fwd_tokens;
                         const int my_base = my_fwd_counts[src_rdma];
                         for (int i = local_id; i < peer_count; i += kComputeWGSize) {
@@ -4003,15 +4013,7 @@ void combine_nvl_rdma(DataType type,
             });
     });
     if (wait_each) queue.wait();
-    dbg_stage("FC6.5-NvlExchange");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombineNvlExchangeDataKernel<dtype_t>>(
-            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
-    });
-    if (wait_each) queue.wait();
-    dbg_stage("7-FwdBarrier");
+    dbg_stage("FC7-NvlExchange");
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t rd_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
