@@ -3202,7 +3202,14 @@ void combine_nvl_rdma(DataType type,
                     auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
                     auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
                     const int dst_idx = plane_base + t;  // VERBATIM index (== peer_recv_pos read side)
-                    faithful_coop_copy(reinterpret_cast<uint8_t*>(&cs_x[static_cast<size_t>(dst_idx) * hidden]),
+                    // Write-through (uc_store) for the row payload into the peer's
+                    // combine-staging plane: the gather reads this data with per-row
+                    // lsc_fence_sysacq + uc_load, but a plain cached store leaves the
+                    // payload in the WRITER GPU's L2, and the release fence may not
+                    // reliably flush 14 KB of interleaved L2 lines before the NVL
+                    // barrier releases the reader. Writing through uc_store publishes
+                    // directly to the memory domain the reader's uc_load observes.
+                    faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&cs_x[static_cast<size_t>(dst_idx) * hidden]),
                                        reinterpret_cast<const uint8_t*>(&my_x[static_cast<size_t>(t) * hidden]),
                                        static_cast<size_t>(hidden) * sizeof(dtype_t), local_id, kComputeWGSize);
                     if (local_id == 0) {
@@ -3445,8 +3452,8 @@ void combine_nvl_rdma(DataType type,
                                     // Per-row invalidation for non-local planes, placed AFTER
                                     // metadata reads (which are small scalar uc_loads that
                                     // don't trigger large L2 fills) and IMMEDIATELY BEFORE
-                                    // the row copy (14 KB via uc_load, which can observe
-                                    // stale L2 lines from a previous row's copy).
+                                    // the row AND topk_weights copy (both read IPC data
+                                    // via uc_load which can observe stale L2 lines).
                                     if (peer != nvl_rank) {
                                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                                         lsc_fence_sysacq();
@@ -3557,7 +3564,7 @@ void combine_nvl_rdma(DataType type,
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
-                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
+                                            uc_store(&rdma_wt[count * num_topk + k], deep_ep::uc_load(&peer_topk[t * num_topk + k]));
                                     }
                                     uc_store(&rdma_recv_pos[count], deep_ep::uc_load(&peer_meta[t].is_token_in_nvl_rank_bits));
                                     uc_store(&rdma_src_nvl[count], deep_ep::uc_load(&peer_meta[t].src_nvl_rank));
