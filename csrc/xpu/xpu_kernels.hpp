@@ -388,6 +388,12 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, int
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
+    // Acquire fence after observing all peers' barrier signals: guarantee
+    // that all prior stores from those peers (IPC writes, release fences)
+    // are visible to this work-group before subsequent reads.
+    if constexpr (!kSyncOnly) {
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    }
 }
 
 template <typename dtype_t>
