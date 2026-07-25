@@ -3427,6 +3427,16 @@ void combine_nvl_rdma(DataType type,
                                 // empty slots have src_nvl_rank=-1 (CombineNvlPlaneInit seed) →
                                 // fail the src_nvl_rank!=nvl_rank check.
                                 for (int t = 0; t < plane_tokens; ++t) {
+                                    // Per-row invalidation for non-local planes:
+                                    // metadata reads above (uc_load on peer_meta) only
+                                    // read small scalar fields and don't fully populate
+                                    // L2, but reading one row's payload (14 KB) via
+                                    // uc_load can trigger an L2 fill for adjacent rows.
+                                    // Re-invalidate before each row on non-local planes.
+                                    if (peer != nvl_rank) {
+                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                        lsc_fence_sysacq();
+                                    }
                                     // Skip sentinel (src_rdma_rank < 0) early to avoid wasting
                                     // uc_load cycles on known-empty slots.
                                     if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0) {
