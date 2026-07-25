@@ -3446,9 +3446,17 @@ void combine_nvl_rdma(DataType type,
                                 for (int t = 0; t < plane_tokens; ++t) {
                                     // Skip sentinel (src_rdma_rank < 0) early to avoid wasting
                                     // uc_load cycles on known-empty slots.
-                                    if (peer_meta[t].src_rdma_rank < 0) continue;
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0 : peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma : peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank : peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    // Per-row invalidation: the per-plane fence above
+                                    // invalidated all L2, but reading previous rows
+                                    // re-fills the cache. Re-invalidate before each
+                                    // row's payload copy to ensure fresh data.
+                                    if (peer != nvl_rank) {
+                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                        lsc_fence_sysacq();
+                                    }
                                     faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
                                                        reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                                        static_cast<size_t>(hidden) * sizeof(dtype_t),
@@ -3549,9 +3557,9 @@ void combine_nvl_rdma(DataType type,
                                 // Iterate ALL plane_tokens rows and rely on the sentinel check
                                 // (empty slots have src_rdma_rank=-1 from CombineNvlPlaneInit).
                                 for (int t = 0; t < plane_tokens; ++t) {
-                                    if (peer_meta[t].src_rdma_rank < 0) continue;
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0 : peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma : peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank : peer_meta[t].src_nvl_rank != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
@@ -3596,11 +3604,13 @@ void combine_nvl_rdma(DataType type,
                         // total tokens IN the consumer's plane).
                         auto* peer_x = cs_x + plane_base * hidden;
                         auto* peer_meta = cs_meta + plane_base;
-                        // Read metadata uncached to avoid re-populating stale L2 lines
-                        // before the row copy (same as the serial gather).
-                        const int dst_rdma = peer_meta[t].src_rdma_rank;
+                        // Read metadata UNCACHED for non-local planes to avoid stale L2 data
+                        // from the IPC write (same as the serial gather).
+                        const int dst_rdma = (peer != nvl_rank)
+                            ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank)
+                            : peer_meta[t].src_rdma_rank;
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
-                        if (peer_meta[t].src_nvl_rank != nvl_rank) return;
+                        if ((peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) : peer_meta[t].src_nvl_rank) != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
