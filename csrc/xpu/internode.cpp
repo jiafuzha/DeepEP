@@ -3403,6 +3403,19 @@ void combine_nvl_rdma(DataType type,
                                 auto* peer_x = cs_x + plane_base * hidden;
                                 auto* peer_meta = cs_meta + plane_base;
                                 auto* peer_topk = cs_topk + plane_base * num_topk;
+                                // Per-plane cache invalidation: plane 0 is LOCAL (this GPU's
+                                // own Pack output, coherent), but plane 1+ was written by a
+                                // PEER nvl_rank via cross-GPU IPC WRITE (CombineNvlPushKernel
+                                // step 1) which is NOT coherent with this GPU's L1/L2. The
+                                // single pre-loop lsc_fence_sysacq can be defeated if plane 0's
+                                // reads re-populate stale L2 lines that then survive for plane
+                                // 1's uc_load reads. Re-invalidate before every non-local plane
+                                // to guarantee the hint-based uc_load observes the peer's pushed
+                                // bytes rather than a stale cached line.
+                                if (peer != nvl_rank) {
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    lsc_fence_sysacq();
+                                }
                                 // cs_counts / cs_meta are published by the PEER nvl_rank via a
                                 // cross-GPU IPC WRITE (CombineNvlPushKernel); read them uncached
                                 // so a stale L2 line cannot mis-count or mis-filter rows.
@@ -3517,6 +3530,12 @@ void combine_nvl_rdma(DataType type,
                                 const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
                                 auto* peer_meta = cs_meta + plane_base;
                                 auto* peer_topk = cs_topk + plane_base * num_topk;
+                                // Per-plane cache invalidation for non-local IPC data
+                                // (see serial gather comment for rationale).
+                                if (peer != nvl_rank) {
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    lsc_fence_sysacq();
+                                }
                                 // Selective push: BOTH nvl_ranks push tokens into the SAME consumer's
                                 // plane based on src_nvl_rank. cs_counts[peer] only counts the
                                 // tokens pushed BY peer, NOT the total tokens IN the plane.
@@ -3570,9 +3589,11 @@ void combine_nvl_rdma(DataType type,
                         // total tokens IN the consumer's plane).
                         auto* peer_x = cs_x + plane_base * hidden;
                         auto* peer_meta = cs_meta + plane_base;
-                        const int dst_rdma = peer_meta[t].src_rdma_rank;
+                        // Read metadata uncached to avoid re-populating stale L2 lines
+                        // before the row copy (same as the serial gather).
+                        const int dst_rdma = deep_ep::uc_load(&peer_meta[t].src_rdma_rank);
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
-                        if (peer_meta[t].src_nvl_rank != nvl_rank) return;
+                        if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3580,8 +3601,16 @@ void combine_nvl_rdma(DataType type,
                             ? (rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes)
                             : (rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes);
                         auto* rdma_x = reinterpret_cast<dtype_t*>(region);
-                        // Only the bulk x row copy runs in the grid (topk/recv_pos/src_nvl were
-                        // written serially in Pass 1). Full-GPU parallel over rows.
+                        // Second invalidation for non-local plane rows: the metadata reads
+                        // above (peer_meta[t].src_rdma_rank etc.) use plain cached loads
+                        // that may re-populate stale L2 lines from prior iterations,
+                        // defeating the pre-kernel lsc_fence_sysacq. Re-invalidate
+                        // immediately before the row copy so uc_load observes the peer's
+                        // IPC-written bytes rather than a stale cached line.
+                        if (peer != nvl_rank) {
+                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                            lsc_fence_sysacq();
+                        }
                         // UNCACHED-source + write-through (uc_load src + uc_store dst): the
                         // peer's cs_x was written via cross-GPU IPC WRITE (CombineNvlPushKernel
                         // step 1), NOT coherent with this GPU's L1/L2; reading it cached (even
