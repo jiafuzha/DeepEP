@@ -370,6 +370,7 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, int
     }
     if constexpr (!kSyncOnly) {
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        deep_ep::lsc_fence_sysrel();
         item.barrier(sycl::access::fence_space::local_space);
     }
 
@@ -393,6 +394,10 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, int
     // are visible to this work-group before subsequent reads.
     if constexpr (!kSyncOnly) {
         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        // Also emit the explicit LSC system-scope acquire fence asm.
+        // On BMG+igub, the sycl-level fence may not emit the full
+        // L2-invalidating instruction; lsc_fence_sysacq guarantees it.
+        deep_ep::lsc_fence_sysacq();
     }
 }
 
