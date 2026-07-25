@@ -1897,7 +1897,7 @@ void dispatch_nvl_rdma(void* recv_x,
                                 nvl_bits |= 1 << (d % num_nvl_ranks);
                                 rdma_bits |= 1 << (d / num_nvl_ranks);
                             }
-                            my_send_meta[token] = SourceMeta{my_rdma_rank, nvl_bits, nvl_rank};
+                            my_send_meta[token] = SourceMeta{my_rdma_rank, token, nvl_rank};
                             my_send_dst_token[token] = -1;
                             my_send_routing_bits[token] = nvl_bits;
                             my_send_rdma_bits[token] = rdma_bits;
