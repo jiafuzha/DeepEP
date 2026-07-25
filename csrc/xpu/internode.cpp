@@ -411,6 +411,7 @@ template <typename dtype_t>
 class CombinedCombineFwdWriteKernel;
 template <typename dtype_t>
 class CombinedCombineFwdBarrierKernel;
+template <typename dtype_t> class CombineNvlExchangeDataKernel;
 template <typename dtype_t>
 class CombinedCombineReduceKernel;
 
@@ -3795,7 +3796,7 @@ void combine_nvl_rdma(DataType type,
                     lsc_fence_sysacq();
                     int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
                     if (local_id == 0) {
-                        for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                        for (int peer = fwd_peer_lo; peer < fwd_peer_hi; ++peer) {
                             auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                             auto* fwd_base = peer_buf + fwd_base_offset;
                             auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
@@ -3861,18 +3862,23 @@ void combine_nvl_rdma(DataType type,
                                              // loads observe the NIC-delivered RDMA payload
 
                         for (int i = 0; i < count; ++i) {
-                            // Forward to ALL local peers so every rank has a complete set
-                            // of received data for the reduce. Each forwarder writes
-                            // its unique src_nvl-plane data into every peer's buffer
-                            // at independent offsets — no collision.
-                            for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                                auto* fwd_base = peer_buf + fwd_base_offset;
-                                auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
-                                auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
-                                auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
-                                if (peer_offsets[peer] >= max_fwd_tokens) continue;
-                                const int dst_idx = peer_offsets[peer]++;
+                            // Uncached read of the NIC-written metadata: rdma_src_nvl is
+                            // delivered by the peer NIC via PCIe P2P into this GPU's HBM and is
+                            // NOT coherent with the GPU cache, so a plain cached load can return
+                            // a stale L2 line (same reason the payload copy below is uncached).
+                            const int target_nvl = uc_load(&rdma_src_nvl[i]);
+                            if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
+                                continue;
+                            }
+                            auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[target_nvl]);
+                            auto* fwd_base = peer_buf + fwd_base_offset;
+                            auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
+                            auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
+                            auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
+                            if (peer_offsets[target_nvl] >= max_fwd_tokens) {
+                                continue;
+                            }
+                            const int dst_idx = peer_offsets[target_nvl]++;
                             // Re-invalidate the GPU cache immediately before EACH row's uncached
                             // copy. The single pre-loop lsc_fence_sysacq can be defeated on a
                             // heavily-loaded rank if a stale rdma_x L2 line (populated by a prior
@@ -3897,15 +3903,39 @@ void combine_nvl_rdma(DataType type,
                                 }
                             }
                             if (local_id == 0) {
-                                fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), nvl_rank};
+                                fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), target_nvl};
                             }
-                            }  // end peer loop
-                        }  // end token loop
+                            if (dbgR && my_rdma_rank == 1 && src_rdma == 0) {
+                                sycl::group_barrier(group);
+                                if (local_id == 0) {
+                                    const uint16_t* sr = reinterpret_cast<const uint16_t*>(&rdma_x[i * hidden]);
+                                    const uint16_t* dr = reinterpret_cast<const uint16_t*>(&fwd_x[dst_idx * hidden]);
+                                    unsigned sf = 0, df = 0;
+                                    for (int h = 0; h < hidden; ++h) {
+                                        sf ^= (static_cast<unsigned>(deep_ep::uc_load(&sr[h])) << (h & 15));
+                                        df ^= (static_cast<unsigned>(dr[h]) << (h & 15));  // CACHED read (reduce's view)
+                                    }
+                                    sycl::ext::oneapi::experimental::printf(
+                                        "[FC6 nvl=%d i=%d dst=%d rp=%d rdmafold=%u fwdfold=%u]\n",
+                                        nvl_rank, i, dst_idx, uc_load(&rdma_recv_pos[i]), sf, df);
+                                    if (i == 0) {
+                                        sycl::ext::oneapi::experimental::printf(
+                                            "[FC6PTR nvl=%d selfbuf=%llu fwdx=%llu rdmax=%llu rdmabase=%llu]\n",
+                                            nvl_rank,
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(buffer_ptrs_gpu[nvl_rank]),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(fwd_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_base));
+                                    }
+                                }
+                                sycl::group_barrier(group);
+                            }
+                        }
 
                         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                         sycl::group_barrier(group);
                         if (local_id == 0) {
-                            for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                            for (int peer = fwd_peer_lo; peer < fwd_peer_hi; ++peer) {
                                 auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
                                 auto* fwd_base = peer_buf + fwd_base_offset;
                                 auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
@@ -3922,8 +3952,61 @@ void combine_nvl_rdma(DataType type,
         dbg_stage("FC6-FwdWrite");
     }
 
+    // ---- FC6.5: Cross-GPU NVL data exchange. With per-GPU RDMA, each rank
+    // receives data from only ONE sender (rank0→rank2, rank1→rank3). The
+    // FwdBarrier synchronizes but does NOT exchange data. Copy each peer's
+    // fwd_x to our own buffer so the reduce sees ALL contributions.
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineFwdBarrierKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* my_fwd_base = my_buf + fwd_base_offset;
+                auto* my_fwd_x = reinterpret_cast<dtype_t*>(my_fwd_base + fwd_layout.fwd_x_offset);
+                auto* my_fwd_meta = reinterpret_cast<SourceMeta*>(my_fwd_base + fwd_layout.fwd_meta_offset);
+                auto* my_fwd_counts = reinterpret_cast<int*>(my_fwd_base + fwd_layout.fwd_count_offset);
+                auto* my_fwd_topk = reinterpret_cast<float*>(my_fwd_base + fwd_layout.fwd_topk_weights_offset);
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    if (peer == nvl_rank) continue;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                    auto* peer_fwd_base = peer_buf + fwd_base_offset;
+                    auto* peer_fwd_x = reinterpret_cast<dtype_t*>(peer_fwd_base + fwd_layout.fwd_x_offset);
+                    auto* peer_fwd_meta = reinterpret_cast<SourceMeta*>(peer_fwd_base + fwd_layout.fwd_meta_offset);
+                    auto* peer_fwd_counts = reinterpret_cast<int*>(peer_fwd_base + fwd_layout.fwd_count_offset);
+                    auto* peer_fwd_topk = reinterpret_cast<float*>(peer_fwd_base + fwd_layout.fwd_topk_weights_offset);
+                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                        if (src_rdma == my_rdma_rank) continue;  // skip local data
+                        int peer_count = peer_fwd_counts[src_rdma];
+                        if (peer_count < 0) peer_count = 0;
+                        if (peer_count > max_fwd_tokens) peer_count = max_fwd_tokens;
+                        const int my_base = my_fwd_counts[src_rdma];
+                        for (int i = local_id; i < peer_count; i += kComputeWGSize) {
+                            const int dst_idx = my_base + i;
+                            if (dst_idx >= max_fwd_tokens) continue;
+                            faithful_coop_copy_ucsrc(reinterpret_cast<uint8_t*>(&my_fwd_x[dst_idx * hidden]),
+                                               reinterpret_cast<const uint8_t*>(&peer_fwd_x[i * hidden]),
+                                               static_cast<size_t>(hidden) * sizeof(dtype_t),
+                                               local_id, kComputeWGSize);
+                            if (local_id == 0) {
+                                my_fwd_meta[dst_idx] = peer_fwd_meta[i];
+                                if (num_topk > 0) {
+                                    for (int k = 0; k < num_topk; ++k)
+                                        my_fwd_topk[dst_idx * num_topk + k] = peer_fwd_topk[i * num_topk + k];
+                                }
+                            }
+                        }
+                        if (local_id == 0) my_fwd_counts[src_rdma] += peer_count;
+                    }
+                }
+                sycl::group_barrier(item.get_group());
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("FC6.5-NvlExchange");
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombineNvlExchangeDataKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
             [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
     });
