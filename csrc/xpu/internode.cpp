@@ -3376,7 +3376,6 @@ void combine_nvl_rdma(DataType type,
                     auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
                     auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
                     auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
-                    auto* cs_counts = reinterpret_cast<int*>(cs_base + combine_stage_layout.fwd_count_offset);
                     const int plane_tokens = combine_stage_layout.plane_tokens;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3407,10 +3406,19 @@ void combine_nvl_rdma(DataType type,
                                 // cs_counts / cs_meta are published by the PEER nvl_rank via a
                                 // cross-GPU IPC WRITE (CombineNvlPushKernel); read them uncached
                                 // so a stale L2 line cannot mis-count or mis-filter rows.
-                                int peer_count = deep_ep::uc_load(&cs_counts[peer]);
-                                if (peer_count < 0) peer_count = 0;
-                                if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
-                                for (int t = 0; t < peer_count; ++t) {
+                                // Selective push: BOTH nvl_ranks push tokens into the SAME consumer's
+                                // plane based on src_nvl_rank. cs_counts[peer] only counts the
+                                // tokens pushed BY peer, NOT the total tokens IN the plane (the
+                                // peer is the CONSUMER, not the producer). Iterate ALL plane_tokens
+                                // rows and rely on the src_nvl_rank/sentinel checks to filter:
+                                // empty slots have src_nvl_rank=-1 (CombineNvlPlaneInit seed) →
+                                // fail the src_nvl_rank!=nvl_rank check.
+                                for (int t = 0; t < plane_tokens; ++t) {
+                                    // Skip sentinel (src_rdma_rank < 0) early to avoid wasting
+                                    // uc_load cycles on known-empty slots.
+                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0) {
+                                        continue;
+                                    }
                                     if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) {
                                         continue;
                                     }
@@ -3490,7 +3498,6 @@ void combine_nvl_rdma(DataType type,
                         auto* cs_base = my_buf + combine_stage_base;
                         auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
                         auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
-                        auto* cs_counts = reinterpret_cast<int*>(cs_base + combine_stage_layout.fwd_count_offset);
                         const int plane_tokens = combine_stage_layout.plane_tokens;
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
@@ -3510,15 +3517,13 @@ void combine_nvl_rdma(DataType type,
                                 const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
                                 auto* peer_meta = cs_meta + plane_base;
                                 auto* peer_topk = cs_topk + plane_base * num_topk;
-                                // cs_counts + cs_meta were written by a PEER nvl_rank via
-                                // cross-GPU IPC WRITE (CombineNvlPushKernel step 1), which is
-                                // NOT coherent with this GPU's L1/L2. Read them UNCACHED (uc_load)
-                                // so a stale L2 line doesn't cause mis-filtering / under-counting
-                                // (the serial gather already has this exact fix).
-                                int peer_count = deep_ep::uc_load(&cs_counts[peer]);
-                                if (peer_count < 0) peer_count = 0;
-                                if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
-                                for (int t = 0; t < peer_count; ++t) {
+                                // Selective push: BOTH nvl_ranks push tokens into the SAME consumer's
+                                // plane based on src_nvl_rank. cs_counts[peer] only counts the
+                                // tokens pushed BY peer, NOT the total tokens IN the plane.
+                                // Iterate ALL plane_tokens rows and rely on the sentinel check
+                                // (empty slots have src_rdma_rank=-1 from CombineNvlPlaneInit).
+                                for (int t = 0; t < plane_tokens; ++t) {
+                                    if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0) continue;
                                     if (deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) continue;
                                     if (deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
@@ -3554,15 +3559,15 @@ void combine_nvl_rdma(DataType type,
                         auto* cs_base = my_buf + combine_stage_base;
                         auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
                         auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
-                        auto* cs_counts = reinterpret_cast<int*>(cs_base + combine_stage_layout.fwd_count_offset);
                         const int plane_tokens = combine_stage_layout.plane_tokens;
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();  // invalidate -> cached int4 loads see pushed data
                         const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
-                        int peer_count = cs_counts[peer];
-                        if (peer_count < 0) peer_count = 0;
-                        if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
-                        if (t >= peer_count) return;
+                        // Selective push: the grid covers ALL plane_tokens rows per peer;
+                        // empty slots have src_rdma_rank=-1 (CombineNvlPlaneInit sentinel) and
+                        // will fail the src_rdma_rank check below — no need for a per-peer count
+                        // bound (which only counts tokens pushed BY a single producer, not the
+                        // total tokens IN the consumer's plane).
                         auto* peer_x = cs_x + plane_base * hidden;
                         auto* peer_meta = cs_meta + plane_base;
                         const int dst_rdma = peer_meta[t].src_rdma_rank;
