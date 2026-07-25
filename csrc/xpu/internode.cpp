@@ -3213,10 +3213,20 @@ void combine_nvl_rdma(DataType type,
                                        reinterpret_cast<const uint8_t*>(&my_x[static_cast<size_t>(t) * hidden]),
                                        static_cast<size_t>(hidden) * sizeof(dtype_t), local_id, kComputeWGSize);
                     if (local_id == 0) {
-                        cs_meta[dst_idx] = my_meta[t];  // valid meta (src_nvl_rank==dst_c) overrides -1 sentinel
+                        // Write cs_meta and cs_topk through uc_store for IPC peer
+                        // writes: same rationale as the row payload uc_store fix.
+                        // SourceMeta is 12 bytes (3 x int); store each field with
+                        // uc_store so it bypasses L2 for cross-GPU IPC writes.
+                        if (dst_c == nvl_rank) {
+                            cs_meta[dst_idx] = my_meta[t];
+                        } else {
+                            deep_ep::uc_store(&cs_meta[dst_idx].src_rdma_rank, my_meta[t].src_rdma_rank);
+                            deep_ep::uc_store(&cs_meta[dst_idx].is_token_in_nvl_rank_bits, my_meta[t].is_token_in_nvl_rank_bits);
+                            deep_ep::uc_store(&cs_meta[dst_idx].src_nvl_rank, my_meta[t].src_nvl_rank);
+                        }
                         if (num_topk > 0) {
                             for (int k = 0; k < num_topk; ++k)
-                                cs_topk[dst_idx * num_topk + k] = my_topk[t * num_topk + k];
+                                deep_ep::uc_store(&cs_topk[dst_idx * num_topk + k], my_topk[t * num_topk + k]);
                         }
                     }
                 }
