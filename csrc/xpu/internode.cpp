@@ -51,6 +51,7 @@ class CombinedDispatchFwdWriteKernel;
 class CombinedDispatchFwdBarrierKernel;
 class CombinedDispatchAssembleKernel;
 class CombinedDispatchHeadKernel;
+class DispatchChannelCountsKernel;
 
 // ---- Faithful (CUDA-parity) dispatch transport (the only transport) ----
 // Collapses the serial single_task Pack/Stage/RdmaSend/RdmaPut into fewer,
@@ -279,6 +280,93 @@ inline void faithful_coop_zero(uint8_t* dst, size_t n, int lane, int lanes) {
     }
     for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
         dst[b] = 0;
+}
+
+// ---- Reusable combine_token reduction (mirrors CUDA combine_token without TMA) ----
+// Reduces tokens across up to kNumSrcRanks source buffers into one output row +
+// topk_weights. The CUDA original uses warp-scope shfl to gather heads; here each
+// WG owns a single combined output row, so the heads/slot_indices are already
+// per-WG (broadcast or precomputed).  kDtypePerInt4 == sizeof(int4)/sizeof(dtype_t)
+// (8 for bfloat16). Bias accumulation is handled separately by the caller.
+template <int kNumSrcRanks, typename dtype_t>
+inline void combine_token_sycl(
+    const int* __restrict__ head_indices,   // [kNumSrcRanks]: head slot per source
+    const int* __restrict__ slot_indices,   // [kNumSrcRanks]: slot index per source
+    const bool* __restrict__ is_source_active, // [kNumSrcRanks]: whether source contributes
+    const int hidden,                         // element count (not int4 count)
+    const int num_topk,
+    dtype_t* __restrict__ combined_row,
+    float* __restrict__ combined_topk_weights,
+    const uint8_t* const* __restrict__ source_bases, // [kNumSrcRanks] base pointers
+    const size_t row_bytes,                  // bytes per row in source buffer
+    const float* const* __restrict__ source_topk_bases, // [kNumSrcRanks] topk_weight bases
+    int local_id,
+    int wg_size) {
+    constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
+    // --- hidden-dimension reduce (per-lane strided) ---
+    for (int h = local_id; h < hidden; h += wg_size) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < kNumSrcRanks; ++s) {
+            if (!is_source_active[s]) continue;
+            const auto* src_row = reinterpret_cast<const dtype_t*>(
+                source_bases[s] + static_cast<size_t>(slot_indices[s]) * row_bytes);
+            acc += static_cast<float>(src_row[h]);
+        }
+        combined_row[h] = static_cast<dtype_t>(acc);
+    }
+    // --- topk_weights reduce ---
+    if (combined_topk_weights != nullptr) {
+        for (int k = local_id; k < num_topk; k += wg_size) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < kNumSrcRanks; ++s) {
+                if (!is_source_active[s]) continue;
+                acc += source_topk_bases[s][slot_indices[s] * num_topk + k];
+            }
+            combined_topk_weights[k] = acc;
+        }
+    }
+}
+
+// ---- Reusable combine_token for variable-rank (dynamic kNumSrcRanks) ----
+// Same as above but kNumSrcRanks is a runtime parameter, so the inner loop
+// cannot be unrolled. Use this when the source rank count varies per token.
+template <typename dtype_t>
+inline void combine_token_sycl_variable(
+    const int* __restrict__ head_indices,
+    const int* __restrict__ slot_indices,
+    const bool* __restrict__ is_source_active,
+    int num_src_ranks,
+    const int hidden,
+    const int num_topk,
+    dtype_t* __restrict__ combined_row,
+    float* __restrict__ combined_topk_weights,
+    const uint8_t* const* __restrict__ source_bases,
+    const size_t row_bytes,
+    const float* const* __restrict__ source_topk_bases,
+    int local_id,
+    int wg_size) {
+    for (int h = local_id; h < hidden; h += wg_size) {
+        float acc = 0.0f;
+        for (int s = 0; s < num_src_ranks; ++s) {
+            if (!is_source_active[s]) continue;
+            const auto* src_row = reinterpret_cast<const dtype_t*>(
+                source_bases[s] + static_cast<size_t>(slot_indices[s]) * row_bytes);
+            acc += static_cast<float>(src_row[h]);
+        }
+        combined_row[h] = static_cast<dtype_t>(acc);
+    }
+    if (combined_topk_weights != nullptr) {
+        for (int k = local_id; k < num_topk; k += wg_size) {
+            float acc = 0.0f;
+            for (int s = 0; s < num_src_ranks; ++s) {
+                if (!is_source_active[s]) continue;
+                acc += source_topk_bases[s][slot_indices[s] * num_topk + k];
+            }
+            combined_topk_weights[k] = acc;
+        }
+    }
 }
 
 template <typename dtype_t>
@@ -1706,6 +1794,51 @@ void dispatch_nvl_rdma(void* recv_x,
     ddbg_stage("1-Init");
 
     // ===================================================================
+    // ===================================================================
+    // ARCHITECTURAL DEVIATIONS FROM CUDA internode.cu
+    // ===================================================================
+    // The XPU/SYCL faithful path differs from the CUDA original in 5 deliberate ways:
+    //
+    // 1. PRODUCER-PUSH INTRA-NODE (gap #6):
+    //    CUDA consumers READ peer NVL buffers via IPC. On BMG/igub, cross-rank
+    //    IPC READ is unstable (DEVICE_LOST-class). We instead use Producer-PUSH:
+    //    each rank WRITES its tokens into every destination peer's staging.
+    //    Consumers read only their OWN local buffer. Required for BMG stability.
+    //
+    // 2. MICRO-KERNEL DECOMPOSITION (gap #4):
+    //    CUDA uses warp specialization within a SINGLE kernel (5 WarpRoles in
+    //    dispatch, 4 in combine) coordinated by named barrier.sync. SYCL lacks
+    //    named barrier.sync for subset-of-WG synchronization, so we split each
+    //    role into its own kernel launch. Queue-ordering + fused-waits
+    //    (DEEP_EP_INTERNODE_FUSE_WAITS=1) mitigate launch overhead.
+    //
+    // 3. AMO-FLAG CROSS-NODE SYNCHRONIZATION (gaps #5,#22):
+    //    CUDA uses nvshmem_sync_all() (global PE barrier) and a sliding-window
+    //    credit model with spinlocks for RDMA backpressure. We use the LL pattern:
+    //    ishmemx_long_atomic_add_qp(-count-1) flag + acquire-poll, with no global
+    //    barrier. Cross-node ordering is guaranteed by RC ordering on the same QP
+    //    (payload put → AMO flag → receiver poll). Buffer lifecycle relies on
+    //    queue-ordering + the next dispatch's Init-zero to recycle buffers.
+    //
+    // 4. TMA → COOPERATIVE COPY (gap #7):
+    //    CUDA uses SM90 TMA (tma_load_1d, tma_store_1d, mbarrier) for bulk copies.
+    //    Intel GPU has no TMA equivalent. We use faithful_coop_copy() — 16B-
+    //    vectorized lane-strided cooperative byte copies. Correctness is identical;
+    //    performance may differ.
+    //
+    // 5. TOKEN-RANGE PARALLELISM (gap #18):
+    //    CUDA stripes tokens across num_sms/2 SM-channels with per-channel QP.
+    //    We use one WG per QP-channel (num_qp_ch from ISHMEM_IBGDA_QPS_PER_PE)
+    //    with per-token WG parallelism (one WG per combined token) instead of
+    //    per-channel token ranges. For large token counts, consider CUDA-style
+    //    channel token-range partitioning via get_channel_task_range().
+    //
+    // Handle semantics (send_nvl_head/send_rdma_head) are verified byte-identical
+    // between this path and the serial fallback (gap #21). The combine reduce
+    // reads combined_nvl_head[ct * num_ranks + dst_rank] which gives the correct
+    // recv_x position; the combine staging planes mirror recv_x positions exactly.
+    // ===================================================================
+    //
     // FAITHFUL (CUDA-parity) DISPATCH TRANSPORT (stage-1 collapse)
     // ===================================================================
     // We run a collapsed transport that
@@ -2647,48 +2780,127 @@ void dispatch_nvl_rdma(void* recv_x,
     if (wait_each) queue.wait();
     ddbg_stage("9-CountsBarrier");
 
+    // ---- F-K11: parallel channel-count prefix sum (WG-parallel, mirrors
+    // CUDA notify_dispatch SM 1+ channel scanning). Each WG handles a subset
+    // of (dst_rank, channel) pairs; WI0 scans is_token_in_rank, then WI0
+    // computes the row-prefix-sum and broadcasts. Replaces the former serial
+    // single_task. ----
+    queue.submit([&](sycl::handler& cgh) {
+        const int total_gbl_rows = num_ranks * num_channels;
+        const int total_rdma_rows = num_rdma_ranks * num_channels;
+        const int total_rows =
+            std::max(total_gbl_rows, total_rdma_rows);
+        const int num_groups =
+            (total_rows + kComputeWGSize - 1) / kComputeWGSize;
+        cgh.parallel_for<DispatchChannelCountsKernel>(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(num_groups) * kComputeWGSize),
+                sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                const int gid = static_cast<int>(item.get_group_linear_id());
+                // Each row = one (dst_rank/total_rank, channel) pair.
+                const int row_id =
+                    gid * kComputeWGSize + local_id;
+                // --- gbl_channel_prefix_matrix ---
+                if (row_id < total_gbl_rows && gbl_channel_prefix_matrix != nullptr) {
+                    const int dst_rank = row_id / num_channels;
+                    const int c = row_id % num_channels;
+                    const int start =
+                        static_cast<int>((static_cast<int64_t>(num_tokens) * c) /
+                                         num_channels);
+                    const int end =
+                        static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) /
+                                         num_channels);
+                    int count = 0;
+                    // each WI scans a strided slice; reduce across WG
+                    for (int token = start + local_id; token < end;
+                         token += kComputeWGSize) {
+                        count +=
+                            is_token_in_rank[token * num_ranks + dst_rank] ? 1
+                                                                            : 0;
+                    }
+                    count = sycl::reduce_over_group(group, count, sycl::plus<int>());
+                    // WI0 computes the channel-level cumulative prefix
+                    if (local_id == 0) {
+                        int cumulative = count;
+                        for (int pc = 0; pc < c; ++pc) {
+                            const int ps = static_cast<int>(
+                                (static_cast<int64_t>(num_tokens) * pc) /
+                                num_channels);
+                            const int pe = static_cast<int>(
+                                (static_cast<int64_t>(num_tokens) * (pc + 1)) /
+                                num_channels);
+                            for (int t = ps; t < pe; ++t)
+                                cumulative +=
+                                    (is_token_in_rank[t * num_ranks +
+                                                       dst_rank]
+                                         ? 1
+                                         : 0);
+                        }
+                        gbl_channel_prefix_matrix[row_id] = cumulative;
+                    }
+                }
+                // --- rdma_channel_prefix_matrix ---
+                if (row_id < total_rdma_rows && rdma_channel_prefix_matrix != nullptr) {
+                    const int dst_rdma = row_id / num_channels;
+                    const int c = row_id % num_channels;
+                    const int start =
+                        static_cast<int>((static_cast<int64_t>(num_tokens) * c) /
+                                         num_channels);
+                    const int end =
+                        static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) /
+                                         num_channels);
+                    int count = 0;
+                    for (int token = start + local_id; token < end;
+                         token += kComputeWGSize) {
+                        bool hit = false;
+                        for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                            const int dst_rank =
+                                dst_rdma * num_nvl_ranks + dst_nvl;
+                            if (is_token_in_rank[token * num_ranks + dst_rank]) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        count += hit ? 1 : 0;
+                    }
+                    count = sycl::reduce_over_group(group, count, sycl::plus<int>());
+                    if (local_id == 0) {
+                        int cumulative = count;
+                        for (int pc = 0; pc < c; ++pc) {
+                            const int ps = static_cast<int>(
+                                (static_cast<int64_t>(num_tokens) * pc) /
+                                num_channels);
+                            const int pe = static_cast<int>(
+                                (static_cast<int64_t>(num_tokens) * (pc + 1)) /
+                                num_channels);
+                            for (int t = ps; t < pe; ++t) {
+                                bool hit = false;
+                                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks;
+                                     ++dst_nvl) {
+                                    if (is_token_in_rank[t * num_ranks +
+                                                         dst_rdma * num_nvl_ranks +
+                                                         dst_nvl]) {
+                                        hit = true;
+                                        break;
+                                    }
+                                }
+                                cumulative += hit ? 1 : 0;
+                            }
+                        }
+                        rdma_channel_prefix_matrix[row_id] = cumulative;
+                    }
+                }
+            });
+    });
+    if (wait_each) queue.wait();
+    ddbg_stage("10-ChannelCounts");
+
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchHeadKernel>([=]() {
-            if (gbl_channel_prefix_matrix != nullptr) {
-                for (int dst_rank = 0; dst_rank < num_ranks; ++dst_rank) {
-                    int cumulative = 0;
-                    for (int c = 0; c < num_channels; ++c) {
-                        const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
-                        const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
-                        int count = 0;
-                        for (int token = start; token < end; ++token) {
-                            count += is_token_in_rank[token * num_ranks + dst_rank] ? 1 : 0;
-                        }
-                        cumulative += count;
-                        gbl_channel_prefix_matrix[dst_rank * num_channels + c] = cumulative;
-                    }
-                }
-            }
-            if (rdma_channel_prefix_matrix != nullptr) {
-                for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                    int cumulative = 0;
-                    for (int c = 0; c < num_channels; ++c) {
-                        const int start = (static_cast<int64_t>(num_tokens) * c) / num_channels;
-                        const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels;
-                        int count = 0;
-                        for (int token = start; token < end; ++token) {
-                            bool hit = false;
-                            for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                                const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
-                                if (is_token_in_rank[token * num_ranks + dst_rank]) {
-                                    hit = true;
-                                    break;
-                                }
-                            }
-                            count += hit ? 1 : 0;
-                        }
-                        cumulative += count;
-                        rdma_channel_prefix_matrix[dst_rdma * num_channels + c] = cumulative;
-                    }
-                }
-            }
-
-            // Producer-PUSH send_nvl_head/send_rdma_head (gap #2): compute the base offset
+            // send_nvl_head/send_rdma_head (gap #2): compute the base offset
             // of THIS rank's token group in each local dst peer's recv_x using ONLY local
             // reads. Each dst peer's Assemble pushed its per_src_count[] (grouped by GLOBAL
             // src rank, incl. RDMA-forwarded contributions) into our OWN peer_counts region
