@@ -254,6 +254,19 @@ class Buffer:
             qpp = max(1, min(int(num_qps_per_rank), 16))
             qpp = 1 << (qpp - 1).bit_length() if qpp > 1 else 1
             os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
+        elif num_rdma_bytes > 0:
+            # Normal (high-throughput) internode: provision one RC QP per CUDA channel
+            # so the RDMA payload put is striped across QPs (qp_id == channel, mirroring
+            # internode.cu:818/835). CUDA uses num_channels = num_sms/2 channels; the
+            # buffer's num_qps_per_rank is passed as num_sms, so num_channels =
+            # num_qps_per_rank // 2. iSHMEM rounds to a power of 2 and clamps [1,16], and
+            # the internode kernel derives its QP-channel count C from this same env, so
+            # qp_id ∈ [0,C) never exceeds the provisioned pool. setdefault => a
+            # user/harness-provided ISHMEM_IBGDA_QPS_PER_PE always wins.
+            num_channels = max(1, int(num_qps_per_rank) // 2)
+            qpp = min(num_channels, 16)
+            qpp = 1 << (qpp.bit_length() - 1)  # round DOWN to pow2 (<= num_channels, exact for iSHMEM)
+            os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
         # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a

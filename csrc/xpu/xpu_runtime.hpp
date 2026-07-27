@@ -169,6 +169,7 @@ void dispatch(void* recv_x,
               int num_max_rdma_chunked_recv_tokens,
               int rank,
               int num_ranks,
+              int num_experts,
               sycl::queue& queue);
 
 void combine(DataType type,
@@ -233,6 +234,7 @@ void dispatch_nvl_rdma(void* recv_x,
                        int barrier_signal_base,
                        int rank,
                        int num_ranks,
+                       int num_experts,
                        sycl::queue& queue);
 
 // Combined NVL+RDMA internode combine

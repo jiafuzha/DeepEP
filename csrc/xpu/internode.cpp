@@ -52,7 +52,7 @@ class CombinedDispatchFwdBarrierKernel;
 class CombinedDispatchAssembleKernel;
 class CombinedDispatchHeadKernel;
 
-// ---- Faithful (CUDA-parity) dispatch transport, gated by DEEP_EP_INTERNODE_FAITHFUL ----
+// ---- Faithful (CUDA-parity) dispatch transport (the only transport) ----
 // Collapses the serial single_task Pack/Stage/RdmaSend/RdmaPut into fewer,
 // work-group/sub-group-parallel kernels and swaps the scalar blocking put +
 // ishmemx_barrier_all_work_group data-path sync for ishmemx_putmem_nbi_warp +
@@ -64,6 +64,12 @@ class FaithfulDispatchRdmaSendKernel;
 class FaithfulDispatchRdmaFlagKernel;
 class FaithfulDispatchFwdWriteKernel;
 class FaithfulDispatchFwdBarrierKernel;
+// ---- Producer-PUSH intra-node NVL transport (gap #2: eliminate cross-rank IPC READS) ----
+// Each producer WRITES its intra-node tokens into the DESTINATION peer's recv-staging
+// region; the consumer reads only its OWN region locally. See dispatch_nvl_rdma below.
+class FaithfulDispatchNvlPushKernel;
+class FaithfulDispatchNvlPushBarrierKernel;
+class FaithfulDispatchCountsBarrierKernel;
 
 // ---- Faithful-path flag/poll helpers (mirror internode_ll.cpp) ----------------
 // Bounded spin cap for the 64-bit cross-PE arrival flag on the RDMA-forward
@@ -187,25 +193,32 @@ inline bool internode_par_gather() {
 // slice. This uses all num_nvl_ranks NICs per node. The intra-node NVL gather (Pack +
 // Assemble peer reads) is unchanged.
 
-// DEEP_EP_INTERNODE_QP_CHANNELS (default 1): number of RC QPs per PE to stripe the
-// RDMA payload put across (CUDA-faithful multi-QP; qp_id = channel, mirrors
-// internode.cu:818/835 where the put + tail AMO ride qp_id == channel_id). The
-// contiguous payload put [0,rdma_count_offset) is split into this many byte chunks,
-// chunk c issued by sub-group c on qp=c (concurrent NIC send queues), then per-c
-// ishmemx_quiet_qp(dst,c) + ishmemx_long_atomic_add_qp(flag[c],...,c). RC in-order
-// keeps flag[c] after chunk c on the SAME qp. Must be a power of 2 and <=
-// kComputeWGSize/32 (one sub-group per channel). The launcher MUST set
-// ISHMEM_IBGDA_QPS_PER_PE to the SAME value so iSHMEM provisions that many QPs.
-// Default 1 preserves the original single-QP behavior byte-for-byte.
+// Number of RC QP-channels the RDMA payload put is striped across (CUDA-faithful
+// multi-QP; qp_id == channel, mirroring internode.cu:818/835 where the put + tail AMO
+// ride qp_id == channel_id). CUDA runs num_channels (= num_sms/2) SM-channels, each
+// sending its own token range on its own QP. The XPU RDMA region is field-major
+// (all-x | meta | idx | wt | scales) rather than token-major like CUDA's per-channel
+// SymBuffer, so the equivalent NIC parallelism is realized by splitting the contiguous
+// payload put [0,rdma_count_offset) into C 16B-aligned byte chunks, chunk c issued by
+// sub-group c on qp=c (concurrent NIC send queues), then per-c ishmemx_quiet_qp(dst,c)
+// + ishmemx_long_atomic_add_qp(flag[c],...,c). RC in-order keeps flag[c] after chunk c
+// on the SAME qp; the receiver waits for all C flags.
+//
+// C is bound to the QPs actually provisioned by iSHMEM: it reads ISHMEM_IBGDA_QPS_PER_PE
+// (which deep_ep/buffer.py auto-sets to clamp_pow2(num_channels) for normal internode),
+// so qp_id ∈ [0,C) never exceeds the provisioned QP pool. iSHMEM rounds QPS_PER_PE to a
+// power of 2 and clamps [1,16]; C is additionally capped at kComputeWGSize/32 (one
+// sub-group per QP-channel). QPS_PER_PE unset (or 1) => single-QP, byte-for-byte the
+// original layout.
 inline int internode_num_qp_channels() {
-    const char* env = std::getenv("DEEP_EP_INTERNODE_QP_CHANNELS");
+    const char* env = std::getenv("ISHMEM_IBGDA_QPS_PER_PE");
     int c = 1;
     if (env != nullptr && env[0] != '\0') c = std::atoi(env);
     if (c < 1) c = 1;
     int p = 1;
-    while (p * 2 <= c) p *= 2;  // clamp down to power of 2
+    while (p * 2 <= c) p *= 2;  // clamp down to power of 2 (matches iSHMEM provisioning)
     c = p;
-    const int max_ch = kComputeWGSize / 32;  // one sub-group drives one channel/QP
+    const int max_ch = kComputeWGSize / 32;  // one sub-group drives one QP-channel
     if (c > max_ch) c = max_ch;
     return c;
 }
@@ -233,6 +246,31 @@ inline long internode_read_flag64(const long* p, int lsc_mode) {
     return deep_ep::uc_load<long>(p);
 }
 
+// GUARANTEED-uncached arrival probe for the 64-bit RDMA flag.
+//
+// The hint-based uc_load (sycl-cache-read-hint 0x7) is only a HINT that IGC MAY
+// drop; unlike internode_ll.cpp, the normal path zeroes the flag IN-PLACE (no
+// parity double-buffer) immediately before polling it on the SAME GPU, so that
+// flag's cache line is HOT in L1/L3 with the just-written 0. A dropped hint then
+// reads the stale cached 0 forever while the NIC-delivered AMO (a PCIe-P2P write
+// that is NOT coherent with the GPU L1/L3) updates only HBM -- so the poll spins
+// until some fence happens to invalidate the line. Fencing every spin (lsc_mode
+// 2) hides this but runs the busy-wait for seconds -> trips the 5 s Xe ccs
+// job_timeout -> Engine reset. lsc_uc_load_i32 emits an EXPLICIT
+// lsc_load.ugm.uc.uc that forces BOTH L1 and L3 uncached at the message
+// descriptor, so it observes the NIC write within microseconds of it landing
+// WITHOUT any per-spin fence. The flag is -count-1 on arrival (0 while pending);
+// for any count in [0, 2^31) the low 32 bits are non-zero (count==0 -> -1 ->
+// 0xFFFFFFFF), so a low-word uncached probe reliably detects arrival. The exact
+// 64-bit value is then re-read via the fenced path by the caller.
+inline int internode_probe_flag_lo(const long* p) {
+#ifdef __SYCL_DEVICE_ONLY__
+    return deep_ep::lsc_uc_load_i32(reinterpret_cast<const int*>(p));
+#else
+    return static_cast<int>(*reinterpret_cast<const volatile int*>(p));
+#endif
+}
+
 // Cooperative 16-byte-vectorized copy of `n` bytes across `lanes` cooperating
 // work-items (lane in [0, lanes)). The prior byte-at-a-time stage copy issued
 // ~n individual 1-byte P2P/IPC stores when staging a non-leader rank's send
@@ -252,6 +290,97 @@ inline void faithful_coop_copy(uint8_t* dst, const uint8_t* src, size_t n, int l
     }
     for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
         dst[b] = src[b];
+}
+
+// Cooperative copy that reads the SOURCE through the hint-based uncached uc_load
+// (sycl-cache-read-hint 0x7) per work-item, and writes the destination with normal
+// stores. Used for the FaithfulCombineFwdWriteKernel (FC6) rdma_x(NIC-written) ->
+// fwd_x handoff.
+//
+// The combine RDMA receive region (rdma_x) is delivered by the peer NIC via PCIe
+// P2P into THIS GPU's HBM, which is NOT coherent with the GPU L1/L2, and the
+// symmetric-heap addresses are reused every iteration. A plain CACHED cooperative
+// copy (faithful_coop_copy) -- even after the kernel's lsc_fence_sysacq invalidate
+// -- can read a stale L2 line for a subset of the row on a racing rank, producing
+// gross combine corruption on exactly the "two same-node contributions summed via
+// one RDMA head" tokens. Reading through uc_load bypasses the cache so every lane
+// observes the NIC-delivered payload; this is the exact primitive
+// internode_ll.cpp::coop_copy_bytes_uc uses for its RDMA reduce input.
+//
+// NOTE (do NOT "optimize" this): a system-scope sycl::atomic_ref load vectorizes
+// into a VECTOR atomic message that does NOT honor the uncached path on this
+// BMG+mlx5 P2P-imported region (returns torn/stale bytes), and the explicit
+// lsc_load.ugm.uc.uc asm (lsc_uc_load_i32) is exec-size-1 SCALAR-ONLY (every SIMD
+// lane would read lane-0's address). The hint-based uc_load is the only primitive
+// that is BOTH genuinely uncached AND correctly vectorized per work-item.
+inline void faithful_coop_copy_ucsrc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            d8[j] = deep_ep::uc_load(&s8[j]);
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        dst[b] = deep_ep::uc_load(&src[b]);
+}
+
+// Cooperative copy that reads the SOURCE with normal (cache-coherent, local) loads
+// and WRITES the DESTINATION through the hint-based write-through uc_store
+// (sycl-cache-write-hint 0x7) per work-item. Used for the combine RDMA-send gather
+// (FC5b): the gathered rows land in the symmetric SEND staging region that the peer
+// NIC then DMA-reads via PCIe P2P.
+//
+// A plain CACHED cooperative store (faithful_coop_copy) leaves the bytes in this
+// GPU's L2; the pre-doorbell fence in FC5b2 is only DEVICE-scope (it orders GPU
+// agents, it does NOT flush L2 out to HBM for an external PCIe agent), so the NIC
+// DMA reads a STALE send buffer -> the receiver gets corrupt rows for exactly the
+// RDMA-forwarded tokens (deterministic on the sending rank). Writing through
+// uc_store publishes the bytes to the memory domain the NIC reads, so the
+// device-scope release before the doorbell is sufficient -- this is precisely the
+// internode_ll.cpp::coop_copy_bytes_store_uc pattern (uc_store staging + device
+// release fence + forced doorbell).
+inline void faithful_coop_copy_dstuc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            deep_ep::uc_store(&d8[j], s8[j]);
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        deep_ep::uc_store(&dst[b], src[b]);
+}
+
+// Cooperative copy that reads the SOURCE uncached (uc_load) AND writes the
+// DESTINATION write-through (uc_store). Used for the combine RDMA-send gather
+// (FC5b): the source is this GPU's combine-staging plane cs_x, which for the
+// "two same-node contributions" tokens was written by a PEER nvl_rank via a
+// cross-GPU IPC WRITE (CombineNvlPushKernel step 1). That cross-GPU write is NOT
+// coherent with this GPU's L1/L2, so a plain cached read of cs_x -- even after the
+// pre-loop lsc_fence_sysacq invalidate -- can return a stale L2 line for a subset
+// of the row on a racing rank. The corruption is then baked into rdma_x and
+// RDMA-shipped to the owner, appearing there as gross corruption of exactly the
+// RDMA-forwarded tokens (deterministic on the routing). Reading cs_x through
+// uc_load bypasses the cache so every lane observes the peer's pushed bytes; the
+// dst (symmetric SEND staging the NIC DMA-reads) is written write-through so the
+// device-scope pre-doorbell release in FC5b2 suffices (see faithful_coop_copy_dstuc).
+inline void faithful_coop_copy_ucsrc_dstuc(uint8_t* dst, const uint8_t* src, size_t n, int lane, int lanes) {
+    size_t done = 0;
+    if ((reinterpret_cast<uintptr_t>(dst) & 0x7) == 0 && (reinterpret_cast<uintptr_t>(src) & 0x7) == 0) {
+        const size_t n8 = n >> 3;
+        auto* d8 = reinterpret_cast<uint64_t*>(dst);
+        auto* s8 = reinterpret_cast<const uint64_t*>(src);
+        for (size_t j = static_cast<size_t>(lane); j < n8; j += static_cast<size_t>(lanes))
+            deep_ep::uc_store(&d8[j], deep_ep::uc_load(&s8[j]));
+        done = n8 << 3;
+    }
+    for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
+        deep_ep::uc_store(&dst[b], deep_ep::uc_load(&src[b]));
 }
 
 inline void faithful_coop_zero(uint8_t* dst, size_t n, int lane, int lanes) {
@@ -282,14 +411,18 @@ template <typename dtype_t>
 class CombinedCombineFwdWriteKernel;
 template <typename dtype_t>
 class CombinedCombineFwdBarrierKernel;
+template <typename dtype_t> class CombineNvlExchangeDataKernel;
+template <typename dtype_t> class CombineNvlExchangeDataKernel;
 template <typename dtype_t>
 class CombinedCombineReduceKernel;
 
-// Faithful combine (DEEP_EP_INTERNODE_FAITHFUL): the serial RdmaPush kernel is
+// Faithful combine: the serial RdmaPush kernel is
 // split into an init barrier + gate-free blocking payload put + kernel-boundary
 // 64-bit AMO count flag, and FwdWrite polls that flag (mirrors dispatch F4a0/
 // F4a2/F4b/F6). Init/Pack/PackBarrier/RdmaSend/FwdBarrier/Reduce are reused
 // verbatim so the reduce math (and thus the output) stays byte-identical.
+template <typename dtype_t>
+class CombineNvlPlaneInitKernel;
 template <typename dtype_t>
 class FaithfulCombineRdmaBarrierKernel;
 template <typename dtype_t>
@@ -304,6 +437,14 @@ template <typename dtype_t>
 class FaithfulCombineRdmaFlagKernel;
 template <typename dtype_t>
 class FaithfulCombineFwdWriteKernel;
+
+// Producer-PUSH intra-node NVL combine transport (gap #2, mirrors dispatch nvlrecv):
+// each rank PUSHES its Pack output into every peer's combine-staging plane; the gather
+// kernels read their OWN staging plane (local read) instead of peer send buffers.
+template <typename dtype_t>
+class CombineNvlPushKernel;
+template <typename dtype_t>
+class CombineNvlPushBarrierKernel;
 
 template <typename dtype_t>
 class CombineInitKernel;
@@ -363,6 +504,7 @@ void dispatch(void* recv_x,
               int num_max_rdma_chunked_recv_tokens,
               int rank,
               int num_ranks,
+              int num_experts,
               sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(recv_x != nullptr && x != nullptr, "XPU internode dispatch requires input and output tensors");
@@ -944,6 +1086,13 @@ void dispatch(void* recv_x,
             queue.wait();
         }
     }
+    // CUDA-faithful local-expert remap of recv_topk_idx (internode.cu:1060-61,1176-79):
+    // a receiver rewrites global expert ids to its own local range and drops non-local
+    // selections (idx -> -1, weight -> 0). Disabled when num_experts == 0 (cached mode).
+    const int num_local_experts_d = (num_experts > 0 && num_ranks > 0) ? num_experts / num_ranks : 0;
+    const bool do_expert_remap_d = (recv_topk_idx != nullptr && num_local_experts_d > 0);
+    const int local_expert_begin_d = do_expert_remap_d ? rank * num_local_experts_d : 0;
+    const int local_expert_end_d = local_expert_begin_d + num_local_experts_d;
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<DispatchCopyKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
             const size_t linear = static_cast<size_t>(id[0]);
@@ -956,8 +1105,16 @@ void dispatch(void* recv_x,
                 }
             }
             if (linear < total_topk_elements && recv_topk_idx != nullptr) {
-                recv_topk_idx[linear] = rdma_topk_idx[linear];
-                recv_topk_weights[linear] = rdma_topk_weights[linear];
+                if (do_expert_remap_d) {
+                    const auto gv = rdma_topk_idx[linear];
+                    const bool loc = (gv >= local_expert_begin_d && gv < local_expert_end_d);
+                    recv_topk_idx[linear] = loc ? static_cast<topk_idx_t>(gv - local_expert_begin_d)
+                                                : static_cast<topk_idx_t>(-1);
+                    recv_topk_weights[linear] = loc ? rdma_topk_weights[linear] : 0.0f;
+                } else {
+                    recv_topk_idx[linear] = rdma_topk_idx[linear];
+                    recv_topk_weights[linear] = rdma_topk_weights[linear];
+                }
             }
             if (linear < total_scale_elements && recv_x_scales != nullptr) {
                 recv_x_scales[linear] = rdma_x_scales[linear];
@@ -1445,6 +1602,7 @@ void dispatch_nvl_rdma(void* recv_x,
                        int barrier_signal_base,
                        int rank,
                        int num_ranks,
+                       int num_experts,
                        sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(recv_x != nullptr && x != nullptr, "dispatch_nvl_rdma requires input and output tensors");
@@ -1485,6 +1643,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             num_max_rdma_chunked_recv_tokens,
                             rank,
                             num_ranks,
+                            num_experts,
                             queue);
         return;
     }
@@ -1525,6 +1684,24 @@ void dispatch_nvl_rdma(void* recv_x,
     // buffer layout so RdmaSend can reuse layout.send_*_offset unchanged.
     const size_t stage_stride = align_offset(layout.total_bytes, 128);
     const size_t stage_base_offset = align_offset(fwd_base_offset + fwd_layout.total_bytes, 128);
+
+    // ---- Producer-PUSH intra-node NVL region (gap #2) ----------------------------------
+    // On this BMG+igub stack a cross-rank IPC READ of a peer's send buffer is unstable
+    // (DEVICE_LOST-class), while a cross-rank IPC WRITE is stable. So instead of the
+    // consumer (Assemble/Head) READING each peer's send buffer, each producer WRITES its
+    // intra-node tokens into the DESTINATION peer's recv-staging region here, and the
+    // consumer reads only its OWN region (local read). Structured exactly like the RDMA
+    // fwd region: num_nvl_ranks disjoint source planes (plane == source nvl_rank), each
+    // holding up to num_tokens tokens (worst case: one source routes all its tokens to
+    // one dest), plus a per-plane count. Passing num_rdma_ranks==1 makes the count array
+    // int[num_nvl_ranks] (one settled count per source plane). Reuses the now-dead
+    // push-staging region location to avoid growing the NVL buffer footprint.
+    NvlForwardLayout nvlrecv_layout(num_tokens, row_bytes, num_topk, num_scales, /*num_rdma_ranks=*/1, num_nvl_ranks);
+    const size_t nvlrecv_base_offset = stage_base_offset;
+    // Per-source published receive counts: each rank's Assemble pushes its per_src_count
+    // (num_ranks ints, grouped by GLOBAL src rank) into every peer's slot [producer_nvl],
+    // so the Head kernel derives send_nvl_head base offsets with LOCAL reads only.
+    const size_t peer_counts_offset = align_offset(nvlrecv_base_offset + nvlrecv_layout.total_bytes, 128);
 
     const size_t rdma_x_size = static_cast<size_t>(num_recv_tokens) * row_bytes;
     const size_t rdma_meta_size = static_cast<size_t>(num_recv_tokens) * sizeof(SourceMeta);
@@ -1647,9 +1824,9 @@ void dispatch_nvl_rdma(void* recv_x,
     ddbg_stage("1-Init");
 
     // ===================================================================
-    // FAITHFUL (CUDA-parity) DISPATCH TRANSPORT (guarded, stage-1 collapse)
+    // FAITHFUL (CUDA-parity) DISPATCH TRANSPORT (stage-1 collapse)
     // ===================================================================
-    // When DEEP_EP_INTERNODE_FAITHFUL is set we run a collapsed transport that
+    // We run a collapsed transport that
     // (a) fuses Pack+Stage into one WG/sub-group-parallel kernel (drops the
     //     serial single_task and the separate Stage + StageBarrier launches),
     // (b) fuses RdmaSend compaction + RDMA put into one kernel that issues
@@ -1664,11 +1841,7 @@ void dispatch_nvl_rdma(void* recv_x,
     // shared Assemble/Head kernels (run after this branch) consume, so the
     // output handle semantics (recv_x ordering, prefix sums, absolute-position
     // send_nvl_head/send_rdma_head) are byte-for-byte identical to the fallback.
-    static const bool kFaithful = [] {
-        const char* env = std::getenv("DEEP_EP_INTERNODE_FAITHFUL");
-        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
-    }();
-    if (kFaithful) {
+    {  // faithful (CUDA-parity) dispatch transport (only path)
         const uint64_t rdma_poll_cap = internode_poll_cap();
         const int rdma_flag_lsc_mode = internode_flag_lsc_mode();
         const bool faithful_force_db = internode_force_db();          // F4a2 put doorbell
@@ -1726,7 +1899,7 @@ void dispatch_nvl_rdma(void* recv_x,
                                 nvl_bits |= 1 << (d % num_nvl_ranks);
                                 rdma_bits |= 1 << (d / num_nvl_ranks);
                             }
-                            my_send_meta[token] = SourceMeta{my_rdma_rank, nvl_bits, nvl_rank};
+                            my_send_meta[token] = SourceMeta{my_rdma_rank, token, nvl_rank};
                             my_send_dst_token[token] = -1;
                             my_send_routing_bits[token] = nvl_bits;
                             my_send_rdma_bits[token] = rdma_bits;
@@ -1844,36 +2017,52 @@ void dispatch_nvl_rdma(void* recv_x,
         // A full ishmem_quiet() blocks forever if an AMO completion is not reaped by the
         // IBGDA layer (leader-only, data-independent, surfaces on a later dispatch).
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8 P2/P3: CONCURRENT CHANNELS. Launch num_send_ch = num_qp_ch work-groups,
+            // one per provisioned QP (LL discipline: a UNIQUE qp per concurrent WG -> no
+            // cross-WG qp WQ sharing, mirrors internode_ll.cpp one-channel-per-WG). Each WG
+            // owns an even token sub-range [ch_t0,ch_t1) of [0,num_tokens) (same split as the
+            // notify-phase channel formula), compacts ITS range in parallel, and puts its rows
+            // on qp=ch. Each WG derives its own contiguous row offset `off` by counting the
+            // matching tokens BEFORE its range (a cheap redundant prefix scan) -> no cross-WG
+            // sync is needed and the compacted rows tile [0,total) in token order, BYTE-
+            // IDENTICAL to the former single-WG serial compaction. The receiver (F-K4) and the
+            // per-channel flag kernel (F-K3b) are therefore unchanged: they still read the
+            // contiguous [0,total) region after waiting for all num_qp_ch flags.
+            const int num_send_ch = num_qp_ch;
             cgh.parallel_for<FaithfulDispatchRdmaSendKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_send_ch) * kComputeWGSize),
+                                  sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
+                    const int ch = static_cast<int>(item.get_group_linear_id());  // send channel == qp
+                    const int ch_t0 = static_cast<int>((static_cast<int64_t>(num_tokens) * ch) / num_send_ch);
+                    const int ch_t1 = static_cast<int>((static_cast<int64_t>(num_tokens) * (ch + 1)) / num_send_ch);
                     {  // per-GPU RDMA: every nvl_rank issues its own RDMA on its own NIC
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
-                        // Optional entry drain of qp0 (A/B via DEEP_EP_INTERNODE_ENTRY_QUIET,
-                        // default OFF): targeted quiet_qp per dst_pe to flush residue from the
-                        // interleaved serial combine / prior faithful AMO before posting.
+                        // Optional entry drain (A/B via DEEP_EP_INTERNODE_ENTRY_QUIET, default
+                        // OFF): each channel drains ITS OWN qp before posting.
                         if (faithful_entry_quiet && local_id == 0) {
                             for (int dq = 0; dq < num_rdma_ranks; ++dq) {
                                 if (dq == my_rdma_rank) continue;
-                                ishmemx_quiet_qp(dq * num_nvl_ranks + nvl_rank, 0u);
+                                ishmemx_quiet_qp(dq * num_nvl_ranks + nvl_rank, static_cast<unsigned>(ch));
                             }
                         }
                         sycl::group_barrier(group);
-                        auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
                         // Per-GPU RDMA: this GPU compacts ONLY its own packed tokens
                         // (single plane == nvl_rank, read from its own NVL buffer).
-                        const int src_nvl_lo = nvl_rank;
-                        const int src_nvl_hi = nvl_rank + 1;
+                        auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                        auto* peer_x = leader_self_buf + layout.send_x_offset;
+                        auto* peer_m = reinterpret_cast<SourceMeta*>(leader_self_buf + layout.send_meta_offset);
+                        auto* peer_idx = reinterpret_cast<topk_idx_t*>(leader_self_buf + layout.send_topk_idx_offset);
+                        auto* peer_wt = reinterpret_cast<float*>(leader_self_buf + layout.send_topk_weights_offset);
+                        auto* peer_scales = reinterpret_cast<float*>(leader_self_buf + layout.send_x_scales_offset);
+                        auto* peer_rdma_bits = reinterpret_cast<int*>(leader_self_buf + layout.send_rdma_dest_bits_offset);
+                        auto* peer_is_in_rank = reinterpret_cast<bool*>(leader_self_buf + layout.send_is_token_in_rank_offset);
                         for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                             if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
-                            if (dbg_buf && local_id == 0) {
-                                sycl::ext::oneapi::experimental::printf(
-                                    "[F4a rank=%d] dst=%d pre-compact\n", rank, dst_rdma);
-                            }
                             auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
                             auto* rdma_x = region;
                             auto* rdma_m = reinterpret_cast<SourceMeta*>(region + rdma_meta_offset);
@@ -1881,107 +2070,120 @@ void dispatch_nvl_rdma(void* recv_x,
                             auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
                             auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
 
-                            // Compact all peers' tokens destined to dst_rdma into the send ring.
-                            // All lanes run identical control flow so `count` is coherent; the
-                            // payload copy is split across lanes, scalar meta by WI0.
-                            int count = 0;
-                            for (int src_nvl = src_nvl_lo; src_nvl < src_nvl_hi; ++src_nvl) {
-                                auto* peer_buf = leader_self_buf;  // own packed buffer (src_nvl == nvl_rank)
-                                auto* peer_x = peer_buf + layout.send_x_offset;
-                                auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
-                                auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
-                                auto* peer_wt = reinterpret_cast<float*>(peer_buf + layout.send_topk_weights_offset);
-                                auto* peer_scales = reinterpret_cast<float*>(peer_buf + layout.send_x_scales_offset);
-                                auto* peer_rdma_bits = reinterpret_cast<int*>(peer_buf + layout.send_rdma_dest_bits_offset);
-                                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                                for (int t = 0; t < num_tokens; ++t) {
+                            // WI0 derives this channel's row prefix `off` (matches in [0,ch_t0)),
+                            // its own token count `cnt` (matches in [ch_t0,ch_t1)) and — only on
+                            // channel 0 — the grand `total` (matches in [0,num_tokens)) stashed
+                            // for the flag kernel. Broadcast off/cnt so all lanes share the same
+                            // compaction bounds.
+                            int off = 0, cnt = 0, total = 0;
+                            if (local_id == 0) {
+                                for (int t = 0; t < ch_t1; ++t) {
                                     if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) continue;
-                                    if (count >= num_recv_tokens) continue;  // capacity guard: send-ring holds
-                                                                             // num_recv_tokens rows; never hit for a
-                                                                             // legit count (<= num_nvl_ranks*num_tokens
-                                                                             // == num_recv_tokens), prevents OOB otherwise
-                                    auto* s_row = peer_x + static_cast<size_t>(t) * row_bytes;
-                                    auto* d_row = rdma_x + static_cast<size_t>(count) * row_bytes;
-                                    faithful_coop_copy(d_row, s_row, row_bytes, local_id, kComputeWGSize);
-                                    if (local_id == 0) {
-                                        int dst_nvl_bits = 0;
-                                        for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                                            const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
-                                            if (peer_is_in_rank[t * num_ranks + dst_rank]) dst_nvl_bits |= 1 << dst_nvl;
-                                        }
-                                        SourceMeta sm = peer_m[t];
-                                        sm.is_token_in_nvl_rank_bits = dst_nvl_bits;
-                                        rdma_m[count] = sm;
-                                        if (topk_idx != nullptr) {
-                                            for (int k = 0; k < num_topk; ++k) {
-                                                rdma_idx[count * num_topk + k] = peer_idx[t * num_topk + k];
-                                                rdma_wt[count * num_topk + k] = peer_wt[t * num_topk + k];
-                                            }
-                                        }
-                                        if (x_scales != nullptr) {
-                                            for (int s = 0; s < num_scales; ++s)
-                                                rdma_scales[count * num_scales + s] = peer_scales[t * num_scales + s];
-                                        }
-                                    }
-                                    ++count;
+                                    if (t < ch_t0) ++off; else ++cnt;
+                                }
+                                if (ch == 0) {
+                                    total = off + cnt;  // off==0 here
+                                    for (int t = ch_t1; t < num_tokens; ++t)
+                                        if ((peer_rdma_bits[t] >> dst_rdma) & 1) ++total;
                                 }
                             }
+                            off = sycl::group_broadcast(group, off, 0);
+                            cnt = sycl::group_broadcast(group, cnt, 0);
 
-                            // Payload warp-put ONLY, deferred doorbell (force_db=false).
-                            // quiet + AMO are deferred to F-K3b AFTER the kernel boundary.
+                            // Compact this channel's matching tokens into rows [off, off+cnt).
+                            // All lanes run identical control flow so `w` stays coherent; the
+                            // payload copy is split across lanes, scalar meta by WI0.
+                            int w = off;
+                            for (int t = ch_t0; t < ch_t1; ++t) {
+                                if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) continue;
+                                if (w >= num_recv_tokens) continue;  // capacity guard (never hit for legit count)
+                                auto* s_row = peer_x + static_cast<size_t>(t) * row_bytes;
+                                auto* d_row = rdma_x + static_cast<size_t>(w) * row_bytes;
+                                faithful_coop_copy(d_row, s_row, row_bytes, local_id, kComputeWGSize);
+                                if (local_id == 0) {
+                                    int dst_nvl_bits = 0;
+                                    for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                                        const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
+                                        if (peer_is_in_rank[t * num_ranks + dst_rank]) dst_nvl_bits |= 1 << dst_nvl;
+                                    }
+                                    SourceMeta sm = peer_m[t];
+                                    sm.is_token_in_nvl_rank_bits = dst_nvl_bits;
+                                    rdma_m[w] = sm;
+                                    if (topk_idx != nullptr) {
+                                        for (int k = 0; k < num_topk; ++k) {
+                                            rdma_idx[w * num_topk + k] = peer_idx[t * num_topk + k];
+                                            rdma_wt[w * num_topk + k] = peer_wt[t * num_topk + k];
+                                        }
+                                    }
+                                    if (x_scales != nullptr) {
+                                        for (int s = 0; s < num_scales; ++s)
+                                            rdma_scales[w * num_scales + s] = peer_scales[t * num_scales + s];
+                                    }
+                                }
+                                ++w;
+                            }
+
+                            // Payload warp-put ONLY, deferred doorbell (force_db selected by
+                            // DEEP_EP_INTERNODE_FORCE_DB). quiet + AMO are deferred to F-K3b
+                            // AFTER the kernel boundary.
                             sycl::group_barrier(group);
                             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                             lsc_fence_sysrel();
                             const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
                             auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                            if (dbg_buf && local_id == 0) {
-                                sycl::ext::oneapi::experimental::printf(
-                                    "[F4a rank=%d] dst=%d pre-put count=%d dst_pe=%d\n",
-                                    rank, dst_rdma, count, dst_pe);
-                            }
+
+                            // This channel's rows are the disjoint slice [off, off+cnt) of every
+                            // field array; put each field-slice on THIS channel's qp=ch. Rows are
+                            // contiguous per channel and tile [0,total), so the peer reassembles
+                            // the exact contiguous region. One warp (sub-group 0) drives qp=ch
+                            // (LL one-warp-per-qp discipline).
+                            const size_t x_off = static_cast<size_t>(off) * row_bytes;
+                            const size_t x_len = static_cast<size_t>(cnt) * row_bytes;
+                            const size_t m_off = rdma_meta_offset + static_cast<size_t>(off) * sizeof(SourceMeta);
+                            const size_t m_len = static_cast<size_t>(cnt) * sizeof(SourceMeta);
+                            const size_t i_off = rdma_topk_idx_offset + static_cast<size_t>(off) * num_topk * sizeof(topk_idx_t);
+                            const size_t i_len = static_cast<size_t>(cnt) * num_topk * sizeof(topk_idx_t);
+                            const size_t w_off = rdma_topk_wt_offset + static_cast<size_t>(off) * num_topk * sizeof(float);
+                            const size_t w_len = static_cast<size_t>(cnt) * num_topk * sizeof(float);
+                            const size_t sc_off = rdma_scales_offset + static_cast<size_t>(off) * num_scales * sizeof(float);
+                            const size_t sc_len = static_cast<size_t>(cnt) * num_scales * sizeof(float);
                             if (faithful_blocking_put) {
                                 // Robust path (A/B via DEEP_EP_INTERNODE_BLOCKING_PUT): single-WI
-                                // blocking ishmem_putmem, identical to the fallback/serial combine.
-                                // No unbounded put_nbi_warp commit gate -> cannot wedge on a
-                                // combine-induced nic_wq_commit gap (the observed F4a2 leader hang).
-                                if (local_id == 0) {
-                                    ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                                // blocking ishmem_putmem per field-slice.
+                                if (cnt > 0 && local_id == 0) {
+                                    ishmem_putmem(dst_region + x_off, region + x_off, x_len, dst_pe);
+                                    ishmem_putmem(dst_region + m_off, region + m_off, m_len, dst_pe);
+                                    if (i_len > 0) ishmem_putmem(dst_region + i_off, region + i_off, i_len, dst_pe);
+                                    if (w_len > 0) ishmem_putmem(dst_region + w_off, region + w_off, w_len, dst_pe);
+                                    if (sc_len > 0) ishmem_putmem(dst_region + sc_off, region + sc_off, sc_len, dst_pe);
                                 }
                                 sycl::group_barrier(group);
                             } else {
-                                // Default path: warp-collective NBI put (cache-hot, fast) with the
-                                // deferred/forced doorbell selected by DEEP_EP_INTERNODE_FORCE_DB.
-                                // CUDA-faithful multi-QP: split the contiguous payload
-                                // [0,rdma_count_offset) into num_qp_ch 16B-aligned byte chunks,
-                                // sub-group c drives chunk c on qp=c (concurrent NIC send queues,
-                                // mirroring internode.cu qp_id==channel_id). Chunks tile [0,L)
-                                // with no gap/overlap; each chunk's tail AMO (F-K3b) rides the
-                                // SAME qp c so RC in-order keeps the flag after its payload.
-                                const int sgid = sg.get_group_id()[0];
-                                if (sgid < num_qp_ch) {
-                                    const size_t L = rdma_count_offset;
-                                    const size_t s = internode_qp_chunk_start(L, sgid, num_qp_ch);
-                                    const size_t e = internode_qp_chunk_start(L, sgid + 1, num_qp_ch);
-                                    if (e > s) {
-                                        ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
-                                                                static_cast<unsigned>(sgid), true, sg,
+                                // Default path: warp-collective NBI put (cache-hot, fast) on qp=ch.
+                                if (cnt > 0 && sg.get_group_id()[0] == 0) {
+                                    const unsigned qp = static_cast<unsigned>(ch);
+                                    ishmemx_putmem_nbi_warp(dst_region + x_off, region + x_off, x_len, dst_pe, qp, true, sg,
+                                                            /*force_db=*/faithful_force_db);
+                                    ishmemx_putmem_nbi_warp(dst_region + m_off, region + m_off, m_len, dst_pe, qp, true, sg,
+                                                            /*force_db=*/faithful_force_db);
+                                    if (i_len > 0)
+                                        ishmemx_putmem_nbi_warp(dst_region + i_off, region + i_off, i_len, dst_pe, qp, true, sg,
                                                                 /*force_db=*/faithful_force_db);
-                                    }
+                                    if (w_len > 0)
+                                        ishmemx_putmem_nbi_warp(dst_region + w_off, region + w_off, w_len, dst_pe, qp, true, sg,
+                                                                /*force_db=*/faithful_force_db);
+                                    if (sc_len > 0)
+                                        ishmemx_putmem_nbi_warp(dst_region + sc_off, region + sc_off, sc_len, dst_pe, qp, true, sg,
+                                                                /*force_db=*/faithful_force_db);
                                     sycl::group_barrier(sg);
                                 }
                                 sycl::group_barrier(group);
                             }
-                            if (dbg_buf && local_id == 0) {
-                                sycl::ext::oneapi::experimental::printf(
-                                    "[F4a rank=%d] dst=%d post-put\n", rank, dst_rdma);
-                            }
-                            // Stash this dst_rdma's token count in the LOCAL send-ring count
-                            // field so F-K3b can post the correct -count-1 flag. This slot is
-                            // NOT transmitted (the put length is rdma_count_offset, i.e. up to
-                            // but excluding this field); it lives in the leader's own iSHMEM
-                            // buffer (same GPU) and survives the kernel boundary.
-                            if (local_id == 0) {
-                                reinterpret_cast<int*>(region + rdma_count_offset)[0] = count;
+                            // Channel 0 stashes the grand token count for F-K3b's -count-1 flag.
+                            // This slot is NOT transmitted (put lengths stop before it); it lives
+                            // in the leader's own iSHMEM buffer and survives the kernel boundary.
+                            if (ch == 0 && local_id == 0) {
+                                reinterpret_cast<int*>(region + rdma_count_offset)[0] = total;
                             }
                             sycl::group_barrier(group);
                         }
@@ -1996,35 +2198,39 @@ void dispatch_nvl_rdma(void* recv_x,
         // flushes the deferred doorbells posted in F-K3a, then the RC-ordered AMO on
         // the SAME qp lands after the payload.
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8 P1: one WG per (dst_rdma, channel c) so the C per-channel quiet/AMO run
+            // CONCURRENTLY (was a single WG serially looping dst_rdma x c). Mirrors
+            // internode_ll.cpp LLDispatchRecvKernel phase A one-channel-per-WG independence.
+            const int flag_wgs = num_rdma_ranks * num_qp_ch;
             cgh.parallel_for<FaithfulDispatchRdmaFlagKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kIshmemWGSize),
+                                  sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     if (local_id != 0) return;
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by F-K3a
-                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
-                        auto* dst_flag = reinterpret_cast<long*>(
-                            rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
-                        // CUDA-faithful multi-QP: per channel c, quiet qp c (flush F-K3a's
-                        // deferred chunk-c doorbell) then post the tail AMO on qp c. Every
-                        // flag carries -count-1 (total token count); RC in-order makes flag[c]
-                        // land after chunk c on the same qp. The receiver waits for ALL C
-                        // flags (=> all chunks placed) then reads [0,count).
-                        for (int c = 0; c < num_qp_ch; ++c) {
-                            ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                            lsc_fence_sysrel();
-                            ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
-                                                       static_cast<unsigned>(c));
-                            if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                        }
-                        if (dbg_buf) {  // EXP3 sender instrumentation
-                            dbg_buf[dst_rdma * 3 + 0] = static_cast<long>(count);
-                            dbg_buf[dst_rdma * 3 + 1] = static_cast<long>(dst_pe);
-                            dbg_buf[dst_rdma * 3 + 2] = 1;
-                        }
+                    const int wg_id = static_cast<int>(item.get_group_linear_id());
+                    const int dst_rdma = wg_id / num_qp_ch;
+                    const int c = wg_id % num_qp_ch;
+                    if (dst_rdma == my_rdma_rank) return;  // local node: no RDMA
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by F-K3a
+                    const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
+                    auto* dst_flag = reinterpret_cast<long*>(
+                        rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
+                    // Channel c on its OWN work-group/qp: quiet qp c (flush F-K3a's deferred
+                    // chunk-c doorbell) then post the tail AMO on qp c. Every flag carries
+                    // -count-1 (total token count); RC in-order makes flag[c] land after
+                    // chunk c on the same qp. The receiver waits for ALL C flags (=> all
+                    // chunks placed) then reads [0,count).
+                    ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    lsc_fence_sysrel();
+                    ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
+                                               static_cast<unsigned>(c));
+                    if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    if (dbg_buf && c == 0) {  // EXP3 sender instrumentation
+                        dbg_buf[dst_rdma * 3 + 0] = static_cast<long>(count);
+                        dbg_buf[dst_rdma * 3 + 1] = static_cast<long>(dst_pe);
+                        dbg_buf[dst_rdma * 3 + 2] = 1;
                     }
                 });
         });
@@ -2088,12 +2294,22 @@ void dispatch_nvl_rdma(void* recv_x,
                             // through the bounded poll cap => undercount, never a hang.
                             for (int c = 0; c < num_qp_ch; ++c) {
                                 uint64_t spins = 0;
-                                long raw = 0;
-                                while (true) {
-                                    raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
-                                    if (raw != 0) break;
+                                long raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
+                                while (raw == 0) {
                                     if (++spins >= rdma_poll_cap) break;
+                                    // GUARANTEED-uncached (lsc_load.ugm.uc.uc) low-word probe:
+                                    // the hint-based uc_load can read a stale cached 0 (the flag
+                                    // is zeroed in-place on this GPU right before polling, so its
+                                    // line is hot in L1/L3 and NOT coherent with the NIC's P2P AMO
+                                    // write). Fencing every spin (mode 2) hides this but runs for
+                                    // seconds -> 5 s ccs watchdog -> Engine reset. The forced-
+                                    // uncached probe observes the NIC write within microseconds
+                                    // with NO per-spin fence. On arrival re-read the full 64-bit
+                                    // value via the fenced path (orders the subsequent payload).
                                     visa_spin_hint();
+                                    if (internode_probe_flag_lo(rdma_flag + c) != 0) {
+                                        raw = internode_read_flag64(rdma_flag + c, 2);
+                                    }
                                 }
                                 if (c == 0) raw0 = raw;
                                 spins_total += spins;
@@ -2209,443 +2425,110 @@ void dispatch_nvl_rdma(void* recv_x,
         });
         if (wait_each) queue.wait();
         ddbg_stage("F7-FwdBarrier");
-    } else {  // ===== non-faithful fallback: existing 8-stage serial transport =====
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.single_task<CombinedDispatchPackKernel>([=]() {
-            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
-            auto* my_counts = reinterpret_cast<int*>(my_buf + layout.count_offset);
-            auto* my_channel_counts = reinterpret_cast<int*>(my_buf + layout.channel_count_offset);
-            auto* my_send_x = my_buf + layout.send_x_offset;
-            auto* my_send_meta = reinterpret_cast<SourceMeta*>(my_buf + layout.send_meta_offset);
-            auto* my_send_topk_idx = reinterpret_cast<topk_idx_t*>(my_buf + layout.send_topk_idx_offset);
-            auto* my_send_topk_weights = reinterpret_cast<float*>(my_buf + layout.send_topk_weights_offset);
-            auto* my_send_x_scales = reinterpret_cast<float*>(my_buf + layout.send_x_scales_offset);
-            auto* my_send_dst_token = reinterpret_cast<int*>(my_buf + layout.send_dst_token_offset);
-            auto* my_send_routing_bits = reinterpret_cast<int*>(my_buf + layout.send_routing_bits_offset);
-            auto* my_send_rdma_bits = reinterpret_cast<int*>(my_buf + layout.send_rdma_dest_bits_offset);
-            auto* my_send_is_in_rank = reinterpret_cast<bool*>(my_buf + layout.send_is_token_in_rank_offset);
-
-            // NvlBufferLayout above is constructed with num_channels=1 (combined-dispatch
-            // single_task uses a single conceptual channel for routing metadata).
-            // The kernel param num_channels may be larger (config-driven SM count); using
-            // it in the channel_count loops below would write 4*num_channels ints into a
-            // region only sized for 4 ints and overflow into send_x. Always use 1 here to
-            // match the layout.
-            constexpr int kPackNumChannels = 1;
-
-            for (int d = 0; d < num_ranks; ++d) {
-                my_counts[d] = 0;
-                for (int c = 0; c < kPackNumChannels; ++c) {
-                    my_channel_counts[d * kPackNumChannels + c] = 0;
-                }
-            }
-
-            for (int token = 0; token < num_tokens; ++token) {
-                int nvl_bits = 0;
-                int rdma_bits = 0;
-                for (int d = 0; d < num_ranks; ++d) {
-                    const bool in_rank = is_token_in_rank[token * num_ranks + d];
-                    my_send_is_in_rank[token * num_ranks + d] = in_rank;
-                    if (!in_rank) {
-                        continue;
-                    }
-                    my_counts[d] += 1;
-                    nvl_bits |= 1 << (d % num_nvl_ranks);
-                    rdma_bits |= 1 << (d / num_nvl_ranks);
-                }
-
-                const auto* src_row = src + static_cast<size_t>(token) * row_bytes;
-                auto* dst_row = my_send_x + static_cast<size_t>(token) * row_bytes;
-                for (size_t b = 0; b < row_bytes; ++b) {
-                    dst_row[b] = src_row[b];
-                }
-
-                my_send_meta[token] = SourceMeta{my_rdma_rank, nvl_bits, nvl_rank};
-                my_send_dst_token[token] = -1;
-                my_send_routing_bits[token] = nvl_bits;
-                my_send_rdma_bits[token] = rdma_bits;
-
-                if (topk_idx != nullptr) {
-                    for (int k = 0; k < num_topk; ++k) {
-                        my_send_topk_idx[token * num_topk + k] = topk_idx[token * num_topk + k];
-                        my_send_topk_weights[token * num_topk + k] = topk_weights[token * num_topk + k];
-                    }
-                }
-                if (x_scales != nullptr) {
-                    for (int s = 0; s < num_scales; ++s) {
-                        my_send_x_scales[token * num_scales + s] = x_scales[token * num_scales + s];
-                    }
-                }
-            }
-
-            for (int d = 0; d < num_ranks; ++d) {
-                int cumulative = 0;
-                for (int c = 0; c < kPackNumChannels; ++c) {
-                    const int start = (static_cast<int64_t>(num_tokens) * c) / kPackNumChannels;
-                    const int end = (static_cast<int64_t>(num_tokens) * (c + 1)) / kPackNumChannels;
-                    int count = 0;
-                    for (int token = start; token < end; ++token) {
-                        count += my_send_is_in_rank[token * num_ranks + d] ? 1 : 0;
-                    }
-                    cumulative += count;
-                    my_channel_counts[d * kPackNumChannels + c] = cumulative;
-                }
-            }
-            // Release fence: flush this rank's packed send buffer (payload, meta,
-            // is_token_in_rank, counts) across PCIe so the other NVL peers'
-            // Assemble kernel reads the up-to-date data, not stale cache.
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-        });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("2-Pack");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchPackBarrierKernel>(
-            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item); });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("3-PackBarrier");
-
-    // StageToLeader: every rank copies its OWN (coherent) send buffer into a
-    // per-src_nvl slot in the LEADER's NVL buffer via a reliable cross-device
-    // WRITE. This replaces the leader's racy IPC READ of peer send buffers.
-    {
-        const size_t stage_bytes = layout.total_bytes;
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<CombinedDispatchStageKernel>(
-                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) {
-                    auto group = item.get_group();
-                    auto* leader_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[0]);
-                    auto* self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
-                    auto* stage_dst = leader_buf + stage_base_offset + static_cast<size_t>(nvl_rank) * stage_stride;
-                    const size_t lid = group.get_local_linear_id();
-                    const size_t stride = group.get_local_linear_range();
-                    for (size_t b = lid; b < stage_bytes; b += stride) {
-                        stage_dst[b] = self_buf[b];
-                    }
-                    sycl::group_barrier(group);
-                    // Release the P2P writes into the leader's VRAM so its
-                    // RdmaSend (after the barrier) observes settled data.
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                });
-        });
-        if (wait_each) queue.wait();
-        ddbg_stage("3b-Stage");
     }
 
+    // ===== Producer-PUSH intra-node NVL exchange (gap #2) =====
+    // CUDA-faithful PRODUCER-PUSH (internode.cu kRDMAAndNVLForwarder / kNVLReceivers):
+    // the producer writes tokens into the DESTINATION peer's recv ring; the consumer
+    // reads only its OWN buffer. Deterministic placement (one source plane per producer,
+    // packed in token order) is used instead of a dynamic ring so there is NO unbounded
+    // back-pressure spin (BMG GuC watchdog safe). This replaces the former consumer-PULL
+    // in CombinedDispatchAssembleKernel/CombinedDispatchHeadKernel that read peer send
+    // buffers over IPC (unstable on BMG+igub).
+    //
+    // F-K8 NvlPush: grid = 1 WG. Each rank reads its OWN send buffer (packed in F-K1) and
+    // WRITES its intra-node tokens (destined for a local peer dst_nvl) into that peer's
+    // nvlrecv plane [nvl_rank], packed in token order. WI0 publishes the per-plane count
+    // after a device/system release fence (remote WRITE + local READ only, zero remote
+    // reads).
     queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchStageBarrierKernel>(
-            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("3c-StageBarrier");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.single_task<CombinedDispatchRdmaSendKernel>([=]() {
-            if (nvl_rank != 0) {
-                return;
-            }
-            // Acquire fence: order reads of the staged send buffers (now in
-            // THIS leader's OWN NVL VRAM, written by every rank's StageToLeader)
-            // after the StageBarrier release.
-            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-            auto* leader_self_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
-            for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                auto* rdma_x = region;
-                auto* rdma_m = reinterpret_cast<SourceMeta*>(region + rdma_meta_offset);
-                auto* rdma_idx = reinterpret_cast<topk_idx_t*>(region + rdma_topk_idx_offset);
-                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
-                auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
-                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                *rdma_count = 0;
-                if (dst_rdma == my_rdma_rank) {
-                    continue;
-                }
-
-                int count = 0;
-                for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
-                    // Read the src_nvl peer's data from the leader's OWN staging
-                    // slot (coherent same-GPU read) instead of the peer's buffer
-                    // over IPC (which races on freshly-written data).
-                    auto* peer_buf = leader_self_buf + stage_base_offset + static_cast<size_t>(src_nvl) * stage_stride;
-                    auto* peer_x = peer_buf + layout.send_x_offset;
-                    auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
-                    auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
-                    auto* peer_wt = reinterpret_cast<float*>(peer_buf + layout.send_topk_weights_offset);
-                    auto* peer_scales = reinterpret_cast<float*>(peer_buf + layout.send_x_scales_offset);
-                    auto* peer_rdma_bits = reinterpret_cast<int*>(peer_buf + layout.send_rdma_dest_bits_offset);
-                    auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                    for (int t = 0; t < num_tokens; ++t) {
-                        if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) {
-                            continue;
-                        }
-                        auto* src_row = peer_x + static_cast<size_t>(t) * row_bytes;
-                        auto* dst_row = rdma_x + static_cast<size_t>(count) * row_bytes;
-                        for (size_t b = 0; b < row_bytes; ++b) {
-                            dst_row[b] = src_row[b];
-                        }
-                        int dst_nvl_bits = 0;
-                        for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                            const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
-                            if (peer_is_in_rank[t * num_ranks + dst_rank]) {
-                                dst_nvl_bits |= 1 << dst_nvl;
-                            }
-                        }
-                        SourceMeta sm = peer_m[t];
-                        sm.is_token_in_nvl_rank_bits = dst_nvl_bits;
-                        rdma_m[count] = sm;
-                        if (topk_idx != nullptr) {
-                            for (int k = 0; k < num_topk; ++k) {
-                                rdma_idx[count * num_topk + k] = peer_idx[t * num_topk + k];
-                                rdma_wt[count * num_topk + k] = peer_wt[t * num_topk + k];
-                            }
-                        }
-                        if (x_scales != nullptr) {
-                            for (int s = 0; s < num_scales; ++s) {
-                                rdma_scales[count * num_scales + s] = peer_scales[t * num_scales + s];
-                            }
-                        }
-                        ++count;
-                    }
-                }
-                *rdma_count = count;
-            }
-        });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("4-RdmaSend");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchRdmaPutKernel>(
-            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
+        cgh.parallel_for<FaithfulDispatchNvlPushKernel>(
+            sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
                 auto group = item.get_group();
-                // Mirror the original CUDA implementation: warp-collective
-                // nvshmemi_ibgda_put_nbi_warp.  iSHMEM has no warp variant, so
-                // use the SCALAR BLOCKING ishmem_putmem from a single WI (group
-                // leader).  The blocking put polls the IBGDA CQ until the NIC
-                // confirms the remote write is ACK'd, guaranteeing the data has
-                // landed in the destination PE's symmetric heap before return.
-                //
-                // The non-blocking ishmem_putmem_nbi + barrier_all path relied
-                // on the barrier's device_quiet to drain the SQ, but that quiet
-                // can return early (it reads SND_DBR which may lag the just-
-                // issued doorbell), so FwdWrite on the remote PE could read
-                // rdma_count while the RDMA write was still in flight -> a
-                // non-deterministic RDMA-half/off-by-N token undercount. The
-                // blocking put removes that race at the source.
-                //
-                // Defence-in-depth for the RDMA-Write-to-GPU-VRAM visibility
-                // gap (a posted PCIe-P2P write may not have landed in the
-                // receiver's VRAM when the sender's RC ACK / barrier release
-                // fires, observed as an iter-0/QP-warmup race): stamp each of
-                // MY receive regions' count field with a sentinel BEFORE the
-                // exchange, so FwdWrite can spin (UC load) until the real
-                // count actually arrives instead of trusting the barrier.
-                constexpr int kRdmaCountSentinel = -424242;
-                if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
-                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                        if (src_rdma == my_rdma_rank) continue;
-                        auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                        uc_store(reinterpret_cast<int*>(rcv + rdma_count_offset), kRdmaCountSentinel);
-                    }
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                }
-                sycl::group_barrier(group);
-                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
-                sycl::group_barrier(group);
-
-                if (nvl_rank == 0 && group.get_local_linear_id() == 0) {
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int dst_pe = dst_rdma * num_nvl_ranks;
-                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        // Split-put for landing-race elimination: write the
-                        // DATA portion (everything before the count field)
-                        // first, then write the COUNT word alone. Both are
-                        // blocking, on the same QP. RC + same-QP ordering
-                        // guarantees the second write's bytes only commit
-                        // to the destination memory AFTER the first write's
-                        // bytes are committed. Receiver's count!=sentinel
-                        // check then becomes a true "all data has landed"
-                        // flag instead of an "ACK seen" flag, eliminating
-                        // the RDMA-Write-to-VRAM byte-level landing race
-                        // that caused the residual ~1/6 dispatch undercount.
-                        // NOTE: kept blocking on this site because switching
-                        // to NBI causes intermittent NIC DEVICE_LOST mid-run
-                        // (likely CQ pressure interaction with the heavy NBI
-                        // traffic from the dispatch payload puts above).
-                        ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                        ishmem_putmem(dst_region + rdma_count_offset,
-                                      region + rdma_count_offset,
-                                      sizeof(int), dst_pe);
-                    }
-                }
-                sycl::group_barrier(group);
-                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
-                sycl::group_barrier(group);
-            });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("5-RdmaPut");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchFwdWriteKernel>(
-            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
-            auto group = item.get_group();
-            const int local_id = static_cast<int>(item.get_local_id(0));
-            if (nvl_rank != 0) {
-                return;
-            }
-            // Acquire fence: the RDMA receive regions (rdma_count / rdma_m /
-            // rdma_x at rdma_base + src_rdma*rdma_region_bytes) were written by
-            // the remote NIC into the local symmetric heap. Order all reads of
-            // that data after the iSHMEM barrier so this kernel observes the
-            // NIC-delivered bytes, not stale GPU L2 cache (the RDMA-half
-            // visibility race).
-            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-            int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
-            if (local_id == 0) {
-                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                    auto* fwd_base = peer_buf + fwd_base_offset;
-                    auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                    for (int r = 0; r < num_rdma_ranks; ++r) {
-                        fwd_counts[r] = 0;
-                    }
-                }
-            }
-            sycl::group_barrier(group);
-
-            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                if (src_rdma == my_rdma_rank) {
-                    continue;
-                }
-                int before[NUM_MAX_NVL_PEERS] = {0};
-                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                    before[peer] = peer_offsets[peer];
-                }
-
-                auto* region = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                auto* rdma_x = region;
-                auto* rdma_m = reinterpret_cast<SourceMeta*>(region + rdma_meta_offset);
-                auto* rdma_idx = reinterpret_cast<topk_idx_t*>(region + rdma_topk_idx_offset);
-                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
-                auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
-                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                // Bounded spin (UC load) to let the NIC-delivered count replace
-                // the pre-exchange sentinel, closing the RDMA-Write-to-VRAM
-                // landing race that the blocking put + barrier alone don't fully
-                // cover on the iter-0/QP-warmup path. Only WI 0 spins, then the
-                // settled count is BROADCAST to every work-item so the token
-                // loop bound (and hence every WI's peer_offsets[] running
-                // counter and dst_idx) is IDENTICAL across the work-group. An
-                // independent per-WI spin could observe the sentinel replacement
-                // at different moments -> divergent loop bounds -> divergent
-                // dst_idx -> corrupted/duplicated forward rows (the dispatch
-                // parallelization regression). The broadcast removes that.
-                constexpr int kRdmaCountSentinel = -424242;
-                constexpr unsigned long kRdmaSpinLimit = 2000000ul;
-                int count = 0;
-                if (local_id == 0) {
-                    count = uc_load(rdma_count);
-                    for (unsigned long spins = 0; count == kRdmaCountSentinel && spins < kRdmaSpinLimit; ++spins) {
-                        if ((spins & 0x3FFF) == 0) {
-                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                        }
-                        count = uc_load(rdma_count);
-                    }
-                    if (count == kRdmaCountSentinel) {
-                        count = 0;  // dropped write: degrade to undercount, not a hang
-                    }
-                }
-                count = sycl::group_broadcast(group, count, 0);
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* my_send_x = my_buf + layout.send_x_offset;
+                auto* my_send_m = reinterpret_cast<SourceMeta*>(my_buf + layout.send_meta_offset);
+                auto* my_send_idx = reinterpret_cast<topk_idx_t*>(my_buf + layout.send_topk_idx_offset);
+                auto* my_send_wt = reinterpret_cast<float*>(my_buf + layout.send_topk_weights_offset);
+                auto* my_send_scales = reinterpret_cast<float*>(my_buf + layout.send_x_scales_offset);
+                auto* my_send_is_in_rank = reinterpret_cast<bool*>(my_buf + layout.send_is_token_in_rank_offset);
+                // The whole GPU's own send buffer is coherent (same device, kernel
+                // boundary after F-K1). Order our own read before the remote writes.
                 sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                for (int i = 0; i < count; ++i) {
-                    SourceMeta sm;
-                    sm.src_rdma_rank = uc_load(&rdma_m[i].src_rdma_rank);
-                    sm.is_token_in_nvl_rank_bits = uc_load(&rdma_m[i].is_token_in_nvl_rank_bits);
-                    sm.src_nvl_rank = uc_load(&rdma_m[i].src_nvl_rank);
-                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                        if (((sm.is_token_in_nvl_rank_bits >> peer) & 1) == 0) {
-                            continue;
-                        }
-                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                        auto* fwd_base = peer_buf + fwd_base_offset;
-                        auto* fwd_x = fwd_base + fwd_layout.fwd_x_offset;
-                        auto* fwd_m = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
-                        auto* fwd_idx = reinterpret_cast<topk_idx_t*>(fwd_base + fwd_layout.fwd_topk_idx_offset);
-                        auto* fwd_wt = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
-                        auto* fwd_scales = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_x_scales_offset);
-                        const int dst_idx = peer_offsets[peer]++;
-                        auto* src_row = rdma_x + static_cast<size_t>(i) * row_bytes;
-                        auto* dst_row = fwd_x + static_cast<size_t>(dst_idx) * row_bytes;
-                        for (size_t b = local_id; b < row_bytes; b += kIshmemWGSize) {
-                            dst_row[b] = uc_load(&src_row[b]);
-                        }
+
+                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                    const int dst_rank = my_rdma_rank * num_nvl_ranks + dst_nvl;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_nvl]);
+                    auto* rc_base = peer_buf + nvlrecv_base_offset;
+                    auto* rc_x = rc_base + nvlrecv_layout.fwd_x_offset;
+                    auto* rc_m = reinterpret_cast<SourceMeta*>(rc_base + nvlrecv_layout.fwd_meta_offset);
+                    auto* rc_idx = reinterpret_cast<topk_idx_t*>(rc_base + nvlrecv_layout.fwd_topk_idx_offset);
+                    auto* rc_wt = reinterpret_cast<float*>(rc_base + nvlrecv_layout.fwd_topk_weights_offset);
+                    auto* rc_scales = reinterpret_cast<float*>(rc_base + nvlrecv_layout.fwd_x_scales_offset);
+                    auto* rc_counts = reinterpret_cast<int*>(rc_base + nvlrecv_layout.fwd_count_offset);
+                    const int plane_base = nvl_rank * nvlrecv_layout.plane_tokens;
+                    int slot = 0;
+                    for (int t = 0; t < num_tokens; ++t) {
+                        if (!my_send_is_in_rank[t * num_ranks + dst_rank]) continue;
+                        if (slot >= nvlrecv_layout.plane_tokens) break;  // per-plane capacity guard
+                        const int dst_idx = plane_base + slot;
+                        auto* src_row = my_send_x + static_cast<size_t>(t) * row_bytes;
+                        auto* dst_row = rc_x + static_cast<size_t>(dst_idx) * row_bytes;
+                        faithful_coop_copy(dst_row, src_row, row_bytes, local_id, kComputeWGSize);
                         if (local_id == 0) {
-                            SourceMeta fwd_sm = sm;
-                            fwd_sm.is_token_in_nvl_rank_bits = i;
-                            fwd_m[dst_idx] = fwd_sm;
+                            rc_m[dst_idx] = my_send_m[t];
                             if (topk_idx != nullptr) {
                                 for (int k = 0; k < num_topk; ++k) {
-                                    fwd_idx[dst_idx * num_topk + k] = uc_load(&rdma_idx[i * num_topk + k]);
-                                    fwd_wt[dst_idx * num_topk + k] = uc_load(&rdma_wt[i * num_topk + k]);
+                                    rc_idx[dst_idx * num_topk + k] = my_send_idx[t * num_topk + k];
+                                    rc_wt[dst_idx * num_topk + k] = my_send_wt[t * num_topk + k];
                                 }
                             }
                             if (x_scales != nullptr) {
-                                for (int s = 0; s < num_scales; ++s) {
-                                    fwd_scales[dst_idx * num_scales + s] = uc_load(&rdma_scales[i * num_scales + s]);
-                                }
+                                for (int s = 0; s < num_scales; ++s)
+                                    rc_scales[dst_idx * num_scales + s] = my_send_scales[t * num_scales + s];
                             }
                         }
+                        ++slot;
                     }
-                }
-
-                // Flush all forwarded payload writes to the remote NVL peers
-                // (IPC-mapped GPU memory across PCIe) BEFORE publishing the
-                // per-source fwd_counts signal, mirroring CUDA's
-                // st_release_sys_global on the NVL channel tail. Every work-item
-                // flushes its own strided payload writes to system scope; WI 0's
-                // fence alone would not order the other WIs' fwd_x stores.
-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                sycl::group_barrier(group);
-                if (local_id == 0) {
-                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                        auto* fwd_base = peer_buf + fwd_base_offset;
-                        auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                        fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
-                    }
+                    // Publish this producer plane's settled count into the dest peer AFTER a
+                    // release fence so the consumer's acquire observes payload-then-count.
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    lsc_fence_sysrel();
+                    sycl::group_barrier(group);
+                    if (local_id == 0) {
+                        rc_counts[nvl_rank] = slot;
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                        lsc_fence_sysrel();
+                    }
+                    sycl::group_barrier(group);
                 }
-            }
-            // Final release fence: ensure every payload + count write issued by
-            // the NVL leader is flushed across PCIe to the remote peers before
-            // this kernel retires and the forward barrier runs.
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-            sycl::group_barrier(group);
-        });
+            });
     });
     if (wait_each) queue.wait();
-    ddbg_stage("6-FwdWrite");
+    ddbg_stage("F8-NvlPush");
 
+    // F-K9 NvlPushBarrier: all producers' intra pushes landed before the consumer reads
+    // its OWN nvlrecv region (ordering via kernel boundary + device-scope NVL barrier).
     queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchFwdBarrierKernel>(
+        cgh.parallel_for<FaithfulDispatchNvlPushBarrierKernel>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
+            [=](sycl::nd_item<1> item) {
+                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item);
+            });
     });
     if (wait_each) queue.wait();
-    ddbg_stage("7-FwdBarrier");
-    }  // end else (non-faithful fallback transport)
+    ddbg_stage("F9-NvlPushBarrier");
 
     // ===== SHARED: Assemble + Head (identical output for both transports) =====
+    // CUDA-faithful local-expert remap of recv_topk_idx (internode.cu:1060-61,1176-79):
+    // rewrite global expert ids to this receiver's local range, dropping non-local
+    // selections (idx -> -1, weight -> 0). Disabled when num_experts == 0 (cached mode).
+    const int num_local_experts_a = (num_experts > 0 && num_ranks > 0) ? num_experts / num_ranks : 0;
+    const bool do_expert_remap_a = (recv_topk_idx != nullptr && num_local_experts_a > 0);
+    const int local_expert_begin_a = do_expert_remap_a ? rank * num_local_experts_a : 0;
+    const int local_expert_end_a = local_expert_begin_a + num_local_experts_a;
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedDispatchAssembleKernel>(
             sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
@@ -2673,19 +2556,25 @@ void dispatch_nvl_rdma(void* recv_x,
             auto* my_fwd_scales = reinterpret_cast<float*>(my_fwd_base + fwd_layout.fwd_x_scales_offset);
             auto* my_fwd_counts = reinterpret_cast<int*>(my_fwd_base + fwd_layout.fwd_count_offset);
 
-            // PASS 1: count tokens per src_rank (intra peers + fwd entries).
+            // Producer-PUSH intra region: this rank's OWN recv-staging (peers pushed here).
+            auto* my_rc_base = my_buf + nvlrecv_base_offset;
+            auto* my_rc_x = my_rc_base + nvlrecv_layout.fwd_x_offset;
+            auto* my_rc_m = reinterpret_cast<SourceMeta*>(my_rc_base + nvlrecv_layout.fwd_meta_offset);
+            auto* my_rc_idx = reinterpret_cast<topk_idx_t*>(my_rc_base + nvlrecv_layout.fwd_topk_idx_offset);
+            auto* my_rc_wt = reinterpret_cast<float*>(my_rc_base + nvlrecv_layout.fwd_topk_weights_offset);
+            auto* my_rc_scales = reinterpret_cast<float*>(my_rc_base + nvlrecv_layout.fwd_x_scales_offset);
+            auto* my_rc_counts = reinterpret_cast<int*>(my_rc_base + nvlrecv_layout.fwd_count_offset);
+
+            // PASS 1: count tokens per src_rank (intra peers pushed into OUR ring + fwd entries).
             int intra_count = 0;
             int fwd_total = 0;
             for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
                 const int src_rank = my_rdma_rank * num_nvl_ranks + src_nvl;
-                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
-                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                int c = 0;
-                for (int t = 0; t < num_tokens; ++t) {
-                    if (peer_is_in_rank[t * num_ranks + my_global_rank]) {
-                        c += 1;
-                    }
-                }
+                // Local read of the count producer src_nvl PUSHED into our plane. Clamp to
+                // plane capacity so a stale/garbage count can never drive an OOB scan.
+                int c = my_rc_counts[src_nvl];
+                if (c < 0) c = 0;
+                if (c > nvlrecv_layout.plane_tokens) c = nvlrecv_layout.plane_tokens;
                 per_src_count[src_rank] += c;
                 intra_count += c;
             }
@@ -2752,34 +2641,40 @@ void dispatch_nvl_rdma(void* recv_x,
             // PASS 2: place each token at cursors[src_rank]++ so recv_x is grouped by src_rank in canonical order.
             for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
                 const int src_rank = my_rdma_rank * num_nvl_ranks + src_nvl;
-                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
-                auto* peer_x = peer_buf + layout.send_x_offset;
-                auto* peer_m = reinterpret_cast<SourceMeta*>(peer_buf + layout.send_meta_offset);
-                auto* peer_idx = reinterpret_cast<topk_idx_t*>(peer_buf + layout.send_topk_idx_offset);
-                auto* peer_wt = reinterpret_cast<float*>(peer_buf + layout.send_topk_weights_offset);
-                auto* peer_scales = reinterpret_cast<float*>(peer_buf + layout.send_x_scales_offset);
-                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                for (int t = 0; t < num_tokens; ++t) {
-                    if (!peer_is_in_rank[t * num_ranks + my_global_rank]) {
-                        continue;
-                    }
+                // Read our OWN recv-staging plane that producer src_nvl PUSHED (local read).
+                // Tokens were pushed in the producer's token order, so scanning slots 0..count
+                // reproduces the exact canonical ordering the consumer-PULL path produced.
+                const int plane_base = src_nvl * nvlrecv_layout.plane_tokens;
+                int c = my_rc_counts[src_nvl];
+                if (c < 0) c = 0;
+                if (c > nvlrecv_layout.plane_tokens) c = nvlrecv_layout.plane_tokens;
+                for (int i = 0; i < c; ++i) {
+                    const int sidx = plane_base + i;
                     const int pos = cursors[src_rank]++;
-                    auto* src_row = peer_x + static_cast<size_t>(t) * row_bytes;
+                    auto* src_row = my_rc_x + static_cast<size_t>(sidx) * row_bytes;
                     auto* dst_row = dst + static_cast<size_t>(pos) * row_bytes;
                     faithful_coop_copy(dst_row, src_row, row_bytes, local_id, kComputeWGSize);
                     if (local_id == 0) {
                         if (meta != nullptr) {
-                            meta[pos] = peer_m[t];
+                            meta[pos] = my_rc_m[sidx];
                         }
                         if (recv_topk_idx != nullptr) {
                             for (int k = 0; k < num_topk; ++k) {
-                                recv_topk_idx[pos * num_topk + k] = peer_idx[t * num_topk + k];
-                                recv_topk_weights[pos * num_topk + k] = peer_wt[t * num_topk + k];
+                                const auto gv = my_rc_idx[sidx * num_topk + k];
+                                if (do_expert_remap_a) {
+                                    const bool loc = (gv >= local_expert_begin_a && gv < local_expert_end_a);
+                                    recv_topk_idx[pos * num_topk + k] = loc ? static_cast<topk_idx_t>(gv - local_expert_begin_a)
+                                                                            : static_cast<topk_idx_t>(-1);
+                                    recv_topk_weights[pos * num_topk + k] = loc ? my_rc_wt[sidx * num_topk + k] : 0.0f;
+                                } else {
+                                    recv_topk_idx[pos * num_topk + k] = gv;
+                                    recv_topk_weights[pos * num_topk + k] = my_rc_wt[sidx * num_topk + k];
+                                }
                             }
                         }
                         if (recv_x_scales != nullptr) {
                             for (int s = 0; s < num_scales; ++s) {
-                                recv_x_scales[pos * num_scales + s] = peer_scales[t * num_scales + s];
+                                recv_x_scales[pos * num_scales + s] = my_rc_scales[sidx * num_scales + s];
                             }
                         }
                     }
@@ -2803,8 +2698,16 @@ void dispatch_nvl_rdma(void* recv_x,
                             }
                             if (recv_topk_idx != nullptr) {
                                 for (int k = 0; k < num_topk; ++k) {
-                                    recv_topk_idx[pos * num_topk + k] = my_fwd_idx[idx * num_topk + k];
-                                    recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                                    const auto gv = my_fwd_idx[idx * num_topk + k];
+                                    if (do_expert_remap_a) {
+                                        const bool loc = (gv >= local_expert_begin_a && gv < local_expert_end_a);
+                                        recv_topk_idx[pos * num_topk + k] = loc ? static_cast<topk_idx_t>(gv - local_expert_begin_a)
+                                                                                : static_cast<topk_idx_t>(-1);
+                                        recv_topk_weights[pos * num_topk + k] = loc ? my_fwd_wt[idx * num_topk + k] : 0.0f;
+                                    } else {
+                                        recv_topk_idx[pos * num_topk + k] = gv;
+                                        recv_topk_weights[pos * num_topk + k] = my_fwd_wt[idx * num_topk + k];
+                                    }
                                 }
                             }
                             if (recv_x_scales != nullptr) {
@@ -2841,10 +2744,36 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 }
             }
+
+            // Producer-PUSH of our per_src_count[] (grouped by GLOBAL src rank, incl. fwd)
+            // into EVERY local peer's peer_counts slot [nvl_rank]. The Head kernel then
+            // derives send_nvl_head base offsets by reading its OWN peer_counts region
+            // (local read) instead of PULLing peer send buffers / peer fwd_meta over IPC.
+            if (local_id == 0) {
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                    auto* peer_counts = reinterpret_cast<int*>(peer_buf + peer_counts_offset);
+                    for (int s = 0; s < num_ranks; ++s)
+                        peer_counts[nvl_rank * num_ranks + s] = per_src_count[s];
+                }
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                lsc_fence_sysrel();
+            }
         });
     });
     if (wait_each) queue.wait();
     ddbg_stage("8-Assemble");
+
+    // F-K10 CountsBarrier: every rank's per_src_count is visible in all peers before Head.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<FaithfulDispatchCountsBarrierKernel>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) {
+                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 3, num_nvl_ranks, item);
+            });
+    });
+    if (wait_each) queue.wait();
+    ddbg_stage("9-CountsBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchHeadKernel>([=]() {
@@ -2887,95 +2816,60 @@ void dispatch_nvl_rdma(void* recv_x,
                 }
             }
 
-            // Compute per-(src_rank, dst_rank) base offsets for INTRA dst_ranks (those in my rdma node).
-            // For dst_rank R in my rdma, the position of src_rank S's token group in R's recv_x = sum over S' < S of count(S' -> R).
-            // S' in my rdma: count via NVL peek of peer's is_token_in_rank.
-            // S' in other rdma: count via NVL peek of R's fwd_meta (entries with matching src_rdma+src_nvl).
-            constexpr int kMaxRanks = 64;
-            int intra_base[NUM_MAX_NVL_PEERS][NUM_MAX_NVL_PEERS] = {{0}};  // intra_base[src_nvl][dst_nvl] = base on R=(my_rdma,dst_nvl) for src=(my_rdma,src_nvl)
-            int per_src_per_dst_count[kMaxRanks][NUM_MAX_NVL_PEERS] = {{0}};  // [src_rank][dst_nvl] = count from src to R
-            // Intra-rdma source contributions to R: per peer s.nvl, count tokens that go to dst_rank=(my_rdma, dst_nvl).
-            for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
-                const int src_rank = my_rdma_rank * num_nvl_ranks + src_nvl;
-                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
-                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                    const int dst_rank = my_rdma_rank * num_nvl_ranks + dst_nvl;
-                    int c = 0;
-                    for (int t = 0; t < num_tokens; ++t) {
-                        if (peer_is_in_rank[t * num_ranks + dst_rank]) c += 1;
-                    }
-                    per_src_per_dst_count[src_rank][dst_nvl] = c;
-                }
-            }
-            // Cross-rdma source contributions to R: count entries in R's fwd_meta with each (src_rdma, src_nvl).
-            for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                auto* dst_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_nvl]);
-                auto* dst_fwd_base = dst_buf + fwd_base_offset;
-                auto* dst_fwd_m = reinterpret_cast<SourceMeta*>(dst_fwd_base + fwd_layout.fwd_meta_offset);
-                auto* dst_fwd_counts = reinterpret_cast<int*>(dst_fwd_base + fwd_layout.fwd_count_offset);
-                for (int p = 0; p < num_fwd_planes; ++p) {
-                    int scan = p * fwd_layout.plane_tokens;
-                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                        const int n = dst_fwd_counts[p * num_rdma_ranks + src_rdma];
-                        for (int i = 0; i < n; ++i) {
-                            const SourceMeta sm = dst_fwd_m[scan + i];
-                            const int src_rank = sm.src_rdma_rank * num_nvl_ranks + sm.src_nvl_rank;
-                            per_src_per_dst_count[src_rank][dst_nvl] += 1;
-                        }
-                        scan += n;
-                    }
-                }
-            }
-            // Now build intra_base[src_nvl][dst_nvl] = sum over s < (my_rdma*num_nvl + src_nvl) of count[s][dst_nvl].
+            // Producer-PUSH send_nvl_head/send_rdma_head (gap #2): compute the base offset
+            // of THIS rank's token group in each local dst peer's recv_x using ONLY local
+            // reads. Each dst peer's Assemble pushed its per_src_count[] (grouped by GLOBAL
+            // src rank, incl. RDMA-forwarded contributions) into our OWN peer_counts region
+            // at slot [dst_nvl]. recv_x on dst=(my_rdma,dst_nvl) is grouped by global src
+            // rank ascending, so the base for our group (src rank == my_global_rank) is the
+            // exclusive prefix sum of that peer's per_src_count over s < my_global_rank.
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* my_peer_counts = reinterpret_cast<int*>(my_buf + peer_counts_offset);
+            // Order the read of the peers' pushed counts after the CountsBarrier release.
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            int intra_base_my[NUM_MAX_NVL_PEERS] = {0};  // base for MY tokens in dst=(my_rdma,dst_nvl)
             for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
                 int prefix = 0;
-                for (int s = 0; s < num_ranks; ++s) {
-                    if (s >= my_rdma_rank * num_nvl_ranks && s < (my_rdma_rank + 1) * num_nvl_ranks) {
-                        const int src_nvl = s - my_rdma_rank * num_nvl_ranks;
-                        intra_base[src_nvl][dst_nvl] = prefix;
-                    }
-                    prefix += per_src_per_dst_count[s][dst_nvl];
+                for (int s = 0; s < my_global_rank; ++s) {
+                    prefix += my_peer_counts[dst_nvl * num_ranks + s];
                 }
+                intra_base_my[dst_nvl] = prefix;
             }
 
-            int same_node_head[NUM_MAX_NVL_PEERS] = {0};
             int rdma_head[NUM_MAX_NVL_PEERS] = {0};
-            // For send_nvl_head: write absolute position = intra_base[my_nvl][dst_nvl] + per-peer ordinal within my src_rank's segment.
-            // The original same_node_head[dst_nvl] counter is repurposed PER src_nvl peer below.
-            int per_peer_dst_ordinal[NUM_MAX_NVL_PEERS][NUM_MAX_NVL_PEERS] = {{0}};  // [src_nvl][dst_nvl]
-            for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
-                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[src_nvl]);
-                auto* peer_is_in_rank = reinterpret_cast<bool*>(peer_buf + layout.send_is_token_in_rank_offset);
-                auto* peer_rdma_bits = reinterpret_cast<int*>(peer_buf + layout.send_rdma_dest_bits_offset);
-                for (int token = 0; token < num_tokens; ++token) {
-                    const bool is_my_token = src_nvl == nvl_rank;
+            int per_peer_dst_ordinal[NUM_MAX_NVL_PEERS] = {0};  // [dst_nvl] ordinal of my token to dst
+            // Only THIS rank's own tokens produce handle entries; read our OWN routing
+            // (is_token_in_rank is this rank's input, a local device pointer). No remote reads.
+            for (int token = 0; token < num_tokens; ++token) {
+                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                    const int dst_rank = my_rdma_rank * num_nvl_ranks + dst_nvl;
+                    if (!is_token_in_rank[token * num_ranks + dst_rank]) {
+                        continue;
+                    }
+                    if (send_nvl_head != nullptr) {
+                        send_nvl_head[token * num_ranks + dst_rank] =
+                            intra_base_my[dst_nvl] + per_peer_dst_ordinal[dst_nvl];
+                    }
+                    per_peer_dst_ordinal[dst_nvl] += 1;
+                }
+                for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
+                    if (dst_rdma == my_rdma_rank) continue;
+                    bool hit = false;
                     for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                        const int dst_rank = my_rdma_rank * num_nvl_ranks + dst_nvl;
-                        if (!peer_is_in_rank[token * num_ranks + dst_rank]) {
-                            continue;
-                        }
-                        if (is_my_token && send_nvl_head != nullptr) {
-                            send_nvl_head[token * num_ranks + dst_rank] =
-                                intra_base[src_nvl][dst_nvl] + per_peer_dst_ordinal[src_nvl][dst_nvl];
-                        }
-                        per_peer_dst_ordinal[src_nvl][dst_nvl] += 1;
-                        same_node_head[dst_nvl] += 1;  // kept for any future diagnostic use
-                    }
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank || ((peer_rdma_bits[token] >> dst_rdma) & 1) == 0) {
-                            continue;
-                        }
-                        // Per-GPU RDMA has one independent RDMA stream per nvl_rank.
-                        // The recv_pos stamped by F6 is the ordinal within this rank's
-                        // same-plane stream, so the handle counts only this nvl plane.
-                        if (is_my_token) {
-                            if (send_rdma_head != nullptr) {
-                                send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
-                            }
-                            rdma_head[dst_rdma] += 1;
+                        const int dst_rank = dst_rdma * num_nvl_ranks + dst_nvl;
+                        if (is_token_in_rank[token * num_ranks + dst_rank]) {
+                            hit = true;
+                            break;
                         }
                     }
+                    if (!hit) continue;
+                    // Per-GPU RDMA has one independent RDMA stream per nvl_rank. The recv_pos
+                    // stamped by F6 is the ordinal within this rank's same-plane stream, so
+                    // the handle counts only this nvl plane.
+                    if (send_rdma_head != nullptr) {
+                        send_rdma_head[token * num_rdma_ranks + dst_rdma] = rdma_head[dst_rdma];
+                    }
+                    rdma_head[dst_rdma] += 1;
                 }
             }
         });
@@ -3073,7 +2967,9 @@ void combine_nvl_rdma(DataType type,
     // rank now handled locally). Bound it by num_rdma_ranks * num_combined_tokens
     // so a peer receiving contributions from multiple source RDMA ranks never
     // overruns its forward region. num_nvl_bytes is provisioned far above this.
-    const int max_fwd_tokens = num_rdma_ranks * num_combined_tokens;
+    // With NVL exchange after FwdBarrier, each rank copies peer's remote
+    // fwd data into its own buffer. Capacity: own data + peer data.
+    const int max_fwd_tokens = num_nvl_ranks * num_rdma_ranks * num_combined_tokens;
     // Per-GPU RDMA combine: each nvl_rank RDMA-sends the tokens it holds whose original
     // source nvl-plane == its own nvl_rank, back to (src_rdma, nvl_rank). The receiver
     // (src_rdma, nvl_rank) therefore always forwards to ITSELF (rdma_src_nvl == its own
@@ -3090,6 +2986,28 @@ void combine_nvl_rdma(DataType type,
     NvlBufferLayout fwd_anchor_layout(max_combine_tokens, num_ranks, 1, row_bytes, num_topk, 0);
     const size_t fwd_base_offset = align_offset(fwd_anchor_layout.total_bytes, 128);
 
+    // ---- Producer-PUSH intra-node NVL combine staging (gap #2) -------------------------
+    // On BMG+igub a cross-rank IPC READ of a peer's Pack output is unstable, while a
+    // cross-rank IPC WRITE is stable. So instead of the gather kernels READING each peer's
+    // Pack output, each rank WRITES its Pack output into every peer's combine-staging plane
+    // (plane == producer nvl_rank), and the gathers read only their OWN plane locally.
+    // num_nvl_ranks disjoint source planes, plane_tokens == max_combine_tokens (rank-
+    // invariant) so the meta/topk
+    // sub-array offsets are FIXED (rank-invariant, no count-dependent arithmetic on the
+    // read side). num_tokens (the combine recv/packed count that Pack stores at
+    // The producer writes its plane at plane_base = nvl_rank * plane_tokens into every
+    // peer's buffer; the consumer reads plane_base = dst_nvl * plane_tokens from its own
+    // buffer. For those offsets to agree across ranks, plane_tokens MUST be rank-invariant.
+    // num_tokens is the per-rank dispatch-receive count and DIFFERS across ranks (the OLD
+    // PULL path avoided planes: it read each peer's send_x at a fixed base indexed by
+    // peer_recv_pos, so per-rank num_tokens never entered the offset). Use the invariant
+    // upper bound max_combine_tokens (== num_nvl_ranks*num_combined_tokens, >= num_tokens);
+    // the pushed count (== num_tokens) is clamped to it. num_scales==0; NvlForwardLayout's
+    // fwd_topk_weights sub-array holds the combine topk_weights (float). Placed after the
+    // fwd region (rank-invariant offset, reuses otherwise-unused NVL buffer space).
+    NvlForwardLayout combine_stage_layout(max_combine_tokens, row_bytes, num_topk, 0, /*num_rdma_ranks=*/1, num_nvl_ranks);
+    const size_t combine_stage_base = align_offset(fwd_base_offset + fwd_layout.total_bytes, 128);
+
     // Each RDMA region must hold up to num_nvl_ranks * num_combined_tokens
     // tokens (the max number of tokens any source rdma_rank could have
     // originally sent to this rdma_rank's NVL peers). Use num_combined_tokens
@@ -3105,7 +3023,7 @@ void combine_nvl_rdma(DataType type,
     const size_t rdma_recv_pos_offset = align_offset(rdma_topk_wt_offset + rdma_topk_wt_size, alignof(int));
     const size_t rdma_src_nvl_offset = align_offset(rdma_recv_pos_offset + rdma_recv_pos_size, alignof(int));
     const size_t rdma_count_offset = align_offset(rdma_src_nvl_offset + rdma_src_nvl_size, alignof(int));
-    // Faithful path (kFaithful) uses a 64-bit AMO count flag at rdma_flag_offset
+    // Faithful path uses a 64-bit AMO count flag at rdma_flag_offset
     // (ishmemx_long_atomic_add_qp, -count-1), mirroring the dispatch F4b flag.
     // Kept separate from rdma_count_offset and INSIDE the region so every rank
     // computes the identical rdma_region_bytes (sender/receiver agree). With
@@ -3124,6 +3042,7 @@ void combine_nvl_rdma(DataType type,
     const size_t init_range = std::max({total_combined, total_topk, total_recv_regions, static_cast<size_t>(1)});
 
     static const bool kDbgCombine = std::getenv("DEEP_EP_DBG_COMBINE") != nullptr;
+    static const int kDbgReduce = std::getenv("DEEP_EP_DBG_REDUCE") != nullptr ? 1 : 0;
     auto dbg_last = std::chrono::high_resolution_clock::now();
     auto dbg_stage = [&](const char* name) {
         if (kDbgCombine) {
@@ -3146,17 +3065,13 @@ void combine_nvl_rdma(DataType type,
     // fallback). All faithful transport primitives (blocking put + AMO flag)
     // were validated by the dispatch port; here they replace the serial
     // RdmaPush's two barrier_all collectives + the count-sentinel handshake.
-    static const bool kFaithful = [] {
-        const char* env = std::getenv("DEEP_EP_INTERNODE_FAITHFUL");
-        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
-    }();
     const uint64_t rdma_poll_cap = internode_poll_cap();
     const int rdma_flag_lsc_mode = internode_flag_lsc_mode();
     const bool faithful_post_amo_quiet = internode_post_amo_quiet();
     const bool faithful_force_db = internode_force_db();          // FC5b put doorbell
     const bool faithful_blocking_put = internode_blocking_put();  // FC5b blocking payload put
     const bool faithful_par_gather = internode_par_gather();      // FC5b grid-parallel gather
-    if (kFaithful) dbg_stage("F-combine ON");
+    dbg_stage("combine ON");
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
@@ -3216,6 +3131,37 @@ void combine_nvl_rdma(DataType type,
     if (wait_each) queue.wait();
     dbg_stage("2-Pack");
 
+    // GAP#8 perf: SELECTIVE producer-push invalidation. Each combine token is owned by
+    // exactly ONE consumer (its src_nvl_rank) -- both the reduce (reads plane[dst_nvl]
+    // [peer_recv_pos], and peer_recv_pos = combined_nvl_head[ct,P] is only set for the
+    // consumer that owns P's position p) and the RDMA gather (filters src_nvl_rank==nvl_rank)
+    // read a producer position from exactly one consumer. So the push routes each token to
+    // ONLY that consumer's plane (verbatim index p, ~num_nvl_ranks x less copy than the old
+    // broadcast-to-all-peers). Unwritten plane slots must be invalidated so the gather's
+    // src_nvl_rank filter rejects them: seed OUR OWN plane meta src_nvl_rank=-1 here, BEFORE
+    // the PackBarrier (which is a cross-rank nvl_barrier => it also orders this init before
+    // any producer's push into our plane; no extra barrier needed).
+    queue.submit([&](sycl::handler& cgh) {
+        const size_t total_slots = static_cast<size_t>(num_nvl_ranks) *
+                                   static_cast<size_t>(combine_stage_layout.plane_tokens);
+        const size_t init_range = ((total_slots + kComputeWGSize - 1) / kComputeWGSize) * kComputeWGSize;
+        cgh.parallel_for<CombineNvlPlaneInitKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max<size_t>(init_range, kComputeWGSize)),
+                              sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                const size_t i = item.get_global_linear_id();
+                if (i >= total_slots) return;
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* cs_meta = reinterpret_cast<SourceMeta*>(
+                    my_buf + combine_stage_base + combine_stage_layout.fwd_meta_offset);
+                cs_meta[i].src_nvl_rank = -1;  // sentinel: unwritten -> gather filter rejects
+                if (i == total_slots - 1)
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("2b-PlaneInit");
+
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
@@ -3224,6 +3170,103 @@ void combine_nvl_rdma(DataType type,
     if (wait_each) queue.wait();
     dbg_stage("3-PackBarrier");
 
+    // ===== Producer-PUSH intra-node NVL combine exchange (gap #2 + selective routing) =====
+    // CN-K1 CombineNvlPush: grid = 1 WG. Each rank reads its OWN Pack output and routes each
+    // token t to ONLY the consumer that owns it (C = my_meta[t].src_nvl_rank), writing at the
+    // VERBATIM index t in that consumer's plane[nvl_rank] (remote WRITE). Verbatim index is
+    // required because the reduce indexes plane[dst_nvl][peer_recv_pos] with the dispatch
+    // position; token t is owned by exactly one consumer, so writing it once (not to every
+    // peer) is ~num_nvl_ranks x less copy while keeping both the reduce and the gather correct.
+    // Unwritten slots were seeded to src_nvl_rank=-1 (CombineNvlPlaneInit) so the gather's
+    // filter skips them. WI0 publishes each producer's count into every consumer's plane after
+    // a release fence. Gather/reduce then read their OWN plane locally (zero remote reads).
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombineNvlPushKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                auto group = item.get_group();
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* my_count_ptr = reinterpret_cast<int*>(my_buf + layout.count_offset);
+                auto* my_x = reinterpret_cast<dtype_t*>(my_buf + layout.send_x_offset);
+                auto* my_meta = reinterpret_cast<SourceMeta*>(my_buf + layout.send_meta_offset);
+                auto* my_topk = reinterpret_cast<float*>(my_buf + layout.send_topk_weights_offset);
+                // Own Pack output is coherent (same device, kernel boundary after Pack).
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                int count = *my_count_ptr;  // == num_tokens
+                if (count < 0) count = 0;
+                if (count > combine_stage_layout.plane_tokens) count = combine_stage_layout.plane_tokens;
+                const int plane_base = nvl_rank * combine_stage_layout.plane_tokens;
+                for (int t = 0; t < count; ++t) {
+                    const int dst_c = my_meta[t].src_nvl_rank;  // owning consumer
+                    if (dst_c < 0 || dst_c >= num_nvl_ranks) continue;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_c]);
+                    auto* cs_base = peer_buf + combine_stage_base;
+                    auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
+                    auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
+                    auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
+                    const int dst_idx = plane_base + t;  // VERBATIM index (== peer_recv_pos read side)
+                    // Write-through (uc_store) for the row payload into the peer's
+                    // combine-staging plane: the gather reads this data with per-row
+                    // lsc_fence_sysacq + uc_load, but a plain cached store leaves the
+                    // payload in the WRITER GPU's L2, and the release fence may not
+                    // reliably flush 14 KB of interleaved L2 lines before the NVL
+                    // barrier releases the reader. Writing through uc_store publishes
+                    // directly to the memory domain the reader's uc_load observes.
+                    faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&cs_x[static_cast<size_t>(dst_idx) * hidden]),
+                                       reinterpret_cast<const uint8_t*>(&my_x[static_cast<size_t>(t) * hidden]),
+                                       static_cast<size_t>(hidden) * sizeof(dtype_t), local_id, kComputeWGSize);
+                    if (local_id == 0) {
+                        // Write cs_meta and cs_topk through uc_store for IPC peer
+                        // writes: same rationale as the row payload uc_store fix.
+                        // SourceMeta is 12 bytes (3 x int); store each field with
+                        // uc_store so it bypasses L2 for cross-GPU IPC writes.
+                        if (dst_c == nvl_rank) {
+                            cs_meta[dst_idx] = my_meta[t];
+                        } else {
+                            deep_ep::uc_store(&cs_meta[dst_idx].src_rdma_rank, my_meta[t].src_rdma_rank);
+                            deep_ep::uc_store(&cs_meta[dst_idx].is_token_in_nvl_rank_bits, my_meta[t].is_token_in_nvl_rank_bits);
+                            deep_ep::uc_store(&cs_meta[dst_idx].src_nvl_rank, my_meta[t].src_nvl_rank);
+                        }
+                        if (num_topk > 0) {
+                            for (int k = 0; k < num_topk; ++k)
+                                deep_ep::uc_store(&cs_topk[dst_idx * num_topk + k], my_topk[t * num_topk + k]);
+                        }
+                    }
+                }
+                sycl::group_barrier(group);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                lsc_fence_sysrel();
+                // Publish our token count into EVERY consumer's plane (each consumer's gather
+                // bounds its plane[nvl_rank] iteration by cs_counts[nvl_rank]).
+                if (local_id == 0) {
+                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                        auto* cs_counts = reinterpret_cast<int*>(
+                            peer_buf + combine_stage_base + combine_stage_layout.fwd_count_offset);
+                        cs_counts[nvl_rank] = count;
+                    }
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    lsc_fence_sysrel();
+                }
+                sycl::group_barrier(group);
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("3b-CombineNvlPush");
+
+    // CN-K2 CombineNvlPushBarrier: all producers' pushes landed before any gather reads
+    // its OWN staging plane (ordering via kernel boundary + device-scope NVL barrier).
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombineNvlPushBarrierKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
+            [=](sycl::nd_item<1> item) {
+                nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item);
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("3c-CombineNvlPushBarrier");
+
     queue.submit([&](sycl::handler& cgh) {
         const size_t rs_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
         cgh.parallel_for<CombinedCombineRdmaSendKernel<dtype_t>>(
@@ -3231,22 +3274,18 @@ void combine_nvl_rdma(DataType type,
             const int local_id = static_cast<int>(item.get_local_id(0));
             const int ct = static_cast<int>(item.get_group(0));
             if (ct >= num_combined_tokens) return;
-            // Acquire fence: order reads of the NVL peers' packed combine
-            // buffers (IPC-mapped remote GPU memory) after their release fence.
+            // Producer-PUSH (gap #2): peers PUSHED their Pack output into OUR combine-
+            // staging planes. Read only our OWN buffer (local read); acquire orders the
+            // read after the CombineNvlPushBarrier release. FIXED plane sub-array offsets
+            // (plane_tokens == max_combine_tokens, rank-invariant) replace count-dep arithmetic.
             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-            // Compute per-peer topk_weights offset based on each peer's actual
-            // num_tokens. The NvlBufferLayout offsets after send_x_offset depend
-            // on num_tokens, so using this rank's layout to read from a peer with
-            // a different received count would access wrong memory.
-            auto peer_topk_offset = [=](int peer_n) -> size_t {
-                size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
-                off = (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
-                off += static_cast<size_t>(peer_n) * sizeof(SourceMeta);
-                off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
-                off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
-                off = (off + alignof(float) - 1) / alignof(float) * alignof(float);
-                return off;
-            };
+            lsc_fence_sysacq();
+            auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+            auto* cs_base = my_buf + combine_stage_base;
+            auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
+            auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
+            auto* cs_counts = reinterpret_cast<int*>(cs_base + combine_stage_layout.fwd_count_offset);
+            const int plane_tokens = combine_stage_layout.plane_tokens;
 
             // One work-group per combined token: each work-group owns dst[ct],
             // so the accumulation across NVL peers is race-free (no two work-
@@ -3260,20 +3299,22 @@ void combine_nvl_rdma(DataType type,
                 }
                 const int peer_recv_pos = combined_nvl_head[ct * num_ranks + dst_rank];
                 const int dst_nvl = dst_rank % num_nvl_ranks;
-                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[dst_nvl]);
-                auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
-                const int peer_count = *peer_count_ptr;
+                // Plane dst_nvl == the data producer dst_nvl PUSHED into our staging.
+                int peer_count = cs_counts[dst_nvl];
+                if (peer_count < 0) peer_count = 0;
+                if (peer_count > plane_tokens) peer_count = plane_tokens;  // count clamp
                 if (peer_recv_pos < 0 || peer_recv_pos >= peer_count) {
                     continue;
                 }
-                auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
+                const size_t plane_base = static_cast<size_t>(dst_nvl) * plane_tokens;
+                auto* peer_x = cs_x + plane_base * hidden;
                 for (int h = local_id; h < hidden; h += kComputeWGSize) {
                     float value = static_cast<float>(dst[ct * hidden + h]);
                     value += static_cast<float>(peer_x[peer_recv_pos * hidden + h]);
                     dst[ct * hidden + h] = static_cast<dtype_t>(value);
                 }
                 if (combined_topk_weights != nullptr) {
-                    auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_offset(peer_count));
+                    auto* peer_topk = cs_topk + plane_base * num_topk;
                     for (int k = local_id; k < num_topk; k += kComputeWGSize) {
                         combined_topk_weights[ct * num_topk + k] += peer_topk[peer_recv_pos * num_topk + k];
                     }
@@ -3298,7 +3339,7 @@ void combine_nvl_rdma(DataType type,
     //         of the count sentinel.
     // Init/Pack/PackBarrier/RdmaSend/FwdBarrier/Reduce are shared verbatim, so the
     // reduce math and the output stay byte-identical to the serial fallback.
-    if (kFaithful) {
+    {  // faithful (CUDA-parity) combine transport (only path)
         // ---- FC5a: init barrier (mirror dispatch F4a0). Zero MY recv-region
         // flags so remote AMOs land onto 0, then the ONE necessary cross-PE
         // rendezvous. Reached by ALL PEs (not leader-gated) so it cannot hang.
@@ -3342,22 +3383,21 @@ void combine_nvl_rdma(DataType type,
             faithful_par_gather && !(combined_topk_weights != nullptr && num_tokens <= 64);
         if (!use_par_gather) {
         queue.submit([&](sycl::handler& cgh) {
+            const int dbgR = kDbgReduce;
             cgh.parallel_for<FaithfulCombineRdmaPutKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    auto peer_meta_off = [=](int peer_n) -> size_t {
-                        size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
-                        return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
-                    };
-                    auto peer_topk_off = [=](int peer_n) -> size_t {
-                        size_t off = peer_meta_off(peer_n) + static_cast<size_t>(peer_n) * sizeof(SourceMeta);
-                        off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
-                        off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
-                        return (off + alignof(float) - 1) / alignof(float) * alignof(float);
-                    };
+                    // Producer-PUSH (gap #2): read our OWN combine-staging planes (peers
+                    // pushed here) with FIXED sub-array offsets. No peer reads.
+                    auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                    auto* cs_base = my_buf + combine_stage_base;
+                    auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
+                    auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
+                    auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
+                    const int plane_tokens = combine_stage_layout.plane_tokens;
                     for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
                         auto* region = is_self_rdma
@@ -3374,44 +3414,65 @@ void combine_nvl_rdma(DataType type,
                         sycl::group_barrier(group);
                         {
                             // Cooperative gather across the work-group; identical to the
-                            // serial RdmaPush gather (uniform uc_load count sequence, bulk
-                            // copy split by local_id, scalar metadata by WI 0).
+                            // serial RdmaPush gather (uniform count sequence, bulk copy split
+                            // by local_id, scalar metadata by WI 0).
                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                            lsc_fence_sysacq();  // invalidate -> cached int4 loads see peers' data
+                            lsc_fence_sysacq();  // invalidate -> cached int4 loads see pushed data
                             int count = 0;
                             for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                                auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
-                                auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
-                                const int peer_count = uc_load(peer_count_ptr);
-                                auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
-                                auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
-                                for (int t = 0; t < peer_count; ++t) {
-                                    // Cached read (coherent after the lsc_fence_sysacq above,
-                                    // same as the payload copy): the former per-token uncached
-                                    // uc_load was issued redundantly by every work-item.
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) {
-                                        continue;
+                                const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
+                                auto* peer_x = cs_x + plane_base * hidden;
+                                auto* peer_meta = cs_meta + plane_base;
+                                auto* peer_topk = cs_topk + plane_base * num_topk;
+                                // Per-plane cache invalidation: plane 0 is LOCAL (this GPU's
+                                // own Pack output, coherent), but plane 1+ was written by a
+                                // PEER nvl_rank via cross-GPU IPC WRITE (CombineNvlPushKernel
+                                // step 1) which is NOT coherent with this GPU's L1/L2. The
+                                // single pre-loop lsc_fence_sysacq can be defeated if plane 0's
+                                // reads re-populate stale L2 lines that then survive for plane
+                                // 1's uc_load reads. Re-invalidate before every non-local plane
+                                // to guarantee the hint-based uc_load observes the peer's pushed
+                                // bytes rather than a stale cached line.
+                                if (peer != nvl_rank) {
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    lsc_fence_sysacq();
+                                }
+                                // cs_counts / cs_meta are published by the PEER nvl_rank via a
+                                // cross-GPU IPC WRITE (CombineNvlPushKernel); read them uncached
+                                // so a stale L2 line cannot mis-count or mis-filter rows.
+                                // Selective push: BOTH nvl_ranks push tokens into the SAME consumer's
+                                // plane based on src_nvl_rank. cs_counts[peer] only counts the
+                                // tokens pushed BY peer, NOT the total tokens IN the plane (the
+                                // peer is the CONSUMER, not the producer). Iterate ALL plane_tokens
+                                // rows and rely on the src_nvl_rank/sentinel checks to filter:
+                                // empty slots have src_nvl_rank=-1 (CombineNvlPlaneInit seed) →
+                                // fail the src_nvl_rank!=nvl_rank check.
+                                for (int t = 0; t < plane_tokens; ++t) {
+                                    // Skip sentinel (src_rdma_rank < 0) early to avoid wasting
+                                    // uc_load cycles on known-empty slots.
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0 : peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma : peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank : peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                    // Per-row invalidation: the per-plane fence above
+                                    // invalidated all L2, but reading previous rows
+                                    // re-fills the cache. Re-invalidate before each
+                                    // row's payload copy to ensure fresh data.
+                                    if (peer != nvl_rank) {
+                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                        lsc_fence_sysacq();
                                     }
-                                    // Per-GPU RDMA: this nvl_rank only handles tokens whose
-                                    // original source nvl-plane == its own nvl_rank (so it sends
-                                    // them back on RDMA plane nvl_rank). Planes partition tokens
-                                    // disjointly, replacing the leader funnel.
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) {
-                                        continue;
-                                    }
-                                    faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
+                                    faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[count * hidden]),
                                                        reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                                        static_cast<size_t>(hidden) * sizeof(dtype_t),
                                                        local_id, kComputeWGSize);
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = local_id; k < num_topk; k += kComputeWGSize) {
-                                            rdma_wt[count * num_topk + k] = uc_load(&peer_topk[t * num_topk + k]);
+                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                         }
                                     }
                                     if (local_id == 0) {
-                                        rdma_recv_pos[count] = uc_load(&peer_meta[t].is_token_in_nvl_rank_bits);
-                                        rdma_src_nvl[count] = uc_load(&peer_meta[t].src_nvl_rank);
+                                        uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
+                                        uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
                                     }
                                     ++count;
                                 }
@@ -3421,6 +3482,15 @@ void combine_nvl_rdma(DataType type,
                                 *rdma_count = count;  // stashed for FC5c's -count-1 flag
                                 if (is_self_rdma) {
                                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                }
+                                if (dbgR && my_rdma_rank == 0 && nvl_rank == 0 && dst_rdma == 1) {
+                                    for (int r = 0; r < count; ++r) {
+                                        const uint16_t* row = reinterpret_cast<const uint16_t*>(&rdma_x[r * hidden]);
+                                        unsigned fold = 0;
+                                        for (int h = 0; h < hidden; ++h) fold ^= (static_cast<unsigned>(row[h]) << (h & 15));
+                                        sycl::ext::oneapi::experimental::printf("[GTHR2 rp=%d fold=%u]\n",
+                                            reinterpret_cast<int*>(region + rdma_recv_pos_offset)[r], fold);
+                                    }
                                 }
                             }
                         }
@@ -3454,24 +3524,18 @@ void combine_nvl_rdma(DataType type,
                     [=](sycl::nd_item<1> item) {
                         const int local_id = static_cast<int>(item.get_local_id(0));
                         if (local_id != 0) return;
-                        auto peer_meta_off = [=](int peer_n) -> size_t {
-                            size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
-                            return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
-                        };
-                        auto peer_topk_off = [=](int peer_n) -> size_t {
-                            size_t off = peer_meta_off(peer_n) + static_cast<size_t>(peer_n) * sizeof(SourceMeta);
-                            off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
-                            off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
-                            return (off + alignof(float) - 1) / alignof(float) * alignof(float);
-                        };
+                        // Producer-PUSH (gap #2): read OUR OWN combine-staging planes with
+                        // FIXED sub-array offsets (no peer reads).
+                        auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                        auto* cs_base = my_buf + combine_stage_base;
+                        auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
+                        auto* cs_topk = reinterpret_cast<float*>(cs_base + combine_stage_layout.fwd_topk_weights_offset);
+                        const int plane_tokens = combine_stage_layout.plane_tokens;
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
-                        // Slot assignment + scalar metadata, both in the exact serial order.
-                        // The metadata (topk/recv_pos/src_nvl) MUST be produced serially: a
-                        // parallel grid reading peer_topk/peer_meta over IPC concurrently is
-                        // unstable on this HW (deterministically corrupts topk_weights), so only
-                        // the bulk x row copy is parallelized in Pass 2. Cached loads (coherent
-                        // after the fence above) replace the former per-token uncached loads.
+                        // Slot assignment + scalar metadata, in the exact serial order (must
+                        // match the serial gather byte-for-byte). Only the bulk x row copy is
+                        // parallelized in Pass 2.
                         for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
                             const bool is_self_rdma = (dst_rdma == my_rdma_rank);
                             auto* region = is_self_rdma
@@ -3482,20 +3546,31 @@ void combine_nvl_rdma(DataType type,
                             auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
                             int count = 0;
                             for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                                auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                                const int peer_count = uc_load(reinterpret_cast<int*>(peer_buf + layout.count_offset));
-                                auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
-                                auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
-                                for (int t = 0; t < peer_count; ++t) {
-                                    if (peer_meta[t].src_rdma_rank != dst_rdma) continue;
-                                    if (peer_meta[t].src_nvl_rank != nvl_rank) continue;
+                                const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
+                                auto* peer_meta = cs_meta + plane_base;
+                                auto* peer_topk = cs_topk + plane_base * num_topk;
+                                // Per-plane cache invalidation for non-local IPC data
+                                // (see serial gather comment for rationale).
+                                if (peer != nvl_rank) {
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                    lsc_fence_sysacq();
+                                }
+                                // Selective push: BOTH nvl_ranks push tokens into the SAME consumer's
+                                // plane based on src_nvl_rank. cs_counts[peer] only counts the
+                                // tokens pushed BY peer, NOT the total tokens IN the plane.
+                                // Iterate ALL plane_tokens rows and rely on the sentinel check
+                                // (empty slots have src_rdma_rank=-1 from CombineNvlPlaneInit).
+                                for (int t = 0; t < plane_tokens; ++t) {
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) < 0 : peer_meta[t].src_rdma_rank < 0) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma : peer_meta[t].src_rdma_rank != dst_rdma) continue;
+                                    if (peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) != nvl_rank : peer_meta[t].src_nvl_rank != nvl_rank) continue;
                                     gather_slot[static_cast<size_t>(peer) * par_per_peer + t] = count;
                                     if (combined_topk_weights != nullptr) {
                                         for (int k = 0; k < num_topk; ++k)
-                                            rdma_wt[count * num_topk + k] = peer_topk[t * num_topk + k];
+                                            uc_store(&rdma_wt[count * num_topk + k], peer_topk[t * num_topk + k]);
                                     }
-                                    rdma_recv_pos[count] = peer_meta[t].is_token_in_nvl_rank_bits;
-                                    rdma_src_nvl[count] = peer_meta[t].src_nvl_rank;
+                                    uc_store(&rdma_recv_pos[count], peer_meta[t].is_token_in_nvl_rank_bits);
+                                    uc_store(&rdma_src_nvl[count], peer_meta[t].src_nvl_rank);
                                     ++count;
                                 }
                             }
@@ -3517,20 +3592,29 @@ void combine_nvl_rdma(DataType type,
                         const int peer = static_cast<int>(g / static_cast<size_t>(par_per_peer));
                         const int t = static_cast<int>(g % static_cast<size_t>(par_per_peer));
                         if (peer >= num_nvl_ranks) return;
-                        auto peer_meta_off = [=](int peer_n) -> size_t {
-                            size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
-                            return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
-                        };
+                        // Producer-PUSH (gap #2): read OUR OWN combine-staging plane (local).
+                        auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                        auto* cs_base = my_buf + combine_stage_base;
+                        auto* cs_x = reinterpret_cast<dtype_t*>(cs_base + combine_stage_layout.fwd_x_offset);
+                        auto* cs_meta = reinterpret_cast<SourceMeta*>(cs_base + combine_stage_layout.fwd_meta_offset);
+                        const int plane_tokens = combine_stage_layout.plane_tokens;
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                        lsc_fence_sysacq();  // invalidate -> cached int4 loads see peers' data
-                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                        const int peer_count = uc_load(reinterpret_cast<int*>(peer_buf + layout.count_offset));
-                        if (t >= peer_count) return;
-                        auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
-                        auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
-                        const int dst_rdma = peer_meta[t].src_rdma_rank;
+                        lsc_fence_sysacq();  // invalidate -> cached int4 loads see pushed data
+                        const size_t plane_base = static_cast<size_t>(peer) * plane_tokens;
+                        // Selective push: the grid covers ALL plane_tokens rows per peer;
+                        // empty slots have src_rdma_rank=-1 (CombineNvlPlaneInit sentinel) and
+                        // will fail the src_rdma_rank check below — no need for a per-peer count
+                        // bound (which only counts tokens pushed BY a single producer, not the
+                        // total tokens IN the consumer's plane).
+                        auto* peer_x = cs_x + plane_base * hidden;
+                        auto* peer_meta = cs_meta + plane_base;
+                        // Read metadata UNCACHED for non-local planes to avoid stale L2 data
+                        // from the IPC write (same as the serial gather).
+                        const int dst_rdma = (peer != nvl_rank)
+                            ? deep_ep::uc_load(&peer_meta[t].src_rdma_rank)
+                            : peer_meta[t].src_rdma_rank;
                         if (dst_rdma < 0 || dst_rdma >= num_rdma_ranks) return;
-                        if (peer_meta[t].src_nvl_rank != nvl_rank) return;
+                        if ((peer != nvl_rank ? deep_ep::uc_load(&peer_meta[t].src_nvl_rank) : peer_meta[t].src_nvl_rank) != nvl_rank) return;
                         const int slot = gather_slot[static_cast<size_t>(peer) * par_per_peer + t];
                         if (slot < 0 || slot >= max_rdma_tokens) return;
                         const bool is_self_rdma = (dst_rdma == my_rdma_rank);
@@ -3538,9 +3622,23 @@ void combine_nvl_rdma(DataType type,
                             ? (rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes)
                             : (rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes);
                         auto* rdma_x = reinterpret_cast<dtype_t*>(region);
-                        // Only the bulk x row copy runs in the grid (topk/recv_pos/src_nvl were
-                        // written serially in Pass 1). Full-GPU parallel over rows.
-                        faithful_coop_copy(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
+                        // Second invalidation for non-local plane rows: the metadata reads
+                        // above (peer_meta[t].src_rdma_rank etc.) use plain cached loads
+                        // that may re-populate stale L2 lines from prior iterations,
+                        // defeating the pre-kernel lsc_fence_sysacq. Re-invalidate
+                        // immediately before the row copy so uc_load observes the peer's
+                        // IPC-written bytes rather than a stale cached line.
+                        if (peer != nvl_rank) {
+                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                            lsc_fence_sysacq();
+                        }
+                        // Plain cooperative copy: the pre-kernel lsc_fence_sysacq
+                        // invalidates all L2, and the per-row fence re-invalidates.
+                        // After invalidation, cached reads should observe fresh HBM
+                        // data. The hint-based uc_load was IGC-droppable and caused
+                        // non-deterministic corruption.
+                        // uc_store dst: publish to NIC DMA domain.
+                        faithful_coop_copy_dstuc(reinterpret_cast<uint8_t*>(&rdma_x[slot * hidden]),
                                            reinterpret_cast<const uint8_t*>(&peer_x[t * hidden]),
                                            static_cast<size_t>(hidden) * sizeof(dtype_t),
                                            local_id, kComputeWGSize);
@@ -3554,53 +3652,89 @@ void combine_nvl_rdma(DataType type,
         // the local compaction are timed independently). Reads the region compacted
         // by FC5b above (visible across the kernel boundary) and puts [0,rdma_count_offset).
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8: TRUE CONCURRENT-WG combine send. One WG per (dst_rdma, channel c) so
+            // the C per-channel byte-chunk puts run on C Xe-cores CONCURRENTLY (was a single
+            // WG whose C sub-groups drove all qps from one Xe-core). Mirrors the stable
+            // dispatch concurrent send (F-K3a/F4b) and internode_ll.cpp LLCombineSendKernel:
+            // each qp is EXCLUSIVELY owned + quiesced by exactly one WG, so no cross-WG
+            // doorbell contention on a shared qp (the discipline that keeps LL's concurrent
+            // grid stable and avoids the doorbell-loss/quiet-spin hang).
+            const int send_wgs = num_rdma_ranks * num_qp_ch;
             cgh.parallel_for<FaithfulCombineRdmaPut2Kernel<dtype_t>>(
-                sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs) * kIshmemWGSize),
+                                  sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
-                    auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;  // self: no RDMA
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
-                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        // Payload put of the data region (length rdma_count_offset), matching
-                        // dispatch F4a2. The count is carried by FC5c's -count-1 AMO flag, so
-                        // (like dispatch) the count field itself is NOT transmitted. Default
-                        // path is the warp-collective NBI put with force_db: a BLOCKING
-                        // ishmem_putmem leaves qp0's nic_wq_commit lagging nic_wq_cnt (no gate
-                        // reconciles it in an ISOLATED, repeated combine), so FC5c's AMO never
-                        // egresses and the receiver poll spins to the cap. The forced-doorbell
-                        // warp-put advances the commit watermark in-call, so each combine is
-                        // self-contained. DEEP_EP_INTERNODE_BLOCKING_PUT keeps the old blocking
-                        // put as an A/B fallback.
-                        if (faithful_blocking_put) {
-                            if (local_id == 0) {
-                                ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                            }
-                            sycl::group_barrier(group);
-                        } else {
-                            // CUDA-faithful multi-QP: split the payload [0,rdma_count_offset)
-                            // into num_qp_ch 16B-aligned byte chunks, sub-group c drives chunk
-                            // c on qp=c (concurrent NIC send queues, mirroring internode.cu
-                            // qp_id==channel_id). FC5c posts a per-channel tail AMO on the same
-                            // qp so RC in-order keeps flag[c] after chunk c.
-                            const int sgid = sg.get_group_id()[0];
-                            if (sgid < num_qp_ch) {
-                                const size_t L = rdma_count_offset;
-                                const size_t s = internode_qp_chunk_start(L, sgid, num_qp_ch);
-                                const size_t e = internode_qp_chunk_start(L, sgid + 1, num_qp_ch);
-                                if (e > s) {
-                                    ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
-                                                            static_cast<unsigned>(sgid), true, sg,
-                                                            /*force_db=*/faithful_force_db);
-                                }
-                                sycl::group_barrier(sg);
-                            }
-                            sycl::group_barrier(group);
+                    const int wg_id = static_cast<int>(item.get_group_linear_id());
+                    const int dst_rdma = wg_id / num_qp_ch;  // WG owns this destination
+                    const int c = wg_id % num_qp_ch;         // ... and EXCLUSIVELY this qp c
+                    if (dst_rdma == my_rdma_rank) return;    // self: no RDMA
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
+                    auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
+                    // Clamp against a stale/garbage count read (the pristine version sized the
+                    // put with the compile-time-constant rdma_count_offset and so could never
+                    // go OOB; a count-sized put MUST guard the length or a bad read under fused
+                    // timing sends L=count*row_bytes past the region -> ccs wedge).
+                    const int count_raw = reinterpret_cast<int*>(region + rdma_count_offset)[0];
+                    const int count = (count_raw < 0) ? 0 : (count_raw > max_rdma_tokens ? max_rdma_tokens : count_raw);
+                    // Payload put of the data region, matching dispatch F4a2. The count is
+                    // carried by FC5c's -count-1 AMO flag, so the count field itself is NOT
+                    // transmitted. Default path is the warp-collective NBI put with force_db:
+                    // a BLOCKING ishmem_putmem leaves the qp's nic_wq_commit lagging nic_wq_cnt
+                    // (no gate reconciles it in an ISOLATED, repeated combine), so FC5c's AMO
+                    // never egresses and the receiver poll spins to the cap. The forced-doorbell
+                    // warp-put advances the commit watermark in-call, so each combine is
+                    // self-contained. DEEP_EP_INTERNODE_BLOCKING_PUT keeps the old blocking put
+                    // as an A/B fallback (only the c==0 WG ships the whole region).
+                    if (faithful_blocking_put) {
+                        if (c == 0 && local_id == 0) {
+                            ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
                         }
+                        return;
                     }
+                    // LL-faithful COUNT-SIZED multi-QP put. Ship only the count-sized VALID
+                    // slices (x + 3 small metadata) to ~halve combine bytes, while keeping
+                    // EVERY qp busy with a forced doorbell + a device-scope release fence
+                    // (mirror LLCombineSendKernel), so FC5c's per-qp quiet+AMO never spins on
+                    // an un-committed qp (the P4 empty-channel hang). This WG drives chunk c on
+                    // its own qp=c.
+                    // Device-scope release: make the gathered bytes NIC-visible (HBM/L2 via
+                    // PCIe P2P) before the doorbells (== internode_ll.cpp F2).
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                    // Stripe the count-sized x payload [0,count*row_bytes) across qps. A min
+                    // length (num_qp_ch*16) keeps every qp's commit watermark advanced even
+                    // when count==0 (receiver ignores the extra bytes: it reads only `count`
+                    // rows).
+                    const size_t x_valid = static_cast<size_t>(count) * row_bytes;
+                    const size_t L = x_valid > 0 ? x_valid : static_cast<size_t>(num_qp_ch) * 16;
+                    const size_t s = internode_qp_chunk_start(L, c, num_qp_ch);
+                    const size_t e = internode_qp_chunk_start(L, c + 1, num_qp_ch);
+                    if (e > s) {
+                        ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
+                                                static_cast<unsigned>(c), true, sg,
+                                                /*force_db=*/faithful_force_db);
+                    }
+                    // Channel 0's WG also ships the 3 small metadata slices (wt/recv_pos/
+                    // src_nvl) on qp 0; flag[0] (posted by FC5c after quiet(qp0)) therefore
+                    // guards both chunk-0 and the metadata. Receiver waits for ALL flags =>
+                    // x + metadata all landed before it reads.
+                    if (c == 0 && count > 0) {
+                        const size_t w_len = static_cast<size_t>(count) * num_topk * sizeof(float);
+                        const size_t rp_len = static_cast<size_t>(count) * sizeof(int);
+                        const size_t sn_len = static_cast<size_t>(count) * sizeof(int);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_topk_wt_offset,
+                                                region + rdma_topk_wt_offset, w_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_recv_pos_offset,
+                                                region + rdma_recv_pos_offset, rp_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                        ishmemx_putmem_nbi_warp(dst_region + rdma_src_nvl_offset,
+                                                region + rdma_src_nvl_offset, sn_len, dst_pe,
+                                                0u, true, sg, /*force_db=*/faithful_force_db);
+                    }
+                    sycl::group_barrier(sg);
                 });
         });
         if (wait_each) queue.wait();
@@ -3611,28 +3745,33 @@ void combine_nvl_rdma(DataType type,
         // quiet_qp flushes the QP, then the RC-ordered AMO posts -count-1 to the
         // receiver's recv-region flag. Posted for EVERY dst_rdma != self.
         queue.submit([&](sycl::handler& cgh) {
+            // GAP#8: TRUE CONCURRENT-WG per-channel quiet/AMO. One WG per (dst_rdma, c) so
+            // each qp is quiesced + flagged by EXACTLY its owning WG (mirrors dispatch F4b
+            // and internode_ll.cpp) -> no shared-qp doorbell contention.
+            const int flag_wgs = num_rdma_ranks * num_qp_ch;
             cgh.parallel_for<FaithfulCombineRdmaFlagKernel<dtype_t>>(
-                sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) {
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kIshmemWGSize),
+                                  sycl::range<1>(kIshmemWGSize)),
+                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     if (local_id != 0) return;
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                        if (dst_rdma == my_rdma_rank) continue;  // local node: no RDMA
-                        auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
-                        const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
-                        const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
-                        auto* dst_flag = reinterpret_cast<long*>(
-                            rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
-                        // Multi-QP: per channel c, quiet qp c then post the tail AMO on qp c
-                        // (every flag carries -count-1). Receiver waits for all num_qp_ch flags.
-                        for (int c = 0; c < num_qp_ch; ++c) {
-                            ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                            lsc_fence_sysrel();
-                            ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
-                                                       static_cast<unsigned>(c));
-                            if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                        }
-                    }
+                    const int wg_id = static_cast<int>(item.get_group_linear_id());
+                    const int dst_rdma = wg_id / num_qp_ch;
+                    const int c = wg_id % num_qp_ch;
+                    if (dst_rdma == my_rdma_rank) return;  // local node: no RDMA
+                    auto* region = rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes;
+                    const int count = reinterpret_cast<int*>(region + rdma_count_offset)[0];  // stashed by FC5b
+                    const int dst_pe = dst_rdma * num_nvl_ranks + nvl_rank;
+                    auto* dst_flag = reinterpret_cast<long*>(
+                        rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes + rdma_flag_offset);
+                    // Channel c on its OWN work-group/qp: quiet qp c (flush FC5b2's chunk-c
+                    // doorbell) then post the tail AMO on qp c (every flag carries -count-1).
+                    // Receiver waits for all num_qp_ch flags.
+                    ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    lsc_fence_sysrel();
+                    ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
+                                               static_cast<unsigned>(c));
+                    if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
                 });
         });
         if (wait_each) queue.wait();
@@ -3643,6 +3782,7 @@ void combine_nvl_rdma(DataType type,
         // body is IDENTICAL to the serial FwdWrite (byte-identical output). Self
         // RDMA rank has no flag (count written locally by FC5b) -> read directly.
         queue.submit([&](sycl::handler& cgh) {
+            const int dbgR = kDbgReduce;
             cgh.parallel_for<FaithfulCombineFwdWriteKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) {
@@ -3698,11 +3838,19 @@ void combine_nvl_rdma(DataType type,
                             for (int c = 0; c < num_qp_ch; ++c) {
                                 long raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
                                 for (uint64_t spins = 0; raw == 0 && spins < rdma_poll_cap; ++spins) {
-                                    if ((spins & 0x3FFF) == 0) {
-                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                                    }
+                                    // GUARANTEED-uncached low-word probe (see dispatch F-K4 and
+                                    // internode_probe_flag_lo): the hint-based uc_load can read a
+                                    // stale cached 0 because the flag is zeroed in-place on this
+                                    // GPU just before polling (no LL-style parity double-buffer),
+                                    // leaving its line hot in L1/L3 and incoherent with the NIC's
+                                    // P2P AMO write. lsc_load.ugm.uc.uc forces L1+L3 uncached so
+                                    // the NIC write is seen within microseconds WITHOUT a per-spin
+                                    // system fence (which would run for seconds and trip the 5 s
+                                    // ccs watchdog). Re-read the full 64-bit value fenced on hit.
                                     visa_spin_hint();
-                                    raw = internode_read_flag64(rdma_flag + c, rdma_flag_lsc_mode);
+                                    if (internode_probe_flag_lo(rdma_flag + c) != 0) {
+                                        raw = internode_read_flag64(rdma_flag + c, 2);
+                                    }
                                 }
                                 if (c == 0) raw0 = raw;
                             }
@@ -3717,10 +3865,11 @@ void combine_nvl_rdma(DataType type,
                                              // loads observe the NIC-delivered RDMA payload
 
                         for (int i = 0; i < count; ++i) {
-                            // Cached read (coherent after lsc_fence_sysacq, same as the payload
-                            // copy below): the former per-token uncached uc_load ran redundantly
-                            // on every work-item.
-                            const int target_nvl = rdma_src_nvl[i];
+                            // Uncached read of the NIC-written metadata: rdma_src_nvl is
+                            // delivered by the peer NIC via PCIe P2P into this GPU's HBM and is
+                            // NOT coherent with the GPU cache, so a plain cached load can return
+                            // a stale L2 line (same reason the payload copy below is uncached).
+                            const int target_nvl = uc_load(&rdma_src_nvl[i]);
                             if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
                                 continue;
                             }
@@ -3733,9 +3882,21 @@ void combine_nvl_rdma(DataType type,
                                 continue;
                             }
                             const int dst_idx = peer_offsets[target_nvl]++;
-                            // int4-vectorized copy of the row (post-invalidate cached loads),
-                            // replacing a per-element uncached uc_load loop.
-                            faithful_coop_copy(reinterpret_cast<uint8_t*>(&fwd_x[dst_idx * hidden]),
+                            // Re-invalidate the GPU cache immediately before EACH row's uncached
+                            // copy. The single pre-loop lsc_fence_sysacq can be defeated on a
+                            // heavily-loaded rank if a stale rdma_x L2 line (populated by a prior
+                            // dispatch/combine iteration that touched the reused symmetric receive
+                            // region) survives to when the hint-based uc_load is DROPPED by IGC on
+                            // some SIMD lane -> that lane reads the stale line, corrupting a subset
+                            // of the row (deterministic on the racing rank). A per-row invalidate
+                            // (no group_barrier -> no extra cross-WG latency) guarantees no stale
+                            // line precedes the copy.
+                            lsc_fence_sysacq();
+                            // UNCACHED-source cooperative copy of the row. rdma_x is NIC-delivered
+                            // (PCIe-P2P, not cache-coherent); read it uncached. fwd_x is a local
+                            // same-GPU buffer -> plain cached store (coherent with the reduce's
+                            // cached read).
+                            faithful_coop_copy_ucsrc(reinterpret_cast<uint8_t*>(&fwd_x[dst_idx * hidden]),
                                                reinterpret_cast<const uint8_t*>(&rdma_x[i * hidden]),
                                                static_cast<size_t>(hidden) * sizeof(dtype_t),
                                                local_id, kComputeWGSize);
@@ -3746,6 +3907,31 @@ void combine_nvl_rdma(DataType type,
                             }
                             if (local_id == 0) {
                                 fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), target_nvl};
+                            }
+                            if (dbgR && my_rdma_rank == 1 && src_rdma == 0) {
+                                sycl::group_barrier(group);
+                                if (local_id == 0) {
+                                    const uint16_t* sr = reinterpret_cast<const uint16_t*>(&rdma_x[i * hidden]);
+                                    const uint16_t* dr = reinterpret_cast<const uint16_t*>(&fwd_x[dst_idx * hidden]);
+                                    unsigned sf = 0, df = 0;
+                                    for (int h = 0; h < hidden; ++h) {
+                                        sf ^= (static_cast<unsigned>(deep_ep::uc_load(&sr[h])) << (h & 15));
+                                        df ^= (static_cast<unsigned>(dr[h]) << (h & 15));  // CACHED read (reduce's view)
+                                    }
+                                    sycl::ext::oneapi::experimental::printf(
+                                        "[FC6 nvl=%d i=%d dst=%d rp=%d rdmafold=%u fwdfold=%u]\n",
+                                        nvl_rank, i, dst_idx, uc_load(&rdma_recv_pos[i]), sf, df);
+                                    if (i == 0) {
+                                        sycl::ext::oneapi::experimental::printf(
+                                            "[FC6PTR nvl=%d selfbuf=%llu fwdx=%llu rdmax=%llu rdmabase=%llu]\n",
+                                            nvl_rank,
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(buffer_ptrs_gpu[nvl_rank]),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(fwd_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_x),
+                                            (unsigned long long)reinterpret_cast<uintptr_t>(rdma_base));
+                                    }
+                                }
+                                sycl::group_barrier(group);
                             }
                         }
 
@@ -3767,289 +3953,71 @@ void combine_nvl_rdma(DataType type,
         });
         if (wait_each) queue.wait();
         dbg_stage("FC6-FwdWrite");
-    } else {
+    }
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedCombineRdmaPushKernel<dtype_t>>(
-            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
-                auto group = item.get_group();
-                const int local_id = static_cast<int>(item.get_local_id(0));
-                // NOTE: do NOT early-return for nvl_rank != 0; every PE must reach
-                // ishmemx_barrier_all_work_group below (it is a cross-PE collective
-                // and would hang waiting for non-puter PEs otherwise).
-                const bool is_puter = (nvl_rank == 0);
-                // Per-peer offset helpers (same logic as NVL accumulate)
-                auto peer_meta_off = [=](int peer_n) -> size_t {
-                    size_t off = layout.send_x_offset + static_cast<size_t>(peer_n) * row_bytes;
-                    return (off + alignof(SourceMeta) - 1) / alignof(SourceMeta) * alignof(SourceMeta);
-                };
-                auto peer_topk_off = [=](int peer_n) -> size_t {
-                    size_t off = peer_meta_off(peer_n) + static_cast<size_t>(peer_n) * sizeof(SourceMeta);
-                    off = (off + alignof(topk_idx_t) - 1) / alignof(topk_idx_t) * alignof(topk_idx_t);
-                    off += static_cast<size_t>(peer_n) * num_topk * sizeof(topk_idx_t);
-                    return (off + alignof(float) - 1) / alignof(float) * alignof(float);
-                };
-
-                // Stamp my receive regions' count with a sentinel BEFORE the
-                // exchange so CombineFwdWrite can spin until the real count
-                // lands (RDMA-Write-to-VRAM visibility defence-in-depth, same
-                // as the dispatch RdmaPut path).
-                constexpr int kRdmaCountSentinel = -424242;
-                if (is_puter && local_id == 0) {
-                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                        if (src_rdma == my_rdma_rank) continue;
-                        auto* rcv = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                        uc_store(reinterpret_cast<int*>(rcv + rdma_count_offset), kRdmaCountSentinel);
-                    }
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                }
-                sycl::group_barrier(group);
-                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
-                sycl::group_barrier(group);
-
-                if (is_puter) {
-                    for (int dst_rdma = 0; dst_rdma < num_rdma_ranks; ++dst_rdma) {
-                    // For the self RDMA rank, gather directly into this rank's
-                    // LOCAL recv region (rdma_base + my_rdma_rank*region) with no
-                    // RDMA put, so CombineFwdWrite forwards these same-node tokens
-                    // to the correct NVL peer. This mirrors the CUDA combine,
-                    // which uses the recv_buffer (not the send_buffer) when
-                    // dst_rdma_rank == rdma_rank. Without it, a token whose
-                    // combine head lands on the self RDMA rank but a *different*
-                    // NVL peer (the off-diagonal ranks where nvl_rank != rdma_rank)
-                    // is serviced by neither the NVL-local path nor the RDMA
-                    // forward path and reduces to zero.
-                    const bool is_self_rdma = (dst_rdma == my_rdma_rank);
-                    auto* region = is_self_rdma
-                        ? (rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes)
-                        : (rdma_base + rdma_send_base + static_cast<size_t>(dst_rdma) * rdma_region_bytes);
-                    auto* rdma_x = reinterpret_cast<dtype_t*>(region);
-                    auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
-                    auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
-                    auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
-                    auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                    if (local_id == 0) {
-                        *rdma_count = 0;
-                    }
-                    sycl::group_barrier(group);
-
-                    {
-                        // Cooperative gather across the whole work-group. Every
-                        // work-item walks the same loop and computes the SAME
-                        // `count` sequence (all inputs are identical uncached
-                        // reads of the NVL peers' packed buffers), so no
-                        // broadcast is needed. Only the bulk hidden/topk copy is
-                        // split across work-items by local_id; scalar metadata
-                        // and the count are written by WI 0. This replaces the
-                        // former single-work-item, per-element uncached copy
-                        // (the combine hot path).
-                        //
-                        // Acquire fence + uncached reads: the NVL peers' packed
-                        // combine buffers are IPC-mapped remote GPU VRAM written
-                        // in the Pack stage. Cached/reordered cross-device reads
-                        // here intermittently miss a peer's freshly-packed token
-                        // (leader reads peer != nvl_rank), dropping it from the
-                        // forward and yielding combined==0 for that token.
-                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                        int count = 0;
-                        for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                            auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                            auto* peer_count_ptr = reinterpret_cast<int*>(peer_buf + layout.count_offset);
-                            auto* peer_x = reinterpret_cast<dtype_t*>(peer_buf + layout.send_x_offset);
-                            const int peer_count = uc_load(peer_count_ptr);
-                            auto* peer_meta = reinterpret_cast<SourceMeta*>(peer_buf + peer_meta_off(peer_count));
-                            auto* peer_topk = reinterpret_cast<float*>(peer_buf + peer_topk_off(peer_count));
-                            for (int t = 0; t < peer_count; ++t) {
-                                if (uc_load(&peer_meta[t].src_rdma_rank) != dst_rdma) {
-                                    continue;
-                                }
-                                for (int h = local_id; h < hidden; h += kIshmemWGSize) {
-                                    rdma_x[count * hidden + h] = uc_load(&peer_x[t * hidden + h]);
-                                }
-                                if (combined_topk_weights != nullptr) {
-                                    for (int k = local_id; k < num_topk; k += kIshmemWGSize) {
-                                        rdma_wt[count * num_topk + k] = uc_load(&peer_topk[t * num_topk + k]);
-                                    }
-                                }
-                                if (local_id == 0) {
-                                    rdma_recv_pos[count] = uc_load(&peer_meta[t].is_token_in_nvl_rank_bits);
-                                    rdma_src_nvl[count] = uc_load(&peer_meta[t].src_nvl_rank);
-                                }
-                                ++count;
-                            }
-                        }
-                        // Ensure every work-item's bulk writes to the region are
-                        // complete and visible within the group before WI 0
-                        // publishes the count / issues the self-region release.
-                        sycl::group_barrier(group);
-                        if (local_id == 0) {
-                            *rdma_count = count;
-                            if (is_self_rdma) {
-                                // Publish the locally-gathered self region before
-                                // the forward kernel reads it (paired with
-                                // FwdWrite's acquire fence). No RDMA put for self.
-                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                            }
-                        }
-                    }
-                    sycl::group_barrier(group);
-
-                    if (!is_self_rdma) {
-                        const int dst_pe = dst_rdma * num_nvl_ranks;
-                        auto* dst_region = rdma_base + static_cast<size_t>(my_rdma_rank) * rdma_region_bytes;
-                        // Split-put for landing-race elimination (see dispatch
-                        // RdmaPut for full rationale). Two sequential blocking
-                        // puts on the same QP: data first, then count alone.
-                        // Kept blocking (matching dispatch site) — NBI on this
-                        // hot path causes intermittent NIC DEVICE_LOST.
-                        if (local_id == 0) {
-                            ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
-                            ishmem_putmem(dst_region + rdma_count_offset,
-                                          region + rdma_count_offset,
-                                          sizeof(int), dst_pe);
-                        }
-                        sycl::group_barrier(group);
-                    }
-                }
-                }  // end if (is_puter)
-                // Cross-PE sync to drain pending RDMA puts and make them visible at
-                // every PE before FWD WRITE reads from the receive regions.
-                // Every PE (including nvl_rank != 0) must reach this collective.
-                sycl::group_barrier(group);
-                ishmemx_barrier_all_work_group(group);  // work-group barrier: single-WI ishmem_barrier_all() spins on host-proxy progress while host is parked in queue.wait() (cold-QP hang); see notify kernel
-                sycl::group_barrier(group);
-            });
-    });
-    if (wait_each) queue.wait();
-    dbg_stage("5-RdmaPush");
-
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedCombineFwdWriteKernel<dtype_t>>(
-            sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)), [=](sycl::nd_item<1> item) {
-            auto group = item.get_group();
-            const int local_id = static_cast<int>(item.get_local_id(0));
-            if (nvl_rank != 0) {
-                return;
-            }
-            // Acquire fence: order reads of the NIC-delivered RDMA receive
-            // regions after the iSHMEM barrier (RDMA-half visibility race).
-            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-            int peer_offsets[NUM_MAX_NVL_PEERS] = {0};
-            if (local_id == 0) {
-                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                    auto* fwd_base = peer_buf + fwd_base_offset;
-                    auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                    for (int r = 0; r < num_rdma_ranks; ++r) {
-                        fwd_counts[r] = 0;
-                    }
-                }
-            }
-            sycl::group_barrier(group);
-
-            for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                // NOTE: src_rdma == my_rdma_rank is NOT skipped. Its recv region
-                // was populated locally by RdmaPush (no RDMA put), so the same
-                // forward-to-NVL-peer logic delivers same-node tokens whose
-                // combine head lands on a different NVL peer. Skipping it drops
-                // those tokens on the off-diagonal ranks.
-                int before[NUM_MAX_NVL_PEERS] = {0};
-                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                    before[peer] = peer_offsets[peer];
-                }
-
-                auto* region = rdma_base + static_cast<size_t>(src_rdma) * rdma_region_bytes;
-                auto* rdma_x = reinterpret_cast<dtype_t*>(region);
-                auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
-                auto* rdma_recv_pos = reinterpret_cast<int*>(region + rdma_recv_pos_offset);
-                auto* rdma_src_nvl = reinterpret_cast<int*>(region + rdma_src_nvl_offset);
-                auto* rdma_count = reinterpret_cast<int*>(region + rdma_count_offset);
-                // Bounded UC spin until the NIC-delivered count replaces the
-                // sentinel (RDMA-Write-to-VRAM landing race; same as dispatch).
-                // Every work-item reads the same deterministic UC value so the
-                // token loop bound stays identical across the work-group.
-                constexpr int kRdmaCountSentinel = -424242;
-                constexpr unsigned long kRdmaSpinLimit = 2000000ul;
-                int count = uc_load(rdma_count);
-                for (unsigned long spins = 0; count == kRdmaCountSentinel && spins < kRdmaSpinLimit; ++spins) {
-                    if ((spins & 0x3FFF) == 0) {
-                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                    }
-                    count = uc_load(rdma_count);
-                }
-                if (count == kRdmaCountSentinel) {
-                    count = 0;  // dropped write: degrade gracefully, no hang
-                }
-                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                for (int i = 0; i < count; ++i) {
-                    const int target_nvl = uc_load(&rdma_src_nvl[i]);
-                    if (target_nvl < 0 || target_nvl >= num_nvl_ranks) {
-                        continue;
-                    }
-                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[target_nvl]);
-                    auto* fwd_base = peer_buf + fwd_base_offset;
-                    auto* fwd_x = reinterpret_cast<dtype_t*>(fwd_base + fwd_layout.fwd_x_offset);
-                    auto* fwd_meta = reinterpret_cast<SourceMeta*>(fwd_base + fwd_layout.fwd_meta_offset);
-                    auto* fwd_topk = reinterpret_cast<float*>(fwd_base + fwd_layout.fwd_topk_weights_offset);
-                    // Guard against overrunning the target peer's forward buffer
-                    // (capacity == max_fwd_tokens). Overrunning would write OOB
-                    // into an adjacent peer's IPC-mapped VRAM.
-                    if (peer_offsets[target_nvl] >= max_fwd_tokens) {
-                        continue;
-                    }
-                    const int dst_idx = peer_offsets[target_nvl]++;
-                    // Bulk hidden/topk copy parallelized across the work-group;
-                    // scalar metadata written by work-item 0.
-                    for (int h = local_id; h < hidden; h += kIshmemWGSize) {
-                        fwd_x[dst_idx * hidden + h] = uc_load(&rdma_x[i * hidden + h]);
-                    }
-                    if (combined_topk_weights != nullptr) {
-                        for (int k = local_id; k < num_topk; k += kIshmemWGSize) {
-                            fwd_topk[dst_idx * num_topk + k] = uc_load(&rdma_wt[i * num_topk + k]);
-                        }
-                    }
-                    if (local_id == 0) {
-                        fwd_meta[dst_idx] = SourceMeta{src_rdma, uc_load(&rdma_recv_pos[i]), target_nvl};
-                    }
-                }
-
-                // Flush forwarded payload writes to the remote NVL peers
-                // (IPC-mapped GPU memory across PCIe) BEFORE publishing the
-                // fwd_counts signal (CUDA st_release_sys_global equivalent).
-                // Every work-item flushes its own payload writes to system
-                // scope; WI 0's fence alone would not flush the others' writes.
-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                sycl::group_barrier(group);
-                if (local_id == 0) {
-                    for (int peer = 0; peer < num_nvl_ranks; ++peer) {
-                        auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
-                        auto* fwd_base = peer_buf + fwd_base_offset;
-                        auto* fwd_counts = reinterpret_cast<int*>(fwd_base + fwd_layout.fwd_count_offset);
-                        fwd_counts[src_rdma] = peer_offsets[peer] - before[peer];
-                    }
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                }
-            }
-            // Final release fence so all payload + count writes are flushed
-            // across PCIe to the remote peers before the forward barrier runs.
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-            sycl::group_barrier(group);
-        });
-    });
-    if (wait_each) queue.wait();
-    dbg_stage("6-FwdWrite");
-    }  // end else (serial RdmaPush + FwdWrite; faithful path handled above)
-
+    // ---- FC6.5 FwdBarrier: synchronize all ranks. All FC6 writes are complete.
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombineFwdBarrierKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item); });
+            [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
     });
     if (wait_each) queue.wait();
     dbg_stage("7-FwdBarrier");
 
+    // ---- FC7: NVL data exchange (after barrier). Each rank copies remote
+    // peer's fwd data to its own buffer so reduce sees ALL contributions.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<CombineNvlExchangeDataKernel<dtype_t>>(
+            sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
+            [=](sycl::nd_item<1> item) {
+                const int local_id = static_cast<int>(item.get_local_id(0));
+                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* my_fwd_base = my_buf + fwd_base_offset;
+                auto* my_fwd_x = reinterpret_cast<dtype_t*>(my_fwd_base + fwd_layout.fwd_x_offset);
+                auto* my_fwd_meta = reinterpret_cast<SourceMeta*>(my_fwd_base + fwd_layout.fwd_meta_offset);
+                auto* my_fwd_counts = reinterpret_cast<int*>(my_fwd_base + fwd_layout.fwd_count_offset);
+                auto* my_fwd_topk = reinterpret_cast<float*>(my_fwd_base + fwd_layout.fwd_topk_weights_offset);
+                for (int peer = 0; peer < num_nvl_ranks; ++peer) {
+                    if (peer == nvl_rank) continue;
+                    auto* peer_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[peer]);
+                    auto* peer_fwd_base = peer_buf + fwd_base_offset;
+                    auto* peer_fwd_x = reinterpret_cast<dtype_t*>(peer_fwd_base + fwd_layout.fwd_x_offset);
+                    auto* peer_fwd_meta = reinterpret_cast<SourceMeta*>(peer_fwd_base + fwd_layout.fwd_meta_offset);
+                    auto* peer_fwd_counts = reinterpret_cast<int*>(peer_fwd_base + fwd_layout.fwd_count_offset);
+                    auto* peer_fwd_topk = reinterpret_cast<float*>(peer_fwd_base + fwd_layout.fwd_topk_weights_offset);
+                    for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
+                        if (src_rdma == my_rdma_rank) continue;
+                        int peer_count = peer_fwd_counts[src_rdma];
+                        if (peer_count <= 0) continue;
+                        if (peer_count > max_fwd_tokens) peer_count = max_fwd_tokens;
+                        const int my_base = my_fwd_counts[src_rdma];
+                        for (int i = local_id; i < peer_count; i += kComputeWGSize) {
+                            const int dst_idx = my_base + i;
+                            if (dst_idx >= max_fwd_tokens) continue;
+                            faithful_coop_copy_ucsrc(reinterpret_cast<uint8_t*>(&my_fwd_x[dst_idx * hidden]),
+                                               reinterpret_cast<const uint8_t*>(&peer_fwd_x[i * hidden]),
+                                               static_cast<size_t>(hidden) * sizeof(dtype_t),
+                                               local_id, kComputeWGSize);
+                            if (local_id == 0) {
+                                my_fwd_meta[dst_idx] = peer_fwd_meta[i];
+                                if (num_topk > 0) {
+                                    for (int k = 0; k < num_topk; ++k)
+                                        my_fwd_topk[dst_idx * num_topk + k] = peer_fwd_topk[i * num_topk + k];
+                                }
+                            }
+                        }
+                        if (local_id == 0) my_fwd_counts[src_rdma] += peer_count;
+                    }
+                }
+                sycl::group_barrier(item.get_group());
+            });
+    });
+    if (wait_each) queue.wait();
+    dbg_stage("FC7-NvlExchange");
+
     queue.submit([&](sycl::handler& cgh) {
         const size_t rd_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
+        const int dbgR = kDbgReduce;
         cgh.parallel_for<CombinedCombineReduceKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(rd_groups * kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
             const int local_id = static_cast<int>(item.get_local_id(0));
@@ -4095,6 +4063,24 @@ void combine_nvl_rdma(DataType type,
                     }
                 }
                 if (is_first) {
+                    if (dbgR && local_id == 0 && my_rdma_rank == 1 && nvl_rank == 0) {
+                        int nmatch = 0;
+                        unsigned f0 = 0, f1 = 0;
+                        int rp0 = -999, rp1 = -999;
+                        for (int i = 0; i < count; ++i) {
+                            const int idx = fwd_offset + i;
+                            if (fwd_meta[idx].is_token_in_nvl_rank_bits != recv_pos_target) continue;
+                            const uint16_t* row = reinterpret_cast<const uint16_t*>(&fwd_x[idx * hidden]);
+                            unsigned fold = 0;
+                            for (int h = 0; h < hidden; ++h) fold ^= (static_cast<unsigned>(row[h]) << (h & 15));
+                            if (nmatch == 0) { f0 = fold; rp0 = idx; }
+                            else if (nmatch == 1) { f1 = fold; rp1 = idx; }
+                            ++nmatch;
+                        }
+                        sycl::ext::oneapi::experimental::printf(
+                            "[RED2 ct=%d src=%d cnt=%d rpt=%d nm=%d i0=%d f0=%u i1=%d f1=%u]\n",
+                            ct, src_rdma, count, recv_pos_target, nmatch, rp0, f0, rp1, f1);
+                    }
                     for (int i = 0; i < count; ++i) {
                         const int idx = fwd_offset + i;
                         if (fwd_meta[idx].is_token_in_nvl_rank_bits != recv_pos_target) {

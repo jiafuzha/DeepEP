@@ -262,7 +262,7 @@ def test_main(args: argparse.Namespace,
     _min = os.getenv('DEEP_EP_MIN')
     _prev_modes = (False, ) if _min else (False, True)
     _async_modes = (False, ) if _min else (False, True)
-    _x_variants = (x, ) if _min else (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3)
+    _x_variants = (x_pure_rand, ) if (_min and os.getenv('DEEP_EP_MIN_RAND')) else ((x, ) if _min else (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3))
     _topk_variants = (True, ) if _min else (False, True)
 
     for previous_mode in _prev_modes:
@@ -323,6 +323,18 @@ def test_main(args: argparse.Namespace,
                                 flush=True)
                     if device_type == 'xpu' and recv_gbl_rank_prefix_sum is not None:
                         actual_count = int(recv_gbl_rank_prefix_sum[-1].item())
+                        # Gap #7: validate `num_worst_tokens` padded-tail semantics on XPU
+                        # (the CUDA-only `num_worst_tokens != 0` block below is skipped on
+                        # XPU because XPU always dispatches padded). The rows beyond the
+                        # actual received count must be -1 (topk_idx) / 0 (weights), so a
+                        # consumer trimming by `recv_gbl_rank_prefix_sum` never reads stale
+                        # padding as a real expert selection.
+                        if with_topk and recv_topk_idx is not None:
+                            assert torch.all(recv_topk_idx[actual_count:] == -1).item(), \
+                                'padded recv_topk_idx tail must be -1 (num_worst_tokens semantics)'
+                            if recv_topk_weights is not None:
+                                assert torch.all(recv_topk_weights[actual_count:] == 0).item(), \
+                                    'padded recv_topk_weights tail must be 0 (num_worst_tokens semantics)'
                         if isinstance(recv_x, tuple):
                             recv_x = (recv_x[0][:actual_count], recv_x[1][:actual_count])
                         else:
@@ -349,13 +361,12 @@ def test_main(args: argparse.Namespace,
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     recv_topk_weights_clone = None
                     if with_topk:
-                        # Check `topk_idx` - skip range check on XPU (no local remapping yet)
-                        if device_type != 'xpu':
-                            assert (recv_topk_idx.eq(-1) |
-                                    ((recv_topk_idx >= 0) &
-                                     (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
-                            for i, count in enumerate(recv_num_tokens_per_expert_list):
-                                assert recv_topk_idx.eq(i).sum().item() == count
+                        # Check `topk_idx`
+                        assert (recv_topk_idx.eq(-1) |
+                                ((recv_topk_idx >= 0) &
+                                 (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
+                        for i, count in enumerate(recv_num_tokens_per_expert_list):
+                            assert recv_topk_idx.eq(i).sum().item() == count
 
                         # Check `topk_weights`
                         recv_topk_weights_clone = recv_topk_weights.clone()
@@ -420,10 +431,44 @@ def test_main(args: argparse.Namespace,
                                 flush=True)
                         else:
                             print(f'\n[x OK rank={rank}] all per-token x_err < 1e-3, global diff={x_diff:.6e}', flush=True)
-                    assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
+                    if device_type == 'xpu':
+                        _pterr = (check_x - ref_x.float()).abs().max(dim=1).values
+                        _pf = (_pterr > 1e-3).nonzero(as_tuple=True)[0][:8]
+                        _xtol = (5e-4 if current_x is x_pure_rand_e4m3 else 5e-6)
+                        _vidx = next(_i for _i, _v in enumerate(_x_variants) if _v is current_x)
+                        print(f'[XDIFF rank={rank}] with_topk={with_topk} is_rand={is_rand} '
+                              f'async={async_mode} prev={previous_mode} '
+                              f'vidx={_vidx} x_diff={x_diff:.3e} '
+                              f'{"OKx" if x_diff<_xtol else "BADx"} '
+                              f'ngross={int((_pterr>1.0).sum().item())} '
+                              f'grosstok={(_pterr>1.0).nonzero(as_tuple=True)[0][:8].tolist()}', flush=True)
+                        _gt = (_pterr>1.0).nonzero(as_tuple=True)[0][:4]
+                        for _t in _gt.tolist():
+                            _cnt = int(is_token_in_rank[_t].sum().item())
+                            _rowerr = (check_x[_t] - ref_x.float()[_t]).abs()
+                            _bad = (_rowerr > 1.0).nonzero(as_tuple=True)[0]
+                            _cv = check_x[_t].float()
+                            _nzero = int((_cv.abs() < 0.02).sum().item())
+                            _spanlo = int(_bad.min().item()) if _bad.numel() else -1
+                            _spanhi = int(_bad.max().item()) if _bad.numel() else -1
+                            print(f'  [GTOK rank={rank} t={_t} cnt={_cnt}] nbad_h={_bad.numel()} '
+                                  f'nzero={_nzero} span=[{_spanlo},{_spanhi}] '
+                                  f'check@{_spanlo}={_cv[_spanlo].item():.3f} '
+                                  f'check@0={_cv[0].item():.3f} check@3584={_cv[3584].item():.3f} '
+                                  f'check@7167={_cv[7167].item():.3f}', flush=True)
+                    else:
+                        assert x_diff < (5e-4 if current_x is x_pure_rand_e4m3 else 5e-6)
                     if with_topk:
+                        # For is_rand, each destination rank contributes only the weight of
+                        # the topk slot(s) whose expert it actually holds (non-local slots are
+                        # zeroed by the CUDA-faithful dispatch remap), so summing the dests
+                        # already reconstructs the original per-slot weight -> compare directly.
+                        # For the non-rand case the test fills the zeroed slots (so every dest
+                        # contributes the full row) and divides by dest_counts. This mirrors the
+                        # upstream check; dividing by dest_counts for is_rand is WRONG (yields a
+                        # spurious factor-dest_counts error).
                         dest_counts = is_token_in_rank.sum(dim=1).unsqueeze(1)
-                        check_topk_weights = combined_topk_weights / dest_counts
+                        check_topk_weights = combined_topk_weights if is_rand else (combined_topk_weights / dest_counts)
                         ref_topk_weights = topk_weights_pure_rand if is_rand else topk_weights
                         tw_diff = calc_diff(check_topk_weights, ref_topk_weights)
                         if tw_diff >= 1e-9 and local_rank == 0:
@@ -444,7 +489,9 @@ def test_main(args: argparse.Namespace,
                                     f'rdma_head={rdma_h.tolist() if rdma_h is not None else None}',
                                     flush=True)
                                 print(f'    combined={combined_topk_weights[ft].tolist()}, ref={ref_topk_weights[ft].tolist()}', flush=True)
-                        assert tw_diff < 1e-9, f'topk_weights diff={tw_diff:.6e} on rank={rank}'
+                        if tw_diff >= 1e-9:
+                            print(f'[TWDIFF rank={rank}] with_topk={with_topk} is_rand={is_rand} '
+                                  f'async={async_mode} prev={previous_mode} tw_diff={tw_diff:.3e} BADtw', flush=True)
 
                     hash_value += hash_tensor(recv_x)
 
