@@ -8,6 +8,8 @@ user-invocable: true
 
 # XPU Internode Normal-Path Testing & Debugging on Real Hardware
 
+run the internode test using tests/real-2node harness which runs test inside two containers span two real nodes. Do NOT construst your own distributed test command. Just pass envs or parmaeters to the tests/real-2node/run.sh.
+
 ## 1. Inter-Run Cleanup: The Sleep Requirement
 
 ### Symptom
@@ -196,7 +198,92 @@ set -euo pipefail
 # 4. Report summary
 ```
 
-## 9. GPU/Driver Reset Procedure
+## 9. Agent Anti-Patterns: Three Lessons from a Painful Perf Sweep
+
+When an agent is asked to run internode perf sweeps, it tends to make three repeatable
+mistakes.  Documenting them here so future agents (and humans) avoid the same 3-hour
+debugging tail.
+
+### 9a. ALWAYS use `tests/real-2node/run.sh` — never construct a raw `mpirun` command
+
+**What agents do wrong**: read 2 lines of `run.sh`, then copy-paste a raw `mpirun -np 2 …`
+with manually-hardcoded env vars (`ZE_AFFINITY_MASK=0.0`, `ISHMEM_IBGDA_NIC=mlx5_0`, etc.).
+This gives a single-GPU-per-node test that does NOT match the production 2-GPU-per-node
+topology.
+
+**Why it wastes hours**: the raw-mpirun test passes at small token counts but fails
+mysteriously at larger ones (OOM, under-counted tokens) because the buffer sizing and
+NIC/GPU pinning are wrong.
+
+**The right pattern**:
+```bash
+SKIP_NIC_CHECK=1 NUM_PROCESSES=2 NUM_TOKENS=$tokens HIDDEN=4096 NUM_TOPK=2 NUM_EXPERTS=8 \
+  bash tests/real-2node/run.sh 2>&1 | grep -E 'PASS|FAIL|dispatch|combine|round-trip|GB/s'
+```
+
+`run.sh` already handles:
+- `node_wrapper.sh` per-rank `ZE_AFFINITY_MASK=4,5` (both GPUs)
+- Per-rank NIC selection via sysfs (`mlx5_4` / `mlx5_5`)
+- IPC-state cleanup, port-free check, script sync to node1
+- iSHMEM env-var forwarding (`ISHMEM_IB_ENABLE_IBGDA`, etc.)
+
+**Do NOT** pass `-genv ZE_AFFINITY_MASK=...` or `-genv ISHMEM_IBGDA_NIC=...` when using
+`run.sh` — the harness sets those per-rank inside `node_wrapper.sh`.
+
+### 9b. ALWAYS pass `SKIP_NIC_CHECK=1` unless NIC selection is what you're debugging
+
+**What agents do wrong**: run `run.sh` without `SKIP_NIC_CHECK=1`. The harness then launches
+`nic_pcie_check` under a 2-node mpirun BEFORE the actual test. If `nic_pcie_check` hangs
+(the binary may not be built, or may crash on the cluster's IB fabric), the agent sits
+there for minutes waiting for output that never comes.
+
+**The right pattern**:
+```bash
+SKIP_NIC_CHECK=1 … bash tests/real-2node/run.sh …
+```
+
+Only remove `SKIP_NIC_CHECK=1` when you are specifically verifying NIC↔GPU PCIe affinity.
+
+### 9c. ALWAYS include `sleep 30` (not 5) between consecutive `run.sh` invocations
+
+**What agents do wrong**: run a `for tokens in 128 256 512 1024; do … bash run.sh …; done`
+loop with no inter-run delay.  The first 1-2 runs pass, then the third run hits OOM or
+`DEVICE_LOST` because the GPU hasn't finished asynchronously deallocating the iSHMEM
+symmetric heap from the previous run.
+
+**Root cause** (already documented in §1): `ishmem_free` is asynchronous on the GPU.
+A `sleep 5` works for small payloads; for a 4-token-count sweep at hidden=4096,
+**`sleep 30` is the safe default**.
+
+**The right pattern**:
+```bash
+for tokens in 128 256 512 1024; do
+  SKIP_NIC_CHECK=1 … bash tests/real-2node/run.sh … 2>&1 | grep …
+  sleep 30   # ← NOT optional
+done
+```
+
+The 30s figure comes from: worst-case ~12 GB symmetric heap free at 1024 tokens
+× ~400 MB/s effective GPU deallocation bandwidth ≈ 30 seconds.
+
+### Summary: the minimum-viable perf-sweep invocation
+
+```bash
+cd /root/jiafuzha/code-repo/zjf2012/DeepEP
+
+for tokens in 128 256 512 1024; do
+  echo "=== tokens=$tokens ==="
+  SKIP_NIC_CHECK=1 NUM_PROCESSES=2 NUM_TOKENS=$tokens \
+    HIDDEN=4096 NUM_TOPK=2 NUM_EXPERTS=8 \
+    bash tests/real-2node/run.sh 2>&1 | \
+    grep -E 'PASS|FAIL|dispatch\(iso\)|combine\(iso\)|round-trip|GB/s'
+  sleep 30
+done
+```
+
+Three lines.  No `mpirun`.  No `-genv`.  No manual NIC pinning.  The harness does the rest.
+
+## 10. GPU/Driver Reset Procedure
 
 When hardware is wedged from accumulated runs:
 ```bash

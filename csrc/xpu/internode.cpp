@@ -2032,18 +2032,21 @@ void dispatch_nvl_rdma(void* recv_x,
         // A full ishmem_quiet() blocks forever if an AMO completion is not reaped by the
         // IBGDA layer (leader-only, data-independent, surfaces on a later dispatch).
         queue.submit([&](sycl::handler& cgh) {
-            // GAP#8 P2/P3: CONCURRENT CHANNELS. Launch num_send_ch = num_qp_ch work-groups,
-            // one per provisioned QP (LL discipline: a UNIQUE qp per concurrent WG -> no
-            // cross-WG qp WQ sharing, mirrors internode_ll.cpp one-channel-per-WG). Each WG
-            // owns an even token sub-range [ch_t0,ch_t1) of [0,num_tokens) (same split as the
-            // notify-phase channel formula), compacts ITS range in parallel, and puts its rows
-            // on qp=ch. Each WG derives its own contiguous row offset `off` by counting the
-            // matching tokens BEFORE its range (a cheap redundant prefix scan) -> no cross-WG
-            // sync is needed and the compacted rows tile [0,total) in token order, BYTE-
-            // IDENTICAL to the former single-WG serial compaction. The receiver (F-K4) and the
-            // per-channel flag kernel (F-K3b) are therefore unchanged: they still read the
-            // contiguous [0,total) region after waiting for all num_qp_ch flags.
-            const int num_send_ch = num_qp_ch;
+            // GAP#8 + GAP#18: CUDA-CHANNEL TOKEN-RANGE PARALLELISM. Launch
+            // num_use_channels * num_qp_ch WGs: each (channel_id, qp) pair owns the
+            // intersection of the channel token range and a QP sub-range within it.
+            // Each WG derives its own contiguous row offset by scanning matching
+            // tokens in prior channels + prior QP sub-ranges. Rows tile [0, total)
+            // in token order. The receiver reads [0, total) after waiting for all
+            // num_qp_ch flags (per-QP AMO guarantees all channel payloads on that QP
+            // have landed, RC in-order).
+            //
+            // Cap channels to max(num_qp_ch, min(num_channels, num_tokens/4)) so each
+            // WG gets at least 4 tokens of work.
+            const int kMinTokensPerChannel = 4;
+            const int max_ch_by_tokens = std::max(1, num_tokens / kMinTokensPerChannel);
+            const int num_use_channels = std::max(num_qp_ch, std::min(num_channels, max_ch_by_tokens));
+            const int num_send_ch = num_use_channels * num_qp_ch;
             cgh.parallel_for<FaithfulDispatchRdmaSendKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_send_ch) * kComputeWGSize),
                                   sycl::range<1>(kComputeWGSize)),
@@ -2051,9 +2054,26 @@ void dispatch_nvl_rdma(void* recv_x,
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
-                    const int ch = static_cast<int>(item.get_group_linear_id());  // send channel == qp
-                    const int ch_t0 = static_cast<int>((static_cast<int64_t>(num_tokens) * ch) / num_send_ch);
-                    const int ch_t1 = static_cast<int>((static_cast<int64_t>(num_tokens) * (ch + 1)) / num_send_ch);
+                    const int linear = static_cast<int>(item.get_group_linear_id());
+                    // Each WG = (channel_id, qp) pair:
+                    //   channel_id in [0, num_use_channels) — CUDA-style token-range partition
+                    //   qp in [0, num_qp_ch) — QP stripe within that channel
+                    const int channel_id = linear / num_qp_ch;
+                    const int ch = linear % num_qp_ch;  // QP for warp-collective put
+                    // Channel token range [ch_start, ch_end), same as CUDA
+                    // get_channel_task_range(num_tokens, num_use_channels, channel_id)
+                    const int ch_tokens_per = num_tokens / num_use_channels;
+                    const int ch_rem = num_tokens % num_use_channels;
+                    const int ch_start = channel_id <= ch_rem
+                        ? (ch_tokens_per + 1) * channel_id
+                        : ch_tokens_per * channel_id + ch_rem;
+                    const int ch_end = channel_id < ch_rem
+                        ? ch_start + ch_tokens_per + 1
+                        : ch_start + ch_tokens_per;
+                    // QP sub-range within the channel
+                    const int ch_n = ch_end - ch_start;
+                    const int ch_t0 = ch_start + static_cast<int>((static_cast<int64_t>(ch_n) * ch) / num_qp_ch);
+                    const int ch_t1 = ch_start + static_cast<int>((static_cast<int64_t>(ch_n) * (ch + 1)) / num_qp_ch);
                     {  // per-GPU RDMA: every nvl_rank issues its own RDMA on its own NIC
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         lsc_fence_sysacq();
@@ -2085,20 +2105,30 @@ void dispatch_nvl_rdma(void* recv_x,
                             auto* rdma_wt = reinterpret_cast<float*>(region + rdma_topk_wt_offset);
                             auto* rdma_scales = reinterpret_cast<float*>(region + rdma_scales_offset);
 
-                            // WI0 derives this channel's row prefix `off` (matches in [0,ch_t0)),
-                            // its own token count `cnt` (matches in [ch_t0,ch_t1)) and — only on
-                            // channel 0 — the grand `total` (matches in [0,num_tokens)) stashed
-                            // for the flag kernel. Broadcast off/cnt so all lanes share the same
-                            // compaction bounds.
+                            // WI0 derives this WG's row prefix `off` (matches in [0, ch_t0)
+                            // spanning: all prior channels [0, ch_start) + current channel's
+                            // prior QP sub-ranges [ch_start, ch_t0)) and its own token count
+                            // `cnt` (matches in [ch_t0, ch_t1)). The first WG (channel 0, qp 0)
+                            // also computes the grand `total` (matches in [0, num_tokens))
+                            // stashed for the flag kernel.
                             int off = 0, cnt = 0, total = 0;
                             if (local_id == 0) {
-                                for (int t = 0; t < ch_t1; ++t) {
+                                // prior channels [0, ch_start)
+                                for (int t = 0; t < ch_start; ++t) {
+                                    if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) continue;
+                                    ++off;
+                                }
+                                // current channel: [ch_start, ch_t0) → prefix; [ch_t0, ch_t1) → cnt
+                                for (int t = ch_start; t < ch_t1; ++t) {
                                     if (((peer_rdma_bits[t] >> dst_rdma) & 1) == 0) continue;
                                     if (t < ch_t0) ++off; else ++cnt;
                                 }
-                                if (ch == 0) {
-                                    total = off + cnt;  // off==0 here
-                                    for (int t = ch_t1; t < num_tokens; ++t)
+                                // first WG computes grand total
+                                if (channel_id == 0 && ch == 0) {
+                                    total = off + cnt;
+                                    for (int t = ch_t1; t < ch_end; ++t)
+                                        if ((peer_rdma_bits[t] >> dst_rdma) & 1) ++total;
+                                    for (int t = ch_end; t < num_tokens; ++t)
                                         if ((peer_rdma_bits[t] >> dst_rdma) & 1) ++total;
                                 }
                             }
@@ -2197,7 +2227,7 @@ void dispatch_nvl_rdma(void* recv_x,
                             // Channel 0 stashes the grand token count for F-K3b's -count-1 flag.
                             // This slot is NOT transmitted (put lengths stop before it); it lives
                             // in the leader's own iSHMEM buffer and survives the kernel boundary.
-                            if (ch == 0 && local_id == 0) {
+                            if (channel_id == 0 && ch == 0 && local_id == 0) {
                                 reinterpret_cast<int*>(region + rdma_count_offset)[0] = total;
                             }
                             sycl::group_barrier(group);
