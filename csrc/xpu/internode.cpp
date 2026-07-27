@@ -1737,61 +1737,9 @@ void dispatch_nvl_rdma(void* recv_x,
     }();
     const bool wait_each = kDbgDispatch || !kFuseWaits;
     ddbg_stage("0-entry");
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedDispatchInitKernel>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-            const size_t linear = static_cast<size_t>(id[0]);
-            if (linear < total_recv_bytes) {
-                dst[linear] = 0;
-            }
-            if (linear < static_cast<size_t>(num_recv_tokens)) {
-                if (meta != nullptr) {
-                    meta[linear].src_rdma_rank = -1;
-                    meta[linear].is_token_in_nvl_rank_bits = 0;
-                    meta[linear].src_nvl_rank = -1;
-                }
-            }
-            if (linear < total_recv_topk && recv_topk_idx != nullptr) {
-                recv_topk_idx[linear] = -1;
-                recv_topk_weights[linear] = 0.0f;
-            }
-            if (linear < total_recv_scales && recv_x_scales != nullptr) {
-                recv_x_scales[linear] = 0.0f;
-            }
-            if (linear < total_send_rdma && send_rdma_head != nullptr) {
-                send_rdma_head[linear] = -1;
-            }
-            if (linear < total_send_nvl && send_nvl_head != nullptr) {
-                send_nvl_head[linear] = -1;
-            }
-            if (linear < static_cast<size_t>(num_ranks) && recv_gbl_rank_prefix_sum != nullptr) {
-                recv_gbl_rank_prefix_sum[linear] = 0;
-            }
-            if (linear < static_cast<size_t>(num_rdma_ranks) && recv_rdma_rank_prefix_sum != nullptr) {
-                recv_rdma_rank_prefix_sum[linear] = 0;
-            }
-            if (linear < static_cast<size_t>(num_ranks) * num_channels) {
-                if (gbl_channel_prefix_matrix != nullptr) {
-                    gbl_channel_prefix_matrix[linear] = 0;
-                }
-                if (recv_gbl_channel_prefix_matrix != nullptr) {
-                    recv_gbl_channel_prefix_matrix[linear] = 0;
-                }
-            }
-            if (linear < static_cast<size_t>(num_rdma_ranks) * num_channels) {
-                if (rdma_channel_prefix_matrix != nullptr) {
-                    rdma_channel_prefix_matrix[linear] = 0;
-                }
-                if (recv_rdma_channel_prefix_matrix != nullptr) {
-                    recv_rdma_channel_prefix_matrix[linear] = 0;
-                }
-            }
-            if (nvl_rank == 0 && linear < total_recv_regions) {
-                rdma_base[linear] = 0;
-            }
-        });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("1-Init");
+    // FUSED: Init zeroing moved into FaithfulDispatchPackStageKernel below.
+    // The separate CombinedDispatchInitKernel launch is eliminated.
+    // ddbg_stage("1-Init") is now reported by PackStage after the pre-zero pass.
 
     // ===================================================================
     // ===================================================================
@@ -1872,13 +1820,73 @@ void dispatch_nvl_rdma(void* recv_x,
             for (int i = 0; i < num_rdma_ranks * 6; ++i) dbg_buf[i] = -424242;  // sentinel = "kernel never wrote"
         }
 
-        // ---- F-K1: fused Pack + Stage (WG-parallel payload; WI0 routing meta) ----
+        // ---- F-K1: fused Init + Pack + Stage (WG-parallel zero + payload; WI0 routing meta) ----
+        // FUSION: the former CombinedDispatchInitKernel zeroing is done here as a
+        // cooperative per-WG pre-pass, eliminating one queue.submit + queue.wait.
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulDispatchPackStageKernel>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
+                    // ---- PHASE 0: cooperative zero-init (was separate CombinedDispatchInitKernel) ----
+                    // Stride over the init_range, zeroing recv buffers, prefix sums, and RDMA regions.
+                    // Only nvl_rank==0 zeroes the shared RDMA recv regions to avoid redundant writes.
+                    {
+                        for (size_t linear = static_cast<size_t>(local_id); linear < init_range; linear += kComputeWGSize) {
+                            if (linear < total_recv_bytes) {
+                                dst[linear] = 0;
+                            }
+                            if (linear < static_cast<size_t>(num_recv_tokens)) {
+                                if (meta != nullptr) {
+                                    meta[linear].src_rdma_rank = -1;
+                                    meta[linear].is_token_in_nvl_rank_bits = 0;
+                                    meta[linear].src_nvl_rank = -1;
+                                }
+                            }
+                            if (linear < total_recv_topk && recv_topk_idx != nullptr) {
+                                recv_topk_idx[linear] = -1;
+                                recv_topk_weights[linear] = 0.0f;
+                            }
+                            if (linear < total_recv_scales && recv_x_scales != nullptr) {
+                                recv_x_scales[linear] = 0.0f;
+                            }
+                            if (linear < total_send_rdma && send_rdma_head != nullptr) {
+                                send_rdma_head[linear] = -1;
+                            }
+                            if (linear < total_send_nvl && send_nvl_head != nullptr) {
+                                send_nvl_head[linear] = -1;
+                            }
+                            if (linear < static_cast<size_t>(num_ranks) && recv_gbl_rank_prefix_sum != nullptr) {
+                                recv_gbl_rank_prefix_sum[linear] = 0;
+                            }
+                            if (linear < static_cast<size_t>(num_rdma_ranks) && recv_rdma_rank_prefix_sum != nullptr) {
+                                recv_rdma_rank_prefix_sum[linear] = 0;
+                            }
+                            if (linear < static_cast<size_t>(num_ranks) * num_channels) {
+                                if (gbl_channel_prefix_matrix != nullptr) {
+                                    gbl_channel_prefix_matrix[linear] = 0;
+                                }
+                                if (recv_gbl_channel_prefix_matrix != nullptr) {
+                                    recv_gbl_channel_prefix_matrix[linear] = 0;
+                                }
+                            }
+                            if (linear < static_cast<size_t>(num_rdma_ranks) * num_channels) {
+                                if (rdma_channel_prefix_matrix != nullptr) {
+                                    rdma_channel_prefix_matrix[linear] = 0;
+                                }
+                                if (recv_rdma_channel_prefix_matrix != nullptr) {
+                                    recv_rdma_channel_prefix_matrix[linear] = 0;
+                                }
+                            }
+                            if (nvl_rank == 0 && linear < total_recv_regions) {
+                                rdma_base[linear] = 0;
+                            }
+                        }
+                    }
+                    sycl::group_barrier(group);
+
+                    // ---- PHASE 1: token packing (original PackStage body) ----
                     auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
                     auto* my_counts = reinterpret_cast<int*>(my_buf + layout.count_offset);
                     auto* my_channel_counts = reinterpret_cast<int*>(my_buf + layout.channel_count_offset);
@@ -1960,7 +1968,7 @@ void dispatch_nvl_rdma(void* recv_x,
                 });
         });
         if (wait_each) queue.wait();
-        ddbg_stage("F2-PackStage");
+        ddbg_stage("F2-PackStage");  // FUSED: was "1-Init" + "F2-PackStage"
 
         // ---- F-K2: NVL barrier (device scope) so all peers staged before leader reads ----
         queue.submit([&](sycl::handler& cgh) {
@@ -2564,15 +2572,87 @@ void dispatch_nvl_rdma(void* recv_x,
     const bool do_expert_remap_a = (recv_topk_idx != nullptr && num_local_experts_a > 0);
     const int local_expert_begin_a = do_expert_remap_a ? rank * num_local_experts_a : 0;
     const int local_expert_end_a = local_expert_begin_a + num_local_experts_a;
+    // FUSION: ChannelCounts → Assemble → Head. The former DispatchChannelCountsKernel
+    // (channel prefix sums) is run as a pre-pass inside Assemble. The former
+    // CombinedDispatchHeadKernel (send_nvl_head/send_rdma_head handles) runs as a
+    // trailing pass after peer_counts publish. Eliminates 2 queue.submit + 2
+    // queue.wait. Only the CountsBarrier must stay (cross-rank nvl_barrier between
+    // publish and read).
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedDispatchAssembleKernel>(
             sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)), [=](sycl::nd_item<1> item) {
+            auto group = item.get_group();
             const int local_id = static_cast<int>(item.get_local_id(0));
             // Acquire fence: invalidate any stale local cache and order all
             // subsequent reads of the NVL peers' forwarded/send buffers
-            // (IPC-mapped remote GPU memory) after the leader's release fence,
-            // mirroring CUDA's ld_acquire_sys_global on the NVL channel tail.
+            // (IPC-mapped remote GPU memory) mirroring CUDA's pattern.
             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+
+            // ---- PHASE 0: channel-count prefix sums (was DispatchChannelCountsKernel) ----
+            // Compute gbl_channel_prefix_matrix and rdma_channel_prefix_matrix
+            // from is_token_in_rank. Strided across work-items; reduce per WG.
+            {
+                const int total_gbl_rows = num_ranks * num_channels;
+                const int total_rdma_rows = num_rdma_ranks * num_channels;
+                const int total_rows = std::max(total_gbl_rows, total_rdma_rows);
+                for (int row_id = local_id; row_id < total_rows; row_id += kComputeWGSize) {
+                    if (row_id < total_gbl_rows && gbl_channel_prefix_matrix != nullptr) {
+                        const int dst_rank = row_id / num_channels;
+                        const int c = row_id % num_channels;
+                        const int ch_start = static_cast<int>((static_cast<int64_t>(num_tokens) * c) / num_channels);
+                        const int ch_end = static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels);
+                        int count = 0;
+                        for (int token = ch_start; token < ch_end; ++token)
+                            count += is_token_in_rank[token * num_ranks + dst_rank] ? 1 : 0;
+                        // Single-WG kernel: no cross-WG reduce needed
+                        int cumulative = count;
+                        for (int pc = 0; pc < c; ++pc) {
+                            const int ps = static_cast<int>((static_cast<int64_t>(num_tokens) * pc) / num_channels);
+                            const int pe = static_cast<int>((static_cast<int64_t>(num_tokens) * (pc + 1)) / num_channels);
+                            for (int t = ps; t < pe; ++t)
+                                cumulative += is_token_in_rank[t * num_ranks + dst_rank] ? 1 : 0;
+                        }
+                        gbl_channel_prefix_matrix[row_id] = cumulative;
+                    }
+                    if (row_id < total_rdma_rows && rdma_channel_prefix_matrix != nullptr) {
+                        const int dst_rdma = row_id / num_channels;
+                        const int c = row_id % num_channels;
+                        const int ch_start = static_cast<int>((static_cast<int64_t>(num_tokens) * c) / num_channels);
+                        const int ch_end = static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) / num_channels);
+                        int count = 0;
+                        for (int token = ch_start; token < ch_end; ++token) {
+                            bool hit = false;
+                            for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                                if (is_token_in_rank[token * num_ranks + dst_rdma * num_nvl_ranks + dst_nvl]) {
+                                    hit = true; break;
+                                }
+                            }
+                            count += hit ? 1 : 0;
+                        }
+                        int cumulative = count;
+                        for (int pc = 0; pc < c; ++pc) {
+                            const int ps = static_cast<int>((static_cast<int64_t>(num_tokens) * pc) / num_channels);
+                            const int pe = static_cast<int>((static_cast<int64_t>(num_tokens) * (pc + 1)) / num_channels);
+                            for (int t = ps; t < pe; ++t) {
+                                bool hit = false;
+                                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
+                                    if (is_token_in_rank[t * num_ranks + dst_rdma * num_nvl_ranks + dst_nvl]) {
+                                        hit = true; break;
+                                    }
+                                }
+                                cumulative += hit ? 1 : 0;
+                            }
+                        }
+                        rdma_channel_prefix_matrix[row_id] = cumulative;
+                    }
+                }
+            }
+            // Barrier: channel counts must be fully written before the per_src_count
+            // scan that writes gbl/rdma prefix sums (those are separate arrays, but
+            // the scan reads recv_gbl_rank_prefix_sum and we want a consistent view).
+            sycl::group_barrier(group);
+
+            // ---- PHASE 1: Assemble recv_x (original body) ----
             constexpr int kMaxRanks = 64;
             // per_src_count/cursors are recomputed identically by every
             // work-item from deterministic reads, so token placement (pos) is
@@ -2797,7 +2877,7 @@ void dispatch_nvl_rdma(void* recv_x,
         });
     });
     if (wait_each) queue.wait();
-    ddbg_stage("8-Assemble");
+    ddbg_stage("8-Assemble");  // FUSED: was "8-Assemble" + "10-ChannelCounts"
 
     // F-K10 CountsBarrier: every rank's per_src_count is visible in all peers before Head.
     queue.submit([&](sycl::handler& cgh) {
@@ -2810,123 +2890,9 @@ void dispatch_nvl_rdma(void* recv_x,
     if (wait_each) queue.wait();
     ddbg_stage("9-CountsBarrier");
 
-    // ---- F-K11: parallel channel-count prefix sum (WG-parallel, mirrors
-    // CUDA notify_dispatch SM 1+ channel scanning). Each WG handles a subset
-    // of (dst_rank, channel) pairs; WI0 scans is_token_in_rank, then WI0
-    // computes the row-prefix-sum and broadcasts. Replaces the former serial
-    // single_task. ----
-    queue.submit([&](sycl::handler& cgh) {
-        const int total_gbl_rows = num_ranks * num_channels;
-        const int total_rdma_rows = num_rdma_ranks * num_channels;
-        const int total_rows =
-            std::max(total_gbl_rows, total_rdma_rows);
-        const int num_groups =
-            (total_rows + kComputeWGSize - 1) / kComputeWGSize;
-        cgh.parallel_for<DispatchChannelCountsKernel>(
-            sycl::nd_range<1>(
-                sycl::range<1>(static_cast<size_t>(num_groups) * kComputeWGSize),
-                sycl::range<1>(kComputeWGSize)),
-            [=](sycl::nd_item<1> item) {
-                auto group = item.get_group();
-                const int local_id = static_cast<int>(item.get_local_id(0));
-                const int gid = static_cast<int>(item.get_group_linear_id());
-                // Each row = one (dst_rank/total_rank, channel) pair.
-                const int row_id =
-                    gid * kComputeWGSize + local_id;
-                // --- gbl_channel_prefix_matrix ---
-                if (row_id < total_gbl_rows && gbl_channel_prefix_matrix != nullptr) {
-                    const int dst_rank = row_id / num_channels;
-                    const int c = row_id % num_channels;
-                    const int start =
-                        static_cast<int>((static_cast<int64_t>(num_tokens) * c) /
-                                         num_channels);
-                    const int end =
-                        static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) /
-                                         num_channels);
-                    int count = 0;
-                    // each WI scans a strided slice; reduce across WG
-                    for (int token = start + local_id; token < end;
-                         token += kComputeWGSize) {
-                        count +=
-                            is_token_in_rank[token * num_ranks + dst_rank] ? 1
-                                                                            : 0;
-                    }
-                    count = sycl::reduce_over_group(group, count, sycl::plus<int>());
-                    // WI0 computes the channel-level cumulative prefix
-                    if (local_id == 0) {
-                        int cumulative = count;
-                        for (int pc = 0; pc < c; ++pc) {
-                            const int ps = static_cast<int>(
-                                (static_cast<int64_t>(num_tokens) * pc) /
-                                num_channels);
-                            const int pe = static_cast<int>(
-                                (static_cast<int64_t>(num_tokens) * (pc + 1)) /
-                                num_channels);
-                            for (int t = ps; t < pe; ++t)
-                                cumulative +=
-                                    (is_token_in_rank[t * num_ranks +
-                                                       dst_rank]
-                                         ? 1
-                                         : 0);
-                        }
-                        gbl_channel_prefix_matrix[row_id] = cumulative;
-                    }
-                }
-                // --- rdma_channel_prefix_matrix ---
-                if (row_id < total_rdma_rows && rdma_channel_prefix_matrix != nullptr) {
-                    const int dst_rdma = row_id / num_channels;
-                    const int c = row_id % num_channels;
-                    const int start =
-                        static_cast<int>((static_cast<int64_t>(num_tokens) * c) /
-                                         num_channels);
-                    const int end =
-                        static_cast<int>((static_cast<int64_t>(num_tokens) * (c + 1)) /
-                                         num_channels);
-                    int count = 0;
-                    for (int token = start + local_id; token < end;
-                         token += kComputeWGSize) {
-                        bool hit = false;
-                        for (int dst_nvl = 0; dst_nvl < num_nvl_ranks; ++dst_nvl) {
-                            const int dst_rank =
-                                dst_rdma * num_nvl_ranks + dst_nvl;
-                            if (is_token_in_rank[token * num_ranks + dst_rank]) {
-                                hit = true;
-                                break;
-                            }
-                        }
-                        count += hit ? 1 : 0;
-                    }
-                    count = sycl::reduce_over_group(group, count, sycl::plus<int>());
-                    if (local_id == 0) {
-                        int cumulative = count;
-                        for (int pc = 0; pc < c; ++pc) {
-                            const int ps = static_cast<int>(
-                                (static_cast<int64_t>(num_tokens) * pc) /
-                                num_channels);
-                            const int pe = static_cast<int>(
-                                (static_cast<int64_t>(num_tokens) * (pc + 1)) /
-                                num_channels);
-                            for (int t = ps; t < pe; ++t) {
-                                bool hit = false;
-                                for (int dst_nvl = 0; dst_nvl < num_nvl_ranks;
-                                     ++dst_nvl) {
-                                    if (is_token_in_rank[t * num_ranks +
-                                                         dst_rdma * num_nvl_ranks +
-                                                         dst_nvl]) {
-                                        hit = true;
-                                        break;
-                                    }
-                                }
-                                cumulative += hit ? 1 : 0;
-                            }
-                        }
-                        rdma_channel_prefix_matrix[row_id] = cumulative;
-                    }
-                }
-            });
-    });
-    if (wait_each) queue.wait();
-    ddbg_stage("10-ChannelCounts");
+    // FUSED: DispatchChannelCountsKernel is now fused into CombinedDispatchAssembleKernel
+    // as a pre-pass (PHASE 0). The separate kernel launch is eliminated.
+    // ddbg_stage("10-ChannelCounts") was merged into ddbg_stage("8-Assemble").
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchHeadKernel>([=]() {
@@ -3184,22 +3150,9 @@ void combine_nvl_rdma(DataType type,
     const bool faithful_par_gather = internode_par_gather();      // FC5b grid-parallel gather
     dbg_stage("combine ON");
 
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<CombinedCombineInitKernel<dtype_t>>(sycl::range<1>(init_range), [=](sycl::id<1> id) {
-            const size_t linear = static_cast<size_t>(id[0]);
-            if (linear < total_combined) {
-                dst[linear] = dtype_t{};
-            }
-            if (linear < total_topk && combined_topk_weights != nullptr) {
-                combined_topk_weights[linear] = 0.0f;
-            }
-            if (nvl_rank == 0 && linear < total_recv_regions) {
-                rdma_base[linear] = 0;
-            }
-        });
-    });
-    if (wait_each) queue.wait();
-    dbg_stage("1-Init");
+    // FUSION: init zeroing merged into Pack kernel below (WG 0's cooperative pre-pass).
+    // Eliminates the separate CombinedCombineInitKernel launch.
+    // dbg_stage("1-Init") is now reported by Pack after the zero pass.
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t pack_groups = static_cast<size_t>(std::max(num_tokens, 1));
@@ -3208,6 +3161,35 @@ void combine_nvl_rdma(DataType type,
             auto group = item.get_group();
             const int local_id = static_cast<int>(item.get_local_id(0));
             const int t = static_cast<int>(item.get_group(0));
+            // ---- PHASE 0: cooperative init zero (was CombinedCombineInitKernel + CombineNvlPlaneInitKernel) ----
+            // Only WG 0 performs the zero initiation; the init_range is small relative
+            // to hidden-sized token copies, so it's fine to serialize here.
+            if (t == 0) {
+                for (size_t linear = static_cast<size_t>(local_id); linear < init_range; linear += kComputeWGSize) {
+                    if (linear < total_combined) {
+                        dst[linear] = dtype_t{};
+                    }
+                    if (linear < total_topk && combined_topk_weights != nullptr) {
+                        combined_topk_weights[linear] = 0.0f;
+                    }
+                    if (nvl_rank == 0 && linear < total_recv_regions) {
+                        rdma_base[linear] = 0;
+                    }
+                }
+                // Also seed cs_meta src_nvl_rank=-1 sentinels (was CombineNvlPlaneInitKernel).
+                // This must happen BEFORE the PackBarrier (which is a cross-rank nvl_barrier),
+                // and it does because PackBarrier is a separate kernel after this one.
+                const size_t total_cs_slots = static_cast<size_t>(num_nvl_ranks) *
+                                              static_cast<size_t>(combine_stage_layout.plane_tokens);
+                auto* my_buf_cs = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
+                auto* cs_meta = reinterpret_cast<SourceMeta*>(
+                    my_buf_cs + combine_stage_base + combine_stage_layout.fwd_meta_offset);
+                for (size_t i = static_cast<size_t>(local_id); i < total_cs_slots; i += kComputeWGSize) {
+                    cs_meta[i].src_nvl_rank = -1;
+                }
+            }
+            sycl::group_barrier(group);
+            // ---- PHASE 1: token packing (original Pack body) ----
             auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
             auto* combine_count = reinterpret_cast<int*>(my_buf + layout.count_offset);
             auto* combine_x = reinterpret_cast<dtype_t*>(my_buf + layout.send_x_offset);
@@ -3240,38 +3222,12 @@ void combine_nvl_rdma(DataType type,
         });
     });
     if (wait_each) queue.wait();
-    dbg_stage("2-Pack");
+    dbg_stage("2-Pack");  // FUSED: was "1-Init" + "2-Pack"
 
-    // GAP#8 perf: SELECTIVE producer-push invalidation. Each combine token is owned by
-    // exactly ONE consumer (its src_nvl_rank) -- both the reduce (reads plane[dst_nvl]
-    // [peer_recv_pos], and peer_recv_pos = combined_nvl_head[ct,P] is only set for the
-    // consumer that owns P's position p) and the RDMA gather (filters src_nvl_rank==nvl_rank)
-    // read a producer position from exactly one consumer. So the push routes each token to
-    // ONLY that consumer's plane (verbatim index p, ~num_nvl_ranks x less copy than the old
-    // broadcast-to-all-peers). Unwritten plane slots must be invalidated so the gather's
-    // src_nvl_rank filter rejects them: seed OUR OWN plane meta src_nvl_rank=-1 here, BEFORE
-    // the PackBarrier (which is a cross-rank nvl_barrier => it also orders this init before
-    // any producer's push into our plane; no extra barrier needed).
-    queue.submit([&](sycl::handler& cgh) {
-        const size_t total_slots = static_cast<size_t>(num_nvl_ranks) *
-                                   static_cast<size_t>(combine_stage_layout.plane_tokens);
-        const size_t init_range = ((total_slots + kComputeWGSize - 1) / kComputeWGSize) * kComputeWGSize;
-        cgh.parallel_for<CombineNvlPlaneInitKernel<dtype_t>>(
-            sycl::nd_range<1>(sycl::range<1>(std::max<size_t>(init_range, kComputeWGSize)),
-                              sycl::range<1>(kComputeWGSize)),
-            [=](sycl::nd_item<1> item) {
-                const size_t i = item.get_global_linear_id();
-                if (i >= total_slots) return;
-                auto* my_buf = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]);
-                auto* cs_meta = reinterpret_cast<SourceMeta*>(
-                    my_buf + combine_stage_base + combine_stage_layout.fwd_meta_offset);
-                cs_meta[i].src_nvl_rank = -1;  // sentinel: unwritten -> gather filter rejects
-                if (i == total_slots - 1)
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-            });
-    });
-    if (wait_each) queue.wait();
-    dbg_stage("2b-PlaneInit");
+    // FUSED: CombineNvlPlaneInitKernel (cs_meta src_nvl_rank=-1 sentinel seed) is
+    // merged into the Pack kernel above (WG 0's zero pass also seeds the combine-
+    // staging meta sentinels). The separate PlaneInit launch is eliminated.
+    // dbg_stage("2b-PlaneInit") was merged into dbg_stage("2-Pack").
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
