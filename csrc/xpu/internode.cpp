@@ -162,9 +162,19 @@ inline bool internode_blocking_put() {
                    // (dispatch F4b / combine FC5c ishmemx_long_atomic_add_qp, whose
                    // Step-6 CAS-max raises nic_wq_commit->nic_wq_cnt), so the warp-put's
                    // ordered-commit gate never wedges. HW-validated on both nodes.
-                   // Set =1 to force the gate-free blocking ishmem_putmem (robust
-                   // fallback; needed only if an interleaved path leaves a commit gap
-                   // unreconciled, e.g. the serial combine when FAITHFUL is OFF).
+                   // Set =1 to force the gate-free single-WI put as an A/B fallback
+                   // (dispatch F4a2 / combine FC5b). The put API is selected by
+                   // DEEP_EP_INTERNODE_NBI_MODE below.
+}
+
+// DEEP_EP_INTERNODE_NBI_MODE: when DEEP_EP_INTERNODE_BLOCKING_PUT=1, selects the
+// single-WI put API used in dispatch F4a2 and combine FC5b.
+//   0:           ishmem_putmem       (blocking, default)
+//   1:           ishmem_putmem_nbi   (non-blocking, faster dispatch)
+inline bool internode_nbi_mode() {
+    const char* env = std::getenv("DEEP_EP_INTERNODE_NBI_MODE");
+    if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
+    return false;  // default: ishmem_putmem (blocking)
 }
 
 // DEEP_EP_INTERNODE_PAR_GATHER (default ON): parallelize the combine leader gather
@@ -1811,6 +1821,7 @@ void dispatch_nvl_rdma(void* recv_x,
         const bool faithful_post_amo_quiet = internode_post_amo_quiet();  // F4b post-AMO quiet
         const bool faithful_entry_quiet = internode_entry_quiet();     // F4a2 entry drain qp0
         const bool faithful_blocking_put = internode_blocking_put();   // F4a2 blocking payload put
+        const bool faithful_nbi_mode = internode_nbi_mode();         // F4a2 NBI vs blocking API
         // EXP3: host-visible per-rdma-rank debug slots (send: count/dst_pe/flag,
         // recv: raw/count/spins). Gated by DEEP_EP_DBG_DISPATCH; nullptr otherwise
         // so the captured-pointer writes compile out to a cheap null check.
@@ -2202,15 +2213,31 @@ void dispatch_nvl_rdma(void* recv_x,
                             const size_t sc_len = static_cast<size_t>(cnt) * num_scales * sizeof(float);
                             if (faithful_blocking_put) {
                                 // Robust path (A/B via DEEP_EP_INTERNODE_BLOCKING_PUT): single-WI
-                                // blocking ishmem_putmem per field-slice.
+                                // put per field-slice. DEEP_EP_INTERNODE_NBI_MODE selects the API:
+                                //   0 (default): ishmem_putmem      (blocking)
+                                //   1:           ishmem_putmem_nbi  (non-blocking, with release fence)
                                 if (cnt > 0 && local_id == 0) {
-                                    ishmem_putmem(dst_region + x_off, region + x_off, x_len, dst_pe);
-                                    ishmem_putmem(dst_region + m_off, region + m_off, m_len, dst_pe);
-                                    if (i_len > 0) ishmem_putmem(dst_region + i_off, region + i_off, i_len, dst_pe);
-                                    if (w_len > 0) ishmem_putmem(dst_region + w_off, region + w_off, w_len, dst_pe);
-                                    if (sc_len > 0) ishmem_putmem(dst_region + sc_off, region + sc_off, sc_len, dst_pe);
+                                    if (faithful_nbi_mode) {
+                                        ishmem_putmem_nbi(dst_region + x_off, region + x_off, x_len, dst_pe);
+                                        ishmem_putmem_nbi(dst_region + m_off, region + m_off, m_len, dst_pe);
+                                        if (i_len > 0) ishmem_putmem_nbi(dst_region + i_off, region + i_off, i_len, dst_pe);
+                                        if (w_len > 0) ishmem_putmem_nbi(dst_region + w_off, region + w_off, w_len, dst_pe);
+                                        if (sc_len > 0) ishmem_putmem_nbi(dst_region + sc_off, region + sc_off, sc_len, dst_pe);
+                                    } else {
+                                        ishmem_putmem(dst_region + x_off, region + x_off, x_len, dst_pe);
+                                        ishmem_putmem(dst_region + m_off, region + m_off, m_len, dst_pe);
+                                        if (i_len > 0) ishmem_putmem(dst_region + i_off, region + i_off, i_len, dst_pe);
+                                        if (w_len > 0) ishmem_putmem(dst_region + w_off, region + w_off, w_len, dst_pe);
+                                        if (sc_len > 0) ishmem_putmem(dst_region + sc_off, region + sc_off, sc_len, dst_pe);
+                                    }
                                 }
                                 sycl::group_barrier(group);
+                                if (faithful_nbi_mode) {
+                                    // NBI path: release fence to make data NIC-visible before the
+                                    // deferred quiet+AMO in F-K3b (separate kernel boundary).
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    lsc_fence_sysrel();
+                                }
                             } else {
                                 // Default path: warp-collective NBI put (cache-hot, fast) on qp=ch.
                                 if (cnt > 0 && sg.get_group_id()[0] == 0) {
@@ -3147,6 +3174,7 @@ void combine_nvl_rdma(DataType type,
     const bool faithful_post_amo_quiet = internode_post_amo_quiet();
     const bool faithful_force_db = internode_force_db();          // FC5b put doorbell
     const bool faithful_blocking_put = internode_blocking_put();  // FC5b blocking payload put
+    const bool faithful_nbi_mode = internode_nbi_mode();          // FC5b NBI vs blocking API
     const bool faithful_par_gather = internode_par_gather();      // FC5b grid-parallel gather
     dbg_stage("combine ON");
 
@@ -3682,7 +3710,22 @@ void combine_nvl_rdma(DataType type,
                     // as an A/B fallback (only the c==0 WG ships the whole region).
                     if (faithful_blocking_put) {
                         if (c == 0 && local_id == 0) {
-                            ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                            if (faithful_nbi_mode) {
+                                ishmem_putmem_nbi(dst_region, region, rdma_count_offset, dst_pe);
+                            } else {
+                                ishmem_putmem(dst_region, region, rdma_count_offset, dst_pe);
+                            }
+                        }
+                        if (faithful_nbi_mode) {
+                            // NBI path: release fence to make data NIC-visible before the kernel
+                            // boundary separates us from FC5c's quiet_qp + AMO.
+                            auto group = item.get_group();
+                            sycl::group_barrier(group);
+                            if (local_id == 0) {
+                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                lsc_fence_sysrel();
+                            }
+                            sycl::group_barrier(group);
                         }
                         return;
                     }
