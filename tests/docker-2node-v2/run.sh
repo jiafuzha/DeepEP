@@ -310,16 +310,33 @@ run_test() {
     local TOTAL_RANKS=$((NUM_PROCESSES * 2))
 
     set +e
+    # Optional env vars: only forward when NON-EMPTY. Several code-side gates use
+    # `getenv(...) != nullptr`, so forwarding an EMPTY value (mpirun -genv NAME "")
+    # would enable them (e.g. DEEP_EP_DBG_* per-stage tracing with queue.wait(),
+    # which serializes every kernel boundary and destroys perf). Build the -genv
+    # list dynamically and skip any var whose value is empty.
+    OPT_GENV_CMDS=""
+    _add_opt_genv() { if [ -n "${2:-}" ]; then OPT_GENV_CMDS="$OPT_GENV_CMDS -genv $1 \"$2\""; fi; }
+    _add_opt_genv DEEP_EP_INTERNODE_PAR_GATHER "${DEEP_EP_INTERNODE_PAR_GATHER:-}"
+    _add_opt_genv DEEP_EP_INTERNODE_BLOCKING_PUT "${DEEP_EP_INTERNODE_BLOCKING_PUT:-}"
+    _add_opt_genv DEEP_EP_INTERNODE_POLL_CAP   "${DEEP_EP_INTERNODE_POLL_CAP:-}"
+    _add_opt_genv DEEP_EP_PERF                 "${DEEP_EP_PERF:-}"
+    _add_opt_genv DEEP_EP_PERF_TOKENS          "${DEEP_EP_PERF_TOKENS:-}"
+    _add_opt_genv DEEP_EP_MIN                  "${DEEP_EP_MIN:-}"
+    _add_opt_genv DEEP_EP_DBG_DISPATCH         "${DEEP_EP_DBG_DISPATCH:-}"
+    _add_opt_genv DEEP_EP_DBG_COMBINE          "${DEEP_EP_DBG_COMBINE:-}"
+    _add_opt_genv DEEP_EP_TIME_WARMUP          "${DEEP_EP_TIME_WARMUP:-}"
+    _add_opt_genv DEEP_EP_XPU_ISHMEM_FINALIZE  "${DEEP_EP_XPU_ISHMEM_FINALIZE:-}"
+    _add_opt_genv DEEP_EP_DBG_DROP             "${DEEP_EP_DBG_DROP:-}"
+    _add_opt_genv DEEP_EP_SKIP_WARMUP          "${DEEP_EP_SKIP_WARMUP:-}"
+    # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)
+    # inside deep_ep/buffer.py (CUDA-faithful multi-QP striping). Only forward an
+    # explicit user/env override here; forwarding a forced "1" would pin single-QP and
+    # defeat the auto-provisioning (mpirun -genv would win over buffer.py's setdefault).
+    _add_opt_genv ISHMEM_IBGDA_QPS_PER_PE      "${ISHMEM_IBGDA_QPS_PER_PE:-}"
+
     docker exec \
-        -e ISHMEM_DEBUG="${ISHMEM_DEBUG:-0}" \
         -e ISHMEM_DIR="$ISHMEM_DIR" \
-        -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
-        -e DEEP_EP_DBG_DROP="${DEEP_EP_DBG_DROP:-}" \
-        -e DEEP_EP_MIN="${DEEP_EP_MIN:-}" \
-        -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
-        -e DEEP_EP_PERF="${DEEP_EP_PERF:-}" \
-        -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
-        -e DEEP_EP_SKIP_WARMUP="${DEEP_EP_SKIP_WARMUP:-}" \
         "$NODE0_CONTAINER" \
         bash -lc "
             source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
@@ -336,20 +353,13 @@ run_test() {
                 -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
-                -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
-                -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+                -genv ISHMEM_IBGDA_DB_BATCH_SIZE \${ISHMEM_IBGDA_DB_BATCH_SIZE:-0} \
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
                 -genv FI_PROVIDER '$FI_PROVIDER_VAL' \
                 -genv ISHMEM_DIR $ISHMEM_DIR \
-                -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
-                -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
-                -genv DEEP_EP_DBG_DROP \"\${DEEP_EP_DBG_DROP:-}\" \
-                -genv DEEP_EP_MIN \"\${DEEP_EP_MIN:-}\" \
-                -genv DEEP_EP_DBG_COMBINE \"\${DEEP_EP_DBG_COMBINE:-}\" \
-                -genv DEEP_EP_PERF \"\${DEEP_EP_PERF:-}\" \
-                -genv DEEP_EP_TIME_WARMUP \"\${DEEP_EP_TIME_WARMUP:-}\" \
-                -genv DEEP_EP_SKIP_WARMUP \"\${DEEP_EP_SKIP_WARMUP:-}\" \
+                -genv ISHMEM_DEBUG \${ISHMEM_DEBUG:-0} \
+                $OPT_GENV_CMDS \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
                 -genv DEEP_EP_RDMA_BYTES $DEEP_EP_RDMA_BYTES \
