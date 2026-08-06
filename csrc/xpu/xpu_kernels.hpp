@@ -408,4 +408,31 @@ struct DeviceBuffer {
     SYCL_EXTERNAL dtype_t& operator[](int64_t idx) const { return buffer()[idx]; }
 };
 
+// ============================================================================
+// Cooperative kernel launch with root_group grid barrier
+// SYCL parity for CUDA cudaLaunchCooperativeKernel + cg::this_grid().sync().
+// Uses sycl::ext::oneapi::experimental::nd_launch with use_root_sync property
+// (oneAPI 2026.0+; 2025.3 does NOT support nd_launch with lambdas).
+//
+// IMPORTANT: nd_launch does not support sycl::local_accessor/SLM (no handler).
+// Kernels launched this way must avoid SLM — use register-file + sub_group
+// communication with work-group barriers instead.
+// ============================================================================
+
+// Launch a kernel cooperatively with root_group grid barrier support.
+// The kernel lambda receives (sycl::nd_item<1>) and can use
+// `item.ext_oneapi_get_root_group()` + `sycl::group_barrier(root_group)`.
+// KernelName must be a forward-declared class (no unnamed lambdas in nd_launch).
+// No SLM is available — the kernel must use private/register data.
+template <typename KernelName, typename KernelFunc>
+inline void nd_launch_root_sync(
+    sycl::queue& q, size_t num_wgs, size_t wg_size, KernelFunc&& kernel_fn)
+{
+    namespace syclex = sycl::ext::oneapi::experimental;
+    syclex::properties props{syclex::use_root_sync};
+    sycl::nd_range<1> ndr{sycl::range<1>{num_wgs * wg_size}, sycl::range<1>{wg_size}};
+    syclex::launch_config cfg{ndr, props};
+    syclex::nd_launch<KernelName>(q, cfg, std::forward<KernelFunc>(kernel_fn));
+}
+
 }  // namespace deep_ep
