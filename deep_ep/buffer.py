@@ -1107,6 +1107,11 @@ class Buffer:
         packed_recv_count = self._xpu_ll_buf('packed_recv_count', (num_local_experts, ),
                                              torch.int32, device, fill=0, slots=2)
 
+        # ---- Token dedup: if a token's two experts are on the same rank, only send once ----
+        # The second expert gets the data via a local GPU copy after the main scatter.
+        # Dedup entries: list of (dst_local_expert, src_local_expert, src_position_in_packed, token_idx)
+        dedup_entries = []
+
         handle_entries = []
         local_expert_begin = self.rank * num_local_experts
         int_mask = (1 << 32) - 1
@@ -1132,6 +1137,57 @@ class Buffer:
                 packed_recv_layout_range[local_expert, src_rank] = (begin << 32) | (count & int_mask)
             packed_recv_count[local_expert] = write_offset
 
+        # ---- Post-scatter dedup: copy tokens between local experts on the same rank ----
+        # For each token where both top-k experts are on this rank's local experts,
+        # the data was only written to the first expert. Copy it to the second.
+        local_global_experts = [local_expert_begin + i for i in range(num_local_experts)]
+        for src_rank in range(self.group_size):
+            if active_mask is not None and not bool(active_mask[src_rank].item()):
+                continue
+            src_topk = gathered_topk_idx[src_rank]
+            for token_i in range(num_tokens):
+                experts_for_token = src_topk[token_i].tolist()
+                # Find which of this token's experts are local
+                local_experts_for_token = [e for e in experts_for_token
+                                           if e >= 0 and e in local_global_experts]
+                if len(local_experts_for_token) >= 2:
+                    # Token maps to 2+ local experts. Data was written to the first one.
+                    # Copy from first to the other(s).
+                    first_global = local_experts_for_token[0]
+                    first_local = first_global - local_expert_begin
+                    # Find position of this token in first_local's packed data
+                    first_pos = None
+                    for le, ge, sr, b, c, tids in handle_entries:
+                        if le == first_local and sr == src_rank:
+                            # Find the position of token_i in this entry
+                            mask = tids == token_i
+                            if mask.any():
+                                pos = int(b + mask.nonzero(as_tuple=False)[0].item())
+                                first_pos = pos
+                                break
+                    if first_pos is not None:
+                        for dup_global in local_experts_for_token[1:]:
+                            dup_local = dup_global - local_expert_begin
+                            # Allocate slot for dup_local
+                            dup_pos = int(packed_recv_count[dup_local].item())
+                            if dup_pos >= num_slots:
+                                raise RuntimeError('XPU low-latency dispatch receive buffer too small for dedup')
+                            # Copy data
+                            packed_bf16[dup_local, dup_pos].copy_(
+                                packed_bf16[first_local, first_pos])
+                            packed_recv_src_info[dup_local, dup_pos] = token_i
+                            # Update layout_range: extend the last src_rank entry
+                            prev = packed_recv_layout_range[dup_local, src_rank].item()
+                            prev_count = int(prev & int_mask)
+                            prev_begin = int(prev >> 32)
+                            packed_recv_layout_range[dup_local, src_rank] = ((prev_begin << 32) |
+                                                                             ((prev_count + 1) & int_mask))
+                            packed_recv_count[dup_local] = dup_pos + 1
+                            # Register as handle entry for combine path
+                            dedup_entries.append(
+                                (dup_local, dup_global, src_rank, dup_pos, 1,
+                                 torch.tensor([token_i], dtype=torch.int64, device=device)))
+
         if cumulative_local_expert_recv_stats is not None:
             cumulative_local_expert_recv_stats.add_(packed_recv_count)
 
@@ -1155,6 +1211,7 @@ class Buffer:
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts)
         self._xpu_low_latency_handle_cache[id(handle)] = {
             'entries': handle_entries,
+            'dedup_entries': dedup_entries if dedup_entries else [],
             'num_tokens': num_tokens,
             'num_local_experts': num_local_experts,
         }
@@ -1240,6 +1297,12 @@ class Buffer:
         num_combined_tokens = topk_idx.size(0)
         contributions = []
         for local_expert, global_expert, src_rank, begin, count, token_indices in cache['entries']:
+            if count == 0:
+                continue
+            values = x[local_expert, begin:begin + count].detach().cpu()
+            contributions.append((global_expert, src_rank, token_indices.cpu(), values))
+        # Also include dedup entries (tokens replicated locally between experts)
+        for local_expert, global_expert, src_rank, begin, count, token_indices in cache.get('dedup_entries', []):
             if count == 0:
                 continue
             values = x[local_expert, begin:begin + count].detach().cpu()
