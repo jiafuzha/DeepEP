@@ -937,7 +937,7 @@ void dispatch_bf16(void* packed_recv_x,
                                 sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                                 uc_store<long>(&rdma_recv_count[slot], static_cast<long>(-cnt - 1));
                             } else {
-                                ishmemx_quiet_qp(dst_rank, static_cast<unsigned int>(le));
+                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
                                 ll_sender_flush(flag_sender_fence);
                                 ishmemx_long_atomic_add_qp(&rdma_recv_count[slot], static_cast<long>(-cnt - 1),
                                                            dst_rank, static_cast<unsigned int>(le));
@@ -1242,7 +1242,7 @@ void combine_bf16(void* combined_x,
                                 sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                                 uc_store<long>(&combine_flag_i[slot], 1L);
                             } else {
-                                ishmemx_quiet_qp(dst_rank, static_cast<unsigned int>(le));
+                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
                                 ll_sender_flush(flag_sender_fence);
                                 ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
                                                            static_cast<unsigned int>(le));
