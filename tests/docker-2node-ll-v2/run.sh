@@ -35,10 +35,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
+DEEP_EP_DIR="${DEEP_EP_DIR:-/root/jiafuzha/code-repo/zjf2012/DeepEP}"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_low_latency.py}"
+TEST_DISABLE_ARG="${TEST_DISABLE_ARG:---disable-nvlink}"
 SSH_DIR="/tmp/deepep-docker-ssh"
-ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 
 NODE0_CONTAINER="deepep-ll-v2-node0"
 NODE1_CONTAINER="deepep-ll-v2-node1"
@@ -393,7 +394,7 @@ run_test() {
 
     echo "===== RUN $TEST_SCRIPT (2 nodes x ${NUM_PROCESSES} ranks = $((NUM_PROCESSES * 2)) total) ====="
 
-    local WRAPPER_PATH="$DEEP_EP_DIR/tests/docker-2node-ll-v2/node_wrapper.sh"
+    local WRAPPER_PATH="$SCRIPT_DIR/node_wrapper.sh"
     docker exec "$NODE0_CONTAINER" chmod +x "$WRAPPER_PATH" 2>/dev/null || true
     docker exec "$NODE1_CONTAINER" chmod +x "$WRAPPER_PATH" 2>/dev/null || true
 
@@ -451,6 +452,7 @@ run_test() {
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
                 -genv ISHMEM_IBGDA_QPS_PER_PE ${ISHMEM_IBGDA_QPS_PER_PE:-1} \
                 -genv ISHMEM_IBGDA_DB_BATCH_SIZE ${ISHMEM_IBGDA_DB_BATCH_SIZE:-0} \
+                -genv ISHMEM_IBGDA_QUIET_SKIP_DRAIN ${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1} \
                 -genv ISHMEM_IBGDA_DB_MODE \"\${ISHMEM_IBGDA_DB_MODE:-0}\" \
                 -genv ISHMEM_IBGDA_STATS_DIR \"\${ISHMEM_IBGDA_STATS_DIR:-}\" \
                 -genv REPRO_MODE \"\${REPRO_MODE:-}\" \
@@ -468,6 +470,7 @@ run_test() {
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
                 -genv FI_PROVIDER tcp \
+                -genv DEEP_EP_DIR $DEEP_EP_DIR \
                 -genv ISHMEM_DIR $ISHMEM_DIR \
                 -genv ISHMEM_DEBUG \"\${ISHMEM_DEBUG:-0}\" \
                 -genv DEEP_EP_DBG_DISPATCH \"\${DEEP_EP_DBG_DISPATCH:-}\" \
@@ -504,7 +507,7 @@ run_test() {
                     --hidden $HIDDEN \
                     --num-topk $NUM_TOPK \
                     --num-experts $NUM_EXPERTS \
-                    --disable-nvlink
+                    $TEST_DISABLE_ARG
         "
     local rc=$?
     set -e

@@ -57,6 +57,7 @@ export RANK=${RANK:-$NODE_RANK}
 #    uses GPU (BASE+L) and must use NIC mlx5_(BASE+L), BASE = 4 (node0) | 6 (node1).
 NIC_BASE=$(( NODE_RANK == 1 ? 6 : 4 ))
 export ISHMEM_IBGDA_NIC="mlx5_$(( NIC_BASE + LOCAL_RANK ))"
+export ISHMEM_IBGDA_QUIET_SKIP_DRAIN=${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1}
 export FI_VERBS_IFACE=${IFACES[$LOCAL_RANK]}
 
 # DeepEP needs PYTHONPATH to find the in-tree deep_ep package

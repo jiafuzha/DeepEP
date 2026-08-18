@@ -262,7 +262,7 @@ inline int ll_flag_sender_fence() {
 }
 
 // Number of work-groups for the coop warp-put payload kernel. The ordered
-// commit gate in ishmemx_putmem_nbi_warp requires the producing sub-groups to be
+// commit gate in ishmemx_putmem_nbi_subgroup requires the producing sub-groups to be
 // CO-RESIDENT (CUDA sizes its grid to num_sms for the same reason). Default to
 // the device compute-unit count; override with DEEP_EP_LL_PUT_WGS.
 inline int ll_put_wgs(sycl::queue& q) {
@@ -894,7 +894,7 @@ void dispatch_bf16(void* packed_recv_x,
                             if (dst_rank == rank)
                                 coop_copy_bytes_store_uc(dst, msg, used_bytes, lane, sg_size);
                             else
-                                ishmemx_putmem_nbi_warp(dst, msg, used_bytes, dst_rank,
+                                ishmemx_putmem_nbi_subgroup(dst, msg, used_bytes, dst_rank,
                                                         static_cast<unsigned int>(le), true, sg, false);
                         }
                     }
@@ -1206,7 +1206,7 @@ void combine_bf16(void* combined_x,
                                     // put's source visibility; system scope unnecessary (F4).
                                     // (CUDA: __syncwarp + tma_store_wait, no system fence.)
                                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                                    ishmemx_putmem_nbi_warp(dst, stage, hidden_bytes, dst_rank,
+                                    ishmemx_putmem_nbi_subgroup(dst, stage, hidden_bytes, dst_rank,
                                                             static_cast<unsigned int>(le), true, sg, false);
                                 }
                             }
