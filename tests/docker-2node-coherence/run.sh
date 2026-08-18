@@ -288,6 +288,7 @@ run_test() {
                     -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
                     -genv ISHMEM_IBGDA_QPS_PER_PE 1 \
                     -genv ISHMEM_IBGDA_DB_BATCH_SIZE 0 \
+                    -genv ISHMEM_IBGDA_QUIET_SKIP_DRAIN \${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1} \
                     -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                     -genv I_MPI_FABRICS shm:ofi \
                     -genv FI_PROVIDER tcp \

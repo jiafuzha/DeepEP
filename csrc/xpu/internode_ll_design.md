@@ -83,7 +83,7 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   makes the bytes NIC-visible.
 - Warps `w < num_topk` then deliver the finished message to `topk_idx[t, w]`'s
   expert slot: `slot_counter[expert].fetch_add(1)` picks the destination slot, and
-  `ishmemx_putmem_nbi_warp(..., force_db=false)` (self rank → `coop_copy_bytes_store_uc`).
+  `ishmemx_putmem_nbi_subgroup(..., force_db=false)` (self rank → `coop_copy_bytes_store_uc`).
 - **No counter warp, no finish-counter, no grid barrier.** Counting is deferred to
   the recv kernel; the kernel boundary provides the ordering the finish-counter
   used to provide. `force_db=false` leaves the last doorbell batch deferred — the
@@ -118,7 +118,7 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   releases `atomic_clean_flag` (`clean_flag`, borrowed from the unused
   `slot_counter` cell) so flag posts wait for the clean.
 - For its expert's received tokens, sub-warps copy each hidden row into per-token
-  symmetric staging and `ishmemx_putmem_nbi_warp` it to the destination's original
+  symmetric staging and `ishmemx_putmem_nbi_subgroup` it to the destination's original
   token slot (`src_idx`); self rank writes directly into local `combine_data`.
 - After a warp-group barrier, sub-warp 1 posts the arrival flag `+1` on QP `le`
   (self → `uc_store`; remote → `quiet_qp` + `atomic_add_qp`), and sub-warp 0 waits
@@ -167,7 +167,7 @@ count. Splitting lets the consume kernels oversubscribe (`ll_consume_wgs` →
 
 ### 3.2 Sends are co-residency-bound anyway — splitting cannot help them
 
-`ishmemx_putmem_nbi_warp` has a **per-QP ordered commit gate**: the sub-group
+`ishmemx_putmem_nbi_subgroup` has a **per-QP ordered commit gate**: the sub-group
 holding `commit == base` must be resident and publish before the next producer can
 advance (a monotonic watermark, the analogue of CUDA's `ready_head` CAS). So the
 **send grid must not exceed resident capacity** regardless of splitting — a

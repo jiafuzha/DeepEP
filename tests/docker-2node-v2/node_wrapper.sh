@@ -29,7 +29,8 @@ if [ -f /opt/intel/oneapi/setvars.sh ]; then
     set -u
 fi
 export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
-export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}
+export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
+export ISHMEM_IBGDA_QUIET_SKIP_DRAIN=${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1}
 export LD_LIBRARY_PATH=${ISHMEM_DIR}/lib:${LD_LIBRARY_PATH:-}
 if [ -f /usr/lib/x86_64-linux-gnu/libhwloc.so ]; then
     export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"

@@ -34,7 +34,7 @@ cd "$SCRIPT_DIR"
 DEEP_EP_DIR="/root/jiafuzha/code-repo/zjf2012/DeepEP"
 TEST_SCRIPT="${TEST_SCRIPT:-tests/test_internode.py}"
 SSH_DIR="/tmp/deepep-docker-ssh"
-ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}"
+ISHMEM_DIR="${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}"
 
 NODE0_CONTAINER="deepep-v2-node0"
 NODE1_CONTAINER="deepep-v2-node1"
@@ -354,6 +354,7 @@ run_test() {
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
                 -genv ISHMEM_IBGDA_DB_BATCH_SIZE \${ISHMEM_IBGDA_DB_BATCH_SIZE:-0} \
+                -genv ISHMEM_IBGDA_QUIET_SKIP_DRAIN \${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1} \
                 -genv ISHMEM_IBGDA_BAR_BACKEND igub \
                 -genv I_MPI_FABRICS shm:ofi \
                 -genv FI_PROVIDER '$FI_PROVIDER_VAL' \

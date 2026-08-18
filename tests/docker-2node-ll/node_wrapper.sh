@@ -22,6 +22,7 @@ eval "$(conda shell.bash hook 2>/dev/null)" 2>/dev/null
 conda activate jiafuzha_deepep 2>/dev/null
 export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
 export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
+export ISHMEM_IBGDA_QUIET_SKIP_DRAIN=${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1}
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${ISHMEM_DIR}/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
 export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"
 

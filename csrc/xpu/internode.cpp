@@ -56,7 +56,7 @@ class DispatchChannelCountsKernel;
 // ---- Faithful (CUDA-parity) dispatch transport (the only transport) ----
 // Collapses the serial single_task Pack/Stage/RdmaSend/RdmaPut into fewer,
 // work-group/sub-group-parallel kernels and swaps the scalar blocking put +
-// ishmemx_barrier_all_work_group data-path sync for ishmemx_putmem_nbi_warp +
+// ishmemx_barrier_all_work_group data-path sync for ishmemx_putmem_nbi_subgroup +
 // ishmemx_quiet_qp + 64-bit ishmemx_long_atomic_add_qp flags (LL pattern).
 class FaithfulDispatchPackStageKernel;
 class FaithfulDispatchPackBarrierKernel;
@@ -143,7 +143,7 @@ inline bool internode_entry_quiet() {
 
 // DEEP_EP_INTERNODE_BLOCKING_PUT (default 0/OFF): use the SAME blocking scalar
 // ishmem_putmem (single WI) for the F4a2 payload put that the fallback and the
-// serial combine use, instead of ishmemx_putmem_nbi_warp. RATIONALE: the warp
+// serial combine use, instead of ishmemx_putmem_nbi_subgroup. RATIONALE: the warp
 // put's ordered-commit gate spins UNBOUNDED on `nic_wq_commit == base`, while
 // the blocking skeleton put (emit_direct_wqe_skeleton) only advances nic_wq_cnt
 // and self-completes via its internal ishmem_quiet -- it has NO unbounded commit
@@ -157,7 +157,7 @@ inline bool internode_blocking_put() {
     const char* env = std::getenv("DEEP_EP_INTERNODE_BLOCKING_PUT");
     if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
     return false;  // default OFF: use the CUDA-faithful warp-collective put
-                   // (ishmemx_putmem_nbi_warp). This is SAFE now that COMBINE is also
+                   // (ishmemx_putmem_nbi_subgroup). This is SAFE now that COMBINE is also
                    // faithful: every qp0 payload put is followed by a reconciling AMO
                    // (dispatch F4b / combine FC5c ishmemx_long_atomic_add_qp, whose
                    // Step-6 CAS-max raises nic_wq_commit->nic_wq_cnt), so the warp-put's
@@ -1803,7 +1803,7 @@ void dispatch_nvl_rdma(void* recv_x,
     // (a) fuses Pack+Stage into one WG/sub-group-parallel kernel (drops the
     //     serial single_task and the separate Stage + StageBarrier launches),
     // (b) fuses RdmaSend compaction + RDMA put into one kernel that issues
-    //     ishmemx_putmem_nbi_warp (warp-collective, deferred doorbell) +
+    //     ishmemx_putmem_nbi_subgroup (warp-collective, deferred doorbell) +
     //     ishmemx_quiet_qp + a 64-bit ishmemx_long_atomic_add_qp count flag
     //     instead of the scalar blocking ishmem_putmem + double
     //     ishmemx_barrier_all_work_group, and
@@ -1993,7 +1993,7 @@ void dispatch_nvl_rdma(void* recv_x,
         ddbg_stage("F3-PackBarrier");
 
         // ---- F-K3a: RdmaSend — compaction + payload warp-put ONLY (deferred doorbell).
-        // Mirrors internode_ll.cpp LLDispatchSendKernel: ishmemx_putmem_nbi_warp with
+        // Mirrors internode_ll.cpp LLDispatchSendKernel: ishmemx_putmem_nbi_subgroup with
         // force_db=false and NO quiet/AMO. The kernel boundary after this (queue.wait)
         // is what guarantees the deferred doorbells are posted before F-K3b's quiet.
         // A fused put+quiet+AMO in ONE kernel does NOT egress the AMO on this BMG/IBGDA
@@ -2242,18 +2242,18 @@ void dispatch_nvl_rdma(void* recv_x,
                                 // Default path: warp-collective NBI put (cache-hot, fast) on qp=ch.
                                 if (cnt > 0 && sg.get_group_id()[0] == 0) {
                                     const unsigned qp = static_cast<unsigned>(ch);
-                                    ishmemx_putmem_nbi_warp(dst_region + x_off, region + x_off, x_len, dst_pe, qp, true, sg,
+                                    ishmemx_putmem_nbi_subgroup(dst_region + x_off, region + x_off, x_len, dst_pe, qp, true, sg,
                                                             /*force_db=*/faithful_force_db);
-                                    ishmemx_putmem_nbi_warp(dst_region + m_off, region + m_off, m_len, dst_pe, qp, true, sg,
+                                    ishmemx_putmem_nbi_subgroup(dst_region + m_off, region + m_off, m_len, dst_pe, qp, true, sg,
                                                             /*force_db=*/faithful_force_db);
                                     if (i_len > 0)
-                                        ishmemx_putmem_nbi_warp(dst_region + i_off, region + i_off, i_len, dst_pe, qp, true, sg,
+                                        ishmemx_putmem_nbi_subgroup(dst_region + i_off, region + i_off, i_len, dst_pe, qp, true, sg,
                                                                 /*force_db=*/faithful_force_db);
                                     if (w_len > 0)
-                                        ishmemx_putmem_nbi_warp(dst_region + w_off, region + w_off, w_len, dst_pe, qp, true, sg,
+                                        ishmemx_putmem_nbi_subgroup(dst_region + w_off, region + w_off, w_len, dst_pe, qp, true, sg,
                                                                 /*force_db=*/faithful_force_db);
                                     if (sc_len > 0)
-                                        ishmemx_putmem_nbi_warp(dst_region + sc_off, region + sc_off, sc_len, dst_pe, qp, true, sg,
+                                        ishmemx_putmem_nbi_subgroup(dst_region + sc_off, region + sc_off, sc_len, dst_pe, qp, true, sg,
                                                                 /*force_db=*/faithful_force_db);
                                     sycl::group_barrier(sg);
                                 }
@@ -3747,7 +3747,7 @@ void combine_nvl_rdma(DataType type,
                     const size_t s = internode_qp_chunk_start(L, c, num_qp_ch);
                     const size_t e = internode_qp_chunk_start(L, c + 1, num_qp_ch);
                     if (e > s) {
-                        ishmemx_putmem_nbi_warp(dst_region + s, region + s, e - s, dst_pe,
+                        ishmemx_putmem_nbi_subgroup(dst_region + s, region + s, e - s, dst_pe,
                                                 static_cast<unsigned>(c), true, sg,
                                                 /*force_db=*/faithful_force_db);
                     }
@@ -3759,13 +3759,13 @@ void combine_nvl_rdma(DataType type,
                         const size_t w_len = static_cast<size_t>(count) * num_topk * sizeof(float);
                         const size_t rp_len = static_cast<size_t>(count) * sizeof(int);
                         const size_t sn_len = static_cast<size_t>(count) * sizeof(int);
-                        ishmemx_putmem_nbi_warp(dst_region + rdma_topk_wt_offset,
+                        ishmemx_putmem_nbi_subgroup(dst_region + rdma_topk_wt_offset,
                                                 region + rdma_topk_wt_offset, w_len, dst_pe,
                                                 0u, true, sg, /*force_db=*/faithful_force_db);
-                        ishmemx_putmem_nbi_warp(dst_region + rdma_recv_pos_offset,
+                        ishmemx_putmem_nbi_subgroup(dst_region + rdma_recv_pos_offset,
                                                 region + rdma_recv_pos_offset, rp_len, dst_pe,
                                                 0u, true, sg, /*force_db=*/faithful_force_db);
-                        ishmemx_putmem_nbi_warp(dst_region + rdma_src_nvl_offset,
+                        ishmemx_putmem_nbi_subgroup(dst_region + rdma_src_nvl_offset,
                                                 region + rdma_src_nvl_offset, sn_len, dst_pe,
                                                 0u, true, sg, /*force_db=*/faithful_force_db);
                     }

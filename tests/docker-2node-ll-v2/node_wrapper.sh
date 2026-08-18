@@ -26,7 +26,8 @@ if [ -f /opt/intel/oneapi/setvars.sh ]; then
     set -u
 fi
 export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1
-export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/code-repo/ishmem_ibgda/build/_install}
+export ISHMEM_DIR=${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
+export ISHMEM_IBGDA_QUIET_SKIP_DRAIN=${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1}
 export LD_LIBRARY_PATH=${ISHMEM_DIR}/lib:${LD_LIBRARY_PATH:-}
 if [ -f /usr/lib/x86_64-linux-gnu/libhwloc.so ]; then
     export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libhwloc.so${LD_PRELOAD:+ $LD_PRELOAD}"
@@ -54,8 +55,10 @@ fi
 # verify_nic_selection.sh / nic_pcie_check (run.sh), which asserts the
 # auto-picked NIC shares the GPU's PCIe switch.
 
-# DeepEP needs PYTHONPATH to find the in-tree deep_ep package.
-export PYTHONPATH=/root/jiafuzha/code-repo/zjf2012/DeepEP:${PYTHONPATH:-}
+# Use the repository selected by run.sh for both the Python package and native
+# extension. The default preserves the original DeepEP harness behavior.
+export DEEP_EP_DIR=${DEEP_EP_DIR:-/root/jiafuzha/code-repo/zjf2012/DeepEP}
+export PYTHONPATH=${DEEP_EP_DIR}:${PYTHONPATH:-}
 
 # DeepEP / iSHMEM needs MASTER_ADDR (rank-0 node hostname).
 export MASTER_ADDR=${MASTER_ADDR:-deepep-ll-v2-node0}
