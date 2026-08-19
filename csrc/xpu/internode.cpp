@@ -57,7 +57,7 @@ class DispatchChannelCountsKernel;
 // Collapses the serial single_task Pack/Stage/RdmaSend/RdmaPut into fewer,
 // work-group/sub-group-parallel kernels and swaps the scalar blocking put +
 // ishmemx_barrier_all_work_group data-path sync for ishmemx_putmem_nbi_subgroup +
-// ishmemx_quiet_qp + 64-bit ishmemx_long_atomic_add_qp flags (LL pattern).
+// ishmemx_fence_qp + 64-bit ishmemx_long_atomic_add_qp flags (LL pattern).
 class FaithfulDispatchPackStageKernel;
 class FaithfulDispatchPackBarrierKernel;
 class FaithfulDispatchRdmaBarrierKernel;
@@ -113,7 +113,7 @@ inline int internode_flag_lsc_mode() {
 //     F4a2-Put on a later cumulative dispatch). The AMO stays in its own kernel
 //     (F4b) so this does NOT reintroduce the fused-kernel AMO-egress bug.
 //   DEEP_EP_INTERNODE_POST_AMO_QUIET (default 0/OFF): add ONE targeted
-//     ishmemx_quiet_qp(dst_pe,0) AFTER the AMO in F4b to reap the AMO's QP
+//     ishmemx_fence_qp(dst_pe,0) AFTER the AMO in F4b to reap the AMO's QP
 //     completion (targeted quiet is LL-safe; NOT the full ishmem_quiet that wedged).
 inline bool internode_force_db() {
     const char* env = std::getenv("DEEP_EP_INTERNODE_FORCE_DB");
@@ -129,7 +129,7 @@ inline bool internode_post_amo_quiet() {
 }
 
 // DEEP_EP_INTERNODE_ENTRY_QUIET (default 0/OFF): at F4a2-Put entry, issue a
-// targeted ishmemx_quiet_qp(dst_pe,0) per dst_rdma to drain any residue left on
+// targeted ishmemx_fence_qp(dst_pe,0) per dst_rdma to drain any residue left on
 // qp0 by the interleaved serial combine (blocking ishmem_putmem) or a prior
 // faithful AMO before posting new qp0 ops. Targeted quiet_qp only (NOT full
 // ishmem_quiet, which wedged). NOTE: quiet_qp doorbells + polls the CQ but does
@@ -211,7 +211,7 @@ inline bool internode_par_gather() {
 // (all-x | meta | idx | wt | scales) rather than token-major like CUDA's per-channel
 // SymBuffer, so the equivalent NIC parallelism is realized by splitting the contiguous
 // payload put [0,rdma_count_offset) into C 16B-aligned byte chunks, chunk c issued by
-// sub-group c on qp=c (concurrent NIC send queues), then per-c ishmemx_quiet_qp(dst,c)
+// sub-group c on qp=c (concurrent NIC send queues), then per-c ishmemx_fence_qp(dst,c)
 // + ishmemx_long_atomic_add_qp(flag[c],...,c). RC in-order keeps flag[c] after chunk c
 // on the SAME qp; the receiver waits for all C flags.
 //
@@ -1780,7 +1780,7 @@ void dispatch_nvl_rdma(void* recv_x,
     //     serial single_task and the separate Stage + StageBarrier launches),
     // (b) fuses RdmaSend compaction + RDMA put into one kernel that issues
     //     ishmemx_putmem_nbi_subgroup (warp-collective, deferred doorbell) +
-    //     ishmemx_quiet_qp + a 64-bit ishmemx_long_atomic_add_qp count flag
+    //     ishmemx_fence_qp + a 64-bit ishmemx_long_atomic_add_qp count flag
     //     instead of the scalar blocking ishmem_putmem + double
     //     ishmemx_barrier_all_work_group, and
     // (c) gates the receiver on an acquire-fence + uc_load bounded-spin poll of
@@ -2048,7 +2048,7 @@ void dispatch_nvl_rdma(void* recv_x,
                         if (faithful_entry_quiet && local_id == 0) {
                             for (int dq = 0; dq < num_rdma_ranks; ++dq) {
                                 if (dq == my_rdma_rank) continue;
-                                ishmemx_quiet_qp(dq * num_nvl_ranks + nvl_rank, static_cast<unsigned>(ch));
+                                ishmemx_fence_qp(dq * num_nvl_ranks + nvl_rank, static_cast<unsigned>(ch));
                             }
                         }
                         sycl::group_barrier(group);
@@ -2247,11 +2247,11 @@ void dispatch_nvl_rdma(void* recv_x,
                     // -count-1 (total token count); RC in-order makes flag[c] land after
                     // chunk c on the same qp. The receiver waits for ALL C flags (=> all
                     // chunks placed) then reads [0,count).
-                    ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    ishmemx_fence_qp(dst_pe, static_cast<unsigned>(c));
                     lsc_fence_sysrel();
                     ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
                                                static_cast<unsigned>(c));
-                    if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    if (faithful_post_amo_quiet) ishmemx_fence_qp(dst_pe, static_cast<unsigned>(c));
                 });
         });
 
@@ -3670,11 +3670,11 @@ void combine_nvl_rdma(DataType type,
                     // Channel c on its OWN work-group/qp: quiet qp c (flush FC5b2's chunk-c
                     // doorbell) then post the tail AMO on qp c (every flag carries -count-1).
                     // Receiver waits for all num_qp_ch flags.
-                    ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    ishmemx_fence_qp(dst_pe, static_cast<unsigned>(c));
                     lsc_fence_sysrel();
                     ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
                                                static_cast<unsigned>(c));
-                    if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
+                    if (faithful_post_amo_quiet) ishmemx_fence_qp(dst_pe, static_cast<unsigned>(c));
                 });
         });
 
