@@ -1946,31 +1946,24 @@ void dispatch_nvl_rdma(void* recv_x,
                 });
         });
 
-        // ---- F-K2: NVL barrier (device scope) so all peers staged before leader reads ----
+        // ---- F-K2 + F-K3a1 FUSED: NVL barrier + flag-zero + cross-PE barrier ----
+        // Was two separate kernel launches (PackBarrier then RdmaBarrier); merged since
+        // both use a single kIshmemWGSize WG with independent operations, saving one
+        // queue.submit + launch-overhead round-trip.
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulDispatchPackBarrierKernel>(
-                sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
-                [=](sycl::nd_item<1> item) {
-                    nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item);
-                });
-        });
-
-        // ---- F-K3a: RdmaSend — compaction + payload warp-put ONLY (deferred doorbell).
-        // Mirrors internode_ll.cpp LLDispatchSendKernel: ishmemx_putmem_nbi_subgroup with
-        // force_db=false and NO quiet/AMO. The kernel boundary after this (queue.wait)
-        // is what guarantees the deferred doorbells are posted before F-K3b's quiet.
-        // A fused put+quiet+AMO in ONE kernel does NOT egress the AMO on this BMG/IBGDA
-        // stack (HW-confirmed: sent=1 but the remote flag never lands).
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<FaithfulDispatchRdmaBarrierKernel>(
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
 
-                    // Zero MY receive-region flags so remote AMOs land onto 0. Under
-                    // per-GPU RDMA every nvl_rank receives its own same-plane stream, so
-                    // every PE zeroes its own flags.
+                    // Phase 1 (was PackBarrier): intra-node NVL device-scope barrier so
+                    // all NVL peers finished their PackStage before we advance.
+                    nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item);
+
+                    // Phase 2 (was RdmaBarrier): zero MY receive-region flags so remote
+                    // AMOs land onto 0. Under per-GPU RDMA every nvl_rank receives its own
+                    // same-plane stream, so every PE zeroes its own flags.
                     if (local_id == 0) {
                         for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
                             if (src_rdma == my_rdma_rank) continue;
@@ -1984,8 +1977,7 @@ void dispatch_nvl_rdma(void* recv_x,
                     sycl::group_barrier(group);
                     // The ONE necessary cross-PE rendezvous: every PE zeroed its flags
                     // before any AMO posts. Called by ALL PEs' work-groups (not leader-
-                    // gated) so the collective does not hang. This replaces the two
-                    // data-path barriers of the fallback with a single init barrier.
+                    // gated) so the collective does not hang.
                     ishmemx_barrier_all_work_group(group);
                     sycl::group_barrier(group);
                 });
