@@ -255,18 +255,40 @@ class Buffer:
             qpp = 1 << (qpp - 1).bit_length() if qpp > 1 else 1
             os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
         elif num_rdma_bytes > 0:
-            # Normal (high-throughput) internode: provision one RC QP per CUDA channel
-            # so the RDMA payload put is striped across QPs (qp_id == channel, mirroring
-            # internode.cu:818/835). CUDA uses num_channels = num_sms/2 channels; the
-            # buffer's num_qps_per_rank is passed as num_sms, so num_channels =
-            # num_qps_per_rank // 2. iSHMEM rounds to a power of 2 and clamps [1,16], and
-            # the internode kernel derives its QP-channel count C from this same env, so
-            # qp_id ∈ [0,C) never exceeds the provisioned pool. setdefault => a
-            # user/harness-provided ISHMEM_IBGDA_QPS_PER_PE always wins.
-            num_channels = max(1, int(num_qps_per_rank) // 2)
-            qpp = min(num_channels, 16)
-            qpp = 1 << (qpp.bit_length() - 1)  # round DOWN to pow2 (<= num_channels, exact for iSHMEM)
-            os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
+            # Normal (high-throughput) internode: SINGLE QP by default.
+            #
+            # The CUDA-faithful design stripes the RDMA payload put across one RC QP per
+            # channel (qp_id == channel, mirroring internode.cu:818/835). On this BMG +
+            # mlx5/IBGDA stack that striping is a NET LOSS: the path is NIC-latency-bound,
+            # not bandwidth-bound, and every extra QP channel adds a full extra NIC
+            # round-trip on the critical path (per-QP ishmemx_fence_qp + tail
+            # ishmemx_long_atomic_add_qp on the sender, plus one more flag the receiver
+            # must poll before it may read the payload). Cost scales with C; bandwidth
+            # does not improve.
+            #
+            # Measured (H=7168, TOPK=2, EXPERTS=8, DB=8, 4 ranks / 2 nodes; round_trip
+            # min, the least jitter-contaminated metric) — monotonic in C at every size:
+            #
+            #     NT      C=1        C=2        C=4        C=8       C=16
+            #     32    3875.7*    3885.6     3983.8     4183.3     4667.1
+            #     64    6845.7*    6846.3     6963.1     7165.2     7622.4
+            #    128   12854.1*   12912.7    13021.5    13367.9    14129.3
+            #    512   51137.7    51042.6*   51060.6    51649.2    51475.4
+            #   1024  101163.6*  101516.4   101453.2   101553.1   101809.9
+            #
+            # C=1 vs the previous C=8 default: -7.3% round-trip at NT=32 (307 us, ~45x the
+            # 6.8 us run-to-run stdev), -4.5% at NT=64, -3.8% at NT=128. At NT>=2048 the
+            # two are equal on min round-trip but C=1 has far lower tail jitter (NT=2048
+            # max 207 ms vs 310 ms). A 3x repeat at NT=32 separates C=1 (3855.3 +/- 6.8)
+            # from C=2 (3900.5 +/- 4.7) by 6.7 sigma, so C=1 is the optimum, not merely
+            # noise-equivalent.
+            #
+            # The kernel derives its QP-channel count C from this same env
+            # (internode_num_qp_channels()), so C=1 also collapses the per-QP flag fan-out
+            # to a single flag per destination. setdefault => an explicit user/harness
+            # ISHMEM_IBGDA_QPS_PER_PE always wins, so multi-QP striping stays available for
+            # stacks where the NIC is the bottleneck rather than the round-trip latency.
+            os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', '1')
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
         # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a
