@@ -148,6 +148,7 @@ if __name__ == '__main__':
                     library_dirs.append(flag[2:])
                 else:
                     extra_link_args.append(flag)
+            extra_link_args.append('-lhwloc')
             ishmem_archive = Path(ishmem_dir) / 'lib' / 'libishmem.a'
             if ishmem_archive.exists():
                 assert_ishmem_archive_fresh(ishmem_archive, ishmem_dir)
