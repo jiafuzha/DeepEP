@@ -1724,32 +1724,8 @@ void dispatch_nvl_rdma(void* recv_x,
                                         total_recv_regions,
                                         static_cast<size_t>(1)});
 
-    static const bool kDbgDispatch = std::getenv("DEEP_EP_DBG_DISPATCH") != nullptr;
-    auto ddbg_last = std::chrono::high_resolution_clock::now();
-    auto ddbg_stage = [&](const char* name) {
-        if (kDbgDispatch) {
-            auto now = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration<double, std::milli>(now - ddbg_last).count();
-            ddbg_last = now;
-            std::fprintf(stderr, "[dispatch rank=%d nvl=%d rdma=%d] stage done: %s (+%.2f ms)\n",
-                         rank, nvl_rank, my_rdma_rank, name, ms);
-            std::fflush(stderr);
-        }
-    };
-    // In-order XPU stream => device executes kernels back-to-back; the per-stage
-    // host queue.wait() is pure round-trip overhead (~2 ms each, ~8 stages =>
-    // ~16 ms). Skip intermediate waits in production (DEEP_EP_INTERNODE_FUSE_WAITS,
-    // default ON); force them when timing stages (kDbgDispatch) or when the fuse is
-    // disabled for A/B. The FINAL wait before returning to Python stays unconditional.
-    static const bool kFuseWaits = [] {
-        const char* e = std::getenv("DEEP_EP_INTERNODE_FUSE_WAITS");
-        return !(e != nullptr && e[0] != '\0' && std::atoi(e) == 0);
-    }();
-    const bool wait_each = kDbgDispatch || !kFuseWaits;
-    ddbg_stage("0-entry");
     // FUSED: Init zeroing moved into FaithfulDispatchPackStageKernel below.
     // The separate CombinedDispatchInitKernel launch is eliminated.
-    // ddbg_stage("1-Init") is now reported by PackStage after the pre-zero pass.
 
     // ===================================================================
     // ===================================================================
@@ -1767,8 +1743,8 @@ void dispatch_nvl_rdma(void* recv_x,
     //    CUDA uses warp specialization within a SINGLE kernel (5 WarpRoles in
     //    dispatch, 4 in combine) coordinated by named barrier.sync. SYCL lacks
     //    named barrier.sync for subset-of-WG synchronization, so we split each
-    //    role into its own kernel launch. Queue-ordering + fused-waits
-    //    (DEEP_EP_INTERNODE_FUSE_WAITS=1) mitigate launch overhead.
+    //    role into its own kernel launch. In-order queue-ordering (no
+    //    intermediate host waits) preserves cross-kernel dependency.
     //
     // 3. AMO-FLAG CROSS-NODE SYNCHRONIZATION (gaps #5,#22):
     //    CUDA uses nvshmem_sync_all() (global PE barrier) and a sliding-window
@@ -1821,16 +1797,7 @@ void dispatch_nvl_rdma(void* recv_x,
         const bool faithful_post_amo_quiet = internode_post_amo_quiet();  // F4b post-AMO quiet
         const bool faithful_entry_quiet = internode_entry_quiet();     // F4a2 entry drain qp0
         const bool faithful_blocking_put = internode_blocking_put();   // F4a2 blocking payload put
-        const bool faithful_nbi_mode = internode_nbi_mode();         // F4a2 NBI vs blocking API
-        // EXP3: host-visible per-rdma-rank debug slots (send: count/dst_pe/flag,
-        // recv: raw/count/spins). Gated by DEEP_EP_DBG_DISPATCH; nullptr otherwise
-        // so the captured-pointer writes compile out to a cheap null check.
-        long* dbg_buf = nullptr;
-        if (kDbgDispatch) {
-            dbg_buf = sycl::malloc_shared<long>(static_cast<size_t>(num_rdma_ranks) * 6, queue);
-            for (int i = 0; i < num_rdma_ranks * 6; ++i) dbg_buf[i] = -424242;  // sentinel = "kernel never wrote"
-        }
-
+        const bool faithful_nbi_mode = internode_nbi_mode();
         // ---- F-K1: fused Init + Pack + Stage (WG-parallel zero + payload; WI0 routing meta) ----
         // FUSION: the former CombinedDispatchInitKernel zeroing is done here as a
         // cooperative per-WG pre-pass, eliminating one queue.submit + queue.wait.
@@ -1978,8 +1945,6 @@ void dispatch_nvl_rdma(void* recv_x,
                     lsc_fence_sysrel();
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F2-PackStage");  // FUSED: was "1-Init" + "F2-PackStage"
 
         // ---- F-K2: NVL barrier (device scope) so all peers staged before leader reads ----
         queue.submit([&](sycl::handler& cgh) {
@@ -1989,8 +1954,6 @@ void dispatch_nvl_rdma(void* recv_x,
                     nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item);
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F3-PackBarrier");
 
         // ---- F-K3a: RdmaSend — compaction + payload warp-put ONLY (deferred doorbell).
         // Mirrors internode_ll.cpp LLDispatchSendKernel: ishmemx_putmem_nbi_subgroup with
@@ -2019,33 +1982,17 @@ void dispatch_nvl_rdma(void* recv_x,
                         lsc_fence_sysrel();
                     }
                     sycl::group_barrier(group);
-                    // Device-side fine-grained tracing (flushes DURING kernel execution,
-                    // unlike the host-visible dbg_buf which is only printed after the
-                    // queue.wait that this kernel may hang inside). Gated on dbg_buf!=null
-                    // (i.e. DEEP_EP_DBG_DISPATCH). Leader/all-rank WI0 only.
-                    if (dbg_buf && local_id == 0) {
-                        sycl::ext::oneapi::experimental::printf(
-                            "[F4a rank=%d nvl=%d] pre-barrier\n", rank, nvl_rank);
-                    }
                     // The ONE necessary cross-PE rendezvous: every PE zeroed its flags
                     // before any AMO posts. Called by ALL PEs' work-groups (not leader-
                     // gated) so the collective does not hang. This replaces the two
                     // data-path barriers of the fallback with a single init barrier.
                     ishmemx_barrier_all_work_group(group);
                     sycl::group_barrier(group);
-                    if (dbg_buf && local_id == 0) {
-                        sycl::ext::oneapi::experimental::printf(
-                            "[F4a rank=%d nvl=%d] post-barrier\n", rank, nvl_rank);
-                    }
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F4a0-Barrier");
 
         // ---- F-K3a2: Put — leader compaction + payload warp-put (force_db=false) ----
-        // Split from the F4a0 barrier and the F4b flag AMO so any hang localizes to a
-        // distinct HOST ddbg stage (device sycl printf is buffered and lost on SIGKILL;
-        // only ddbg_stage host prints are reliably flushed). NO full ishmem_quiet() here
+        // Split from the F4a0 barrier and the F4b flag AMO. NO full ishmem_quiet() here
         // or in F4b: LL (internode_ll.cpp L940-942 / L1245-1247) uses ONLY a targeted
         // quiet_qp BEFORE the AMO and NEVER a full quiet, nor any quiet after the AMO.
         // A full ishmem_quiet() blocks forever if an AMO completion is not reaped by the
@@ -2270,8 +2217,6 @@ void dispatch_nvl_rdma(void* recv_x,
                     }
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F4a2-Put");
 
         // ---- F-K3b: RdmaFlag — quiet + 64-bit AMO ONLY, after the kernel boundary.
         // Mirrors internode_ll.cpp LLDispatchRecvKernel phase A (L938-942): quiet_qp
@@ -2307,15 +2252,8 @@ void dispatch_nvl_rdma(void* recv_x,
                     ishmemx_long_atomic_add_qp(dst_flag + c, static_cast<long>(-count - 1), dst_pe,
                                                static_cast<unsigned>(c));
                     if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
-                    if (dbg_buf && c == 0) {  // EXP3 sender instrumentation
-                        dbg_buf[dst_rdma * 3 + 0] = static_cast<long>(count);
-                        dbg_buf[dst_rdma * 3 + 1] = static_cast<long>(dst_pe);
-                        dbg_buf[dst_rdma * 3 + 2] = 1;
-                    }
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F4b-RdmaFlag");
 
         // ---- F-K4: leader forwards RDMA-received tokens to local NVL peers (flag poll) ----
         queue.submit([&](sycl::handler& cgh) {
@@ -2393,11 +2331,6 @@ void dispatch_nvl_rdma(void* recv_x,
                             // cannot happen.
                             if (count < 0) count = 0;
                             if (count > num_recv_tokens) count = num_recv_tokens;
-                            if (dbg_buf) {  // EXP3 receiver instrumentation
-                                dbg_buf[num_rdma_ranks * 3 + src_rdma * 3 + 0] = raw0;
-                                dbg_buf[num_rdma_ranks * 3 + src_rdma * 3 + 1] = static_cast<long>(count);
-                                dbg_buf[num_rdma_ranks * 3 + src_rdma * 3 + 2] = static_cast<long>(spins_total);
-                            }
                         }
                         count = sycl::group_broadcast(group, count, 0);
                         sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -2469,21 +2402,6 @@ void dispatch_nvl_rdma(void* recv_x,
                     sycl::group_barrier(group);
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F6-FwdWrite");
-        if (kDbgDispatch && dbg_buf) {  // EXP3: dump sender/receiver flag signal
-            for (int r = 0; r < num_rdma_ranks; ++r) {
-                fprintf(stderr, "[F4 SEND] rank=%d my_rdma=%d -> dst_rdma=%d dst_pe=%ld count=%ld sent=%ld\n",
-                        rank, my_rdma_rank, r, dbg_buf[r * 3 + 1], dbg_buf[r * 3 + 0], dbg_buf[r * 3 + 2]);
-            }
-            for (int r = 0; r < num_rdma_ranks; ++r) {
-                fprintf(stderr, "[F6 RECV] rank=%d src_rdma=%d raw=%ld count=%ld spins=%ld\n",
-                        rank, r, dbg_buf[num_rdma_ranks * 3 + r * 3 + 0],
-                        dbg_buf[num_rdma_ranks * 3 + r * 3 + 1], dbg_buf[num_rdma_ranks * 3 + r * 3 + 2]);
-            }
-            fflush(stderr);
-            sycl::free(dbg_buf, queue);
-        }
 
         // ---- F-K5: NVL barrier before shared Assemble/Head consume fwd_* ----
         queue.submit([&](sycl::handler& cgh) {
@@ -2493,8 +2411,6 @@ void dispatch_nvl_rdma(void* recv_x,
                     nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item);
                 });
         });
-        if (wait_each) queue.wait();
-        ddbg_stage("F7-FwdBarrier");
     }
 
     // ===== Producer-PUSH intra-node NVL exchange (gap #2) =====
@@ -2576,8 +2492,6 @@ void dispatch_nvl_rdma(void* recv_x,
                 }
             });
     });
-    if (wait_each) queue.wait();
-    ddbg_stage("F8-NvlPush");
 
     // F-K9 NvlPushBarrier: all producers' intra pushes landed before the consumer reads
     // its OWN nvlrecv region (ordering via kernel boundary + device-scope NVL barrier).
@@ -2588,8 +2502,6 @@ void dispatch_nvl_rdma(void* recv_x,
                 nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item);
             });
     });
-    if (wait_each) queue.wait();
-    ddbg_stage("F9-NvlPushBarrier");
 
     // ===== SHARED: Assemble + Head (identical output for both transports) =====
     // CUDA-faithful local-expert remap of recv_topk_idx (internode.cu:1060-61,1176-79):
@@ -2903,8 +2815,6 @@ void dispatch_nvl_rdma(void* recv_x,
             }
         });
     });
-    if (wait_each) queue.wait();
-    ddbg_stage("8-Assemble");  // FUSED: was "8-Assemble" + "10-ChannelCounts"
 
     // F-K10 CountsBarrier: every rank's per_src_count is visible in all peers before Head.
     queue.submit([&](sycl::handler& cgh) {
@@ -2914,12 +2824,9 @@ void dispatch_nvl_rdma(void* recv_x,
                 nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 3, num_nvl_ranks, item);
             });
     });
-    if (wait_each) queue.wait();
-    ddbg_stage("9-CountsBarrier");
 
     // FUSED: DispatchChannelCountsKernel is now fused into CombinedDispatchAssembleKernel
     // as a pre-pass (PHASE 0). The separate kernel launch is eliminated.
-    // ddbg_stage("10-ChannelCounts") was merged into ddbg_stage("8-Assemble").
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.single_task<CombinedDispatchHeadKernel>([=]() {
@@ -3146,25 +3053,6 @@ void combine_nvl_rdma(DataType type,
     const size_t total_recv_regions = static_cast<size_t>(num_rdma_ranks) * rdma_region_bytes;
     const size_t init_range = std::max({total_combined, total_topk, total_recv_regions, static_cast<size_t>(1)});
 
-    static const bool kDbgCombine = std::getenv("DEEP_EP_DBG_COMBINE") != nullptr;
-    auto dbg_last = std::chrono::high_resolution_clock::now();
-    auto dbg_stage = [&](const char* name) {
-        if (kDbgCombine) {
-            auto now = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration<double, std::milli>(now - dbg_last).count();
-            dbg_last = now;
-            std::fprintf(stderr, "[combine rank=%d nvl=%d rdma=%d] stage done: %s (+%.2f ms)\n",
-                         rank, nvl_rank, my_rdma_rank, name, ms);
-            std::fflush(stderr);
-        }
-    };
-    static const bool kFuseWaits = [] {
-        const char* e = std::getenv("DEEP_EP_INTERNODE_FUSE_WAITS");
-        return !(e != nullptr && e[0] != '\0' && std::atoi(e) == 0);
-    }();
-    const bool wait_each = kDbgCombine || !kFuseWaits;
-    dbg_stage("0-entry");
-
     // Faithful combine gate (shared with dispatch). Empty/"0" => OFF (serial
     // fallback). All faithful transport primitives (blocking put + AMO flag)
     // were validated by the dispatch port; here they replace the serial
@@ -3176,11 +3064,9 @@ void combine_nvl_rdma(DataType type,
     const bool faithful_blocking_put = internode_blocking_put();  // FC5b blocking payload put
     const bool faithful_nbi_mode = internode_nbi_mode();          // FC5b NBI vs blocking API
     const bool faithful_par_gather = internode_par_gather();      // FC5b grid-parallel gather
-    dbg_stage("combine ON");
 
     // FUSION: init zeroing merged into Pack kernel below (WG 0's cooperative pre-pass).
     // Eliminates the separate CombinedCombineInitKernel launch.
-    // dbg_stage("1-Init") is now reported by Pack after the zero pass.
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t pack_groups = static_cast<size_t>(std::max(num_tokens, 1));
@@ -3249,21 +3135,16 @@ void combine_nvl_rdma(DataType type,
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("2-Pack");  // FUSED: was "1-Init" + "2-Pack"
 
     // FUSED: CombineNvlPlaneInitKernel (cs_meta src_nvl_rank=-1 sentinel seed) is
     // merged into the Pack kernel above (WG 0's zero pass also seeds the combine-
     // staging meta sentinels). The separate PlaneInit launch is eliminated.
-    // dbg_stage("2b-PlaneInit") was merged into dbg_stage("2-Pack").
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<CombinedCombinePackBarrierKernel<dtype_t>>(
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
             [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base, num_nvl_ranks, item); });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("3-PackBarrier");
 
     // ===== Producer-PUSH intra-node NVL combine exchange (gap #2 + selective routing) =====
     // CN-K1 CombineNvlPush: grid = 1 WG. Each rank reads its OWN Pack output and routes each
@@ -3330,8 +3211,6 @@ void combine_nvl_rdma(DataType type,
                 sycl::group_barrier(group);
             });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("3b-CombineNvlPush");
 
     // CN-K2 CombineNvlPushBarrier: all producers' pushes landed before any gather reads
     // its OWN staging plane (ordering via kernel boundary + device-scope NVL barrier).
@@ -3342,8 +3221,6 @@ void combine_nvl_rdma(DataType type,
                 nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 1, num_nvl_ranks, item);
             });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("3c-CombineNvlPushBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t rs_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
@@ -3400,8 +3277,6 @@ void combine_nvl_rdma(DataType type,
             }
         });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("4-RdmaSend");
 
     // ==================== FAITHFUL COMBINE RDMA PUSH + FORWARD ====================
     // Replaces the serial RdmaPush's TWO ishmemx_barrier_all_work_group data-path
@@ -3442,8 +3317,6 @@ void combine_nvl_rdma(DataType type,
                     sycl::group_barrier(group);
                 });
         });
-        if (wait_each) queue.wait();
-        dbg_stage("FC5a-RdmaBarrier");
 
         // ---- FC5b: leader gather/compact + gate-free BLOCKING payload put. No
         // cross-PE op here, so non-leaders early-return. Self RDMA rank gathers
@@ -3616,7 +3489,6 @@ void combine_nvl_rdma(DataType type,
                         }
                     });
             });
-            if (wait_each) queue.wait();
             // Pass 2: one work-group per input token (peer,t); copy the row + topk +
             // recv_pos/src_nvl into the precomputed slot. Full-GPU parallel row copy.
             const size_t par_groups = slot_n;
@@ -3665,8 +3537,6 @@ void combine_nvl_rdma(DataType type,
                     });
             });
         }
-        if (wait_each) queue.wait();
-        dbg_stage("FC5b-Gather");
 
         // ---- FC5b2: leader payload put (split from FC5b gather so the NIC put and
         // the local compaction are timed independently). Reads the region compacted
@@ -3772,8 +3642,6 @@ void combine_nvl_rdma(DataType type,
                     sycl::group_barrier(sg);
                 });
         });
-        if (wait_each) queue.wait();
-        dbg_stage("FC5b2-Put");
 
         // ---- FC5c: kernel-boundary 64-bit AMO count flag (mirror dispatch F4b).
         // The kernel boundary after FC5b guarantees the blocking puts landed; the
@@ -3809,8 +3677,6 @@ void combine_nvl_rdma(DataType type,
                     if (faithful_post_amo_quiet) ishmemx_quiet_qp(dst_pe, static_cast<unsigned>(c));
                 });
         });
-        if (wait_each) queue.wait();
-        dbg_stage("FC5c-RdmaFlag");
 
         // ---- FC6: leader forwards RDMA-received tokens to local NVL peers,
         // polling the 64-bit AMO flag instead of the count sentinel. The forward
@@ -3939,8 +3805,6 @@ void combine_nvl_rdma(DataType type,
                     sycl::group_barrier(group);
                 });
         });
-        if (wait_each) queue.wait();
-        dbg_stage("FC6-FwdWrite");
     }
 
     queue.submit([&](sycl::handler& cgh) {
@@ -3948,8 +3812,6 @@ void combine_nvl_rdma(DataType type,
             sycl::nd_range<1>(sycl::range<1>(std::max(num_nvl_ranks, 32)), sycl::range<1>(std::max(num_nvl_ranks, 32))),
             [=](sycl::nd_item<1> item) { nvl_barrier(barrier_signal_ptrs_gpu, nvl_rank, barrier_signal_base + 2, num_nvl_ranks, item); });
     });
-    if (wait_each) queue.wait();
-    dbg_stage("7-FwdBarrier");
 
     queue.submit([&](sycl::handler& cgh) {
         const size_t rd_groups = static_cast<size_t>(std::max(num_combined_tokens, 1));
@@ -4031,7 +3893,6 @@ void combine_nvl_rdma(DataType type,
         });
     });
     queue.wait();
-    dbg_stage("8-Reduce");
 #else
     TORCH_CHECK(false, "combine_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
 #endif
