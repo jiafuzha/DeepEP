@@ -87,7 +87,9 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
 - **No counter warp, no finish-counter, no grid barrier.** Counting is deferred to
   the recv kernel; the kernel boundary provides the ordering the finish-counter
   used to provide. `force_db=false` leaves the last doorbell batch deferred — the
-  recv kernel's `quiet_qp` flushes it.
+  recv kernel's `fence_qp` flushes it (advances `nic_wq_commit` and rings the
+  doorbell without waiting for CQEs; RC in-order delivery still lands the count
+  flag after the payloads on the target QP).
 - Block 0 additionally zeroes the opposite-parity `rdma_recv_count` slots (CUDA
   `next_clean`).
 
@@ -97,10 +99,17 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   `responsible_expert_idx = sm_id`.
 - **Phase A (count post):** warp 0 histograms `topk_idx == responsible_expert` and
   posts the count flag `(-count-1)` on QP `le`. Because the send kernel has fully
-  exited, all payload puts are already committed; `ishmemx_quiet_qp(dst_rank, le)`
-  drains the QP (flushing deferred doorbells, §3.3) and the RC-ordered
-  `ishmemx_long_atomic_add_qp` lands the flag *after* the payloads. The self
-  channel (`dst_rank == rank`) uses a system-release fence + `uc_store`.
+  exited, all payload puts are already committed; `ishmemx_fence_qp(dst_rank, le)`
+  establishes a **QP-scoped ordering fence** (flushing any deferred doorbells and
+  publishing the ordered-commit watermark up to the current claim, §3.3), and the
+  subsequent RC-ordered `ishmemx_long_atomic_add_qp` is guaranteed by RC in-order
+  delivery to land the flag *after* every prior payload put on the same QP. The
+  self channel (`dst_rank == rank`) uses a system-release fence + `uc_store`.
+  Fence rather than quiet: the sender does **not** need to wait for the CQE
+  completions of the payload puts — RC ordering makes the AMO land after them on
+  the receiver regardless, so `fence_qp` (post-side ordering only, no local
+  wait-for-drain) is strictly cheaper than the earlier `quiet_qp`, and was
+  measured to reduce per-iteration latency without affecting correctness.
 - A whole-WG `group_barrier` publishes the **self-channel** count (written by this
   same WG in Phase A) to Phase B. Cross-rank channels are remote (landed via NIC
   AMO) and need no barrier.
@@ -121,9 +130,11 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   symmetric staging and `ishmemx_putmem_nbi_subgroup` it to the destination's original
   token slot (`src_idx`); self rank writes directly into local `combine_data`.
 - After a warp-group barrier, sub-warp 1 posts the arrival flag `+1` on QP `le`
-  (self → `uc_store`; remote → `quiet_qp` + `atomic_add_qp`), and sub-warp 0 waits
-  on the incoming arrival flag for its channel. The kernel exit is the grid sync:
-  once it returns, every flag has been observed and all `combine_data` is globally
+  (self → `uc_store`; remote → `fence_qp` + `atomic_add_qp` — RC in-order delivery
+  guarantees the AMO lands after every prior payload put on the same QP without
+  waiting for their CQE completions), and sub-warp 0 waits on the incoming
+  arrival flag for its channel. The kernel exit is the grid sync: once it
+  returns, every flag has been observed and all `combine_data` is globally
   visible.
 
 ### 2.4 `LLCombineReduceKernel` — weighted top-k reduce (token-parallel)
@@ -182,12 +193,18 @@ The fused dispatch used a per-expert finish-counter (each send bumped it, the
 count-send waited for `2*TAG`) purely to guarantee *all payloads for expert E are
 posted before E's count flag*. The kernel boundary provides that for free: when
 `LLDispatchSendKernel` exits, **every** put is committed, so `LLDispatchRecvKernel`
-can `quiet_qp` + post the flag with no finish-counter. This depends on the iSHMEM
-**quiet_qp v2** behaviour (`ibgda(quiet_qp): drain full committed prefix on shared
-QP`): quiet snapshots the claim counter `nic_wq_cnt`, spins until the ordered
-`nic_wq_commit` watermark catches up, then rings the doorbell to the full committed
-prefix — flushing the `force_db=false` deferred doorbells the send kernel left,
-without ever doorbelling an unwritten slot.
+can `fence_qp` + post the flag with no finish-counter. This uses the iSHMEM
+**fence_qp** primitive (`ibgda(fence_qp): publish full committed prefix on shared
+QP without waiting for CQE`): fence rings the doorbell to the ordered
+`nic_wq_commit` watermark caught up to the current claim counter — flushing the
+`force_db=false` deferred doorbells the send kernel left, without ever
+doorbelling an unwritten slot — but, unlike `quiet_qp`, does **not** locally spin
+on the completion queue for the outstanding puts to retire. RC in-order
+delivery on the target QP guarantees the subsequent RC AMO (count flag) lands
+after every prior payload put anyway, so waiting for CQE completion is
+unnecessary. Using `fence_qp` instead of `quiet_qp` therefore preserves
+correctness while removing the drain wait from the flag-post critical path
+(measured net win, no correctness regression).
 
 ### 3.4 Net effect
 
@@ -322,3 +339,136 @@ finish_counter / finish_ready num_experts * int each  (legacy; unused by the spl
 
 The `barrier`, `finish_counter`, and `finish_ready` regions are retained for layout
 stability but are no longer written by the phase-split kernels.
+
+---
+
+## 7. Planned kernel fusion (CUDA-parity single-kernel LL)
+
+The current XPU LL path is **phase-split**: dispatch is two kernels
+(`LLDispatchSendKernel` → `LLDispatchRecvKernel`) and combine is two kernels
+(`LLCombineSendKernel` → `LLCombineReduceKernel`). The CUDA reference in
+`csrc/cuda_kernels/internode_ll.cu` runs each direction as **one** kernel:
+warp-specialized send/count/recv phases inside a single work-group, joined
+across work-groups by `cg::this_grid().sync()`. This section captures the plan
+to close that gap on BMG using two SYCL primitives that were previously
+unavailable in this kernel:
+
+1. **`NamedBarrier` (SPIR-V `cl_khr_subgroup_named_barrier`)** — a
+   sub-group-subset barrier that replaces CUDA `bar.sync <id>, <count>` and lets
+   warps *within* a work-group synchronize a subset (caster warps ↔ counter
+   warp) while other warps run ahead. See `named_barrier_usage.md` for the class
+   in `xpu_kernels.hpp`, the iSHMEM `NBarrierCnt` coexistence requirement
+   (`IGC_SelectiveFunctionControl=1`), and the JIT-repro test.
+2. **`sycl_ext_oneapi_root_group` + `use_root_sync` + `nd_launch`** — a
+   hardware-managed device-wide barrier
+   (`sycl::group_barrier(root_group)`) that replaces CUDA
+   `cg::this_grid().sync()` and the current kernel boundary. See
+   `root_group_cooperative_launch.md` for the launch config
+   (`syclex::launch_config{ndr, {use_root_sync}}` + `syclex::nd_launch`) and the
+   `max_num_work_groups_sync` host-side occupancy query that keeps the grid
+   inside the device's co-resident capacity (deadlock-safe).
+
+Both primitives coexist inside one kernel: `NamedBarrier` synchronizes
+warp-subsets within a WG; `group_barrier(root_group)` synchronizes across WGs.
+
+### 7.1 Target fused shape (CUDA parity)
+
+| Direction | Fused kernel | Warp specialization inside one WG | Grid sync |
+|---|---|---|---|
+| dispatch | `LLDispatchFusedKernel` | warps `0..num_topk-1` = payload cast + IBGDA warp-put per top-k expert; warp `num_warps-1` = counter warp (histograms `topk_idx`, cleans opposite-parity `rdma_recv_count`, seeds `atomic_finish_counter_per_expert`, posts the `-count-1` count flag via `fence_qp` + `atomic_add_qp` once its finish-counter hits `2*FINISHED_SUM_TAG`) | one `group_barrier(root_group)` between the count-post and Phase B (poll + copy) — replaces the current dispatch kernel boundary and CUDA `cg::this_grid().sync()` at `internode_ll.cu:360` |
+| combine | `LLCombineFusedKernel` | sub-warps `0..num_warps_per_group-1` = per-token IBGDA sends of this expert's combined output back to the dispatching rank's original slot; sub-warp 1 (after warp-group barrier) = arrival-flag post (`fence_qp` + `+1 atomic_add_qp`); sub-warp 0 = arrival-flag receive-wait | one `group_barrier(root_group)` between the send/flag phase and the weighted top-k reduce phase — replaces the current combine kernel boundary and CUDA `cg::this_grid().sync()` at `internode_ll.cu:977` |
+
+### 7.2 CUDA → XPU sync mapping used by the fused kernels
+
+| CUDA source | XPU/SYCL equivalent | Role in the fused LL kernel |
+|---|---|---|
+| `bar.sync 1, num_threads` (dispatch, `internode_ll.cu:252`) | `NamedBarrier::init(num_threads/32)` + `.sync(kNamedBarrierGlobalFence)` | Sync ALL caster warps between "row cast into `rdma_x`" and "IBGDA put to top-k experts" |
+| `bar.sync warp_group_id+2, num_warps_per_group*32` (dispatch counter, `internode_ll.cu:420`) | Per-warp-group `NamedBarrier` (one instance per `warp_group_id`) | Sync one warp group's caster + counter warps before the count-flag AMO |
+| `bar.sync warp_group_id+1, num_warps_per_group*32` (combine, `internode_ll.cu:918`) | Per-warp-group `NamedBarrier` | Warp-group-scoped rendezvous between the per-token send warps and the flag-post sub-warp |
+| `cg::this_grid().sync()` (`internode_ll.cu:360, 977`) | `sycl::group_barrier(item.ext_oneapi_get_root_group())` | Device-wide barrier between send/count and recv phases in a single fused launch |
+| `__syncwarp()` | `sycl::group_barrier(sub_group)` | Unchanged; already used |
+| `__syncthreads()` | `sycl::group_barrier(work_group)` | Kept for whole-WG rendezvous (e.g., publishing per-expert `shared_num_tokens_sent_per_expert` to the count sub-warp before the AMO) |
+
+Because BMG forces `num_warp_groups == 1` for `num_experts <= num_device_sms`
+(see §4), the initial fused implementation uses **one** `NamedBarrier`
+instance per WG (caster subset + counter subset) and does not yet need the
+per-warp-group `NamedBarrier` array. Adding a `NamedBarrier[num_warp_groups]`
+array follows the same pattern once `num_warp_groups > 1` is enabled — which
+also requires making each warp group its own WG on the current split path (§4).
+
+### 7.3 Launch changes: `nd_launch` with `use_root_sync`
+
+Both fused kernels move from the current `queue.submit` + `parallel_for` to the
+cooperative-launch path documented in `root_group_cooperative_launch.md`:
+
+```cpp
+namespace syclex = sycl::ext::oneapi::experimental;
+
+syclex::properties props{syclex::use_root_sync};
+// host-side occupancy query (cache per kernel/wg_size/local_mem tuple)
+auto max_wgs = syclex::get_kernel_info<
+    LLDispatchFusedKernel,
+    syclex::info::kernel::max_num_work_groups_sync>(queue, wg_size, props, 0);
+
+const int num_sms = std::min<int>(num_experts, max_wgs);
+sycl::nd_range<1> ndr{static_cast<size_t>(num_sms) * wg_size, wg_size};
+syclex::launch_config cfg{ndr, props};
+syclex::nd_launch(queue, cfg, LLDispatchFusedKernel{args...});
+```
+
+The `max_num_work_groups_sync` query replaces the current
+`kLLFusedMaxCoresidentWGs = 32` empirical cap: the runtime tells us the exact
+co-resident capacity for THIS kernel/wg-size/SLM combination, so the fused grid
+can safely grow up to that cap on future silicon without the manual constant.
+`num_sms` still stays `>= num_experts` (one WG per responsible expert
+channel) — the query only lifts the upper bound.
+
+### 7.4 Correctness prerequisites (before flipping the switch)
+
+The following must be in place before enabling the fused kernels; each is
+already documented in a companion note:
+
+1. **iSHMEM + `NamedBarrier` coexistence** — build with the
+   `IGC_SelectiveFunctionControl=1` workaround (see `named_barrier_usage.md`).
+   Without it, IGC stamps `NBarrierCnt=1` on non-inlined iSHMEM subroutines in
+   the RDC-linked module and the JIT rejects a kernel that also uses
+   `NamedBarrier`.
+2. **`root_group` build/runtime capability** — oneAPI 2025.0+ with the
+   experimental extension enabled at compile time and the target device
+   reporting the capability at run time. Query `max_num_work_groups_sync`
+   once per kernel configuration and cache it (host-side).
+3. **iSHMEM archive parity** — the `libishmem.a` merged into `deep_ep_cpp.so`
+   must be the same repo that provides the fast, correct
+   `ishmemx_barrier_all_work_group` and the `ishmemx_fence_qp` used above
+   (see the copilot-instructions "iSHMEM archive parity" pitfall).
+4. **Grid size vs co-residency** — `nd_launch` with `use_root_sync` validates
+   this, but the fallback path (env `DEEP_EP_LL_FUSED_WGS` override) must not
+   exceed `max_num_work_groups_sync`; a spinning `root_group` participant that
+   is not resident trips the GuC watchdog → `DEVICE_LOST` exactly like the
+   old `GridBarrier`.
+
+### 7.5 Expected wins and A/B plan
+
+The split path already recovers the fused design's per-QP commit-gate ceiling
+on the send side (§3.2), so the win from fusion is not on the send throughput
+axis. The measurable wins targeted are:
+
+- **Fewer host-side kernel submissions per iteration** (2 → 1 per direction).
+  Removes one `queue.submit` + one implicit kernel-boundary sync per direction
+  from the launch critical path; matters most at small `num_tokens` where the
+  launch overhead is a non-trivial fraction of the ~1 ms iteration.
+- **Overlap of the intra-WG counter warp with the caster warps** via the
+  sub-group-subset `NamedBarrier` — the counter warp can drive its histogram
+  and `atomic_finish_counter_per_expert` bumps in parallel with cast + put,
+  instead of waiting for the whole-WG `group_barrier`.
+- **Zero-scratch grid barrier** — `group_barrier(root_group)` replaces the
+  legacy `GridBarrier`'s two `uint32_t` scratch cells + UC-load spin, and the
+  layout entries `barrier` / `finish_counter` / `finish_ready` (§6) become
+  reusable — they are currently retained only for layout stability.
+
+Validation follows the split-path baseline in §5.5:
+`docker-2node-ll` at H7168 / topk2 / 8 experts, tokens ∈ {32, 128, 256, 512,
+1024, 2048, 4096}. A regression on **any** row (or a `DEVICE_LOST` on clean
+HW that a control build on the same iSHMEM archive does not reproduce)
+gates the switch. The fused path stays behind a compile-time or env flag
+until the full sweep matches or beats the split baseline with tight tails.

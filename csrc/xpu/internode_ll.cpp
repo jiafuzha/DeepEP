@@ -805,113 +805,36 @@ void dispatch_bf16(void* packed_recv_x,
     queue.memset(packed_recv_src_info, 0xFF, recv_src_elems * sizeof(int));
     queue.memset(slot_counter, 0, static_cast<size_t>(num_experts) * sizeof(int));
 
-    // ======================= PHASE-SPLIT DISPATCH (2 kernels) =======================
-    // The fused kernel used one grid of num_experts BIG (1024-WI) work-groups joined
-    // by an in-kernel GridBarrier + a device-scope finish-counter to gate the send->recv
-    // handoff. Both of those are replaced by the KERNEL BOUNDARY here:
-    //   Kernel 1 (LLDispatchSendKernel): every token's message is cast (FP8/BF16) and
-    //     IBGDA-warp-put to its top-k expert slots. No counting, no finish-counter, no
-    //     grid barrier. force_db=false leaves the last doorbell batch deferred; the recv
-    //     kernel's quiet_qp rings it (quiet targets nic_wq_cnt, flushing deferred WQEs).
-    //   Kernel 2 (LLDispatchRecvKernel): grid = num_experts. Phase A (per responsible
-    //     expert) histograms topk_idx and posts the count flag (-count-1) via quiet_qp +
-    //     AMO (self path = uc_store). The kernel boundary guarantees ALL puts are posted
-    //     before quiet_qp, so the finish-counter gate is unnecessary. A whole-WG barrier
-    //     then makes the SELF-channel count (written by this same WG in phase A) visible
-    //     to Phase B's poll (self src_rank==rank is always the same WG for write+read;
-    //     cross-rank channels are remote/independent). Phase B is the former recv phase.
-    // The send grid is co-residency-bound by the IBGDA per-QP ordered commit gate, so it
-    // stays at num_sms (== num_experts) by default; DEEP_EP_LL_SEND_WGS can raise it but
-    // MUST NOT exceed the device's resident WG capacity (a spinning producer WG trips the
-    // GuC watchdog -> GT reset). The token-parallel recv copy stays on num_experts WGs
-    // (32 sub-warps each) which already saturates the copy for these sizes.
-    int send_wgs = num_sms;
-    if (const char* se = std::getenv("DEEP_EP_LL_SEND_WGS")) {
-        const int v = std::atoi(se);
-        if (v > 0) send_wgs = v;
-    }
+    // ======================= FUSED DISPATCH =======================
+    // Single-kernel CUDA-parity dispatch (was previously two queue.submit()s
+    // separated by the implicit kernel-boundary sync). The kernel is launched
+    // cooperatively via nd_launch_root_sync<> so that
+    // sycl::group_barrier(item.ext_oneapi_get_root_group()) can bridge the
+    // send/count phase and the recv/poll+copy phase in a single launch, mirroring
+    // CUDA's cg::this_grid().sync() at internode_ll.cu:360. Warp specialization
+    // (caster warps 0..num_warps-2 + counter warp num_warps-1) is synchronized by a
+    // sub-group-subset NamedBarrier == CUDA `bar.sync 1, num_caster_threads`
+    // (internode_ll.cu:252). Payload-before-flag ordering uses the CUDA per-expert
+    // finish-counter (atomic_finish_counter_per_expert): each caster send bumps it +1
+    // (system-scope acq_rel), the counter warp seeds +TAG on WG0 for every expert
+    // and adds (TAG - count) for its responsible experts, and the count-sender waits
+    // for 2*TAG via uc_load before ringing the count flag. Remote flag AMOs use
+    // ishmemx_fence_qp (post-side ordering only; RC in-order delivery guarantees the
+    // subsequent AMO lands after the payload puts on the same QP without waiting for
+    // CQE drain).
+    {
+        auto* finish_counter = reinterpret_cast<int*>(base + layout.finish_counter_offset);
+        auto* finish_ready_host = reinterpret_cast<int*>(base + layout.finish_ready_offset);
+        queue.memset(finish_counter, 0, static_cast<size_t>(num_experts) * sizeof(int));
+        queue.memset(finish_ready_host, 0, static_cast<size_t>(num_experts) * sizeof(int));
 
-    // ---- Kernel 1: cast + put every token to its top-k experts (no counting). ----
-    queue.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for<LLDispatchSendKernel>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs) * wg_size), sycl::range<1>(wg_size)),
+        nd_launch_root_sync<LowLatencyDispatchFusedKernel>(
+            queue, static_cast<size_t>(num_sms), static_cast<size_t>(wg_size),
             [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                 auto group = item.get_group();
                 auto sg = item.get_sub_group();
                 const int sm_id = static_cast<int>(item.get_group_linear_id());
-                const int warp_id = static_cast<int>(sg.get_group_linear_id());
-                const int lane = static_cast<int>(sg.get_local_linear_id());
-                const int sg_size = static_cast<int>(sg.get_local_range()[0]);
-                // No counter warp in the split: ALL warps cast cooperatively.
-                const int caster_tid = warp_id * 32 + lane;
-                const int num_caster_threads = num_warps * 32;
-
-                // Block 0 cleans the opposite-parity rdma_recv_count (CUDA next_clean).
-                if (sm_id == 0 && warp_id == 0) {
-                    const int clean_parity = 1 - dispatch_parity;
-                    for (int i = lane; i < num_recv_channels; i += sg_size)
-                        uc_store<long>(&rdma_recv_count[i * 2 + clean_parity], 0L);
-                }
-
-                // Token loop striped across the send grid. Each iteration is a whole-WG
-                // cooperative cast followed by a whole-WG barrier; warp `warp_id < num_topk`
-                // then puts the finished message to topk_idx[token, warp_id]'s expert slot.
-                for (int t = sm_id; t < num_tokens; t += send_wgs) {
-                    uint8_t* msg = rdma_x + static_cast<size_t>(t) * msg_bytes;
-                    int* hdr = reinterpret_cast<int*>(msg);
-                    const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
-                        static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes);
-                    const int dst_expert = (warp_id < num_topk)
-                        ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + warp_id]) : -1;
-                    if (caster_tid == 0) hdr[0] = t;  // CUDA rdma_x_src_idx
-                    if (use_fp8) {
-                        cast_token_fp8_strided(msg + sizeof(int) * 4,
-                                               reinterpret_cast<float*>(msg + scales_off),
-                                               src_bf16, num_scales, round_scale, sg, lane, sg_size,
-                                               warp_id, num_warps);
-                    } else {
-                        coop_copy_bytes(msg + sizeof(int) * 4, reinterpret_cast<const uint8_t*>(src_bf16),
-                                        payload_bytes, caster_tid, num_caster_threads);
-                    }
-                    // Device-scope release: make the cast bytes NIC-visible (HBM/L2 via PCIe
-                    // P2P) before the doorbell. WG-scope group_barrier alone does not (F2).
-                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                    sycl::group_barrier(group);
-                    if (dst_expert >= 0 && dst_expert < num_experts) {
-                        const int dst_rank = dst_expert / num_local_experts;
-                        const int le = dst_expert % num_local_experts;
-                        int slot = 0;
-                        if (lane == 0) {
-                            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space> sc(slot_counter[dst_expert]);
-                            slot = sc.fetch_add(1);
-                        }
-                        slot = sycl::group_broadcast(sg, slot, 0);
-                        const size_t dst_slot =
-                            (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot;
-                        uint8_t* dst = rdma_recv_x + dst_slot * msg_bytes;
-                        if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
-                            if (dst_rank == rank)
-                                coop_copy_bytes_store_uc(dst, msg, used_bytes, lane, sg_size);
-                            else
-                                ishmemx_putmem_nbi_subgroup(dst, msg, used_bytes, dst_rank,
-                                                        static_cast<unsigned int>(le), true, sg, false);
-                        }
-                    }
-                }
-            });
-    });
-
-    // ---- Kernel 2: post count flags (phase A) then poll + copy messages (phase B). ----
-    queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int, 1> shared_recv_cnt(sycl::range<1>(std::max(num_warp_groups, 1)), cgh);
-        sycl::local_accessor<int, 1> shared_recv_begin(sycl::range<1>(std::max(num_warp_groups, 1)), cgh);
-        cgh.parallel_for<LLDispatchRecvKernel>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * wg_size), sycl::range<1>(wg_size)),
-            [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
-                auto group = item.get_group();
-                auto sg = item.get_sub_group();
-                const int sm_id = static_cast<int>(item.get_group_linear_id());
+                const int num_sms_total = static_cast<int>(item.get_group_range(0));
                 const int warp_id = static_cast<int>(sg.get_group_linear_id());
                 const int lane = static_cast<int>(sg.get_local_linear_id());
                 const int sg_size = static_cast<int>(sg.get_local_range()[0]);
@@ -919,41 +842,172 @@ void dispatch_bf16(void* packed_recv_x,
                 const int sub_warp_id = warp_id % num_warps_per_group;
                 const int responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
-                // ---- Phase A: count tokens this rank sent to responsible_expert_idx and
-                // post the count flag (-count-1). The kernel boundary already guarantees all
-                // payload puts are posted; quiet_qp drains QP=le (flushing deferred doorbells)
-                // and the RC-ordered AMO lands after the payloads. Only warp 0 counts.
-                if (responsible_expert_idx < num_experts && warp_id == 0) {
-                    const int dst_rank = responsible_expert_idx / num_local_experts;
-                    const int le = responsible_expert_idx % num_local_experts;
-                    int cnt = 0;
-                    for (int i = lane; i < num_tokens * num_topk; i += sg_size)
-                        if (static_cast<int>(topk_idx[i]) == responsible_expert_idx) ++cnt;
-                    cnt = sycl::reduce_over_group(sg, cnt, sycl::plus<int>());
-                    if (lane == 0) {
-                        const int slot = (le * num_ranks + rank) * 2 + dispatch_parity;
-                        if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
-                            if (dst_rank == rank) {
-                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                                uc_store<long>(&rdma_recv_count[slot], static_cast<long>(-cnt - 1));
-                            } else {
-                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
-                                ll_sender_flush(flag_sender_fence);
-                                ishmemx_long_atomic_add_qp(&rdma_recv_count[slot], static_cast<long>(-cnt - 1),
-                                                           dst_rank, static_cast<unsigned int>(le));
+                // Cross-work-item scratch: nd_launch has NO SLM, and private
+                // variables are per-work-item (NOT shared across sub-groups in a
+                // WG). Route the send-count from the counter warp to the count-
+                // sender via the per-expert finish_ready scratch (already
+                // allocated in the layout), and re-read the recv (count, begin)
+                // from packed_recv_layout_range after the group_barrier.
+                auto* finish_ready_scratch = reinterpret_cast<int*>(base + layout.finish_ready_offset);
+
+                // ============================ SEND + COUNT PHASE ============================
+                if (warp_id < num_warps - 1) {
+                    // -------- Caster warps: cast row -> put per top-k expert. --------
+                    const int caster_tid = warp_id * 32 + lane;
+                    const int num_caster_threads = (num_warps - 1) * 32;
+                    // WG0 caster warp 0 also zeroes the opposite-parity rdma_recv_count
+                    // (CUDA `next_clean`). Only the caster region is uniform across
+                    // participants of the caster NamedBarrier below.
+                    if (sm_id == 0 && warp_id == 0) {
+                        const int clean_parity = 1 - dispatch_parity;
+                        for (int i = lane; i < num_recv_channels; i += sg_size)
+                            uc_store<long>(&rdma_recv_count[i * 2 + clean_parity], 0L);
+                    }
+                    // Caster subset barrier (sub-groups 0..num_warps-2). CUDA:
+                    //   asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
+                    // Init handle once per participant; the SPIR-V builtin resolves
+                    // to a per-work-group named-barrier handle keyed by the count.
+                    NamedBarrier caster_barrier;
+                    caster_barrier.init(num_warps - 1);
+                    for (int t = sm_id; t < num_tokens; t += num_sms_total) {
+                        uint8_t* msg = rdma_x + static_cast<size_t>(t) * msg_bytes;
+                        int* hdr = reinterpret_cast<int*>(msg);
+                        const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                            static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes);
+                        const int dst_expert = (warp_id < num_topk)
+                            ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + warp_id]) : -1;
+                        if (caster_tid == 0) hdr[0] = t;  // CUDA rdma_x_src_idx
+                        if (use_fp8) {
+                            cast_token_fp8_strided(msg + sizeof(int) * 4,
+                                                   reinterpret_cast<float*>(msg + scales_off),
+                                                   src_bf16, num_scales, round_scale, sg, lane, sg_size,
+                                                   warp_id, num_warps - 1);
+                        } else {
+                            coop_copy_bytes(msg + sizeof(int) * 4, reinterpret_cast<const uint8_t*>(src_bf16),
+                                            payload_bytes, caster_tid, num_caster_threads);
+                        }
+                        // Device-scope release so the NIC (PCIe P2P DMA) sees the cast
+                        // bytes; caster subset barrier then ensures all casters agree the
+                        // message is ready before the top-k dispatch put.
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                        caster_barrier.sync(kNamedBarrierGlobalFence);
+                        if (dst_expert >= 0 && dst_expert < num_experts) {
+                            const int dst_rank = dst_expert / num_local_experts;
+                            const int le = dst_expert % num_local_experts;
+                            int slot = 0;
+                            if (lane == 0) {
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space> sc(slot_counter[dst_expert]);
+                                slot = sc.fetch_add(1);
+                            }
+                            slot = sycl::group_broadcast(sg, slot, 0);
+                            const size_t dst_slot =
+                                (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot;
+                            uint8_t* dst = rdma_recv_x + dst_slot * msg_bytes;
+                            if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
+                                if (dst_rank == rank)
+                                    coop_copy_bytes_store_uc(dst, msg, used_bytes, lane, sg_size);
+                                else
+                                    ishmemx_putmem_nbi_subgroup(dst, msg, used_bytes, dst_rank,
+                                                            static_cast<unsigned int>(le), true, sg, false);
+                            }
+                            sycl::group_barrier(sg);
+                            // CUDA atomic_add_release_global(finish_counter[dst_expert], 1).
+                            if (lane == 0) {
+                                sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                                 sycl::access::address_space::global_space> fc(finish_counter[dst_expert]);
+                                fc.fetch_add(1);
                             }
                         }
                     }
+                } else {
+                    // -------- Counter warp (num_warps - 1): seed finish-counter + histogram. --------
+                    if (sm_id == 0) {
+                        // WG0 seeds finish_counter[e] += TAG for every expert (CUDA parity).
+                        for (int i = lane; i < num_experts; i += sg_size) {
+                            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                             sycl::access::address_space::global_space> fc(finish_counter[i]);
+                            fc.fetch_add(kFinishedSumTag);
+                        }
+                    }
+                    // Per-warp-group histogram: this WG owns experts [expert_begin_idx, expert_end_idx).
+                    int expert_count[32] = {0};
+                    const int expert_begin_idx = sm_id * num_warp_groups;
+                    const int expert_end_idx = sycl::min(expert_begin_idx + num_warp_groups, num_experts);
+                    for (int i = lane; i < num_tokens * num_topk; i += sg_size) {
+                        int idx = static_cast<int>(topk_idx[i]);
+                        if (idx >= expert_begin_idx && idx < expert_end_idx)
+                            expert_count[idx - expert_begin_idx]++;
+                    }
+                    for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
+                        const int sum = sycl::reduce_over_group(sg, expert_count[i - expert_begin_idx], sycl::plus<int>());
+                        if (lane == 0) {
+                            // Publish the send count to the count-sender WG (same WG).
+                            // Global memory + device-scope release (see the whole-WG
+                            // group_barrier below) makes it visible to every work-item.
+                            uc_store<int>(&finish_ready_scratch[i], sum);
+                            // CUDA finish_counter[i] += (TAG - sum). Final target = 2*TAG.
+                            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                                             sycl::access::address_space::global_space> fc(finish_counter[i]);
+                            fc.fetch_add(kFinishedSumTag - sum);
+                        }
+                    }
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
                 }
-                // Make the SELF-channel count (src_rank==rank, written above by THIS WG)
-                // visible to phase B's poll below. Cross-rank channels are remote (landed via
-                // AMO) and need no barrier. This is the intra-WG substitute for the fused
-                // kernel's grid barrier between send and recv on the self path.
+
+                // Whole-WG barrier: publishes finish_ready_scratch (the send count)
+                // and the finish_counter bumps from the counter warp so the count-
+                // sender (sub_warp 0 lane 0) can observe them. With num_warp_groups==1
+                // this is safe (no divergent barrier: every warp reaches it).
                 sycl::group_barrier(group);
 
-                // ============================ RECV PHASE (Phase B) ============================
-                // Each WG's warp group `warp_group_id` handles channel responsible_expert_idx
-                // = (local_expert, src_rank). sub-warp 1 waits for the count (overlaps sub-warp 0).
+                // -------- Count-send: wait finish_counter==2*TAG, then post -count-1 flag. --------
+                if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane == 0) {
+                    const int dst_rank = responsible_expert_idx / num_local_experts;
+                    const int le = responsible_expert_idx % num_local_experts;
+                    uint64_t spins = 0;
+                    while (true) {
+                        // uc_load reads through GPU caches (CUDA ld_acquire_global).
+                        const int val = uc_load<int>(&finish_counter[responsible_expert_idx]);
+                        if (val == kFinishedSumTag * 2) break;
+                        if (++spins >= poll_cap) break;
+                        visa_spin_hint();
+                    }
+                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                    // Read the per-expert send count (written by this same WG's counter
+                    // warp above, then published to us by the group_barrier).
+                    const int local_send_count = uc_load<int>(&finish_ready_scratch[responsible_expert_idx]);
+                    const int slot = (le * num_ranks + rank) * 2 + dispatch_parity;
+                    if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
+                        if (dst_rank == rank) {
+                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                            uc_store<long>(&rdma_recv_count[slot], static_cast<long>(-local_send_count - 1));
+                        } else {
+                            // fence_qp (post-side ordering) instead of quiet_qp (drain wait):
+                            // RC in-order delivery guarantees the AMO lands after prior
+                            // payload puts on the same QP without local CQE wait.
+                            ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
+                            ll_sender_flush(flag_sender_fence);
+                            ishmemx_long_atomic_add_qp(&rdma_recv_count[slot], static_cast<long>(-local_send_count - 1),
+                                                       dst_rank, static_cast<unsigned int>(le));
+                        }
+                    }
+                    // CUDA workspace clean (matches internode_ll.cu:337-342).
+                    slot_counter[responsible_expert_idx] = 0;
+                    finish_counter[responsible_expert_idx] = 0;
+                    if (dst_rank == 0) packed_recv_count[le] = 0;
+                }
+
+                // ============================ GRID BARRIER ============================
+                // Device-wide barrier == CUDA cg::this_grid().sync() (internode_ll.cu:360).
+                // Bridges the send/count phase (writers of rdma_recv_count on every WG)
+                // and the recv/poll+copy phase (readers on every WG) inside one launch.
+                {
+                    auto root = item.ext_oneapi_get_root_group();
+                    sycl::group_barrier(root);
+                }
+
+                // ============================ RECV PHASE ============================
                 if (responsible_expert_idx < num_experts) {
                     const int src_rank = responsible_expert_idx / num_local_experts;
                     const int local_expert = responsible_expert_idx % num_local_experts;
@@ -980,23 +1034,29 @@ void dispatch_bf16(void* packed_recv_x,
                         }
                         packed_recv_layout_range[local_expert * num_ranks + src_rank] =
                             static_cast<int64_t>(pack_range(count, begin));
+                        // Ensure the packed layout_range publish is visible device-wide
+                        // before the WG barrier hands off to the copier sub-warps.
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
                         if (cumulative_local_expert_recv_stats != nullptr && count > 0) {
                             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                              sycl::access::address_space::global_space> st(cumulative_local_expert_recv_stats[local_expert]);
                             st.fetch_add(count);
                         }
-                        shared_recv_cnt[warp_group_id] = count;
-                        shared_recv_begin[warp_group_id] = begin;
                     }
+                    // Publish (count, begin) via packed_recv_layout_range (written by
+                    // sub_warp 1 lane 0 above; nd_launch has no SLM so we cannot use a
+                    // work-group-local variable). Every work-item unpacks it after the
+                    // whole-WG barrier.
                     sycl::group_barrier(group);
-                    const int count = shared_recv_cnt[warp_group_id];
-                    const int begin = shared_recv_begin[warp_group_id];
+                    int count, begin;
+                    {
+                        const int64_t packed = packed_recv_layout_range[local_expert * num_ranks + src_rank];
+                        unpack_range(packed, count, begin);
+                    }
                     if (count > 0) {
                         if (flag_recv_acq != 0 && lane == 0) ll_recv_acquire(flag_recv_acq);
                         const size_t src_base = (static_cast<size_t>(local_expert) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank;
                         const size_t dst_base = static_cast<size_t>(local_expert) * num_ranks * num_max_dispatch_tokens_per_rank + begin;
-                        // Sub-warps of this warp group copy tokens in parallel (== CUDA
-                        // `for i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group`).
                         for (int i = sub_warp_id; i < count; i += num_warps_per_group) {
                             const uint8_t* rmsg = rdma_recv_x + (src_base + i) * msg_bytes;
                             const size_t dst_row = dst_base + i;
@@ -1030,7 +1090,7 @@ void dispatch_bf16(void* packed_recv_x,
                     }
                 }
             });
-    });
+    }
 #endif
 }
 
@@ -1080,18 +1140,21 @@ void combine_bf16(void* combined_x,
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
 
-    // --- PHASE-SPLIT combine (was a single fused kernel with cg::this_grid().sync()).
-    // Geometry MIRRORS the faithful dispatch: grid = num_sms BIG blocks of
-    // num_warps*32 work-items (32 sub-groups when num_experts <= compute-units), one
+    // --- FUSED COMBINE (CUDA parity: one kernel + cg::this_grid().sync()). Geometry:
+    // grid = num_sms BIG blocks of num_warps*32 work-items (num_warp_groups==1 forced
+    // by TORCH_CHECK below => 32 sub-groups when num_experts <= compute-units), one
     // warp group per responsible expert (responsible_expert_idx = sm_id*num_warp_groups
-    // + warp_group_id). CUDA has TWO warp kinds within a warp group:
+    // + warp_group_id). Warp specialization mirrors CUDA CombineWithLogFMT:
     //   - sub-warps 0..num_warps_per_group-1: issue per-token IBGDA sends of this
-    //     expert's combined output back to its dispatching rank (scattered to the
+    //     expert's combined output back to its dispatching rank (scatter to the
     //     token's ORIGINAL slot src_idx, NOT a contiguous [min,max] span).
-    //   - sub-warp 1: after the warp-group barrier, waits atomic_clean_flag then posts
-    //     the arrival flag (+1) to the destination.
-    // Phases: send-put + post-flag -> recv-flag poll -> ONE GridBarrier
-    // (== cg::this_grid().sync()) -> grid-strided weighted top-k reduce.
+    //   - After the warp-group barrier (CUDA `bar.sync warp_group_id+1, ...`,
+    //     internode_ll.cu:918 -- here a NamedBarrier of num_warps_per_group
+    //     participants), sub-warp 1 posts the arrival flag (+1) to the destination
+    //     and sub-warp 0 waits for the incoming arrival flag for its own channel.
+    // The single grid barrier (`sycl::group_barrier(root_group)` ==
+    // cg::this_grid().sync() at internode_ll.cu:977) then hands off to the token-
+    // parallel weighted top-k reduce phase in the same kernel.
     {
         // CUDA launch geometry (internode_ll.cu::combine host code).
         const int num_device_sms = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
@@ -1103,227 +1166,189 @@ void combine_bf16(void* combined_x,
         const int num_sms = (num_experts + num_warp_groups - 1) / num_warp_groups;
         const int wg_size = num_warps * 32;
         TORCH_CHECK(num_warps_per_group > 1, "LL combine requires num_warps_per_group > 1");
-        // See the matching guard in the dispatch path: this fused combine kernel is correct
-        // ONLY for num_warp_groups == 1 (num_experts <= num_device_sms). CUDA uses warp-group-
-        // scoped named barriers (`bar.sync warp_group_id+1, num_warps_per_group*32`); BMG cannot
-        // express a warp-group-subset barrier, so this port uses a whole-WG group_barrier. With
-        // num_warp_groups > 1 that over-synchronizes across warp groups and diverges from CUDA's
-        // per-warp-group rendezvous. Fail loud instead of running an unfaithful/unsafe geometry.
-        // The phase-split kernels (warp-group-per-workgroup) are the proper fix.
+        // See the matching guard in the dispatch path: this fused combine kernel is
+        // correct ONLY for num_warp_groups == 1 (num_experts <= num_device_sms). CUDA
+        // uses warp-group-scoped named barriers (`bar.sync warp_group_id+1, ...`); BMG
+        // expresses that via NamedBarrier at num_warp_groups==1 (whole-WG substitute).
         TORCH_CHECK(num_warp_groups == 1,
                     "XPU LL combine currently supports only num_experts <= max_compute_units "
                     "(num_warp_groups == 1); got num_experts=", num_experts, ", num_device_sms=",
                     num_device_sms, " -> num_warp_groups=", num_warp_groups,
-                    ". num_warp_groups>1 requires the warp-group-per-workgroup phase-split kernels.");
+                    ". num_warp_groups>1 requires the warp-group-per-workgroup fused kernel.");
 
         const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
         // atomic_clean_flag (CUDA): reuse the dispatch-only slot_counter region (a single
         // int); combine never touches slot_counter, so this is a free scratch cell.
         auto* clean_flag = reinterpret_cast<int*>(base + layout.slot_counter_offset);
-
-        // ---- PHASE-SPLIT combine (removes the in-kernel GridBarrier). Kernel 1
-        // (LLCombineSendKernel, grid=num_sms==num_experts) does the commit-gated
-        // per-token IBGDA sends + posts/polls the arrival flags. Kernel 2
-        // (LLCombineReduceKernel, large token-parallel grid) does the grid-strided
-        // weighted top-k reduce. The KERNEL BOUNDARY replaces cg::this_grid().sync():
-        // once kernel 1 exits, every expert's flag has been observed and all
-        // combine_data is written + globally visible, so kernel 2 can reduce freely.
-        // The reduce has no per-QP commit gate (pure local reads), so kernel 2's grid
-        // is oversubscribable and scales with the token count (== CUDA sizing its
-        // combine grid to num_combined_tokens / num_recv_per_sm).
         queue.memset(clean_flag, 0, sizeof(int));
 
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LLCombineSendKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * wg_size), sycl::range<1>(wg_size)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
-                    auto group = item.get_group();
-                    auto sg = item.get_sub_group();
-                    const int sm_id = static_cast<int>(item.get_group_linear_id());
-                    const int warp_id = static_cast<int>(sg.get_group_linear_id());
-                    const int lane = static_cast<int>(sg.get_local_linear_id());
-                    const int sg_size = static_cast<int>(sg.get_local_range()[0]);
-                    const int warp_group_id = warp_id / num_warps_per_group;
-                    const int sub_warp_id = warp_id % num_warps_per_group;
-                    const int responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+        nd_launch_root_sync<LowLatencyCombineFusedKernel>(
+            queue, static_cast<size_t>(num_sms), static_cast<size_t>(wg_size),
+            [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                auto sg = item.get_sub_group();
+                const int sm_id = static_cast<int>(item.get_group_linear_id());
+                const int num_sms_total = static_cast<int>(item.get_group_range(0));
+                const int warp_id = static_cast<int>(sg.get_group_linear_id());
+                const int lane = static_cast<int>(sg.get_local_linear_id());
+                const int sg_size = static_cast<int>(sg.get_local_range()[0]);
+                const int warp_group_id = warp_id / num_warps_per_group;
+                const int sub_warp_id = warp_id % num_warps_per_group;
+                const int responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
-                    // ============================ SEND PHASE ============================
-                    // Clean the OPPOSITE-parity combine_flag receive slots (CUDA next_clean),
-                    // then release atomic_clean_flag (+num_experts) so flag posts wait for it.
-                    if (sm_id == 0 && warp_group_id == 0 && sub_warp_id == 0) {
-                        const int clean_parity = combine_parity ^ 1;
-                        for (int i = lane; i < num_experts; i += sg_size)
-                            uc_store<long>(&combine_flag_i[i * 2 + clean_parity], 0L);
-                        sycl::group_barrier(sg);
-                        if (lane == 0) {
-                            // clean_flag is an intra-GPU cross-WG gate (CUDA atomic_clean_flag,
-                            // device-scope .gpu). Release orders the zeroed opposite-parity
-                            // combine_flag_i slots before the counter bump (F5).
-                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space> cf(clean_flag[0]);
-                            cf.fetch_add(num_experts);
-                        }
-                    }
-
-                    // Issue per-token IBGDA sends for this responsible expert. Each sub-warp
-                    // owns a stride of this expert's tokens; it copies the token's hidden row
-                    // into per-token symmetric staging (send_data at the token's own slot),
-                    // then warp-puts it to the destination's ORIGINAL token slot src_idx.
-                    if (responsible_expert_idx < num_experts) {
-                        const int dst_rank = responsible_expert_idx / num_local_experts;
-                        const int le = responsible_expert_idx % num_local_experts;
-                        const int global_expert = rank * num_local_experts + le;
-                        int count = 0, begin = 0;
-                        unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
-                        const bool masked = ll_rank_masked(mask_buffer_ptr, dst_rank);
-                        const size_t local_stride =
-                            static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
-                        const auto* local_x =
-                            static_cast<const uint8_t*>(x) + static_cast<size_t>(le) * local_stride * hidden_bytes;
-                        const int* local_src_info = src_info + static_cast<size_t>(le) * local_stride;
-
-                        if (!masked) {
-                            for (int token_idx = begin + sub_warp_id; token_idx < begin + count;
-                                 token_idx += num_warps_per_group) {
-                                int src_idx = (lane == 0) ? local_src_info[token_idx] : 0;
-                                src_idx = sycl::group_broadcast(sg, src_idx, 0);
-                                if (src_idx < 0 || src_idx >= num_max_dispatch_tokens_per_rank) continue;
-                                const size_t dst_slot =
-                                    static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + src_idx;
-                                uint8_t* dst = combine_data + dst_slot * hidden_bytes;
-                                const uint8_t* srcrow = local_x + static_cast<size_t>(token_idx) * hidden_bytes;
-                                if (dst_rank == rank) {
-                                    // Self: write directly into local combine_data (== CUDA p2p copy).
-                                    coop_copy_bytes_store_uc(dst, srcrow, hidden_bytes, lane, sg_size);
-                                } else {
-                                    // Remote: stage into symmetric send_data, flush, warp-put.
-                                    uint8_t* stage = send_data +
-                                        static_cast<size_t>(le * local_stride + token_idx) * hidden_bytes;
-                                    coop_copy_bytes(stage, srcrow, hidden_bytes, lane, sg_size);
-                                    sycl::group_barrier(sg);
-                                    // NIC DMAs GPU HBM -> device-scope release suffices for the
-                                    // put's source visibility; system scope unnecessary (F4).
-                                    // (CUDA: __syncwarp + tma_store_wait, no system fence.)
-                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                                    ishmemx_putmem_nbi_subgroup(dst, stage, hidden_bytes, dst_rank,
-                                                            static_cast<unsigned int>(le), true, sg, false);
-                                }
-                            }
-                        }
-                    }
-
-                    // Warp-group barrier (== CUDA bar.sync warp_group+1). With
-                    // num_warp_groups==1 this is the whole-WG barrier; reached
-                    // unconditionally by every warp so no divergent-barrier deadlock.
-                    sycl::group_barrier(group);
-
-                    // Flag post: sub-warp 1 lane 0. Wait atomic_clean_flag>0 (next_clean done),
-                    // then post the arrival flag (+1) on QP=le. Self => uc_store; remote =>
-                    // quiet + atomic-add on the payload's QP (RC in-order: flag after payload).
-                    if (responsible_expert_idx < num_experts && sub_warp_id == 1 && lane == 0) {
-                        const int dst_rank = responsible_expert_idx / num_local_experts;
-                        const int le = responsible_expert_idx % num_local_experts;
-                        const int global_expert = rank * num_local_experts + le;
-                        {
-                            uint64_t spins = 0;
-                            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space> cf(clean_flag[0]);
-                            while (cf.load() == 0) {
-                                if (++spins >= poll_cap) break;
-                                visa_spin_hint();
-                            }
-                            // Device-scope acquire pairs with the clean_flag device release (F5).
-                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
-                        }
-                        if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
-                            const int slot = global_expert * 2 + combine_parity;
-                            if (dst_rank == rank) {
-                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                                uc_store<long>(&combine_flag_i[slot], 1L);
-                            } else {
-                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
-                                ll_sender_flush(flag_sender_fence);
-                                ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
-                                                           static_cast<unsigned int>(le));
-                            }
-                        }
+                // ---- WG0 warp_group 0 sub_warp 0: clean opposite-parity combine_flag
+                // slots (CUDA next_clean), then release atomic_clean_flag (+num_experts)
+                // so flag posts below wait for the clean.
+                if (sm_id == 0 && warp_group_id == 0 && sub_warp_id == 0) {
+                    const int clean_parity = combine_parity ^ 1;
+                    for (int i = lane; i < num_experts; i += sg_size)
+                        uc_store<long>(&combine_flag_i[i * 2 + clean_parity], 0L);
+                    sycl::group_barrier(sg);
+                    if (lane == 0) {
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
                         sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
                                          sycl::access::address_space::global_space> cf(clean_flag[0]);
-                        cf.fetch_add(-1);
+                        cf.fetch_add(num_experts);
                     }
-
-                    // ---- Recv-flag wait (CombineWait): responsible expert, sub-warp 0 lane 0.
-                    // Skip self owners (flag set locally) and masked ranks.
-                    if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane == 0) {
-                        const int src_rank = responsible_expert_idx / num_local_experts;
-                        if (src_rank != rank && !ll_rank_masked(mask_buffer_ptr, src_rank)) {
-                            const int slot = responsible_expert_idx * 2 + combine_parity;
-                            uint64_t spins = 0;
-                            while (ll_read_flag64(&combine_flag_i[slot], flag_lsc_mode) == 0) {
-                                if (++spins >= poll_cap) break;
-                                visa_spin_hint();
-                            }
-                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-                        }
-                    }
-
-                    // ---- Kernel boundary below (== CUDA cg::this_grid().sync()): once this
-                    // send/flag kernel exits, every expert flag has been observed and all
-                    // combine_data is written + globally visible before the reduce kernel runs.
                 }
-                );
-        });
 
-        // ============================ REDUCE KERNEL ============================
-        // Grid-strided weighted top-k reduction into combined_x (CUDA CombineReduce
-        // without SM90 TMA/LogFMT: read each topk source's combine_data row). Pure
-        // local reads (no IBGDA/commit gate) => oversubscribable, token-parallel grid.
-        const int reduce_wgs = ll_consume_wgs(queue, static_cast<int>(reduce_work), 1);
-        const int reduce_wg_size = kLLConsumeWGSize;
-        queue.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for<LLCombineReduceKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(reduce_wgs) * reduce_wg_size),
-                                  sycl::range<1>(reduce_wg_size)),
-                [=](sycl::nd_item<1> item) {
-                    const size_t global_id = item.get_global_id(0);
-                    const size_t global_size = item.get_global_range(0);
-                    auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
-                    // combine_data's REMOTE expert rows are written by the peer NIC via
-                    // IBGDA RDMA. The GPU L2 is NOT coherent with external PCIe-P2P writes
-                    // and the symmetric-heap slots are reused every iteration, so a plain
-                    // cached read here can return stale L2 lines (prior iteration's data or
-                    // the zero-init bytes) even though the send/flag kernel's boundary
-                    // guarantees the bytes have LANDED in HBM. The send kernel's per-flag
-                    // acquire fence runs in a DIFFERENT kernel / different work-items, so it
-                    // does not make THIS kernel's caches coherent. Mirror the dispatch recv
-                    // path: either issue ONE system-scope acquire (L2 invalidate) per
-                    // work-item then read cached (flag_recv_acq>=1, default, faster), or read
-                    // every element uncached (flag_recv_acq==0 fallback).
-                    const bool recv_uncached = (flag_recv_acq == 0);
-                    if (!recv_uncached)
-                        ll_recv_acquire(flag_recv_acq);
-                    for (size_t idx = global_id; idx < reduce_work; idx += global_size) {
-                        const int token_idx = static_cast<int>(idx / hidden);
-                        const int h = static_cast<int>(idx % hidden);
-                        float acc = 0.0f;
-                        for (int k = 0; k < num_topk; ++k) {
-                            const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
-                            if (expert < 0 || expert >= num_experts) continue;
-                            const int src_rank = expert / num_local_experts;
-                            if (ll_rank_masked(mask_buffer_ptr, src_rank)) continue;
-                            const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
-                                combine_data +
-                                (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
-                            const float fv = recv_uncached
-                                                 ? static_cast<float>(uc_load(value + h))
-                                                 : static_cast<float>(value[h]);
-                            acc += fv * topk_weights[token_idx * num_topk + k];
+                // ---- SEND PHASE: per-token IBGDA sends of this expert's combined output
+                // back to the dispatching rank's original slot src_idx. ------
+                if (responsible_expert_idx < num_experts) {
+                    const int dst_rank = responsible_expert_idx / num_local_experts;
+                    const int le = responsible_expert_idx % num_local_experts;
+                    const int global_expert = rank * num_local_experts + le;
+                    int count = 0, begin = 0;
+                    unpack_range(layout_range[le * num_ranks + dst_rank], count, begin);
+                    const bool masked = ll_rank_masked(mask_buffer_ptr, dst_rank);
+                    const size_t local_stride =
+                        static_cast<size_t>(num_ranks) * num_max_dispatch_tokens_per_rank;
+                    const auto* local_x =
+                        static_cast<const uint8_t*>(x) + static_cast<size_t>(le) * local_stride * hidden_bytes;
+                    const int* local_src_info = src_info + static_cast<size_t>(le) * local_stride;
+
+                    if (!masked) {
+                        for (int token_idx = begin + sub_warp_id; token_idx < begin + count;
+                             token_idx += num_warps_per_group) {
+                            int src_idx = (lane == 0) ? local_src_info[token_idx] : 0;
+                            src_idx = sycl::group_broadcast(sg, src_idx, 0);
+                            if (src_idx < 0 || src_idx >= num_max_dispatch_tokens_per_rank) continue;
+                            const size_t dst_slot =
+                                static_cast<size_t>(global_expert) * num_max_dispatch_tokens_per_rank + src_idx;
+                            uint8_t* dst = combine_data + dst_slot * hidden_bytes;
+                            const uint8_t* srcrow = local_x + static_cast<size_t>(token_idx) * hidden_bytes;
+                            if (dst_rank == rank) {
+                                coop_copy_bytes_store_uc(dst, srcrow, hidden_bytes, lane, sg_size);
+                            } else {
+                                uint8_t* stage = send_data +
+                                    static_cast<size_t>(le * local_stride + token_idx) * hidden_bytes;
+                                coop_copy_bytes(stage, srcrow, hidden_bytes, lane, sg_size);
+                                sycl::group_barrier(sg);
+                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                                ishmemx_putmem_nbi_subgroup(dst, stage, hidden_bytes, dst_rank,
+                                                        static_cast<unsigned int>(le), true, sg, false);
+                            }
                         }
-                        out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
                     }
-                });
-        });
+                }
+
+                // ---- Warp-group barrier (CUDA `bar.sync warp_group_id+1, ...`,
+                // internode_ll.cu:918). Sub-group-subset barrier of
+                // num_warps_per_group participants: syncs the caster sub-warps with the
+                // flag-post sub-warp 1 while leaving other work-groups free to progress.
+                {
+                    NamedBarrier wg_barrier;
+                    wg_barrier.init(num_warps_per_group);
+                    wg_barrier.sync(kNamedBarrierGlobalFence);
+                }
+
+                // ---- Flag post (sub_warp 1 lane 0): wait clean_flag then send +1 flag. ----
+                if (responsible_expert_idx < num_experts && sub_warp_id == 1 && lane == 0) {
+                    const int dst_rank = responsible_expert_idx / num_local_experts;
+                    const int le = responsible_expert_idx % num_local_experts;
+                    const int global_expert = rank * num_local_experts + le;
+                    {
+                        uint64_t spins = 0;
+                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space> cf(clean_flag[0]);
+                        while (cf.load() == 0) {
+                            if (++spins >= poll_cap) break;
+                            visa_spin_hint();
+                        }
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                    }
+                    if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
+                        const int slot = global_expert * 2 + combine_parity;
+                        if (dst_rank == rank) {
+                            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                            uc_store<long>(&combine_flag_i[slot], 1L);
+                        } else {
+                            // fence_qp (post-side ordering) instead of quiet_qp (drain wait):
+                            // RC in-order delivery makes the flag AMO land after prior
+                            // combine_data puts on the same QP without waiting for CQEs.
+                            ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
+                            ll_sender_flush(flag_sender_fence);
+                            ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
+                                                       static_cast<unsigned int>(le));
+                        }
+                    }
+                    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> cf(clean_flag[0]);
+                    cf.fetch_add(-1);
+                }
+
+                // ---- Flag recv-wait (sub_warp 0 lane 0). ----
+                if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane == 0) {
+                    const int src_rank = responsible_expert_idx / num_local_experts;
+                    if (src_rank != rank && !ll_rank_masked(mask_buffer_ptr, src_rank)) {
+                        const int slot = responsible_expert_idx * 2 + combine_parity;
+                        uint64_t spins = 0;
+                        while (ll_read_flag64(&combine_flag_i[slot], flag_lsc_mode) == 0) {
+                            if (++spins >= poll_cap) break;
+                            visa_spin_hint();
+                        }
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                    }
+                }
+
+                // ============================ GRID BARRIER ============================
+                // Device-wide barrier == CUDA cg::this_grid().sync() (internode_ll.cu:977).
+                // All expert flags observed + all combine_data writes globally visible
+                // before the reduce phase reads them.
+                {
+                    auto root = item.ext_oneapi_get_root_group();
+                    sycl::group_barrier(root);
+                }
+
+                // ============================ REDUCE PHASE ============================
+                // Grid-strided weighted top-k reduction into combined_x (CUDA CombineReduce
+                // without SM90 TMA/LogFMT: read each topk source's combine_data row). Pure
+                // local reads (no IBGDA/commit gate) => the whole grid can participate.
+                const bool recv_uncached = (flag_recv_acq == 0);
+                if (!recv_uncached) ll_recv_acquire(flag_recv_acq);
+
+                const size_t global_tid = static_cast<size_t>(sm_id) * wg_size + static_cast<size_t>(item.get_local_linear_id());
+                const size_t global_size_total = static_cast<size_t>(num_sms_total) * wg_size;
+                auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
+
+                for (size_t idx = global_tid; idx < reduce_work; idx += global_size_total) {
+                    const int token_idx = static_cast<int>(idx / hidden);
+                    const int h = static_cast<int>(idx % hidden);
+                    float acc = 0.0f;
+                    for (int k = 0; k < num_topk; ++k) {
+                        const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
+                        if (expert < 0 || expert >= num_experts) continue;
+                        if (ll_rank_masked(mask_buffer_ptr, expert / num_local_experts)) continue;
+                        const auto* value = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                            combine_data +
+                            (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) * hidden_bytes);
+                        const float fv = recv_uncached
+                                             ? static_cast<float>(uc_load(value + h))
+                                             : static_cast<float>(value[h]);
+                        acc += fv * topk_weights[token_idx * num_topk + k];
+                    }
+                    out[static_cast<size_t>(token_idx) * hidden + h] = bf16_from_float(acc);
+                }
+            });
         (void)combine_wait_recv_cost_stats;
     }
 #endif
