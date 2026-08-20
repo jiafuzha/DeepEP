@@ -1638,6 +1638,8 @@ struct Buffer {
                                      rank,
                                      num_ranks,
                                      num_experts,
+                                     config.num_max_nvl_chunked_send_tokens,
+                                     config.num_max_nvl_chunked_recv_tokens,
                                      comm_stream.queue());
 
         std::optional<EventHandle> event;

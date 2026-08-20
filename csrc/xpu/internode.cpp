@@ -493,6 +493,20 @@ SYCL_EXTERNAL inline void nvl_barrier(int** barrier_signal_ptrs, int rank, int s
     }
 }
 
+// ===========================================================================
+// FUSED, warp-specialized CUDA-faithful dispatch (see the .inc for the full
+// CUDA<->SYCL mapping). Selected by DEEP_EP_INTERNODE_FUSED=1; the phase-split
+// implementation below remains the default until the matching fused COMBINE
+// lands, because the two are coupled through the `send_rdma_head` /
+// `send_nvl_head` handle semantics.
+// ===========================================================================
+#include "internode_dispatch_fused.inc"
+
+inline bool internode_fused_enabled() {
+    const char* e = std::getenv("DEEP_EP_INTERNODE_FUSED");
+    return e != nullptr && e[0] == '1';
+}
+
 struct NvlBufferLayout {
     // Offsets within each rank's NVL buffer (buffer_ptrs[nvl_rank])
     size_t count_offset = 0;          // int[num_ranks]: per-destination token counts
@@ -642,6 +656,8 @@ void dispatch_nvl_rdma(void* recv_x,
                        int rank,
                        int num_ranks,
                        int num_experts,
+                       int num_max_nvl_chunked_send_tokens,
+                       int num_max_nvl_chunked_recv_tokens,
                        sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     TORCH_CHECK(recv_x != nullptr && x != nullptr, "dispatch_nvl_rdma requires input and output tensors");
@@ -664,6 +680,41 @@ void dispatch_nvl_rdma(void* recv_x,
     const int my_global_rank = my_rdma_rank * num_nvl_ranks + nvl_rank;
     const int num_rdma_ranks = num_ranks / num_nvl_ranks;
     TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "dispatch_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
+
+    if (internode_fused_enabled()) {
+        const int hidden_int4 = static_cast<int>((static_cast<size_t>(hidden) * element_size) / sizeof(int4_t));
+        TORCH_CHECK(static_cast<size_t>(hidden) * element_size % sizeof(int4_t) == 0,
+                    "fused internode dispatch requires the token row to be 16B-aligned");
+        const bool cached_mode = (send_rdma_head == nullptr);
+        const int num_bytes_per_token = fused_num_bytes_per_token(hidden_int4, num_scales, num_topk);
+#define DEEP_EP_FUSED_DISPATCH_CASE(R)                                                                                \
+    case R:                                                                                                           \
+        launch_fused_dispatch_clean<R>(rdma_buffer_ptr, buffer_ptrs_gpu[nvl_rank], num_channels, num_nvl_ranks,        \
+                                       num_bytes_per_token, num_max_rdma_chunked_recv_tokens,                         \
+                                       num_max_nvl_chunked_recv_tokens, queue);                                       \
+        queue.wait();                                                                                                 \
+        ishmem_barrier_all();                                                                                         \
+        launch_fused_dispatch<R>(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,                              \
+                                 static_cast<SourceMeta*>(recv_src_meta), x, x_scales, topk_idx, topk_weights,         \
+                                 send_rdma_head, send_nvl_head, recv_rdma_channel_prefix_matrix,                       \
+                                 recv_gbl_channel_prefix_matrix, rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,\
+                                 gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, is_token_in_rank, num_tokens,    \
+                                 hidden_int4, num_scales, num_topk, num_experts, rdma_buffer_ptr,                      \
+                                 num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,  \
+                                 num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, rank, num_ranks,    \
+                                 num_nvl_ranks, num_channels, cached_mode, queue);                                    \
+        break
+        switch (num_rdma_ranks) {
+            DEEP_EP_FUSED_DISPATCH_CASE(2);
+            DEEP_EP_FUSED_DISPATCH_CASE(4);
+            DEEP_EP_FUSED_DISPATCH_CASE(8);
+            default:
+                TORCH_CHECK(false, "fused internode dispatch supports 2/4/8 RDMA ranks, got ", num_rdma_ranks);
+        }
+#undef DEEP_EP_FUSED_DISPATCH_CASE
+        queue.wait();
+        return;
+    }
 
     // CUDA-faithful per-GPU RDMA: every nvl_rank sends its own RDMA on its own NIC
     // (dst_pe = dst_rdma*num_nvl_ranks + nvl_rank). The receive-side forward buffer

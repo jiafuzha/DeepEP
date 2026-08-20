@@ -176,6 +176,8 @@ void dispatch_nvl_rdma(void* recv_x,
                        int rank,
                        int num_ranks,
                        int num_experts,
+                       int num_max_nvl_chunked_send_tokens,
+                       int num_max_nvl_chunked_recv_tokens,
                        sycl::queue& queue);
 
 // Combined NVL+RDMA internode combine
