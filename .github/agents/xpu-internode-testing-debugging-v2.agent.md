@@ -36,14 +36,24 @@ bash tests/docker-2node-v2/run.sh --up
 # Build iSHMEM + DeepEP inside node0 ONLY
 docker exec deepep-v2-node0 bash -lc "
   source /opt/intel/oneapi/setvars.sh --force
-  export ISHMEM_DIR=/root/jiafuzha/code-repo/ishmem_ibgda/build/_install
+  export ISHMEM_DIR=/root/jiafuzha/ishmem_ibgda/build/_install
   unset TORCH_XPU_ARCH_LIST XPU_AOT_TARGETS
-  cd /root/jiafuzha/code-repo/ishmem_ibgda && bash _build_ishmem.sh
+  cd /root/jiafuzha/ishmem_ibgda && bash _build_ishmem.sh
   cd /root/jiafuzha/code-repo/zjf2012/DeepEP
   rm -rf build/ishmem-sycl-dlink  # force iSHMEM re-extraction
   python setup.py build_ext --inplace
 "
 ```
+
+> **iSHMEM tree: use `/root/jiafuzha/ishmem_ibgda`, NOT
+> `/root/jiafuzha/code-repo/ishmem_ibgda`.** These are two DISTINCT trees (not
+> symlinks). The harness defaults to `/root/jiafuzha/ishmem_ibgda/build/_install`
+> in all three places (`tests/docker-2node-v2/run.sh`, `docker-compose.yml`,
+> `node_wrapper.sh`), while `code-repo/ishmem_ibgda` is a stale copy. Building
+> against the stale tree while the harness runs against the fresh one is the
+> classic archive-parity trap (slow/hanging barrier, or `DEVICE_LOST`). Always
+> build and link against the SAME tree the harness runs against, and re-verify
+> `md5sum build/ishmem-sycl-dlink/barrier.cpp.o` after switching archives.
 
 After building, `run.sh` will automatically sync the torch editable metadata from the stash (`/root/jiafuzha/.deepep-v2-torch-meta`) into both containers via its `sync_torch_metadata()` call. No manual sync step needed.
 
@@ -232,9 +242,9 @@ bash tests/docker-2node-v2/run.sh --up
 echo "=== Building iSHMEM + DeepEP ==="
 docker exec deepep-v2-node0 bash -lc "
   source /opt/intel/oneapi/setvars.sh --force
-  export ISHMEM_DIR=/root/jiafuzha/code-repo/ishmem_ibgda/build/_install
+  export ISHMEM_DIR=/root/jiafuzha/ishmem_ibgda/build/_install
   unset TORCH_XPU_ARCH_LIST XPU_AOT_TARGETS
-  cd /root/jiafuzha/code-repo/ishmem_ibgda && bash _build_ishmem.sh
+  cd /root/jiafuzha/ishmem_ibgda && bash _build_ishmem.sh
   cd /root/jiafuzha/code-repo/zjf2012/DeepEP
   rm -rf build/ishmem-sycl-dlink
   python setup.py build_ext --inplace
@@ -272,7 +282,7 @@ bash tests/docker-2node-v2/run.sh --down
 | Variable | Default | Purpose |
 |---|---|---|
 | `TEST_SCRIPT` | `tests/test_internode.py` | Which test to run |
-| `ISHMEM_DIR` | `/root/jiafuzha/code-repo/ishmem_ibgda/build/_install` | iSHMEM install path |
+| `ISHMEM_DIR` | `/root/jiafuzha/ishmem_ibgda/build/_install` | iSHMEM install path (matches `run.sh` / `docker-compose.yml` / `node_wrapper.sh`; NOT the stale `code-repo/ishmem_ibgda` tree) |
 | `DEEP_EP_NVL_BYTES` | `134217728` (128 MiB) | NVL buffer size |
 | `DEEP_EP_RDMA_BYTES` | `67108864` (64 MiB) | RDMA buffer size |
 | `ISHMEM_SYMMETRIC_SIZE` | `268435456` (256 MiB) | iSHMEM symmetric heap |

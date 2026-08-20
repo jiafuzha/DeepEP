@@ -153,9 +153,20 @@ and does NOT use the `NamedBarrier` SPIR-V instructions — so it does NOT contr
 `NBarrierCnt` attributes and does NOT exacerbate the conflict.
 
 However, because `NamedBarrier` IS still needed for warp specialization, the
-`IGC_SelectiveFunctionControl=1` workaround (or IGC patch) from
-`named_barrier_ishmem_conflict.md` remains REQUIRED for any fused kernel that uses BOTH
-`NamedBarrier` AND iSHMEM.
+`NamedBarrier` + iSHMEM coexistence problem remains a **hard blocker** for any fused kernel
+that uses BOTH `NamedBarrier` AND iSHMEM on this stack.
+
+> **STATUS UPDATE (2026-08-20) — the old workaround is OBSOLETE.**
+> `IGC_SelectiveFunctionControl=1` is **no longer the fix and must NOT be set**.
+> Nor does building iSHMEM with `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF` resolve it: that flag
+> only drops `__attribute__((noinline))`, and `inline` is a hint IGC ignores once the large
+> bnxt IBGDA helpers exceed its inline budget (link emits `warning: Stack call has been
+> detected`). IGC then stamps `.kernel_attr NBarrierCnt=N` on the kernel body **and** on every
+> outlined vISA stack-call `.function`, and vISA rejects the module:
+> `Error Message: More than 1 kernel attribute defined NBarrierCnt`, surfacing at runtime as
+> `error: parsing vISA inline assembly failed`.
+> See `csrc/xpu/named_barrier_usage.md` for the captured `*.inline.visaasm` evidence and the
+> checked-in repro at `csrc/xpu/tools/test_nbarrier_ishmem_repro.cpp`.
 
 ---
 
@@ -199,8 +210,12 @@ syclex::nd_launch(q, cfg, kernel);
 ### Phase 2: Add NamedBarrier for warp specialization
 
 Once root_group is in place, add `NamedBarrier` for the fused-kernel warp specialization
-pattern (matching CUDA's `bar.sync`). This requires the
-`IGC_SelectiveFunctionControl=1` workaround from `named_barrier_ishmem_conflict.md`.
+pattern (matching CUDA's `bar.sync`).
+
+> **BLOCKED (2026-08-20).** This phase cannot currently land: `NamedBarrier` + iSHMEM in one
+> kernel fails vISA finalization with `More than 1 kernel attribute defined NBarrierCnt`.
+> `IGC_SelectiveFunctionControl=1` is OBSOLETE and does not help, and neither does
+> `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF`. See `csrc/xpu/named_barrier_usage.md`.
 
 ### CUDA → SYCL mapping summary
 
