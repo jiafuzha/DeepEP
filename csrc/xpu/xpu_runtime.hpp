@@ -138,8 +138,6 @@ void finalize();
 
 int get_source_meta_bytes();
 
-// True when the fused, warp-specialized CUDA-faithful internode kernels are selected.
-bool fused_internode_enabled();
 
 // CUDA-faithful `notify_dispatch` (csrc/cuda_kernels/internode.cu:93). Produces the
 // routing metadata that the fused dispatch consumes read-only, and performs the

@@ -322,12 +322,14 @@ void launch_fused_combine(void* combined_x,
                 auto* nb_rcv = ::named_barrier_init(Shape::kRDMAReceivers + 1);     // CUDA barrier id 1
                 auto* nb_d0 = ::named_barrier_init(Shape::kWarpsPerForwarder);      // CUDA barrier id 2 + 0
                 auto* nb_d1 = ::named_barrier_init(Shape::kWarpsPerForwarder);      // ... + 1
-                // IGC LIMIT (measured): a kernel that declares ~10 SPIR-V named barriers makes the
-                // BMG back-end die with "internal compiler error" during codegen.  Four barriers
-                // compile fine.  Until the real limit is characterised we alias the per-destination
-                // handles above dst_rdma_rank 1 and reject kNumRDMARanks > 2 on the host.
-                auto* nb_d2 = nb_d0;
-                auto* nb_d3 = nb_d0;
+                auto* nb_d2 = ::named_barrier_init(Shape::kWarpsPerForwarder);      // ... + 2
+                auto* nb_d3 = ::named_barrier_init(Shape::kWarpsPerForwarder);      // ... + 3
+                // IGC LIMIT (measured on BMG, oneAPI 2025.3, this kernel): 8 SPIR-V named
+                // barriers in one kernel JIT fine, 9 makes the back-end raise
+                // "IGC: internal compiler error".  (A trivial standalone kernel takes 10+, so
+                // this is a kernel-complexity interaction, not a hard architectural count.)
+                // The combine kernel uses 2 + kNumRDMARanks barriers, so kNumRDMARanks <= 4 is
+                // supported and the handles above dst_rdma_rank 3 are aliased (unreachable).
                 auto* nb_d4 = nb_d0;
                 auto* nb_d5 = nb_d0;
                 auto* nb_d6 = nb_d0;

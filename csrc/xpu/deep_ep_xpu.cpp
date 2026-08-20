@@ -1528,9 +1528,6 @@ struct Buffer {
         } else {
             TORCH_CHECK(num_tokens_per_rank.has_value() && num_tokens_per_rdma_rank.has_value() && num_tokens_per_expert.has_value(),
                         "non-cached internode dispatch requires token count tensors");
-            TORCH_CHECK(num_worst_tokens > 0 || internode::fused_internode_enabled(),
-                        "XPU internode_dispatch non-cached metadata exchange is not complete; pass num_worst_tokens for the "
-                        "correctness-first path");
         }
 
         auto compute_stream = c10::xpu::getCurrentXPUStream();
@@ -1591,21 +1588,13 @@ struct Buffer {
         // They therefore MUST be pre-filled with -1.  `send_nvl_head` is indexed by
         // RDMA-queue slot (not by local token) and strided by NUM_MAX_NVL_PEERS, i.e.
         // {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}.
-        //
-        // The legacy phase-split path uses different (token, global-rank) semantics; keep
-        // its shape until it is removed.
-        const bool fused_heads = internode::fused_internode_enabled();
         auto send_rdma_head = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::full({num_tokens, num_rdma_ranks}, -1, int_options));
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::full(
-                  fused_heads ? std::vector<int64_t>{std::max(num_rdma_recv_tokens, num_tokens * num_rdma_ranks),
-                                                     NUM_MAX_NVL_PEERS}
-                              : std::vector<int64_t>{num_tokens, num_ranks},
-                  -1,
-                  int_options));
+                  {std::max(num_rdma_recv_tokens, num_tokens * num_rdma_ranks), NUM_MAX_NVL_PEERS}, -1, int_options));
 
         const size_t copy_rows = static_cast<size_t>(std::min(num_tokens, num_recv_tokens));
         if (copy_rows > 0) {
@@ -1621,7 +1610,7 @@ struct Buffer {
         // CUDA-faithful routing-metadata exchange (csrc/cuda_kernels/internode.cu:93).
         // Only the fused path consumes these tensors read-only; the legacy phase-split
         // dispatch still produces them itself.
-        if (internode::fused_internode_enabled() && !cached_mode) {
+        if (!cached_mode) {
             const int hidden_int4 = static_cast<int>((static_cast<size_t>(hidden) * x.element_size()) / 16);
             if (num_worst_tokens == 0) {
                 *moe_recv_counter_mapped = -1;
