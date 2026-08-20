@@ -459,6 +459,10 @@ struct Buffer {
     int num_nvl_ranks;
     int rdma_rank;
     int nvl_rank;
+    // NOTE: no longer reachable for internode normal dispatch/combine, which now
+    // assert num_nvl_bytes > 0. It only still shapes Buffer construction/sync
+    // (rank numbering, iSHMEM participation). Removing it entirely is a separate
+    // follow-up so this kernel removal stays bisectable.
     bool global_rdma_mode;
     int num_rdma_ranks;
     int device_id;
@@ -1480,9 +1484,16 @@ struct Buffer {
         pybind11::gil_scoped_release release;
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_dispatch");
         TORCH_CHECK(!low_latency_mode, "XPU internode_dispatch requires a high-throughput buffer, not a low-latency buffer");
-        const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
-        TORCH_CHECK(combined_nvl_rdma_mode || (num_rdma_bytes > 0 && rdma_buffer_ptr != nullptr),
-                    "XPU internode_dispatch requires an iSHMEM RDMA buffer or combined NVL+RDMA mode");
+        // Internode normal REQUIRES the combined NVL+RDMA path: NVL buffers for
+        // intra-node peers plus iSHMEM RDMA across nodes. The former pure-iSHMEM
+        // global_rdma_mode implementation (num_nvl_bytes == 0) has been removed,
+        // so assert the precondition instead of silently selecting a fallback.
+        TORCH_CHECK(num_nvl_bytes > 0,
+                    "XPU internode_dispatch requires num_nvl_bytes > 0 (combined NVL+RDMA mode); "
+                    "the num_nvl_bytes == 0 pure-RDMA internode path is no longer supported");
+        TORCH_CHECK(num_rdma_ranks > 1,
+                    "XPU internode_dispatch requires num_rdma_ranks > 1 (more than one node); "
+                    "use intranode_dispatch for a single node");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat8_e4m3fn,
                     "XPU internode_dispatch currently supports BF16 and FP8 tensors only");
         TORCH_CHECK(x_scales.has_value() == (x.scalar_type() == torch::kFloat8_e4m3fn),
@@ -1576,8 +1587,7 @@ struct Buffer {
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty(
-                  combined_nvl_rdma_mode ? std::vector<int64_t>{num_tokens, num_ranks}
-                                         : std::vector<int64_t>{num_rdma_recv_tokens, NUM_MAX_NVL_PEERS},
+                  std::vector<int64_t>{num_tokens, num_ranks},
                   int_options));
 
         const size_t copy_rows = static_cast<size_t>(std::min(num_tokens, num_recv_tokens));
@@ -1591,80 +1601,44 @@ struct Buffer {
                                     ? static_cast<int>(num_tokens_per_expert->size(0))
                                     : 0;
 
-        if (combined_nvl_rdma_mode) {
-            internode::dispatch_nvl_rdma(recv_x.data_ptr(),
-                                         recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
-                                         recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                         recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
-                                         cached_mode ? nullptr : recv_src_meta->data_ptr(),
-                                         rdma_buffer_ptr,
-                                         x.data_ptr(),
-                                         x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
-                                         topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                         topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
-                                         cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
-                                         cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
-                                         cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
-                                         cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
-                                         rdma_channel_prefix_matrix.data_ptr<int>(),
-                                         recv_rdma_rank_prefix_sum.data_ptr<int>(),
-                                         gbl_channel_prefix_matrix.data_ptr<int>(),
-                                         recv_gbl_rank_prefix_sum.data_ptr<int>(),
-                                         cached_mode ? nullptr : num_tokens_per_rank->data_ptr<int>(),
-                                         is_token_in_rank.data_ptr<bool>(),
-                                         num_tokens,
-                                         num_recv_tokens,
-                                         hidden,
-                                         static_cast<int>(x.element_size()),
-                                         num_topk,
-                                         num_scales,
-                                         num_channels,
-                                         config.num_max_rdma_chunked_send_tokens,
-                                         config.num_max_rdma_chunked_recv_tokens,
-                                         buffer_ptrs_gpu,
-                                         barrier_signal_ptrs_gpu,
-                                         nvl_rank,
-                                         num_nvl_ranks,
-                                         reserve_barrier_signals(4),  // base..base+3: Pack, Fwd, NvlPush, Counts barriers
-                                         rank,
-                                         num_ranks,
-                                         num_experts,
-                                         comm_stream.queue());
-        } else {
-            internode::dispatch(recv_x.data_ptr(),
-                                recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
-                                recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
-                                cached_mode ? nullptr : recv_src_meta->data_ptr(),
-                                rdma_buffer_ptr,
-                                x.data_ptr(),
-                                x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
-                                topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
-                                topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
-                                cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
-                                cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
-                                cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
-                                cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
-                                rdma_channel_prefix_matrix.data_ptr<int>(),
-                                recv_rdma_rank_prefix_sum.data_ptr<int>(),
-                                gbl_channel_prefix_matrix.data_ptr<int>(),
-                                recv_gbl_rank_prefix_sum.data_ptr<int>(),
-                                cached_mode ? nullptr : num_tokens_per_rank->data_ptr<int>(),
-                                is_token_in_rank.data_ptr<bool>(),
-                                num_tokens,
-                                num_recv_tokens,
-                                hidden,
-                                static_cast<int>(x.element_size()),
-                                num_topk,
-                                num_scales,
-                                num_channels,
-                                config.num_max_rdma_chunked_send_tokens,
-                                config.num_max_rdma_chunked_recv_tokens,
-                                rank,
-                                num_ranks,
-                                num_experts,
-                                comm_stream.queue());
-        }
+        internode::dispatch_nvl_rdma(recv_x.data_ptr(),
+                                     recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,
+                                     recv_topk_idx.has_value() ? recv_topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                                     recv_topk_weights.has_value() ? recv_topk_weights->data_ptr<float>() : nullptr,
+                                     cached_mode ? nullptr : recv_src_meta->data_ptr(),
+                                     rdma_buffer_ptr,
+                                     x.data_ptr(),
+                                     x_scales_contig.has_value() ? x_scales_contig->data_ptr<float>() : nullptr,
+                                     topk_idx.has_value() ? topk_idx->data_ptr<topk_idx_t>() : nullptr,
+                                     topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr,
+                                     cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
+                                     cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
+                                     cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
+                                     cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
+                                     rdma_channel_prefix_matrix.data_ptr<int>(),
+                                     recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                     gbl_channel_prefix_matrix.data_ptr<int>(),
+                                     recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                                     cached_mode ? nullptr : num_tokens_per_rank->data_ptr<int>(),
+                                     is_token_in_rank.data_ptr<bool>(),
+                                     num_tokens,
+                                     num_recv_tokens,
+                                     hidden,
+                                     static_cast<int>(x.element_size()),
+                                     num_topk,
+                                     num_scales,
+                                     num_channels,
+                                     config.num_max_rdma_chunked_send_tokens,
+                                     config.num_max_rdma_chunked_recv_tokens,
+                                     buffer_ptrs_gpu,
+                                     barrier_signal_ptrs_gpu,
+                                     nvl_rank,
+                                     num_nvl_ranks,
+                                     reserve_barrier_signals(4),  // base..base+3: Pack, Fwd, NvlPush, Counts barriers
+                                     rank,
+                                     num_ranks,
+                                     num_experts,
+                                     comm_stream.queue());
 
         std::optional<EventHandle> event;
         if (async) {
@@ -1740,6 +1714,13 @@ struct Buffer {
         bool allocate_on_comm_stream) {
         TORCH_CHECK(is_available(), "XPU Buffer must be synced before internode_combine");
         TORCH_CHECK(!low_latency_mode, "XPU internode_combine requires a high-throughput buffer, not a low-latency buffer");
+        // Mirrors internode_dispatch: only the combined NVL+RDMA path remains.
+        TORCH_CHECK(num_nvl_bytes > 0,
+                    "XPU internode_combine requires num_nvl_bytes > 0 (combined NVL+RDMA mode); "
+                    "the num_nvl_bytes == 0 pure-RDMA internode path is no longer supported");
+        TORCH_CHECK(num_rdma_ranks > 1,
+                    "XPU internode_combine requires num_rdma_ranks > 1 (more than one node); "
+                    "use intranode_combine for a single node");
         TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "XPU internode_combine currently supports BF16 tensors only");
         check_xpu_tensor(x, "x");
         check_xpu_tensor(src_meta, "src_meta");
@@ -1791,64 +1772,35 @@ struct Buffer {
         }
 
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
-        const bool combined_nvl_rdma_mode = num_nvl_bytes > 0 && num_rdma_ranks > 1;
-
-        if (combined_nvl_rdma_mode) {
-            internode::combine_nvl_rdma(scalar_type_to_data_type(x.scalar_type()),
-                                        combined_x.data_ptr(),
-                                        combined_topk_weights_ptr,
-                                        is_combined_token_in_rank.data_ptr<bool>(),
-                                        rdma_buffer_ptr,
-                                        x.data_ptr(),
-                                        topk_weights_ptr,
-                                        bias_ptrs[0],
-                                        bias_ptrs[1],
-                                        combined_rdma_head.data_ptr<int>(),
-                                        combined_nvl_head.data_ptr<int>(),
-                                        src_meta.data_ptr(),
-                                        rdma_channel_prefix_matrix.data_ptr<int>(),
-                                        rdma_rank_prefix_sum.data_ptr<int>(),
-                                        gbl_channel_prefix_matrix.data_ptr<int>(),
-                                        num_tokens,
-                                        num_combined_tokens,
-                                        hidden,
-                                        num_topk,
-                                        config.num_max_rdma_chunked_send_tokens,
-                                        config.num_max_rdma_chunked_recv_tokens,
-                                        buffer_ptrs_gpu,
-                                        barrier_signal_ptrs_gpu,
-                                        nvl_rank,
-                                        num_nvl_ranks,
-                                        reserve_barrier_signals(3),  // base: Pack, base+1: NvlPush, base+2: Fwd
-                                        rank,
-                                        num_ranks,
-                                        comm_stream.queue());
-        } else {
-            internode::combine(scalar_type_to_data_type(x.scalar_type()),
-                               combined_x.data_ptr(),
-                               combined_topk_weights_ptr,
-                               is_combined_token_in_rank.data_ptr<bool>(),
-                               rdma_buffer_ptr,
-                               x.data_ptr(),
-                               topk_weights_ptr,
-                               bias_ptrs[0],
-                               bias_ptrs[1],
-                               combined_rdma_head.data_ptr<int>(),
-                               combined_nvl_head.data_ptr<int>(),
-                               src_meta.data_ptr(),
-                               rdma_channel_prefix_matrix.data_ptr<int>(),
-                               rdma_rank_prefix_sum.data_ptr<int>(),
-                               gbl_channel_prefix_matrix.data_ptr<int>(),
-                               num_tokens,
-                               num_combined_tokens,
-                               hidden,
-                               num_topk,
-                               config.num_max_rdma_chunked_send_tokens,
-                               config.num_max_rdma_chunked_recv_tokens,
-                               rank,
-                               num_ranks,
-                               comm_stream.queue());
-        }
+        internode::combine_nvl_rdma(scalar_type_to_data_type(x.scalar_type()),
+                                    combined_x.data_ptr(),
+                                    combined_topk_weights_ptr,
+                                    is_combined_token_in_rank.data_ptr<bool>(),
+                                    rdma_buffer_ptr,
+                                    x.data_ptr(),
+                                    topk_weights_ptr,
+                                    bias_ptrs[0],
+                                    bias_ptrs[1],
+                                    combined_rdma_head.data_ptr<int>(),
+                                    combined_nvl_head.data_ptr<int>(),
+                                    src_meta.data_ptr(),
+                                    rdma_channel_prefix_matrix.data_ptr<int>(),
+                                    rdma_rank_prefix_sum.data_ptr<int>(),
+                                    gbl_channel_prefix_matrix.data_ptr<int>(),
+                                    num_tokens,
+                                    num_combined_tokens,
+                                    hidden,
+                                    num_topk,
+                                    config.num_max_rdma_chunked_send_tokens,
+                                    config.num_max_rdma_chunked_recv_tokens,
+                                    buffer_ptrs_gpu,
+                                    barrier_signal_ptrs_gpu,
+                                    nvl_rank,
+                                    num_nvl_ranks,
+                                    reserve_barrier_signals(3),  // base: Pack, base+1: NvlPush, base+2: Fwd
+                                    rank,
+                                    num_ranks,
+                                    comm_stream.queue());
 
         std::optional<EventHandle> event;
         if (async) {
