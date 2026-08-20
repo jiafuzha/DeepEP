@@ -268,10 +268,13 @@ inline void faithful_coop_copy(uint8_t* dst, const uint8_t* src, size_t n, int l
     size_t done = 0;
     if ((reinterpret_cast<uintptr_t>(dst) & 0xF) == 0 && (reinterpret_cast<uintptr_t>(src) & 0xF) == 0) {
         const size_t n16 = n >> 4;
-        auto* d16 = reinterpret_cast<sycl::vec<uint32_t, 4>*>(dst);
-        auto* s16 = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(src);
-        for (size_t j = static_cast<size_t>(lane); j < n16; j += static_cast<size_t>(lanes))
-            d16[j] = s16[j];
+        auto* d16 = reinterpret_cast<int4_t*>(dst);
+        auto* s16 = reinterpret_cast<const int4_t*>(src);
+        // Register-staged LSC copy: 4 loads issued before any store, so PCIe/L3
+        // latency overlaps instead of serializing one dependent load-store pair
+        // per iteration (the old `d16[j] = s16[j]` form). `.uc.ca`/`.wb.wb` keep
+        // this payload out of L1 while staying L3-cacheable.
+        UNROLLED_GROUP_COPY(4, lane, lanes, n16, d16, s16, ld_nc_global_v, st_na_global_v);
         done = n16 << 4;
     }
     for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))
@@ -282,10 +285,10 @@ inline void faithful_coop_zero(uint8_t* dst, size_t n, int lane, int lanes) {
     size_t done = 0;
     if ((reinterpret_cast<uintptr_t>(dst) & 0xF) == 0) {
         const size_t n16 = n >> 4;
-        auto* d16 = reinterpret_cast<sycl::vec<uint32_t, 4>*>(dst);
-        const sycl::vec<uint32_t, 4> z{0u, 0u, 0u, 0u};
+        auto* d16 = reinterpret_cast<int4_t*>(dst);
+        const int4_t z{0u, 0u, 0u, 0u};
         for (size_t j = static_cast<size_t>(lane); j < n16; j += static_cast<size_t>(lanes))
-            d16[j] = z;
+            st_na_global_v(d16 + j, z);
         done = n16 << 4;
     }
     for (size_t b = done + static_cast<size_t>(lane); b < n; b += static_cast<size_t>(lanes))

@@ -286,15 +286,33 @@ spin forever on a stale line.
 and **passed**: AOT `spir64_gen` for all 7 devices including `bmg`, with IGC emitting real
 `nbarrier.signal`/`nbarrier.wait`. **The plan is unblocked; proceed directly to Step 1.**
 
-**Step 1 — port the LSC helper library (prerequisite, and a standalone win).**
-`csrc/xpu/` has none of these today, so this is a real porting task, not a rename. Bring over
-from DeepSymm `utils.hpp`: `ld_nc_global`, `ld_nc_global_v`, `st_na_global`, `st_na_global_v`,
-`ld_volatile_global`, `st_volatile_global`, `memory_fence_system/device/workgroup`,
-`UNROLLED_WARP_COPY`, `UNROLLED_TWOWARP_COPY`, `barrier_block_bypass`. Then replace
-`faithful_coop_copy` with
-`UNROLLED_WARP_COPY(4or5, lane, n_int4, dst, src, ld_nc_global_v, st_na_global_v)`.
-**Independent of named barriers and independently testable** — do it first for a low-risk win,
-and measure before going further.
+**Step 1 — ✅ DONE, but MEASURED NEUTRAL. Landed as a prerequisite, not as a win.**
+`csrc/xpu/` had none of these helpers, so this was a real porting task. Added to
+`xpu_kernels.hpp`: `int4_t`, `ld_nc_global_v` (`lsc_load.ugm.uc.ca ... :d32x4`),
+`st_na_global_v` (`lsc_store.ugm.wb.wb ... :d32x4`), and `UNROLLED_GROUP_COPY` (a
+work-group-wide analogue of DeepSymm's 32-lane `UNROLLED_WARP_COPY`).
+`faithful_coop_copy` now does a 4-deep register-staged LSC copy instead of
+`d16[j] = s16[j]`; `faithful_coop_zero` uses `st_na_global_v`.
+
+⚠ **Result: no measurable gain.** Both tests PASS, no regression, but:
+
+| | baseline `min` | with LSC | Δ |
+|--|--|--|--|
+| NT=32 round_trip | 3875.7 µs | 3882.9 µs | +7.2 µs (noise floor ≈35 µs) |
+| NT=1024 round_trip | 101177.5 µs | 101458.7 µs | +0.28% |
+| NT=1024 dispatch | 72133.3 µs | 71986.1 µs | −0.2% |
+
+**This is the expected outcome and it confirms the perf model:** the path is
+**NIC-latency-bound**, not copy-bandwidth-bound. Payload movement at line rate is
+only ~2% of a dispatch (~56 µs of 2876 µs at NT=32), so making the copy faster
+cannot move the total. **Do not expect Steps 1-4 to pay off through bandwidth.**
+The remaining ~1 ms of unexplained per-call fixed cost is a *rendezvous/latency*
+problem (flag polling, deferred doorbells, `barrier_all` at ~39-48 µs each), and
+that is where the next investigation should go — see `INTERNODE_PERF_ANALYSIS.md`.
+
+Step 1 is still worth keeping: it is correct, faithful to CUDA's `ld.global.nc` /
+`st.global.na` semantics, regression-free, and it provides the helper library that
+Steps 3-4 need.
 
 **Step 2.** Parallelize the metadata: move the `local_id == 0` topk/scales loops to lane-strided
 sub-group work.

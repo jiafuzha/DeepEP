@@ -151,6 +151,64 @@ SYCL_EXTERNAL inline int lsc_uc_load_i32(const int* ptr) {
 #endif
 }
 
+// ---- Bulk-payload LSC copy primitives (CUDA `ld.global.nc` / `st.global.na`) ----
+// Cross-device (P2P/IPC) and RDMA-landed payload should bypass L1 but stay
+// cacheable in L3: `.uc.ca` on loads, `.wb.wb` on stores. `d32x4` moves the full
+// 16 bytes in ONE LSC message, matching CUDA's `int4` copies. Mirrors the proven
+// DeepSymm csrc/sycl/utils.hpp forms.
+struct alignas(16) int4_t {
+    uint32_t x, y, z, w;
+};
+
+SYCL_EXTERNAL inline int4_t ld_nc_global_v(const int4_t* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
+    vec4_t tmp;
+    auto* addr = reinterpret_cast<const void*>(ptr);
+    asm volatile("lsc_load.ugm.uc.ca (M1, 32) %0:d32x4 flat[%1]:a64" : "=rw"(tmp) : "rw"(addr));
+    int4_t r;
+    __builtin_memcpy(&r, &tmp, 16);
+    return r;
+#else
+    return *ptr;
+#endif
+}
+
+SYCL_EXTERNAL inline void st_na_global_v(int4_t* ptr, int4_t value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
+    vec4_t tmp;
+    __builtin_memcpy(&tmp, &value, 16);
+    auto* addr = reinterpret_cast<void*>(ptr);
+    asm volatile("lsc_store.ugm.wb.wb (M1, 32) flat[%0]:a64 %1:d32x4" : : "rw"(addr), "rw"(tmp) : "memory");
+#else
+    *ptr = value;
+#endif
+}
+
+// Work-group-wide unrolled copy. Unlike DeepSymm's UNROLLED_WARP_COPY (32-lane)
+// this strides by the full work-group so it can back a WG-cooperative copy.
+// The point of UNROLL is memory-level parallelism: issue UNROLL loads into
+// registers BEFORE any store, so PCIe/L3 latency overlaps instead of serializing
+// one load-store pair at a time.
+#define UNROLLED_GROUP_COPY(UNROLL_FACTOR, TID, NTHREADS, N, DST, SRC, LD_FUNC, ST_FUNC)                    \
+    {                                                                                                      \
+        const int __stride = (NTHREADS) * (UNROLL_FACTOR);                                                 \
+        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type __vals[(UNROLL_FACTOR)];         \
+        auto __src = (SRC);                                                                                \
+        auto __dst = (DST);                                                                                \
+        const int __n = static_cast<int>(N);                                                               \
+        int __i = static_cast<int>(TID);                                                                   \
+        for (; __i + __stride <= __n; __i += __stride) {                                                   \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j)                              \
+                __vals[__j] = LD_FUNC(__src + __i + __j * (NTHREADS));                                     \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j)                              \
+                ST_FUNC(__dst + __i + __j * (NTHREADS), __vals[__j]);                                      \
+        }                                                                                                  \
+        for (; __i < __n; __i += (NTHREADS))                                                               \
+            ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                                    \
+    }
+
 // Acquire/invalidate counterpart of the LSC release fence: invalidates the GPU
 // data cache so a subsequent load observes externally-written (NIC RDMA) data.
 SYCL_EXTERNAL inline void lsc_fence_sysacq() {
