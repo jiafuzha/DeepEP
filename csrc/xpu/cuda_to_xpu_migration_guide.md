@@ -335,12 +335,34 @@ for why they could not be removed in the split-kernel form).
 - **NT=128 fails pre-existing** (`x_diff=2.974172e-02`) — reproduces at HEAD, not a regression.
 - Noise floor: NT=32 dispatch stdev 15.2 µs, range 35.6 µs. Ignore deltas below ~35 µs.
 
-### Expected payoff
+### Expected payoff — REVISED AFTER MEASUREMENT
 
-Appendix F decomposes dispatch into a **~0.8–1.25 ms fixed cost** plus a stream running at
-**0.6 GB/s vs 22.6 GB/s achievable**. Steps 1–2 attack the streaming term; steps 3–4 attack the
-fixed term. Both are ~10× opportunities, unlike the launch-overhead work (3.2 µs/kernel), which
-was measured and rejected.
+The original estimate here was that Appendix F's decomposition (dispatch = **~0.8–1.25 ms fixed
+cost** + a stream running at **0.6 GB/s vs 22.6 GB/s achievable**) made Steps 1-2 a ~10×
+opportunity on the streaming term.
+
+**Step 1 was implemented and measured, and that estimate did not hold: the gain was zero**
+(NT=32 +7.2 µs, NT=1024 +0.28% — all inside noise). The reason is that the "0.6 GB/s stream" is
+not a *bandwidth* limit at all. Payload movement at line rate accounts for only ~2% of a
+dispatch (~56 µs of 2876 µs at NT=32); the apparent low bandwidth is latency and rendezvous
+serialization being *amortized over* the byte count, not a slow copy. Making the copy faster
+therefore cannot move the total.
+
+**Revised guidance, in priority order:**
+
+1. **The ~1 ms per-call fixed rendezvous cost is the only target that matters.** Only ~130 µs of
+   it is accounted for (2× `barrier_all` @ 39-48 µs, ~24 launches @ 3.2 µs, ~56 µs on the wire).
+   **~1 ms is still unexplained** — most likely deferred-doorbell / flag-poll stalls. *Profile
+   this before writing any more optimization code.*
+2. **Steps 3-4 (fusion) attack the fixed term** and remain plausible, but bound the expectation
+   honestly: at 3.2 µs/launch, collapsing ~34 kernels is worth **~110 µs (~2.8%)**, not 10×. A
+   38→4 refactor is high-risk for that return — do step 1 of the profiling above first.
+3. **Steps 1-2 (streaming) are done/low-value.** Keep Step 1 for correctness and as the helper
+   library Steps 3-4 need; do not expect throughput from Step 2.
+
+The broader lesson, consistent with every other experiment in `INTERNODE_PERF_ANALYSIS.md`
+(launch overhead, single-work-group, PCIe contention — all disproven by measurement): **on this
+stack NIC round-trips dominate everything else. Measure before optimizing.**
 
 ---
 
