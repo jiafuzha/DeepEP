@@ -138,6 +138,40 @@ void finalize();
 
 int get_source_meta_bytes();
 
+// True when the fused, warp-specialized CUDA-faithful internode kernels are selected.
+bool fused_internode_enabled();
+
+// CUDA-faithful `notify_dispatch` (csrc/cuda_kernels/internode.cu:93). Produces the
+// routing metadata that the fused dispatch consumes read-only, and performs the
+// control-plane cleaning between two cross-PE barriers.
+void notify_dispatch(const int* num_tokens_per_rank,
+                     int* moe_recv_counter_mapped,
+                     const int* num_tokens_per_rdma_rank,
+                     int* moe_recv_rdma_counter_mapped,
+                     const int* num_tokens_per_expert,
+                     int* moe_recv_expert_counter_mapped,
+                     int num_experts,
+                     const bool* is_token_in_rank,
+                     int num_tokens,
+                     int num_worst_tokens,
+                     int num_channels,
+                     int hidden_int4,
+                     int num_scales,
+                     int num_topk,
+                     int expert_alignment,
+                     int* rdma_channel_prefix_matrix,
+                     int* recv_rdma_rank_prefix_sum,
+                     int* gbl_channel_prefix_matrix,
+                     int* recv_gbl_rank_prefix_sum,
+                     void* rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens,
+                     void** buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens,
+                     int rank,
+                     int num_ranks,
+                     int num_nvl_ranks,
+                     sycl::queue& queue);
+
 // Combined NVL+RDMA internode dispatch (multi-node with NVL within node, RDMA across nodes)
 void dispatch_nvl_rdma(void* recv_x,
                        float* recv_x_scales,

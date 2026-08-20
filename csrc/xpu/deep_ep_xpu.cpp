@@ -1475,7 +1475,7 @@ struct Buffer {
                        const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
                        const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
-                       int,
+                       int expert_alignment,
                        int num_worst_tokens,
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
@@ -1528,7 +1528,7 @@ struct Buffer {
         } else {
             TORCH_CHECK(num_tokens_per_rank.has_value() && num_tokens_per_rdma_rank.has_value() && num_tokens_per_expert.has_value(),
                         "non-cached internode dispatch requires token count tensors");
-            TORCH_CHECK(num_worst_tokens > 0,
+            TORCH_CHECK(num_worst_tokens > 0 || internode::fused_internode_enabled(),
                         "XPU internode_dispatch non-cached metadata exchange is not complete; pass num_worst_tokens for the "
                         "correctness-first path");
         }
@@ -1600,6 +1600,45 @@ struct Buffer {
         const int num_experts = num_tokens_per_expert.has_value()
                                     ? static_cast<int>(num_tokens_per_expert->size(0))
                                     : 0;
+
+        // CUDA-faithful routing-metadata exchange (csrc/cuda_kernels/internode.cu:93).
+        // Only the fused path consumes these tensors read-only; the legacy phase-split
+        // dispatch still produces them itself.
+        if (internode::fused_internode_enabled() && !cached_mode) {
+            const int hidden_int4 = static_cast<int>((static_cast<size_t>(hidden) * x.element_size()) / 16);
+            if (num_worst_tokens == 0) {
+                *moe_recv_counter_mapped = -1;
+                if (moe_recv_rdma_counter_mapped != nullptr) *moe_recv_rdma_counter_mapped = -1;
+                for (int i = 0; i < num_experts / num_ranks; ++i) moe_recv_expert_counter_mapped[i] = -1;
+            }
+            internode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(),
+                                       moe_recv_counter_mapped,
+                                       num_tokens_per_rdma_rank->data_ptr<int>(),
+                                       moe_recv_rdma_counter_mapped,
+                                       num_tokens_per_expert->data_ptr<int>(),
+                                       moe_recv_expert_counter_mapped,
+                                       num_experts,
+                                       is_token_in_rank.data_ptr<bool>(),
+                                       num_tokens,
+                                       num_worst_tokens,
+                                       num_channels,
+                                       hidden_int4,
+                                       num_scales,
+                                       num_topk,
+                                       expert_alignment,
+                                       rdma_channel_prefix_matrix.data_ptr<int>(),
+                                       recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                       gbl_channel_prefix_matrix.data_ptr<int>(),
+                                       recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                                       rdma_buffer_ptr,
+                                       config.num_max_rdma_chunked_recv_tokens,
+                                       buffer_ptrs_gpu,
+                                       config.num_max_nvl_chunked_recv_tokens,
+                                       rank,
+                                       num_ranks,
+                                       num_nvl_ranks,
+                                       comm_stream.queue());
+        }
 
         internode::dispatch_nvl_rdma(recv_x.data_ptr(),
                                      recv_x_scales.has_value() ? recv_x_scales->data_ptr<float>() : nullptr,

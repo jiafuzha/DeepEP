@@ -507,6 +507,8 @@ inline bool internode_fused_enabled() {
     return e != nullptr && e[0] == '1';
 }
 
+#include "internode_notify_fused.inc"
+
 struct NvlBufferLayout {
     // Offsets within each rank's NVL buffer (buffer_ptrs[nvl_rank])
     size_t count_offset = 0;          // int[num_ranks]: per-destination token counts
@@ -619,6 +621,62 @@ struct NvlForwardLayout {
 // delivery orders flag[c] behind chunk c. It deliberately never calls the
 // global ishmem_quiet() (see the note at F-K3b).
 // ============================================================================
+// ============================================================================
+// Exported CUDA-faithful `notify_dispatch` (see internode_notify_fused.inc).
+// ============================================================================
+bool fused_internode_enabled() {
+    return internode_fused_enabled();
+}
+
+void notify_dispatch(const int* num_tokens_per_rank,
+                     int* moe_recv_counter_mapped,
+                     const int* num_tokens_per_rdma_rank,
+                     int* moe_recv_rdma_counter_mapped,
+                     const int* num_tokens_per_expert,
+                     int* moe_recv_expert_counter_mapped,
+                     int num_experts,
+                     const bool* is_token_in_rank,
+                     int num_tokens,
+                     int num_worst_tokens,
+                     int num_channels,
+                     int hidden_int4,
+                     int num_scales,
+                     int num_topk,
+                     int expert_alignment,
+                     int* rdma_channel_prefix_matrix,
+                     int* recv_rdma_rank_prefix_sum,
+                     int* gbl_channel_prefix_matrix,
+                     int* recv_gbl_rank_prefix_sum,
+                     void* rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens,
+                     void** buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens,
+                     int rank,
+                     int num_ranks,
+                     int num_nvl_ranks,
+                     sycl::queue& queue) {
+    const int num_rdma_ranks = num_ranks / num_nvl_ranks;
+#define DEEP_EP_NOTIFY_CASE(R)                                                                                        \
+    case R:                                                                                                           \
+        launch_fused_notify_dispatch<R>(num_tokens_per_rank, moe_recv_counter_mapped, num_tokens_per_rdma_rank,        \
+                                        moe_recv_rdma_counter_mapped, num_tokens_per_expert,                          \
+                                        moe_recv_expert_counter_mapped, num_experts, is_token_in_rank, num_tokens,     \
+                                        num_worst_tokens, num_channels, expert_alignment, hidden_int4, num_scales,     \
+                                        num_topk, num_max_rdma_chunked_recv_tokens, num_max_nvl_chunked_recv_tokens,   \
+                                        rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,                         \
+                                        gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, rdma_buffer_ptr,          \
+                                        buffer_ptrs, rank, num_ranks, num_nvl_ranks, queue);                          \
+        break
+    switch (num_rdma_ranks) {
+        DEEP_EP_NOTIFY_CASE(2);
+        DEEP_EP_NOTIFY_CASE(4);
+        DEEP_EP_NOTIFY_CASE(8);
+        default:
+            TORCH_CHECK(false, "internode notify_dispatch supports 2/4/8 RDMA ranks, got ", num_rdma_ranks);
+    }
+#undef DEEP_EP_NOTIFY_CASE
+}
+
 void dispatch_nvl_rdma(void* recv_x,
                        float* recv_x_scales,
                        topk_idx_t* recv_topk_idx,
@@ -686,14 +744,25 @@ void dispatch_nvl_rdma(void* recv_x,
         TORCH_CHECK(static_cast<size_t>(hidden) * element_size % sizeof(int4_t) == 0,
                     "fused internode dispatch requires the token row to be 16B-aligned");
         const bool cached_mode = (send_rdma_head == nullptr);
-        const int num_bytes_per_token = fused_num_bytes_per_token(hidden_int4, num_scales, num_topk);
+        (void)fused_num_bytes_per_token(hidden_int4, num_scales, num_topk);
+        // In non-cached mode `notify_dispatch` already cleaned both control planes
+        // between two cross-PE barriers (CUDA internode.cu:153-166). In cached mode
+        // CUDA does the same work in `cached_notify` (internode.cu:1327-1345), so it
+        // is performed here, likewise fenced by a cross-PE barrier on both sides.
 #define DEEP_EP_FUSED_DISPATCH_CASE(R)                                                                                \
     case R:                                                                                                           \
-        launch_fused_dispatch_clean<R>(rdma_buffer_ptr, buffer_ptrs_gpu, nvl_rank, num_channels, num_nvl_ranks,        \
-                                       num_bytes_per_token, num_max_rdma_chunked_recv_tokens,                         \
-                                       num_max_nvl_chunked_recv_tokens, queue);                                       \
-        queue.wait();                                                                                                 \
-        ishmem_barrier_all();                                                                                         \
+        if (cached_mode) {                                                                                            \
+            const auto rc = fused_get_rdma_clean_meta(hidden_int4, num_scales, num_topk, R, num_nvl_ranks,             \
+                                                      num_max_rdma_chunked_recv_tokens, num_channels);                \
+            const auto nc = fused_get_nvl_clean_meta(hidden_int4, num_scales, num_topk, R, num_nvl_ranks,              \
+                                                     num_max_nvl_chunked_recv_tokens, num_channels);                  \
+            queue.wait();                                                                                             \
+            ishmem_barrier_all();                                                                                     \
+            launch_fused_clean_planes<R>(rdma_buffer_ptr, buffer_ptrs_gpu, nvl_rank, rc.first, rc.second, nc.first,    \
+                                         nc.second, queue);                                                           \
+            queue.wait();                                                                                             \
+            ishmem_barrier_all();                                                                                     \
+        }                                                                                                             \
         launch_fused_dispatch<R>(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,                              \
                                  static_cast<SourceMeta*>(recv_src_meta), x, x_scales, topk_idx, topk_weights,         \
                                  send_rdma_head, send_nvl_head, recv_rdma_channel_prefix_matrix,                       \
