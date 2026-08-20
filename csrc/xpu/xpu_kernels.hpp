@@ -156,6 +156,23 @@ SYCL_EXTERNAL inline int lsc_uc_load_i32(const int* ptr) {
 // cacheable in L3: `.uc.ca` on loads, `.wb.wb` on stores. `d32x4` moves the full
 // 16 bytes in ONE LSC message, matching CUDA's `int4` copies. Mirrors the proven
 // DeepSymm csrc/sycl/utils.hpp forms.
+// Poll-load of a queue counter.  CUDA uses `ld_acquire_sys_global` (a CACHED
+// system-scope acquire load).  On BMG the two producer paths write the counter
+// through different routes: the NIC (IBGDA AMO) writes memory directly, while
+// the self/local path uses a device atomic that lands in the cache hierarchy.
+// An uncached load misses the latter; a cached load can miss the former.  Read
+// both and take the max - the counter is monotonically increasing, so this is
+// always a valid (possibly conservative) observation.
+template <typename T>
+inline __attribute__((always_inline)) T poll_load(const T* p) {
+    T a = uc_load(p);
+    sycl::atomic_ref<T, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        r(*const_cast<T*>(p));
+    T b = r.load(sycl::memory_order::acquire);
+    return a > b ? a : b;
+}
+
 struct alignas(16) int4_t {
     uint32_t x, y, z, w;
 };
@@ -174,6 +191,24 @@ SYCL_EXTERNAL inline int4_t ld_nc_global_v(const int4_t* ptr) {
 #endif
 }
 
+// Fully uncached (L1 AND L3 bypass) 16-byte load. Needed for payload that was
+// delivered by an agent outside the Xe cache hierarchy (NIC RDMA writes, peer
+// GPU IPC stores): the symmetric heap addresses are recycled every iteration,
+// so `.uc.ca` can still hit a stale L3 line from the previous epoch.
+SYCL_EXTERNAL inline int4_t ld_uc_global_v(const int4_t* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
+    vec4_t tmp;
+    auto* addr = reinterpret_cast<const void*>(ptr);
+    asm volatile("lsc_load.ugm.uc.uc (M1, 32) %0:d32x4 flat[%1]:a64" : "=rw"(tmp) : "rw"(addr));
+    int4_t r;
+    __builtin_memcpy(&r, &tmp, 16);
+    return r;
+#else
+    return *ptr;
+#endif
+}
+
 SYCL_EXTERNAL inline void st_na_global_v(int4_t* ptr, int4_t value) {
 #ifdef __SYCL_DEVICE_ONLY__
     using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
@@ -181,6 +216,22 @@ SYCL_EXTERNAL inline void st_na_global_v(int4_t* ptr, int4_t value) {
     __builtin_memcpy(&tmp, &value, 16);
     auto* addr = reinterpret_cast<void*>(ptr);
     asm volatile("lsc_store.ugm.wb.wb (M1, 32) flat[%0]:a64 %1:d32x4" : : "rw"(addr), "rw"(tmp) : "memory");
+#else
+    *ptr = value;
+#endif
+}
+
+// Fully uncached (L1 AND L3 bypass) 16-byte store. The counterpart of
+// ld_uc_global_v: data that will be consumed by an agent outside this GPU's
+// cache hierarchy (a peer GPU reading our IPC-mapped buffer, or the NIC DMA
+// reading a send buffer) must not be left sitting in a write-back cache line.
+SYCL_EXTERNAL inline void st_uc_global_v(int4_t* ptr, int4_t value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
+    vec4_t tmp;
+    __builtin_memcpy(&tmp, &value, 16);
+    auto* addr = reinterpret_cast<void*>(ptr);
+    asm volatile("lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32x4" : : "rw"(addr), "rw"(tmp) : "memory");
 #else
     *ptr = value;
 #endif

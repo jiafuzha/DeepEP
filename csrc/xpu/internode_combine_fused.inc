@@ -93,6 +93,7 @@ void launch_fused_cached_notify_heads(int* combined_rdma_head,
                                       const int* rdma_rank_prefix_sum,
                                       int num_nvl_ranks,
                                       sycl::queue& queue) {
+    (void)num_nvl_ranks;
     // combined_rdma_head: one lane per RDMA rank, one sub-group per channel.
     {
         const size_t wg = 32;
@@ -129,7 +130,7 @@ void launch_fused_cached_notify_heads(int* combined_rdma_head,
                     const int dst_rdma_rank = g / num_channels;
                     const int channel = g % num_channels;
                     const int lane = static_cast<int>(item.get_local_id(0));
-                    if (lane >= num_nvl_ranks) return;
+                    if (lane >= NUM_MAX_NVL_PEERS) return;  // CUDA internode.cu:1444
                     int token_start_idx =
                         channel == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel - 1];
                     int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel];
@@ -138,9 +139,9 @@ void launch_fused_cached_notify_heads(int* combined_rdma_head,
                     token_end_idx += shift;
                     int last_head = 1 << 25;
                     for (int t = token_end_idx - 1; t >= token_start_idx; --t) {
-                        const int cur = combined_nvl_head[static_cast<int64_t>(t) * num_nvl_ranks + lane];
+                        const int cur = combined_nvl_head[static_cast<int64_t>(t) * NUM_MAX_NVL_PEERS + lane];
                         if (cur < 0)
-                            combined_nvl_head[static_cast<int64_t>(t) * num_nvl_ranks + lane] = -last_head - 1;
+                            combined_nvl_head[static_cast<int64_t>(t) * NUM_MAX_NVL_PEERS + lane] = -last_head - 1;
                         else
                             last_head = cur;
                     }
@@ -226,20 +227,20 @@ inline __attribute__((always_inline)) void fused_combine_token(bool is_token_in_
             }
         }
         for (int j = 0; j < num_topk_ranks; ++j) {
-            int4_t v = ld_nc_global_v(get_addr_fn(topk_ranks[j], slot_indices[j], i));
+            int4_t v = ld_uc_global_v(get_addr_fn(topk_ranks[j], slot_indices[j], i));
             auto* rv = reinterpret_cast<const uint16_t*>(&v);
             for (int k = 0; k < kDtypePerInt4; ++k) values[k] += fused_bf16_to_float(rv[k]);
         }
         int4_t out;
         auto* od = reinterpret_cast<uint16_t*>(&out);
         for (int j = 0; j < kDtypePerInt4; ++j) od[j] = fused_float_to_bf16(values[j]);
-        st_na_global_v(combined_row + i, out);
+        st_uc_global_v(combined_row + i, out);
     }
 
     if (lane_id < num_topk && combined_topk_weights != nullptr) {
         float value = 0.f;
         for (int i = 0; i < num_topk_ranks; ++i) value += recv_tw_fn(topk_ranks[i], slot_indices[i], lane_id);
-        combined_topk_weights[lane_id] = value;
+        uc_store(combined_topk_weights + lane_id, value);
     }
 }
 
@@ -417,7 +418,7 @@ void launch_fused_combine(void* combined_x,
                                                 num_max_nvl_chunked_send_tokens;
                             if (sycl::any_of_group(sg, is_lane_ready)) break;
                             if (lane_id < kNumRDMARanks && token_start_idx < token_end_idx)
-                                cached_channel_head_idx = uc_load(ch_head + lane_id);
+                                cached_channel_head_idx = poll_load(ch_head + lane_id);
                             if (++spins > kFusedSpinCap) break;
                         }
 
@@ -444,12 +445,12 @@ void launch_fused_combine(void* combined_x,
                                 uint8_t* dst = ch_x + static_cast<size_t>(dst_slot_idx) * num_bytes_per_token;
                                 const auto* src = static_cast<const int4_t*>(x) + token_idx * hidden_int4;
                                 for (int j = lane_id; j < hidden_int4; j += 32)
-                                    st_na_global_v(reinterpret_cast<int4_t*>(dst) + j, ld_nc_global_v(src + j));
+                                    st_uc_global_v(reinterpret_cast<int4_t*>(dst) + j, ld_nc_global_v(src + j));
                                 if (lane_id == num_topk)
                                     *reinterpret_cast<SourceMeta*>(dst + hidden_bytes) = src_meta[token_idx];
                                 if (lane_id < num_topk)
-                                    reinterpret_cast<float*>(dst + hidden_bytes + sizeof(SourceMeta))[lane_id] =
-                                        topk_weights[token_idx * num_topk + lane_id];
+                                    uc_store(reinterpret_cast<float*>(dst + hidden_bytes + sizeof(SourceMeta)) + lane_id,
+                                             topk_weights[token_idx * num_topk + lane_id]);
                                 sycl::group_barrier(sg);
                             }
                             if (lane_id == current_rdma_idx) token_start_idx = static_cast<int>(token_idx);
@@ -492,7 +493,8 @@ void launch_fused_combine(void* combined_x,
                         channel_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
                     num_tokens_to_combine -= num_tokens_prefix;
                     num_tokens_prefix += (dst_rdma_rank == 0) ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-                    const int* my_combined_nvl_head = combined_nvl_head + static_cast<int64_t>(num_tokens_prefix) * num_nvl_ranks;
+                    const int* my_combined_nvl_head =
+                        combined_nvl_head + static_cast<int64_t>(num_tokens_prefix) * NUM_MAX_NVL_PEERS;
 
                     for (int token_start_idx = 0; token_start_idx < num_tokens_to_combine;
                          token_start_idx += num_max_rdma_chunked_send_tokens) {
@@ -505,7 +507,7 @@ void launch_fused_combine(void* combined_x,
                             uint64_t spins = 0;
                             while (true) {
                                 const int num_used_slots =
-                                    token_start_idx - static_cast<int>(uc_load(rdma_channel_head.buffer(dst_rdma_rank)));
+                                    token_start_idx - static_cast<int>(poll_load(rdma_channel_head.buffer(dst_rdma_rank)));
                                 if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens) break;
                                 if (++spins > kFusedSpinCap) break;
                             }
@@ -541,14 +543,14 @@ void launch_fused_combine(void* combined_x,
                             int expected_head = -1;
                             if (lane_id < num_nvl_ranks) {
                                 expected_head =
-                                    my_combined_nvl_head[static_cast<int64_t>(token_idx) * num_nvl_ranks + lane_id];
+                                    my_combined_nvl_head[static_cast<int64_t>(token_idx) * NUM_MAX_NVL_PEERS + lane_id];
                                 slm_store(smem_fwd_nvl_head, warp_id * NUM_MAX_NVL_PEERS + lane_id,
                                           expected_head < 0 ? (-expected_head - 1) : expected_head);
                             }
 
                             uint64_t spins = 0;
                             while (cached_nvl_channel_tail_idx <= expected_head) {
-                                cached_nvl_channel_tail_idx = uc_load(nvl_tail(local_buffer_ptr, lane_id) + dst_rdma_rank);
+                                cached_nvl_channel_tail_idx = poll_load(nvl_tail(local_buffer_ptr, lane_id) + dst_rdma_rank);
                                 if (++spins > kFusedSpinCap) break;
                             }
                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
@@ -563,15 +565,18 @@ void launch_fused_combine(void* combined_x,
                                        hidden_int4_idx;
                             };
                             auto recv_tw_fn = [&](int src_nvl_rank, int slot_idx, int k) -> float {
-                                return reinterpret_cast<const float*>(nvl_x(local_buffer_ptr, src_nvl_rank) + rdma_x_shift +
-                                                                      static_cast<size_t>(slot_idx) * num_bytes_per_token +
-                                                                      hidden_bytes + sizeof(SourceMeta))[k];
+                                return uc_load(reinterpret_cast<const float*>(
+                                                   nvl_x(local_buffer_ptr, src_nvl_rank) + rdma_x_shift +
+                                                   static_cast<size_t>(slot_idx) * num_bytes_per_token + hidden_bytes +
+                                                   sizeof(SourceMeta)) +
+                                               k);
                             };
                             fused_combine_token<NUM_MAX_NVL_PEERS, false, NUM_MAX_NVL_PEERS>(
                                 expected_head >= 0, expected_head, lane_id, hidden_int4, num_topk,
                                 reinterpret_cast<int4_t*>(shifted),
                                 reinterpret_cast<float*>(shifted + hidden_bytes + sizeof(SourceMeta)), nullptr, nullptr,
                                 num_max_nvl_chunked_recv_tokens_per_rdma, get_addr_fn, recv_tw_fn, sg);
+
 
                             if (lane_id < num_nvl_ranks)
                                 slm_store(smem_fwd_nvl_head, warp_id * NUM_MAX_NVL_PEERS + lane_id,
@@ -672,7 +677,7 @@ void launch_fused_combine(void* combined_x,
 
                         uint64_t spins = 0;
                         while (cached_channel_tail_idx <= expected_head) {
-                            cached_channel_tail_idx = static_cast<int>(uc_load(rdma_channel_tail.buffer(lane_id)));
+                            cached_channel_tail_idx = static_cast<int>(poll_load(rdma_channel_tail.buffer(lane_id)));
                             if (++spins > kFusedSpinCap) break;
                         }
                         sycl::group_barrier(sg);
@@ -685,9 +690,11 @@ void launch_fused_combine(void* combined_x,
                                    hidden_int4_idx;
                         };
                         auto recv_tw_fn = [&](int src_rdma_rank, int slot_idx, int k) -> float {
-                            return reinterpret_cast<const float*>(rdma_channel_data.recv_buffer(src_rdma_rank) +
-                                                                  static_cast<size_t>(slot_idx) * num_bytes_per_token +
-                                                                  hidden_bytes + sizeof(SourceMeta))[k];
+                            return uc_load(reinterpret_cast<const float*>(
+                                               rdma_channel_data.recv_buffer(src_rdma_rank) +
+                                               static_cast<size_t>(slot_idx) * num_bytes_per_token + hidden_bytes +
+                                               sizeof(SourceMeta)) +
+                                           k);
                         };
                         fused_combine_token<kNumRDMARanks, true, kNumRDMARanks>(
                             expected_head >= 0, expected_head, lane_id, hidden_int4, num_topk,

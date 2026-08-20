@@ -1562,9 +1562,13 @@ struct Buffer {
         torch::Tensor recv_gbl_rank_prefix_sum =
             cached_mode ? cached_recv_gbl_rank_prefix_sum.value() : torch::zeros({num_ranks}, int_options);
 
-        auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+        // The XPU internode dispatch always runs in `num_worst_tokens` mode, so `recv_x`
+        // (and the handle tensors derived from it) is padded past the real received-token
+        // count.  CUDA never returns padded rows from a cached dispatch, so it can leave
+        // them uninitialised; here they are observable, so zero-fill instead of `empty`.
+        auto recv_x = torch::zeros({num_recv_tokens, hidden}, x.options());
         auto recv_x_scales = x_scales.has_value()
-            ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_scales}, (x_scales_contig.has_value() ? x_scales_contig->options() : x_scales->options())))
+            ? std::optional<torch::Tensor>(torch::zeros({num_recv_tokens, num_scales}, (x_scales_contig.has_value() ? x_scales_contig->options() : x_scales->options())))
             : std::optional<torch::Tensor>();
         auto recv_topk_idx = topk_idx.has_value()
             ? std::optional<torch::Tensor>(torch::empty({num_recv_tokens, num_topk}, topk_idx->options()))
@@ -1581,13 +1585,26 @@ struct Buffer {
         auto recv_gbl_channel_prefix_matrix = cached_mode
             ? std::optional<torch::Tensor>()
             : std::optional<torch::Tensor>(torch::empty({num_ranks, num_channels}, int_options));
+        // CUDA parity (deep_ep/buffer.py:874-875 on the CUDA path): both handles are
+        // *sparse* -- dispatch only writes the entries that correspond to a token it
+        // actually forwards, and `cached_notify` rewrites the remaining NEGATIVE entries.
+        // They therefore MUST be pre-filled with -1.  `send_nvl_head` is indexed by
+        // RDMA-queue slot (not by local token) and strided by NUM_MAX_NVL_PEERS, i.e.
+        // {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}.
+        //
+        // The legacy phase-split path uses different (token, global-rank) semantics; keep
+        // its shape until it is removed.
+        const bool fused_heads = internode::fused_internode_enabled();
         auto send_rdma_head = cached_mode
             ? std::optional<torch::Tensor>()
-            : std::optional<torch::Tensor>(torch::empty({num_tokens, num_rdma_ranks}, int_options));
+            : std::optional<torch::Tensor>(torch::full({num_tokens, num_rdma_ranks}, -1, int_options));
         auto send_nvl_head = cached_mode
             ? std::optional<torch::Tensor>()
-            : std::optional<torch::Tensor>(torch::empty(
-                  std::vector<int64_t>{num_tokens, num_ranks},
+            : std::optional<torch::Tensor>(torch::full(
+                  fused_heads ? std::vector<int64_t>{std::max(num_rdma_recv_tokens, num_tokens * num_rdma_ranks),
+                                                     NUM_MAX_NVL_PEERS}
+                              : std::vector<int64_t>{num_tokens, num_ranks},
+                  -1,
                   int_options));
 
         const size_t copy_rows = static_cast<size_t>(std::min(num_tokens, num_recv_tokens));

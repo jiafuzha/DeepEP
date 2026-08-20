@@ -475,7 +475,7 @@ void launch_fused_dispatch(void* recv_x,
                         // Wait for the remote buffer to be released.
                         uint64_t spins = 0;
                         while (in_rank_mask != 0 && rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
-                            cached_rdma_channel_head = static_cast<int>(uc_load(rdma_channel_head.buffer(lane_id)));
+                            cached_rdma_channel_head = static_cast<int>(poll_load(rdma_channel_head.buffer(lane_id)));
                             if (++spins > kFusedSpinCap) break;
                         }
                         sycl::group_barrier(sg);
@@ -697,10 +697,10 @@ void launch_fused_dispatch(void* recv_x,
                     if (lane_id < kNumRDMARanks) {
                         uint64_t spins = 0;
                         while (true) {
-                            const int meta_0 = uc_load(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
-                            const int meta_1 = uc_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks + dst_nvl_rank);
-                            const int meta_2 = uc_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks * 2);
-                            const int meta_3 = uc_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks * 2 + 1);
+                            const int meta_0 = poll_load(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
+                            const int meta_1 = poll_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks + dst_nvl_rank);
+                            const int meta_2 = poll_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks * 2);
+                            const int meta_3 = poll_load(rdma_channel_meta.recv_buffer(lane_id) + num_nvl_ranks * 2 + 1);
                             if (meta_0 < 0 && meta_1 < 0 && meta_2 < 0 && meta_3 < 0) {
                                 const int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
                                 uc_store(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
@@ -721,7 +721,9 @@ void launch_fused_dispatch(void* recv_x,
                     lsc_fence_sysrel();
 
                     int* my_send_nvl_head =
-                        (send_nvl_head != nullptr) ? (send_nvl_head + src_rdma_channel_prefix * num_nvl_ranks + dst_nvl_rank) : nullptr;
+                        (send_nvl_head != nullptr)
+                            ? (send_nvl_head + static_cast<int64_t>(src_rdma_channel_prefix) * NUM_MAX_NVL_PEERS + dst_nvl_rank)
+                            : nullptr;
 
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
                     ::work_group_named_barrier(nb_forwarder, 0x3);  // CUDA :959 sync_forwarder_smem()
@@ -739,7 +741,7 @@ void launch_fused_dispatch(void* recv_x,
                             while (true) {
                                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens) break;
-                                cached_nvl_channel_head = sycl::select_from_group(sg, uc_load(nvl_channel_head.buffer()), 0);
+                                cached_nvl_channel_head = sycl::select_from_group(sg, poll_load(nvl_channel_head.buffer()), 0);
                                 if (++spins > kFusedSpinCap) break;
                             }
                         }
@@ -752,7 +754,7 @@ void launch_fused_dispatch(void* recv_x,
                                 if (sycl::select_from_group(sg, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                                     if (lane_id == src_rdma_rank && cached_rdma_channel_head == cached_rdma_channel_tail) {
                                         lsc_fence_sysacq();
-                                        cached_rdma_channel_tail = static_cast<int>(uc_load(rdma_channel_tail.buffer(src_rdma_rank)));
+                                        cached_rdma_channel_tail = static_cast<int>(poll_load(rdma_channel_tail.buffer(src_rdma_rank)));
                                     }
                                     if (sycl::select_from_group(
                                             sg, cached_rdma_channel_tail > cached_rdma_channel_head ? 1 : 0, src_rdma_rank))
@@ -780,7 +782,7 @@ void launch_fused_dispatch(void* recv_x,
                                 const int cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
                                 rdma_nvl_token_idx += is_in_dst_nvl_rank ? 1 : 0;
                                 if (!kCachedMode && my_send_nvl_head != nullptr)
-                                    my_send_nvl_head[static_cast<int64_t>(i) * num_nvl_ranks] = cached_head;
+                                    my_send_nvl_head[static_cast<int64_t>(i) * NUM_MAX_NVL_PEERS] = cached_head;
                             }
                             if (!is_in_dst_nvl_rank) continue;
 
@@ -896,8 +898,8 @@ void launch_fused_dispatch(void* recv_x,
                     if (lane_id < kNumRDMARanks) {
                         uint64_t spins = 0;
                         while (true) {
-                            start_offset = uc_load(nvl_channel_prefix_start.buffer() + lane_id);
-                            end_offset = uc_load(nvl_channel_prefix_end.buffer() + lane_id);
+                            start_offset = poll_load(nvl_channel_prefix_start.buffer() + lane_id);
+                            end_offset = poll_load(nvl_channel_prefix_end.buffer() + lane_id);
                             if (start_offset < 0 && end_offset < 0) {
                                 start_offset = -start_offset - 1;
                                 end_offset = -end_offset - 1;
@@ -919,7 +921,7 @@ void launch_fused_dispatch(void* recv_x,
                         uint64_t spins = 0;
                         while (true) {
                             if (cached_channel_head_idx != cached_channel_tail_idx) break;
-                            cached_channel_tail_idx = sycl::select_from_group(sg, uc_load(nvl_channel_tail.buffer()), 0);
+                            cached_channel_tail_idx = sycl::select_from_group(sg, poll_load(nvl_channel_tail.buffer()), 0);
                             if (++spins > kFusedSpinCap) break;
                         }
                         if (cached_channel_head_idx == cached_channel_tail_idx) break;  // spin cap hit

@@ -2115,7 +2115,7 @@ void combine_nvl_rdma(DataType type,
                                             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, num_nvl_ranks, queue);   \
         queue.wait();                                                                                                 \
         ishmem_barrier_all();                                                                                         \
-        launch_fused_combine<R>(combined_x, combined_topk_weights, x, topk_weights, bias_0, bias_1,                    \
+        launch_fused_combine<R>(combined_x, combined_topk_weights, x, topk_weights, bias_0, bias_1,               \
                                 combined_rdma_head, combined_nvl_head, static_cast<const SourceMeta*>(src_meta),       \
                                 rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,           \
                                 num_tokens, num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,                    \
