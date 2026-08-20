@@ -689,7 +689,7 @@ void dispatch_nvl_rdma(void* recv_x,
         const int num_bytes_per_token = fused_num_bytes_per_token(hidden_int4, num_scales, num_topk);
 #define DEEP_EP_FUSED_DISPATCH_CASE(R)                                                                                \
     case R:                                                                                                           \
-        launch_fused_dispatch_clean<R>(rdma_buffer_ptr, buffer_ptrs_gpu[nvl_rank], num_channels, num_nvl_ranks,        \
+        launch_fused_dispatch_clean<R>(rdma_buffer_ptr, buffer_ptrs_gpu, nvl_rank, num_channels, num_nvl_ranks,        \
                                        num_bytes_per_token, num_max_rdma_chunked_recv_tokens,                         \
                                        num_max_nvl_chunked_recv_tokens, queue);                                       \
         queue.wait();                                                                                                 \

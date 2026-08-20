@@ -73,6 +73,44 @@
 //       qps_per_pe read from ISHMEM_IBGDA_QPS_PER_PE.
 // ============================================================================
 
+// STATUS / REMAINING PREREQUISITES (measured, not assumed)
+// ----------------------------------------------------------------------------
+// Validated so far on Arc Pro B60 / 2 nodes x 2 GPUs:
+//   * The kernel COMPILES and device-links against libishmem.a with no
+//     "Stack call has been detected" warning -> NamedBarrier + iSHMEM coexist
+//     inside a real fused DeepEP kernel (retracting the old blocker).
+//   * With DEEP_EP_INTERNODE_FUSED=1 it LAUNCHES AND COMPLETES: no vISA
+//     "NBarrierCnt" failure, no hang on either named barrier, no DEVICE_LOST.
+//
+// Two prerequisites remain before it can be the default:
+//
+//   P1. `notify_dispatch` is not ported. In CUDA (internode.cu:93) a SEPARATE
+//       kernel performs the cross-rank count exchange and produces
+//       rdma_channel_prefix_matrix / gbl_channel_prefix_matrix /
+//       recv_rdma_rank_prefix_sum / recv_gbl_rank_prefix_sum, which
+//       `dispatch` then consumes READ-ONLY (they are `const int*` there).
+//       The XPU port never implemented it: those four tensors are allocated as
+//       torch::zeros() by deep_ep_xpu.cpp:1537-1545 and are FILLED INSIDE the
+//       phase-split dispatch (csrc/xpu/internode.cpp:1640/1671/1744/1762).
+//       Running the fused kernel therefore feeds it all-zero routing metadata,
+//       which surfaces as `recv_gbl_rank_prefix_sum[-1] == 0` in
+//       tests/test_internode.py:325.
+//
+//   P2. `combine` must be fused in the same change. dispatch and combine are
+//       coupled through send_rdma_head / send_nvl_head: this kernel writes them
+//       with the CUDA meaning (send_nvl_head indexed by RDMA-queue slot, CUDA
+//       internode.cu:983-988; send_rdma_head = the RDMA ring tail, :657-658)
+//       while the phase-split combine at csrc/xpu/internode.cpp:2261/2863
+//       consumes the legacy XPU meaning (destination-local receive position,
+//       produced at csrc/xpu/internode.cpp:1890/1911). A source rank cannot
+//       derive the legacy value locally -- it needs the DESTINATION's
+//       recv_gbl_channel_prefix_matrix row -- which is exactly why the legacy
+//       path carries the extra count push-back kernels (F-K9/F-K10).
+//
+// Neither prerequisite is a synchronization limitation: both named barriers
+// behave exactly as the CUDA barrier.sync sites they replace.
+// ----------------------------------------------------------------------------
+
 // ---- csrc/cuda_kernels/buffer.cuh ports (device-side symmetric slicing) ----
 
 template <typename dtype_t>
@@ -167,40 +205,44 @@ class FusedDispatchCleanKernel;
 // ---------------------------------------------------------------------------
 template <int kNumRDMARanks>
 void launch_fused_dispatch_clean(void* rdma_buffer_ptr,
-                                 void* nvl_buffer_ptr,
+                                 void** buffer_ptrs_gpu,
+                                 int nvl_rank,
                                  int num_channels,
                                  int num_nvl_ranks,
                                  int num_bytes_per_token,
                                  int num_max_rdma_chunked_recv_tokens,
                                  int num_max_nvl_chunked_recv_tokens,
                                  sycl::queue& queue) {
-    // RDMA control plane: meta (decoupled send+recv) + head + tail.
+    // --- RDMA control plane (host-side memset: rdma_buffer_ptr is host-known) ---
     {
         void* p = rdma_buffer_ptr;
         FusedSymBuffer<uint8_t> data(p, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, 0, num_channels);
         (void)data;
-        auto* meta_base = static_cast<int*>(p);
-        const size_t meta_ints =
-            static_cast<size_t>(num_nvl_ranks * 2 + 2) * kNumRDMARanks * num_channels * 2 +  // SymBuffer<int>, decoupled
-            static_cast<size_t>(1) * kNumRDMARanks * num_channels +                          // head  (non-decoupled)
-            static_cast<size_t>(1) * kNumRDMARanks * num_channels * 2;                       // tail  (uint64 = 2 ints)
-        // head is uint64 too: recompute exactly.
-        const size_t n_meta = static_cast<size_t>(num_nvl_ranks * 2 + 2) * kNumRDMARanks * num_channels * 2;
-        const size_t n_head = static_cast<size_t>(2) * kNumRDMARanks * num_channels;  // uint64_t -> 2 ints
-        const size_t n_tail = static_cast<size_t>(2) * kNumRDMARanks * num_channels;
-        (void)meta_ints;
-        const size_t total = n_meta + n_head + n_tail;
-        queue.memset(meta_base, 0, total * sizeof(int));
+        // meta (SymBuffer<int>, decoupled => x2) + head (uint64) + tail (uint64)
+        const size_t n_meta_bytes =
+            static_cast<size_t>(num_nvl_ranks * 2 + 2) * sizeof(int) * kNumRDMARanks * num_channels * 2;
+        const size_t n_head_bytes = sizeof(uint64_t) * kNumRDMARanks * num_channels;
+        const size_t n_tail_bytes = sizeof(uint64_t) * kNumRDMARanks * num_channels;
+        queue.memset(p, 0, n_meta_bytes + n_head_bytes + n_tail_bytes);
     }
-    // NVL control plane: prefix_start / prefix_end / head / tail. `nvl_channel_x`
-    // (payload) needs no clearing.
+    // --- NVL control plane: buffer_ptrs_gpu is DEVICE memory, so the base pointer
+    //     must be resolved on the device. One tiny kernel does the zeroing. ---
     {
-        void* p = nvl_buffer_ptr;
-        FusedAsymBuffer<uint8_t> x(p, num_max_nvl_chunked_recv_tokens * num_bytes_per_token, num_nvl_ranks, 0, num_channels, 0);
-        (void)x;
-        const size_t n_ints = static_cast<size_t>(kNumRDMARanks) * num_nvl_ranks * num_channels * 2 +  // prefix_start + prefix_end
+        const size_t nvl_x_bytes = static_cast<size_t>(num_max_nvl_chunked_recv_tokens) * num_bytes_per_token *
+                                   num_nvl_ranks * num_channels;
+        const size_t n_ints = static_cast<size_t>(kNumRDMARanks) * num_nvl_ranks * num_channels * 2 +  // prefix_start/end
                               static_cast<size_t>(1) * num_nvl_ranks * num_channels * 2;              // head + tail
-        queue.memset(p, 0, n_ints * sizeof(int));
+        constexpr size_t kWG = 256;
+        const size_t global = ((n_ints + kWG - 1) / kWG) * kWG;
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for<FusedDispatchCleanKernel<kNumRDMARanks>>(
+                sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kWG)), [=](sycl::nd_item<1> item) {
+                    const size_t i = item.get_global_linear_id();
+                    if (i >= n_ints) return;
+                    auto* base = static_cast<uint8_t*>(buffer_ptrs_gpu[nvl_rank]) + nvl_x_bytes;
+                    uc_store(reinterpret_cast<int*>(base) + i, 0);
+                });
+        });
     }
 }
 
