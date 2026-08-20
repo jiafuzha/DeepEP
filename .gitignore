@@ -6,3 +6,6 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
+
+# Built PyTorch extension artifacts
+*.so
