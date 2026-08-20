@@ -133,18 +133,22 @@ translation units never see the bnxt code — it arrives as pre-compiled device 
 With `NOINLINE=OFF`, DeepEP rebuilds clean and `tests/docker-2node-v2` reports
 `===== PASS tests/test_internode.py =====`.
 
-### Remaining consequence for the internode NORMAL fusion
+### Relationship to the phase-split XPU implementation
 
-The toolchain no longer blocks fusion, but a **separate, structural** obstacle stands:
-the current XPU internode NORMAL phase boundaries are **grid-scope or cross-PE**
-(whole-grid NVL `nvl_barrier`, `ishmemx_barrier_all_work_group`, and different grid shapes
-per phase: 1 WG vs `num_use_channels*num_qp_ch` WGs vs `num_rdma_ranks*num_qp_ch` WGs).
-NamedBarrier is a *within-work-group* sub-group-subset barrier and cannot replace any of
-them. A true CUDA-parity re-fusion would additionally require re-introducing the CUDA
-sliding-window credit transport (`rdma_send_channel_{lock,tail,window}`,
-`forward_channel_{head,retired}`), which the XPU port deliberately replaced with an AMO-flag
-transport, and which depends on the forwarder **pull**-reading peer NVL buffers over IPC —
-unstable on BMG. Re-fusion is thus a design decision, not a barrier substitution.
+The current phase boundaries in `csrc/xpu/internode.cpp` (whole-grid NVL `nvl_barrier`,
+`ishmemx_barrier_all_work_group`, and differing grid shapes per phase) are an **artifact of
+the NamedBarrier workaround**, not a requirement of the algorithm.
+
+> **Retraction (2026-08-20).** An earlier revision of this document claimed the XPU internode
+> NORMAL phase boundaries were *inherently* grid-scope/cross-PE and therefore that NamedBarrier
+> was structurally the wrong tool. **That was wrong.** It reasoned from the workaround's own
+> structure back to the algorithm — circular. Verified fact: `csrc/cuda_kernels/internode.cu`
+> contains **no** `cooperative_groups`, **no** `this_grid()`, and **no** grid sync of any kind.
+> `dispatch` (line 447) and `combine` (line 1716) are each **one fused kernel** whose every
+> internal synchronization is an intra-block `barrier.sync`/`bar.sync`. Only `notify_dispatch`
+> and `cached_notify` are separate kernels in CUDA, and they are separate in the XPU port too.
+> With the toolchain issue resolved, re-fusing to a single warp-specialized kernel per direction
+> is the correct target.
 
 ## Verification
 

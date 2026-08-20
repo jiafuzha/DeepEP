@@ -115,11 +115,18 @@ templates on `kNumRDMARanks` and `NUM_MAX_NVL_PEERS` (=8) drive the whole layout
 > Evidence + standalone repro: `csrc/xpu/named_barrier_usage.md`,
 > `csrc/xpu/tools/test_nbarrier_ishmem_repro.cpp`.
 >
-> A second, INDEPENDENT obstacle to re-fusion remains: `csrc/xpu/internode.cpp` is not a
-> warp-specialized port awaiting subset barriers. It is a micro-kernel decomposition with a
-> different (AMO-flag, push-only) transport whose phase boundaries are **grid-scope or
-> cross-PE** — which a within-work-group subset barrier cannot express regardless of the
-> toolchain. Re-fusion is therefore a design decision, not a mechanical barrier substitution.
+> **RETRACTION (2026-08-20): the former "grid-scope phase boundary" objection was WRONG.**
+> An earlier revision of this file argued that the XPU internode NORMAL phase boundaries are
+> inherently grid-scope/cross-PE, so NamedBarrier was structurally the wrong tool. That
+> reasoned from the *workaround's* structure back to the algorithm — circular. Verified:
+> `csrc/cuda_kernels/internode.cu` has **no** `cooperative_groups`, **no** `this_grid()`, and
+> **no** grid sync at all. `dispatch` (line 447) and `combine` (line 1716) are each **one fused
+> warp-specialized kernel** synchronized purely by intra-block `barrier.sync`/`bar.sync`
+> (lines 563, 580, 1952, 1953, 1966). Only `notify_dispatch` (line 93) and `cached_notify`
+> (line 1311) are separate kernels in CUDA — and those stay separate in the XPU port.
+> The grid-scope barriers exist ONLY in the phase-split workaround. **The correct target is one
+> fused kernel per direction**, with each CUDA `barrier.sync <id>, N*32` becoming a NamedBarrier
+> of count `N` sub-groups.
 
 ### 3.1 Overview map
 
