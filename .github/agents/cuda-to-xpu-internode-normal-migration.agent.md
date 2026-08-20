@@ -407,7 +407,11 @@ Follow `.github/agents/ishmem-ibgda-xpu-perf-debug.agent.md`. In particular:
   NamedBarrier+iSHMEM coexistence is broken in your build).
 - ❌ Hand-rolled SLM arrival-counter subset barriers — **DEADLOCK** on BMG.
 - ❌ Reading peer buffers via IPC (`ld_nc_global` from a peer pointer) — remote READ
-  IPC is UNSTABLE; convert to a push pattern.
+  IPC is UNSTABLE; convert to a push pattern. **Note (verified):** CUDA's internode NVL
+  protocol is *already* push-only in both dispatch and combine — the sender writes `x`/`tail`
+  into the destination's buffer and reads only its own `head`; the coordinator writes `head`
+  into the peer (`internode.cu:529-556`, `:2044-2085`, `:2216-2280`). So nothing in the
+  internode path needs converting; keep CUDA's data flow verbatim.
 - ❌ Passing `named_barrier_init` result through class members, function args, PHIs, GEPs
   — IGC NamedBarriersResolution crashes.
 - ❌ Building without `[[intel::reqd_sub_group_size(32)]]` on kernels that use
@@ -417,6 +421,34 @@ Follow `.github/agents/ishmem-ibgda-xpu-perf-debug.agent.md`. In particular:
 - ❌ Calling `ishmem_finalize` — DeepEP intentionally skips it.
 - ❌ Adding `TORCH_XPU_ARCH_LIST=bmg` for the DeepEP extension build — bmg-only AOT is
   unstable and often causes `UR_RESULT_ERROR_DEVICE_LOST`.
+- ❌ **`sycl::ext::oneapi::bfloat16` conversion operators inside a NamedBarrier kernel.**
+  They lower to the external devicelib symbols `__devicelib_ConvertBF16ToFINTEL` /
+  `__devicelib_ConvertFToBF16INTEL`, which IGC materializes as vISA **stack calls** →
+  `error: IGC: internal compiler error` (same NBarrierCnt-on-outlined-function class of
+  failure as the iSHMEM bnxt helpers). Convert inline with bit manipulation (RNE rounding).
+  Generalize: **any** outlined/external device function in a NamedBarrier kernel breaks it.
+- ❌ **Declaring ~10 distinct named barriers in one kernel** — ICEs in IGC codegen (between
+  `push_analysis` and `codegen`) even with zero stack calls. 4 is known-good; the true limit
+  is somewhere in 5..9 and is uncharacterised. Alias handles when you need more.
+- ❌ **Porting CUDA per-lane divergent lock/spin idioms verbatim.** A SYCL sub-group is one
+  lock-stepped EU thread, so patterns that depend on Volta+ independent thread scheduling —
+  e.g. `acquire_lock(rdma_send_channel_lock + lane_id)`, where each lane holds a *different*
+  lock and progress requires lanes to advance independently — deadlock on Xe. Serialize the
+  critical section (e.g. over `dst_rdma_rank`), or have one lane evaluate a sub-group-wide
+  condition and broadcast it. Preserve the original release ordering.
+- ❌ Rebuilding after editing only a `.inc` file. `setup.py` does **not** track `.inc` files as
+  dependencies, so the `.so` relinks from **stale** objects and you silently test the OLD code.
+  Always `touch csrc/xpu/internode.cpp` first.
+
+### Fast IGC ICE triage (no 2-node harness needed, ~3 min)
+
+The runtime JIT-compiles from embedded SPIR-V (`-device pvc,bmg,...` is passed to the runtime;
+the `.so` is not a finished AOT image). So dump and replay offline:
+
+```bash
+IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=$PWD/igcdump  <run once>
+ocloc compile -file <dump>.spv -spirv_input -device bmg
+```
 
 ## 12. Quick reference: file map
 

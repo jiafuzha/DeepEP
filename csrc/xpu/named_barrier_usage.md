@@ -245,22 +245,56 @@ Fusing them into single-work-group kernels with warp specialization (matching CU
 
 ### Known limitations on BMG
 
+- **No `bfloat16` conversion operators in a NamedBarrier kernel.**
+  `sycl::ext::oneapi::bfloat16`'s conversion operators lower to the *external* devicelib symbols
+  `__devicelib_ConvertBF16ToFINTEL` / `__devicelib_ConvertFToBF16INTEL`. These are undefined in
+  the module, so IGC materializes them as vISA **stack calls** — the exact
+  `NBarrierCnt`-on-an-outlined-`.function` situation that `ISHMEMI_IBGDA_BNXT_NOINLINE=OFF`
+  cures for iSHMEM. Symptom: `error: IGC: internal compiler error` at JIT time, accompanied by
+  `warning: ... Stack call has been detected` for the same kernel.
+  **Fix:** do the conversion inline with bit manipulation (RNE rounding). Generalized rule: *any*
+  external/outlined device function in a NamedBarrier kernel will trigger this, not just iSHMEM's.
+- **Named-barrier COUNT limit (~5..9, uncharacterised).** Even with zero stack calls, a kernel
+  declaring ~10 distinct named barriers ICEs in IGC codegen (dies between `push_analysis` and
+  `codegen` in the shader dumps). **4 barriers compile fine.** This caps how faithfully CUDA's
+  per-destination `bar.sync (dst_rdma_rank + 2), ...` (`internode.cu:1966`) can be reproduced for
+  larger RDMA-rank counts; handles must be aliased above a small number of destinations.
 - **SLM subset barriers deadlock** — only hardware barriers (NamedBarrier, group_barrier)
   provide guaranteed cross-sub-group forward progress. Do NOT hand-roll SLM arrival-counter
   spin barriers.
+- **No per-lane divergent spin/lock patterns.** A SYCL sub-group is a single lock-stepped EU
+  thread, so CUDA idioms that rely on Volta+ independent thread scheduling — e.g.
+  `acquire_lock(rdma_send_channel_lock + lane_id)` at `internode.cu`, where each lane holds a
+  *different* lock and progress requires lanes to advance independently — deadlock on Xe.
+  Restructure: serialize the critical section, or have one lane evaluate a sub-group-wide
+  condition and broadcast it.
 - **`num_warp_groups == 1` is forced** on BMG because `num_device_sms == 160 >= num_experts`.
   For `num_experts <= 160` there is only 1 warp group — the warp-specialization is
   `caster_warps + counter_warp` within a SINGLE warp group, not across multiple groups.
 - **`num_warps_per_group == 32`** (all 32 sub-groups in one WG) with
   `caster_warps = num_warps - 1` and `counter_warp = 1`.
 
+## Debugging workflow
+
+- **Fast offline ICE repro (~3 min, no 2-node harness).** The runtime JIT-compiles from embedded
+  SPIR-V — the `-device pvc,bmg,...` string is handed to the runtime, it is not a finished AOT
+  image. So dump with `IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=$PWD/igcdump`, then replay:
+
+  ```bash
+  ocloc compile -file <dump>.spv -spirv_input -device bmg
+  ```
+
+- **Build trap: `setup.py` does NOT track `.inc` files as dependencies.** Editing only a `.inc`
+  relinks the `.so` from *stale* objects and silently tests the OLD code. Always
+  `touch csrc/xpu/internode.cpp` before rebuilding.
+
 ## Files and locations
 
 | File | Purpose |
 |---|---|
 | `csrc/xpu/xpu_kernels.hpp` | `NamedBarrier` class + global SPIR-V declarations |
-| `/root/jiafuzha/code-repo/ishmem_ibgda/src/ishmem.h` | `ISHMEM_DEVICE_ATTRIBUTES` (no per-fn annotation available) |
-| `/root/jiafuzha/code-repo/ishmem_ibgda/src/ibgda_device_impl.h` | IBGDA inline device functions (bnxt `noinline` markers) |
-| `/root/jiafuzha/code-repo/ishmem_ibgda/src/rma_impl.h` | RMA inline templates (put/get) |
+| `/root/jiafuzha/ishmem_ibgda/src/ishmem.h` | `ISHMEM_DEVICE_ATTRIBUTES` (no per-fn annotation available) |
+| `/root/jiafuzha/ishmem_ibgda/src/ibgda_device_impl.h` | IBGDA inline device functions (bnxt `noinline` markers) |
+| `/root/jiafuzha/ishmem_ibgda/src/rma_impl.h` | RMA inline templates (put/get) |
 | `csrc/xpu/internode_ll.cpp` | Current LL kernel impl with NamedBarrier + root_group |
 | `csrc/cuda_kernels/internode_ll.cu` | CUDA reference with `bar.sync` warp specialization |
