@@ -508,6 +508,7 @@ inline bool internode_fused_enabled() {
 }
 
 #include "internode_notify_fused.inc"
+#include "internode_combine_fused.inc"
 
 struct NvlBufferLayout {
     // Offsets within each rank's NVL buffer (buffer_ptrs[nvl_rank])
@@ -2051,8 +2052,8 @@ void combine_nvl_rdma(DataType type,
                       const float* topk_weights,
                       const void* bias_0,
                       const void* bias_1,
-                      const int* combined_rdma_head,
-                      const int* combined_nvl_head,
+                      int* combined_rdma_head,
+                      int* combined_nvl_head,
                       const void* src_meta,
                       const int* rdma_channel_prefix_matrix,
                       const int* rdma_rank_prefix_sum,
@@ -2070,6 +2071,9 @@ void combine_nvl_rdma(DataType type,
                       int barrier_signal_base,
                       int rank,
                       int num_ranks,
+                      int num_channels_arg,
+                      int num_max_nvl_chunked_send_tokens,
+                      int num_max_nvl_chunked_recv_tokens,
                       sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     // Mirrors dispatch_nvl_rdma: the RDMA-only fallback no longer exists.
@@ -2088,6 +2092,54 @@ void combine_nvl_rdma(DataType type,
     const int my_rdma_rank = rank / num_nvl_ranks;
     const int num_rdma_ranks = num_ranks / num_nvl_ranks;
     TORCH_CHECK(num_rdma_ranks <= NUM_MAX_NVL_PEERS, "combine_nvl_rdma currently supports up to ", NUM_MAX_NVL_PEERS, " RDMA ranks");
+
+    if (internode_fused_enabled()) {
+        const int hidden_int4 = hidden / static_cast<int>(sizeof(int4_t) / sizeof(dtype_t));
+        TORCH_CHECK(hidden % static_cast<int>(sizeof(int4_t) / sizeof(dtype_t)) == 0,
+                    "fused internode combine requires the token row to be 16B-aligned");
+        const int num_channels = num_channels_arg;
+        const int nbpt = fused_combine_num_bytes_per_token(hidden_int4, num_topk);
+#define DEEP_EP_FUSED_COMBINE_CASE(R)                                                                                 \
+    case R: {                                                                                                         \
+        const int rdma_clean_off = static_cast<int>(static_cast<int64_t>(nbpt) * num_max_rdma_chunked_recv_tokens * R  \
+                                                    * 2 * num_channels / sizeof(int));                                \
+        const int rdma_clean_n = (num_nvl_ranks * 2 + 4) * R * 2 * num_channels;                                       \
+        const int nvl_clean_off = static_cast<int>(static_cast<int64_t>(num_max_nvl_chunked_recv_tokens) * nbpt *      \
+                                                   num_nvl_ranks * num_channels / sizeof(int));                       \
+        const int nvl_clean_n = num_nvl_ranks * (2 * R + 2) * num_channels;                                            \
+        queue.wait();                                                                                                 \
+        ishmem_barrier_all();                                                                                         \
+        launch_fused_clean_planes<R>(rdma_buffer_ptr, buffer_ptrs_gpu, nvl_rank, rdma_clean_off, rdma_clean_n,         \
+                                     nvl_clean_off, nvl_clean_n, queue);                                              \
+        launch_fused_cached_notify_heads<R>(combined_rdma_head, combined_nvl_head, num_combined_tokens, num_channels,  \
+                                            rdma_channel_prefix_matrix, rdma_rank_prefix_sum, num_nvl_ranks, queue);   \
+        queue.wait();                                                                                                 \
+        ishmem_barrier_all();                                                                                         \
+        launch_fused_combine<R>(combined_x, combined_topk_weights, x, topk_weights, bias_0, bias_1,                    \
+                                combined_rdma_head, combined_nvl_head, static_cast<const SourceMeta*>(src_meta),       \
+                                rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,           \
+                                num_tokens, num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,                    \
+                                num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,   \
+                                num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, rank, num_ranks,     \
+                                num_nvl_ranks, num_channels, queue);                                                  \
+        break;                                                                                                        \
+    }
+        // See internode_combine_fused.inc: the per-destination NamedBarrier handles above
+        // dst_rdma_rank 1 are aliased because >4 named barriers in one kernel makes the BMG
+        // IGC back-end raise an internal compiler error, so only 2 RDMA ranks are correct.
+        TORCH_CHECK(num_rdma_ranks == 2,
+                    "fused internode combine currently supports 2 RDMA ranks only (IGC named-barrier limit)");
+        switch (num_rdma_ranks) {
+            DEEP_EP_FUSED_COMBINE_CASE(2)
+            DEEP_EP_FUSED_COMBINE_CASE(4)
+            DEEP_EP_FUSED_COMBINE_CASE(8)
+            default:
+                TORCH_CHECK(false, "fused internode combine supports 2/4/8 RDMA ranks, got ", num_rdma_ranks);
+        }
+#undef DEEP_EP_FUSED_COMBINE_CASE
+        queue.wait();
+        return;
+    }
 
     const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(dtype_t);
     auto* dst = static_cast<dtype_t*>(combined_x);

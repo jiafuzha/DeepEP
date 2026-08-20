@@ -1,0 +1,106 @@
+Loading igub_vmem driver on host: /root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko
+  insmod failed (already loaded or insufficient privilege?)
+===== Verifying RDMA accessibility =====
+deepep-ll-v2-node0 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+deepep-ll-v2-node1 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+Both nodes report PORT_ACTIVE on assigned NICs (mlx5_0 / mlx5_2).
+Control-plane reachable (deepep-ll-v2-node1:2331 from deepep-ll-v2-node0).
+WARNING: ibv_rc_pingpong over the host hostname did not succeed.
+         (Test still proceeds; iSHMEM uses physical NICs via /dev/infiniband).
+  local address:  LID 0x0000, QPN 0x000b98, PSN 0xb99296, GID ::ffff:192.168.8.105
+  remote address: LID 0x0000, QPN 0x000cb9, PSN 0x747966, GID ::ffff:192.168.8.95
+8192 bytes in 0.00 seconds = 93.62 Mbit/sec
+1 iters in 0.00 seconds = 700.00 usec/iter
+Couldn't connect to deepep-ll-v2-node0:18515
+  local address:  LID 0x0000, QPN 0x000518, PSN 0xd92cf9, GID ::ffff:192.168.1.76
+===== RDMA accessibility check done =====
+iSHMEM NIC selection: cached PASS for this container lifetime; skipping re-check.
+===== Cleaning leaked IPC state (/dev/shm PSM3/CCL sems) =====
+===== Ensuring MASTER_PORT 29500 free on both nodes =====
+[deepep-ll-v2-node0] port 29500 held by:
+LISTEN 0      4096                *:29500       *:* users:(("python3",pid=32673,fd=27))                                                             
+[deepep-ll-v2-node0] killing pids holding port 29500: 3
+32673
+[deepep-ll-v2-node0] port 29500 is free
+[deepep-ll-v2-node1] port 29500 is free
+===== RUN tests/test_low_latency.py (2 nodes x 2 ranks = 4 total) =====
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+[deepep-ll-v2-node0 lr=0 gr=0] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f0np0
+[deepep-ll-v2-node1 lr=1 gr=3] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f1np1
+[deepep-ll-v2-node0 lr=1 gr=1] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f1np1
+[deepep-ll-v2-node1 lr=0 gr=2] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f0np0
+xpu_layout_bytes: 22947968, legacy_hint: 29819136
+Allocating buffer size: 29.819136 MB ...
+xpu_layout_bytes: 22947968, legacy_hint: 29819136
+xpu_layout_bytes: 22947968, legacy_hint: 29819136
+xpu_layout_bytes: 22947968, legacy_hint: 29819136
+Allocating buffer size: 29.819136 MB ...
+[DeepEP] signal cleanup armed for [15, 2] (pid 19189)
+[DeepEP] signal cleanup armed for [15, 2] (pid 19190)
+[DeepEP] signal cleanup armed for [15, 2] (pid 34206)
+[DeepEP] signal cleanup armed for [15, 2] (pid 34205)
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+MPI startup(): I_MPI_MPCP_SERVER_PORT environment variable is not supported.
+MPI startup(): Similar variables:
+	 I_MPI_HYDRA_SERVICE_PORT
+MPI startup(): I_MPI_MPCP_RANK environment variable is not supported.
+MPI startup(): I_MPI_MPCP_SIZE environment variable is not supported.
+MPI startup(): I_MPI_MPCP environment variable is not supported.
+MPI startup(): I_MPI_MPCP_SERVER_NAME environment variable is not supported.
+MPI startup(): To check the list of supported variables, use the impi_info utility or refer to https://www.intel.com/content/www/us/en/docs/mpi-library/developer-reference-linux/
+[SYNCDBG rank 0] init done, before barrier#1
+[SYNCDBG rank 0] after barrier#1, before alloc+memset
+[SYNCDBG rank 1] init done, before barrier#1
+[SYNCDBG rank 1] after barrier#1, before alloc+memset
+[SYNCDBG rank 2] init done, before barrier#1
+[SYNCDBG rank 2] after barrier#1, before alloc+memset
+[SYNCDBG rank 3] init done, before barrier#1
+[SYNCDBG rank 3] after barrier#1, before alloc+memset
+[SYNCDBG rank 3] after memset, before barrier#2
+[SYNCDBG rank 0] after memset, before barrier#2
+[SYNCDBG rank 1] after memset, before barrier#2
+[SYNCDBG rank 2] after memset, before barrier#2
+[SYNCDBG rank 0] after barrier#2 (sync complete)
+[SYNCDBG rank 2] after barrier#2 (sync complete)
+[SYNCDBG rank 1] after barrier#2 (sync complete)
+[SYNCDBG rank 3] after barrier#2 (sync complete)
+/root/jiafuzha/code-repo/pytorch/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026:07:30-13:28:51:19189 |CCL_WARN| MPI was initialized externally, CCL-MPI specific environment is ignored
+/root/jiafuzha/code-repo/pytorch/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026:07:30-13:28:51:34205 |CCL_WARN| MPI was initialized externally, CCL-MPI specific environment is ignored
+/root/jiafuzha/code-repo/pytorch/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026:07:30-13:28:51:34206 |CCL_WARN| MPI was initialized externally, CCL-MPI specific environment is ignored
+/root/jiafuzha/code-repo/pytorch/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026:07:30-13:28:51:19190 |CCL_WARN| MPI was initialized externally, CCL-MPI specific environment is ignored
+2026:07:30-13:28:52:35157:[1] |CCL_WARN| invalid NUMA node -1, NUMA node count 1, skip thread membind
+2026:07:30-13:28:52:20140:[3] |CCL_WARN| invalid NUMA node -1, NUMA node count 1, skip thread membind
+2026:07:30-13:28:52:34205:[0] |CCL_WARN| topology recognition shows PCIe connection between devices. If this is not correct, you can disable topology recognition, with CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0. This will assume XeLinks across devices

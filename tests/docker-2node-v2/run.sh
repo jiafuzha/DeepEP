@@ -330,6 +330,8 @@ run_test() {
     _add_opt_genv DEEP_EP_DBG_DROP             "${DEEP_EP_DBG_DROP:-}"
     _add_opt_genv DEEP_EP_SKIP_WARMUP          "${DEEP_EP_SKIP_WARMUP:-}"
     _add_opt_genv DEEP_EP_INTERNODE_FUSED      "${DEEP_EP_INTERNODE_FUSED:-}"
+    _add_opt_genv IGC_ShaderDumpEnable         "${IGC_ShaderDumpEnable:-}"
+    _add_opt_genv IGC_DumpToCustomDir          "${IGC_DumpToCustomDir:-}"
     # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)
     # inside deep_ep/buffer.py (CUDA-faithful multi-QP striping). Only forward an
     # explicit user/env override here; forwarding a forced "1" would pin single-QP and

@@ -1,0 +1,6 @@
+run1: PASS resets=0 avg_t=1165.47 us
+run2: PASS resets=0 avg_t=1177.92 us
+run3: PASS resets=0 avg_t=1175.22 us
+run4: PASS resets=0 avg_t=1222.18 us
+run5: PASS resets=0 avg_t=1169.82 us
+run6: PASS resets=0 avg_t=1178.41 us

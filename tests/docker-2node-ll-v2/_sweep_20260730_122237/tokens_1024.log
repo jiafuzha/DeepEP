@@ -1,0 +1,144 @@
+Loading igub_vmem driver on host: /root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko
+  insmod failed (already loaded or insufficient privilege?)
+===== Verifying RDMA accessibility =====
+deepep-ll-v2-node0 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+deepep-ll-v2-node1 IB devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,
+Both nodes report PORT_ACTIVE on assigned NICs (mlx5_0 / mlx5_2).
+Control-plane reachable (deepep-ll-v2-node1:2331 from deepep-ll-v2-node0).
+WARNING: ibv_rc_pingpong over the host hostname did not succeed.
+         (Test still proceeds; iSHMEM uses physical NICs via /dev/infiniband).
+  local address:  LID 0x0000, QPN 0x000b98, PSN 0xb99296, GID ::ffff:192.168.8.105
+  remote address: LID 0x0000, QPN 0x000cb9, PSN 0x747966, GID ::ffff:192.168.8.95
+8192 bytes in 0.00 seconds = 93.62 Mbit/sec
+1 iters in 0.00 seconds = 700.00 usec/iter
+Couldn't connect to deepep-ll-v2-node0:18515
+  local address:  LID 0x0000, QPN 0x0004cb, PSN 0xb16c61, GID ::ffff:192.168.1.76
+===== RDMA accessibility check done =====
+iSHMEM NIC selection: cached PASS for this container lifetime; skipping re-check.
+===== Cleaning leaked IPC state (/dev/shm PSM3/CCL sems) =====
+===== Ensuring MASTER_PORT 29500 free on both nodes =====
+[deepep-ll-v2-node0] port 29500 is free
+[deepep-ll-v2-node1] port 29500 is free
+===== RUN tests/test_low_latency.py (2 nodes x 2 ranks = 4 total) =====
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+IPL WARN> Can not detect NUMA nodes for all cores. Check if RAM of all NUMA nodes is available.
+[deepep-ll-v2-node1 lr=0 gr=2] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f0np0
+[deepep-ll-v2-node0 lr=0 gr=0] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f0np0
+[deepep-ll-v2-node1 lr=1 gr=3] ZE_AFFINITY_MASK=2,3 IFACE=ens2005f1np1
+[deepep-ll-v2-node0 lr=1 gr=1] ZE_AFFINITY_MASK=0,1 IFACE=ens1006f1np1
+xpu_layout_bytes: 367150208, legacy_hint: 477102336
+Allocating buffer size: 477.102336 MB ...
+xpu_layout_bytes: 367150208, legacy_hint: 477102336
+Allocating buffer size: 477.102336 MB ...
+xpu_layout_bytes: 367150208, legacy_hint: 477102336
+xpu_layout_bytes: 367150208, legacy_hint: 477102336
+[DeepEP] signal cleanup armed for [15, 2] (pid 14049)
+[DeepEP] signal cleanup armed for [15, 2] (pid 7396)
+[DeepEP] signal cleanup armed for [15, 2] (pid 14050)
+[DeepEP] signal cleanup armed for [15, 2] (pid 7397)
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_STATS_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_DIR' is not a supported variable
+[INIT] WARN: ishmemi_parse_env
+[INIT]        Environment variable 'ISHMEM_IBGDA_DB_MODE' is not a supported variable
+MPI startup(): I_MPI_MPCP_SERVER_PORT environment variable is not supported.
+MPI startup(): Similar variables:
+	 I_MPI_HYDRA_SERVICE_PORT
+MPI startup(): I_MPI_MPCP_RANK environment variable is not supported.
+MPI startup(): I_MPI_MPCP_SIZE environment variable is not supported.
+MPI startup(): I_MPI_MPCP environment variable is not supported.
+MPI startup(): I_MPI_MPCP_SERVER_NAME environment variable is not supported.
+MPI startup(): To check the list of supported variables, use the impi_info utility or refer to https://www.intel.com/content/www/us/en/docs/mpi-library/developer-reference-linux/
+[SYNCDBG rank 0] init done, before barrier#1
+[SYNCDBG rank 0] after barrier#1, before alloc+memset
+[0000] WARN: ishmemi_alloc
+[0000]        Unable to allocate 477102336 bytes in symmetric heap
+[SYNCDBG rank 2] init done, before barrier#1
+[SYNCDBG rank 2] after barrier#1, before alloc+memset
+[0002] WARN: ishmemi_alloc
+[0002]        Unable to allocate 477102336 bytes in symmetric heap
+[SYNCDBG rank 1] init done, before barrier#1
+[SYNCDBG rank 1] after barrier#1, before alloc+memset
+[0001] WARN: ishmemi_alloc
+[0001]        Unable to allocate 477102336 bytes in symmetric heap
+[SYNCDBG rank 3] init done, before barrier#1
+[SYNCDBG rank 3] after barrier#1, before alloc+memset
+[0003] WARN: ishmemi_alloc
+[0003]        Unable to allocate 477102336 bytes in symmetric heap
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 572, in <module>
+[rank0]:     test_loop(int(mpi_local_rank), num_processes, args)
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 382, in test_loop
+[rank0]:     buffer = deep_ep.Buffer(group,
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 306, in __init__
+[rank0]:     self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+[rank0]: RuntimeError: ishmem_align failed for 477102336 bytes
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 572, in <module>
+[rank2]:     test_loop(int(mpi_local_rank), num_processes, args)
+[rank2]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 382, in test_loop
+[rank2]:     buffer = deep_ep.Buffer(group,
+[rank2]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 306, in __init__
+[rank2]:     self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+[rank2]: RuntimeError: ishmem_align failed for 477102336 bytes
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 572, in <module>
+[rank1]:     test_loop(int(mpi_local_rank), num_processes, args)
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 382, in test_loop
+[rank1]:     buffer = deep_ep.Buffer(group,
+[rank1]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 306, in __init__
+[rank1]:     self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+[rank1]: RuntimeError: ishmem_align failed for 477102336 bytes
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 572, in <module>
+[rank3]:     test_loop(int(mpi_local_rank), num_processes, args)
+[rank3]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/tests/test_low_latency.py", line 382, in test_loop
+[rank3]:     buffer = deep_ep.Buffer(group,
+[rank3]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/root/jiafuzha/code-repo/zjf2012/DeepEP/deep_ep/buffer.py", line 306, in __init__
+[rank3]:     self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+[rank3]: RuntimeError: ishmem_align failed for 477102336 bytes
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+WARNING: destroy() was not called before DeepEP XPU buffer destruction, which can leak resources.
+terminate called without an active exception
+terminate called without an active exception
+terminate called without an active exception
+terminate called without an active exception
+
+===================================================================================
+=   BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES
+=   RANK 0 PID 14049 RUNNING AT deepep-ll-v2-node0
+=   KILLED BY SIGNAL: 6 (Aborted)
+===================================================================================
+
+===================================================================================
+=   BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES
+=   RANK 1 PID 14050 RUNNING AT deepep-ll-v2-node0
+=   KILLED BY SIGNAL: 6 (Aborted)
+===================================================================================
+===== FAIL tests/test_low_latency.py (rc=255) =====

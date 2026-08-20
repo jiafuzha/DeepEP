@@ -1,0 +1,118 @@
+# ===========================================================================
+# Docker Compose: 2-Node DeepEP Internode LOW-LATENCY Simulation  -- v2
+#
+# Recreated on the isolated `docker/` image foundation. See docker-2node-v2 for
+# the isolation rationale: the self-contained `deepep_jiafuzha` image ships the
+# RDMA/verbs userspace + oneAPI + level-zero + system python3, so the containers
+# only bind-mount the single /root/jiafuzha workspace, narrowed read-only sysfs
+# and the specific devices they need.
+#
+# Distinct identity (deepep-ll-v2-* with ports 2330/2331) from every other sim
+# so the compose projects never collide; they share the same physical GPUs/NICs
+# and must not run at once.
+#
+# Simulates 2 physical nodes, each with 2 GPUs + 2 NICs (defaults = smc26):
+#   deepep-ll-v2-node0: GPUs 0,1 + NICs mlx5_0,mlx5_1  (SSH 127.0.0.1:2330)
+#   deepep-ll-v2-node1: GPUs 2,3 + NICs mlx5_2,mlx5_3  (SSH 127.0.0.1:2331)
+#
+# Host networking preserves the real NIC/GID state (bridge-network containers
+# zero RoCE GID tables, breaking iSHMEM IBGDA address-handle creation).
+# ===========================================================================
+
+x-common: &common
+  build:
+    context: ../../docker
+    dockerfile: Dockerfile
+  image: ${IMAGE_NAME:-deepep_jiafuzha}
+  privileged: true
+  network_mode: host
+  cap_add:
+    - IPC_LOCK
+  # Private per-container IPC namespace (do NOT use ipc: host) -> each simulated
+  # node gets its own /dev/shm, preventing PSM3/oneCCL/MPI shm + named-semaphore
+  # collisions between the two "nodes".
+  shm_size: '16gb'
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  working_dir: /root/jiafuzha
+  volumes:
+    - /root/jiafuzha:/root/jiafuzha:rw
+    # NOTE: the patched NEO (UC UAR) bind-mount was REMOVED (2026-07-08): forcing the
+    # NIC UAR page UC (kernel patch #1 + NEO) regressed LL to a GPU compute wedge (0/10).
+    # Best config = stock kernel/runtime + the iSHMEM system-scope-fence doorbell fix (8/10).
+    - /sys/bus/pci/devices:/sys/bus/pci/devices:ro
+    - /sys/class/drm:/sys/class/drm:ro
+    - /sys/class/infiniband:/sys/class/infiniband:ro
+    - /sys/devices:/sys/devices:ro
+    - /tmp/deepep-docker-ssh:/tmp/ssh-keys:ro
+  devices:
+    - /dev/dri:/dev/dri
+    - /dev/infiniband:/dev/infiniband
+    - /dev/igub_vmem:/dev/igub_vmem
+  environment: &common-env
+    no_proxy: ${NO_PROXY:-localhost,127.0.0.1}
+    http_proxy: ${http_proxy:-}
+    https_proxy: ${https_proxy:-}
+    ISHMEM_DIR: ${ISHMEM_DIR:-/root/jiafuzha/ishmem_ibgda/build/_install}
+    MASTER_ADDR: ${MASTER_ADDR:-deepep-ll-v2-node0}
+
+services:
+  node0:
+    <<: *common
+    container_name: deepep-ll-v2-node0
+    hostname: deepep-ll-v2-node0
+    extra_hosts:
+      - "deepep-ll-v2-node0:127.0.0.1"
+      - "deepep-ll-v2-node1:127.0.0.1"
+    environment:
+      <<: *common-env
+      SIM_NODE_RANK: "0"
+      ZE_AFFINITY_MASK: ${NODE0_ZE_AFFINITY_MASK:-0,1}
+      NODE_MLX5_HCAS: ${NODE0_MLX5_HCAS:-mlx5_0,mlx5_1}
+      NODE_IB_IFACES: ${NODE0_IB_IFACES:-ens1006f0np0,ens1006f1np1}
+      SSHD_PORT: "2330"
+    command: >
+      bash -c "
+        mkdir -p /root/.ssh /var/run/sshd &&
+        printenv | grep -E '^(SIM_NODE_RANK|ZE_AFFINITY_MASK|NODE_MLX5_HCAS|NODE_IB_IFACES)=' | sed 's/^/export /' > /run/deepep_node_env &&
+        ssh-keygen -A >/dev/null 2>&1 &&
+        cp /tmp/ssh-keys/id_rsa /root/.ssh/id_rsa &&
+        cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
+        cp /tmp/ssh-keys/config /root/.ssh/config &&
+        chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
+        sed -i 's/#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config &&
+        /usr/sbin/sshd -p 2330 &&
+        echo 'deepep-ll-v2-node0 ready (hostname=deepep-ll-v2-node0, SSH 127.0.0.1:2330)' &&
+        sleep infinity
+      "
+
+  node1:
+    <<: *common
+    container_name: deepep-ll-v2-node1
+    hostname: deepep-ll-v2-node1
+    extra_hosts:
+      - "deepep-ll-v2-node0:127.0.0.1"
+      - "deepep-ll-v2-node1:127.0.0.1"
+    environment:
+      <<: *common-env
+      SIM_NODE_RANK: "1"
+      ZE_AFFINITY_MASK: ${NODE1_ZE_AFFINITY_MASK:-2,3}
+      NODE_MLX5_HCAS: ${NODE1_MLX5_HCAS:-mlx5_2,mlx5_3}
+      NODE_IB_IFACES: ${NODE1_IB_IFACES:-ens2005f0np0,ens2005f1np1}
+      SSHD_PORT: "2331"
+    command: >
+      bash -c "
+        mkdir -p /root/.ssh /var/run/sshd &&
+        printenv | grep -E '^(SIM_NODE_RANK|ZE_AFFINITY_MASK|NODE_MLX5_HCAS|NODE_IB_IFACES)=' | sed 's/^/export /' > /run/deepep_node_env &&
+        ssh-keygen -A >/dev/null 2>&1 &&
+        cp /tmp/ssh-keys/id_rsa /root/.ssh/id_rsa &&
+        cp /tmp/ssh-keys/id_rsa.pub /root/.ssh/authorized_keys &&
+        cp /tmp/ssh-keys/config /root/.ssh/config &&
+        chmod 600 /root/.ssh/id_rsa /root/.ssh/authorized_keys /root/.ssh/config &&
+        sed -i 's/#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config &&
+        /usr/sbin/sshd -p 2331 &&
+        echo 'deepep-ll-v2-node1 ready (hostname=deepep-ll-v2-node1, SSH 127.0.0.1:2331)' &&
+        sleep infinity
+      "

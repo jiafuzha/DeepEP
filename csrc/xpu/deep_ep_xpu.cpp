@@ -1841,6 +1841,9 @@ struct Buffer {
                                     reserve_barrier_signals(3),  // base: Pack, base+1: NvlPush, base+2: Fwd
                                     rank,
                                     num_ranks,
+                                    config.num_sms / 2,
+                                    config.num_max_nvl_chunked_send_tokens,
+                                    config.num_max_nvl_chunked_recv_tokens,
                                     comm_stream.queue());
 
         std::optional<EventHandle> event;
