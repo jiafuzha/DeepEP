@@ -686,9 +686,8 @@ void dispatch_nvl_rdma(void* recv_x,
     // WRITE (owner -> peer) is reliable. So instead of the leader READING peer
     // send buffers, each rank COPIES its own (coherent) send buffer into a
     // per-src_nvl slot in the leader's NVL buffer; the leader then reads its
-    // OWN staging (same-GPU coherent). stage_stride mirrors the full NVL
+    // OWN staging (same-GPU coherent). The staging region mirrors the full NVL
     // buffer layout so RdmaSend can reuse layout.send_*_offset unchanged.
-    const size_t stage_stride = align_offset(layout.total_bytes, 128);
     const size_t stage_base_offset = align_offset(fwd_base_offset + fwd_layout.total_bytes, 128);
 
     // ---- Producer-PUSH intra-node NVL region (gap #2) ----------------------------------
@@ -839,7 +838,7 @@ void dispatch_nvl_rdma(void* recv_x,
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulDispatchPackStageKernel>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     // ---- PHASE 0: cooperative zero-init (was separate CombinedDispatchInitKernel) ----
@@ -988,7 +987,7 @@ void dispatch_nvl_rdma(void* recv_x,
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulDispatchPackBarrierKernel>(
                 sycl::nd_range<1>(sycl::range<1>(kIshmemWGSize), sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
 
@@ -1043,7 +1042,7 @@ void dispatch_nvl_rdma(void* recv_x,
             cgh.parallel_for<FaithfulDispatchRdmaSendKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_send_ch) * kComputeWGSize),
                                   sycl::range<1>(kComputeWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
@@ -1268,7 +1267,7 @@ void dispatch_nvl_rdma(void* recv_x,
             cgh.parallel_for<FaithfulDispatchRdmaFlagKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kIshmemWGSize),
                                   sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     if (local_id != 0) return;
                     const int wg_id = static_cast<int>(item.get_group_linear_id());
@@ -1342,7 +1341,6 @@ void dispatch_nvl_rdma(void* recv_x,
                         int count = 0;
                         if (local_id == 0) {
                             long raw0 = 0;
-                            uint64_t spins_total = 0;
                             // CUDA-faithful multi-QP: each channel c posts its own tail flag on
                             // qp c after chunk c's payload. Wait for ALL num_qp_ch flags (=> all
                             // byte chunks placed) before reading [0,count). Every flag carries
@@ -1358,7 +1356,6 @@ void dispatch_nvl_rdma(void* recv_x,
                                     visa_spin_hint();
                                 }
                                 if (c == 0) raw0 = raw;
-                                spins_total += spins;
                             }
                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                             count = (raw0 == 0) ? 0 : static_cast<int>(-raw0 - 1);
@@ -1657,9 +1654,7 @@ void dispatch_nvl_rdma(void* recv_x,
             auto* my_rc_scales = reinterpret_cast<float*>(my_rc_base + nvlrecv_layout.fwd_x_scales_offset);
             auto* my_rc_counts = reinterpret_cast<int*>(my_rc_base + nvlrecv_layout.fwd_count_offset);
 
-            // PASS 1: count tokens per src_rank (intra peers pushed into OUR ring + fwd entries).
-            int intra_count = 0;
-            int fwd_total = 0;
+            // PASS 1: count tokens per src_rank (intra peers pushed into OUR ring).
             for (int src_nvl = 0; src_nvl < num_nvl_ranks; ++src_nvl) {
                 const int src_rank = my_rdma_rank * num_nvl_ranks + src_nvl;
                 // Local read of the count producer src_nvl PUSHED into our plane. Clamp to
@@ -1668,12 +1663,6 @@ void dispatch_nvl_rdma(void* recv_x,
                 if (c < 0) c = 0;
                 if (c > nvlrecv_layout.plane_tokens) c = nvlrecv_layout.plane_tokens;
                 per_src_count[src_rank] += c;
-                intra_count += c;
-            }
-            for (int p = 0; p < num_fwd_planes; ++p) {
-                for (int src_rdma = 0; src_rdma < num_rdma_ranks; ++src_rdma) {
-                    fwd_total += my_fwd_counts[p * num_rdma_ranks + src_rdma];
-                }
             }
             // Per-plane scan: plane p's forwarded tokens live in the disjoint slice
             // [p*plane_tokens, ...), packed in src_rdma order (peer_offsets monotonic
@@ -2353,9 +2342,8 @@ void combine_nvl_rdma(DataType type,
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<FaithfulCombineRdmaPutKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(kComputeWGSize), sycl::range<1>(kComputeWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
-                    auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     // Producer-PUSH (gap #2): read our OWN combine-staging planes (peers
                     // pushed here) with FIXED sub-array offsets. No peer reads.
@@ -2513,7 +2501,7 @@ void combine_nvl_rdma(DataType type,
                 cgh.parallel_for<FaithfulCombineParGatherKernel<dtype_t>>(
                     sycl::nd_range<1>(sycl::range<1>(par_groups * kComputeWGSize),
                                       sycl::range<1>(kComputeWGSize)),
-                    [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                         const int local_id = static_cast<int>(item.get_local_id(0));
                         const size_t g = item.get_group(0);
                         const int peer = static_cast<int>(g / static_cast<size_t>(par_per_peer));
@@ -2570,7 +2558,7 @@ void combine_nvl_rdma(DataType type,
             cgh.parallel_for<FaithfulCombineRdmaPut2Kernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs) * kIshmemWGSize),
                                   sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     auto sg = item.get_sub_group();
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     const int wg_id = static_cast<int>(item.get_group_linear_id());
@@ -2676,7 +2664,7 @@ void combine_nvl_rdma(DataType type,
             cgh.parallel_for<FaithfulCombineRdmaFlagKernel<dtype_t>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(flag_wgs) * kIshmemWGSize),
                                   sycl::range<1>(kIshmemWGSize)),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                     const int local_id = static_cast<int>(item.get_local_id(0));
                     if (local_id != 0) return;
                     const int wg_id = static_cast<int>(item.get_group_linear_id());
