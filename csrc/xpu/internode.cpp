@@ -1702,7 +1702,16 @@ void dispatch_nvl_rdma(void* recv_x,
     // multi-QP (num_qp_ch>1) the flag is an ARRAY of num_qp_ch longs (one per
     // channel/QP); default num_qp_ch==1 enlarges the region by a single long as
     // before, so the single-QP layout is byte-for-byte unchanged.
-    const int num_qp_ch = internode_num_qp_channels();
+    // GUARD: the blocking-put A/B path (DEEP_EP_INTERNODE_BLOCKING_PUT) issues its
+    // payload through the plain ishmem_putmem*/ishmem_putmem_nbi APIs, because this
+    // iSHMEM build provides no single-work-item per-QP put (ishmemx_putmem_nbi_qp is
+    // declared in ishmemx.h but NOT defined in libishmem.a -- only fence_qp, quiet_qp
+    // and int/long_atomic_add_qp are implemented). Those plain APIs select a QP by
+    // atomic round-robin once num_qps_per_pe > 1, which would silently break F-K3b's
+    // "flag[c] lands after chunk c on the SAME qp" RC-in-order invariant and let the
+    // receiver read a partially-written region. Pin to a single channel/QP in that
+    // mode. combine_nvl_rdma applies the identical guard so both layouts agree.
+    const int num_qp_ch = internode_blocking_put() ? 1 : internode_num_qp_channels();
     const size_t rdma_flag_offset = align_offset(rdma_count_offset + sizeof(int), alignof(long));
     const size_t rdma_region_bytes =
         align_offset(rdma_flag_offset + static_cast<size_t>(num_qp_ch) * sizeof(long), 128);
@@ -2159,6 +2168,17 @@ void dispatch_nvl_rdma(void* recv_x,
                                 //   0 (default): ishmem_putmem      (blocking)
                                 //   1:           ishmem_putmem_nbi  (non-blocking, with release fence)
                                 if (cnt > 0 && local_id == 0) {
+                                    // NOTE: these are the NON-per-QP APIs on purpose — this
+                                    // iSHMEM build declares ishmemx_putmem_nbi_qp/_qp in
+                                    // ishmemx.h but does NOT define them in libishmem.a (only
+                                    // fence_qp, quiet_qp, int/long_atomic_add_qp are
+                                    // implemented), and there is no single-work-item per-QP put.
+                                    // The plain APIs pick a QP by atomic round-robin
+                                    // (ishmemi_ibgda_device_peer_context_rr) once
+                                    // num_qps_per_pe > 1, which would break F-K3b's
+                                    // "flag[ch] lands after chunk ch on the SAME qp" invariant.
+                                    // The launcher therefore pins num_qp_ch = 1 whenever this
+                                    // blocking-put A/B path is enabled; see dispatch_nvl_rdma.
                                     if (faithful_nbi_mode) {
                                         ishmem_putmem_nbi(dst_region + x_off, region + x_off, x_len, dst_pe);
                                         ishmem_putmem_nbi(dst_region + m_off, region + m_off, m_len, dst_pe);
@@ -3037,7 +3057,11 @@ void combine_nvl_rdma(DataType type,
     // multi-QP (num_qp_ch>1) the flag is an ARRAY of num_qp_ch longs (one per
     // channel/QP); default num_qp_ch==1 is byte-for-byte the single-QP layout.
     // The serial fallback simply never touches these slots.
-    const int num_qp_ch = internode_num_qp_channels();
+    // GUARD: identical to dispatch_nvl_rdma -- the blocking-put A/B path uses the
+    // plain (round-robin) ishmem_putmem* APIs because no single-work-item per-QP put
+    // exists in this iSHMEM build, so pin to one channel/QP in that mode. Both
+    // launchers must apply this identically or the RDMA region layouts disagree.
+    const int num_qp_ch = internode_blocking_put() ? 1 : internode_num_qp_channels();
     const size_t rdma_flag_offset = align_offset(rdma_count_offset + sizeof(int), alignof(long));
     const size_t rdma_region_bytes =
         align_offset(rdma_flag_offset + static_cast<size_t>(num_qp_ch) * sizeof(long), 128);
@@ -3575,6 +3599,10 @@ void combine_nvl_rdma(DataType type,
                     // as an A/B fallback (only the c==0 WG ships the whole region).
                     if (faithful_blocking_put) {
                         if (c == 0 && local_id == 0) {
+                            // Non-per-QP on purpose: this iSHMEM build has no single-work-item
+                            // per-QP put (ishmemx_putmem_nbi_qp is declared in ishmemx.h but
+                            // undefined in libishmem.a). Safe only because the launcher pins
+                            // num_qp_ch = 1 in blocking-put mode; see combine_nvl_rdma.
                             if (faithful_nbi_mode) {
                                 ishmem_putmem_nbi(dst_region, region, rdma_count_offset, dst_pe);
                             } else {
