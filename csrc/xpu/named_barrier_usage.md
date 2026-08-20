@@ -254,11 +254,16 @@ Fusing them into single-work-group kernels with warp specialization (matching CU
   `warning: ... Stack call has been detected` for the same kernel.
   **Fix:** do the conversion inline with bit manipulation (RNE rounding). Generalized rule: *any*
   external/outlined device function in a NamedBarrier kernel will trigger this, not just iSHMEM's.
-- **Named-barrier COUNT limit (~5..9, uncharacterised).** Even with zero stack calls, a kernel
-  declaring ~10 distinct named barriers ICEs in IGC codegen (dies between `push_analysis` and
-  `codegen` in the shader dumps). **4 barriers compile fine.** This caps how faithfully CUDA's
-  per-destination `bar.sync (dst_rdma_rank + 2), ...` (`internode.cu:1966`) can be reproduced for
-  larger RDMA-rank counts; handles must be aliased above a small number of destinations.
+- **Named-barrier count is limited by kernel COMPLEXITY, not by a hard architectural cap.**
+  Measured on BMG: a *trivial* standalone kernel compiles and runs with **10** named barriers,
+  so there is no architectural limit at ~5-9. But inside the real fused internode combine
+  kernel, **8 named barriers JIT fine (full matrix passes) and 9 raises
+  `error: IGC: internal compiler error`** (dies between `push_analysis` and `codegen` in the
+  shader dumps). Budget barriers conservatively in large kernels and re-measure by bisection
+  after significant kernel growth — unrelated additions can push you over the cliff.
+  This is what caps CUDA's per-destination `bar.sync (dst_rdma_rank + 2), ...`
+  (`internode.cu:1966`): combine declares `2 + num_rdma_ranks` barriers, so
+  `num_rdma_ranks <= 4` is supported and `R=8` (10 barriers) ICEs.
 - **SLM subset barriers deadlock** — only hardware barriers (NamedBarrier, group_barrier)
   provide guaranteed cross-sub-group forward progress. Do NOT hand-roll SLM arrival-counter
   spin barriers.

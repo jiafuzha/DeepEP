@@ -27,7 +27,40 @@ inventing new ones — the patterns encode hard-won CUDA-parity and BMG-specific
 |---|---|---|
 | `csrc/cuda_kernels/intranode.cu` | `/root/jiafuzha/code-repo/DeepSymm/csrc/sycl/intranode.cpp` | Kernel launch shape, sub-group sync, **NamedBarrier warp-specialization**, `barrier_block_bypass` (CUDA IPC P2P barrier), `Buffer<T>` layout, `UNROLLED_TWOWARP_COPY`. |
 | `csrc/cuda_kernels/internode_ll.cu` | `csrc/xpu/internode_ll.cpp` | **NVSHMEM/IBGDA → iSHMEM/IBGDA** symbol map, RDMA path vs P2P-fast-path selection, GridBarrier/`ishmem_barrier_all` replacement for `cg::this_grid().sync()`, memory-ordering fences. |
-| `csrc/cuda_kernels/internode.cu` | `csrc/xpu/internode.cpp` (target) | Existing partial WIP — extend/refactor using patterns from the two references above. |
+| `csrc/cuda_kernels/internode.cu` | `csrc/xpu/internode.cpp` (+ `internode_{dispatch,combine,notify}_fused.inc`) | **COMPLETE** — see §1.1. |
+
+## 1.1 Migration status: COMPLETE (2026-08-20)
+
+The internode NORMAL path is now a fused, warp-specialized, CUDA-faithful port and is the
+**default** (the `DEEP_EP_INTERNODE_FUSED` env gate and all legacy phase-split micro-kernels
+were deleted; `internode.cpp` went 3090 → 447 lines with the kernels in three `.inc` files).
+`tests/docker-2node-v2` passes the full matrix (64 configs, BF16/FP8 × with/without top-k ×
+async × previous-event).
+
+| CUDA kernel | XPU kernel | Barriers |
+|---|---|---|
+| `dispatch` (`internode.cu:447`) | fused, 5 warp roles, 512 WI / 16 sub-groups | `named_barrier_init(8)` (`:563`), `named_barrier_init(9)` (`:580`) |
+| `combine` (`internode.cu:1716`) | fused, 4 warp roles, 800 WI / 25 sub-groups | `init(kForwarders+1)`=25 (`:1952`), `init(kRDMAReceivers+1)`=17 (`:1953`), one per RDMA destination (`:1966`) |
+| `notify_dispatch` (`internode.cu:93`) | separate kernel (as in CUDA) | cross-PE iSHMEM barriers — legitimate |
+| `cached_notify` (`internode.cu:1311`) | `launch_fused_cached_notify_heads` | head-negation transform, `:1375-1465` |
+
+> ⚠️ **KNOWN LIMITATION: `num_rdma_ranks ∈ {2, 4}` only** (host `TORCH_CHECK`). Combine declares
+> `2 + num_rdma_ranks` named barriers and 9 barriers ICE in that kernel (§11), so `R=8` is not
+> supported. **R=4 is compile/JIT-validated but NOT runtime-validated** — the harness is
+> 2 nodes × 2 GPUs, so only `R=2` is exercised numerically. 8-node deployments will hit the check.
+
+**Deviations from CUDA** (each forced, with the reason):
+1. `poll_load` dual uncached+cached-atomic read instead of `ld_acquire_sys_global` (§6.0).
+2. Inline bit-manipulation bf16↔float (RNE) — the devicelib converts are stack calls (§11).
+3. Fully-uncached 16-byte payload path (`ld_uc_global_v` / `st_uc_global_v`).
+4. `ishmemx_fence_qp` instead of `nvshmemi_ibgda_quiet`; never a global `ishmem_quiet()`.
+5. `send_rdma_head` / `send_nvl_head` pre-filled with `-1` — they are *sparse* handles that
+   `cached_notify` rewrites (CUDA parity, `deep_ep/buffer.py:874-875`).
+6. `recv_x` / `recv_x_scales` zero-filled. The XPU dispatch always runs in `num_worst_tokens`
+   mode and a *cached* dispatch returns the padded rows to the caller; CUDA returns exactly
+   `num_recv_tokens` rows so it can leave padding uninitialised (`internode.cu:1194-1207` only
+   cleans `recv_topk_idx`). `torch::empty` garbage there shows up as `NaN`/non-uniform rows.
+7. CUDA's per-lane `acquire_lock(... + lane_id)` serialized over `dst_rdma_rank` (§11).
 
 ## 2. Structural mapping (kernels, launches, indexing)
 
@@ -291,6 +324,32 @@ docker sim — it is intentionally disabled by `ISHMEM_ENABLE_GPU_IPC=0`. See
 `xpu/internode_ll.cpp:869-899` for the exact pattern.
 
 ## 6. Memory-ordering fences (the single biggest source of silent corruption)
+
+> ### 6.0 SPLIT PRODUCER PATHS: never poll a queue counter with `uc_load` alone
+>
+> **This was the single hardest bug in the internode migration — it silently dropped tokens
+> and produced `NaN` rows rather than failing loudly.**
+>
+> CUDA polls queue heads/tails with `ld_acquire_sys_global`, a **cached** system-scope acquire
+> load. On BMG the two producers of those very same counters write through **different routes**:
+>
+> | Producer | Route | Visible to |
+> |---|---|---|
+> | Remote peer | IBGDA AMO | lands directly in memory → only an **uncached** load sees it |
+> | Self / local path | device `atomic_ref::fetch_add` | lands in the **cache hierarchy** → an uncached load never sees it |
+>
+> So `uc_load` alone misses every local increment, and a cached load alone misses every remote
+> AMO. Decisive evidence captured at a receiver spin-out: `uc_load` returned `0` while a cached
+> system-scope acquire `atomic_ref::load` **on the same address** returned `8`. Every RDMA-receiver
+> poll therefore ran to the spin cap (`max_rcv_spins == 200000001`) and then `break`-ed, silently
+> dropping tokens.
+>
+> **Fix — `poll_load<T>()` in `csrc/xpu/xpu_kernels.hpp`: read BOTH and take the max.** These
+> counters are monotonically increasing, so the max is always a valid observation. After the fix
+> `max_rcv_spins` fell from 2×10⁸ to 131–359.
+>
+> **Rule: use `poll_load` at every queue-counter polling site.** A silent spin-cap `break` is the
+> signature of this bug — always instrument the observed spin count when tokens go missing.
 
 CUDA PTX fences map to `sycl::atomic_fence` **plus** an explicit `lsc_fence` for
 system scope. Established mapping (see `DeepSymm/.../utils.hpp:64`, `xpu/xpu_kernels.hpp`):
