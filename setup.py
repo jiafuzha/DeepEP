@@ -54,6 +54,48 @@ def assert_ishmem_archive_fresh(archive_path, ishmem_dir):
             f'To bypass this check set DEEP_EP_ALLOW_STALE_ISHMEM=1.')
 
 
+def check_ishmem_bnxt_inlinable(ishmem_dir):
+    # iSHMEM's bnxt IBGDA device helpers in src/ibgda_device_impl.h are marked
+    # ISHMEMI_IBGDA_BNXT_NOINLINE, which the iSHMEM CMake defines as
+    # __attribute__((noinline)) unless configured with -DISHMEMI_IBGDA_BNXT_NOINLINE=OFF.
+    #
+    # That macro is a PRIVATE target_compile_definitions on ishmem-objects, and
+    # ibgda_device_impl.h is NOT part of the installed include tree, so DeepEP CANNOT
+    # influence it from here -- it is baked into libishmem.a at iSHMEM build time.
+    #
+    # It matters because noinline forces IGC to outline those helpers as vISA stack
+    # calls and stamp `.kernel_attr NBarrierCnt=N` on each one, so any DeepEP kernel
+    # that uses SPIR-V named barriers alongside iSHMEM dies at module finalization with
+    # "More than 1 kernel attribute defined NBarrierCnt" -> "parsing vISA inline
+    # assembly failed" at runtime. Detect the bad configuration and say so loudly.
+    if os.getenv('DEEP_EP_ALLOW_BNXT_NOINLINE', '0') == '1':
+        return
+    cache = Path(ishmem_dir).parent / 'CMakeCache.txt'
+    if not cache.is_file():
+        return  # not a cmake build tree we can introspect; skip
+    try:
+        for line in cache.read_text(errors='ignore').splitlines():
+            if line.startswith('ISHMEMI_IBGDA_BNXT_NOINLINE:'):
+                if line.strip().split('=', 1)[-1].strip().upper() in ('ON', 'TRUE', '1', 'YES'):
+                    print(
+                        '\n' + '=' * 78 + '\n'
+                        'WARNING: libishmem.a was built with ISHMEMI_IBGDA_BNXT_NOINLINE=ON.\n'
+                        f'  cmake cache: {cache}\n'
+                        'The bnxt IBGDA device helpers therefore carry __attribute__((noinline)),\n'
+                        'so IGC will outline them as vISA stack calls and stamp NBarrierCnt on each.\n'
+                        'Any kernel combining SPIR-V named barriers with iSHMEM will then fail with\n'
+                        '  "More than 1 kernel attribute defined NBarrierCnt"\n'
+                        '  -> runtime: "error: parsing vISA inline assembly failed"\n'
+                        'This CANNOT be fixed from DeepEP: the macro is PRIVATE to the iSHMEM build\n'
+                        'and ibgda_device_impl.h is not installed. Rebuild iSHMEM with\n'
+                        '  -DISHMEMI_IBGDA_BNXT_NOINLINE=OFF   (e.g. bash _build_ishmem.sh)\n'
+                        'then remove build/ishmem-sycl-dlink and rebuild DeepEP.\n'
+                        'Silence this check with DEEP_EP_ALLOW_BNXT_NOINLINE=1.\n' + '=' * 78 + '\n')
+                return
+    except OSError:
+        return
+
+
 def extract_archive_objects_for_sycl_dlink(archive_path, output_dir):
     archive_path = Path(archive_path).resolve()
     output_dir = Path(output_dir).resolve()
@@ -152,6 +194,7 @@ if __name__ == '__main__':
             ishmem_archive = Path(ishmem_dir) / 'lib' / 'libishmem.a'
             if ishmem_archive.exists():
                 assert_ishmem_archive_fresh(ishmem_archive, ishmem_dir)
+                check_ishmem_bnxt_inlinable(ishmem_dir)
                 sycl_dlink_objects = extract_archive_objects_for_sycl_dlink(ishmem_archive, Path('build') / 'ishmem-sycl-dlink')
                 append_sycl_dlink_objects(sycl_dlink_objects)
         else:

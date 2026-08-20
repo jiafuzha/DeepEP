@@ -361,11 +361,10 @@ present in `xpu_kernels.hpp` make a direct port possible:
 
 1. **`NamedBarrier` (SPIR-V `cl_khr_subgroup_named_barrier`)** — sub-group-subset
    barrier replacing CUDA `bar.sync <id>, <count>`. See `named_barrier_usage.md`
-   for the class and the JIT-repro test. **BLOCKED as of 2026-08-20:** using it in
-   the same kernel as iSHMEM fails vISA finalization with `More than 1 kernel
-   attribute defined NBarrierCnt`. The previously documented
-   `IGC_SelectiveFunctionControl=1` workaround is OBSOLETE and must not be used;
-   `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF` does not fix it either.
+   for the class and the JIT-repro test. **Requires** the iSHMEM archive to be built
+   with `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF`; otherwise it fails vISA finalization with
+   `More than 1 kernel attribute defined NBarrierCnt`. The previously documented
+   `IGC_SelectiveFunctionControl=1` workaround is OBSOLETE and must not be used.
 2. **`sycl_ext_oneapi_root_group` + `use_root_sync` + `nd_launch`** — device-wide
    barrier `sycl::group_barrier(root_group)` replacing CUDA
    `cg::this_grid().sync()`. See `root_group_cooperative_launch.md`.

@@ -33,14 +33,19 @@ public:
 };
 ```
 
-## STATUS (2026-08-20): BLOCKED on BMG + iSHMEM/IBGDA — do NOT attempt fusion yet
+## STATUS (2026-08-20): RESOLVED — NamedBarrier + iSHMEM works, but the iSHMEM archive MUST be built with `ISHMEMI_IBGDA_BNXT_NOINLINE=OFF`
 
-NamedBarrier works **standalone** on BMG (a 3-of-4 sub-group subset barrier was validated),
-but it **cannot be used in any kernel that transitively calls an iSHMEM IBGDA device
-function** on the current toolchain. This blocks the whole "re-fuse the phase-split
-internode kernels into CUDA-parity warp-specialized kernels" effort.
+NamedBarrier works standalone on BMG **and** in kernels that transitively call iSHMEM IBGDA
+device functions — *provided* `libishmem.a` was built with
+`-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF`. An archive built with the CMake **default (`ON`)** makes
+any such kernel fail at runtime module finalization.
 
-### Symptom
+> An earlier revision of this document declared this permanently blocked. That conclusion was
+> wrong: it was measured against an archive whose `CMakeCache.txt` said
+> `ISHMEMI_IBGDA_BNXT_NOINLINE:BOOL=ON`, i.e. the flag had never actually been applied. Always
+> verify the cache, not the build script.
+
+### Symptom (when the archive is built with NOINLINE=ON)
 
 The AOT device link SUCCEEDS (`Build succeeded for : pvc / bmg / ...`), but the kernel
 fails at *runtime* module finalization:
@@ -50,6 +55,8 @@ error: parsing vISA inline assembly failed:
 Found a total of 1 errors in vISA input.
 error: backend compiler failed build.
 ```
+
+A `warning: Stack call has been detected` at link time is the early tell.
 
 ### Root cause (exact)
 
@@ -73,56 +80,71 @@ Error in CISA routine with name: _ZTS11ReproKernel
 1883:.kernel_attr NBarrierCnt=2                  <-- duplicate
 1898:.function "..._Z32ishmemi_ibgda_bnxt_ring_doorbell..._71"
 1900:.kernel_attr NBarrierCnt=2                  <-- duplicate
-1987:.function "..._Z27ishmemi_ibgda_bnxt_fill_msn..._70"
-2155:.function "..._Z32ishmemi_ibgda_bnxt_claim_sq_slot..._69"
-2363:.function "..._Z36ishmemi_ibgda_device_can_bnxt_direct..._15"
 ```
 
-Once `named_barrier_init` is present anywhere in the kernel, IGC stamps
-`.kernel_attr NBarrierCnt=N` on the kernel body **and again on every outlined vISA
-stack-call `.function`** that IGC emitted for the large iSHMEM IBGDA bnxt helpers. vISA
-rejects the duplicate attribute on the enclosing CISA routine.
+`__attribute__((noinline))` on the bnxt helpers forces IGC to outline them as vISA stack-call
+`.function`s. Once `named_barrier_init` is present anywhere in the kernel, IGC stamps
+`.kernel_attr NBarrierCnt=N` on the kernel body **and again on every outlined `.function`**,
+and vISA rejects the duplicate attribute on the enclosing CISA routine. Removing the
+attribute lets IGC inline them, so no outlined routines exist to be double-stamped.
 
-### `ISHMEMI_IBGDA_BNXT_NOINLINE=OFF` does NOT fix this
+### The fix, and why DeepEP cannot apply it itself
 
-The harness iSHMEM at `/root/jiafuzha/ishmem_ibgda` IS built with
-`-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF` (see its `_build_ishmem.sh`), i.e. the helpers carry no
-`__attribute__((noinline))`. IGC **still** outlines them as vISA stack calls, because they
-are far too large for its inliner (`warning: Stack call has been detected` at link time).
-The `inline` keyword is only a hint; the CMake flag cannot force IGC's hand.
+Build iSHMEM with the helpers inlinable:
 
-### Workarounds tried — none viable
+```bash
+cd /root/jiafuzha/ishmem_ibgda && bash _build_ishmem.sh   # passes -DISHMEMI_IBGDA_BNXT_NOINLINE=OFF
+# then, in DeepEP:
+rm -rf build/ishmem-sycl-dlink && python3 setup.py build_ext --inplace
+```
+
+Verify it actually took effect — do **not** trust the script alone:
+
+```bash
+grep ISHMEMI_IBGDA_BNXT_NOINLINE /root/jiafuzha/ishmem_ibgda/build/CMakeCache.txt
+# want: ISHMEMI_IBGDA_BNXT_NOINLINE:BOOL=OFF
+```
+
+Passing `-DISHMEMI_IBGDA_BNXT_NOINLINE=` in **DeepEP's** compile flags does nothing:
+`src/CMakeLists.txt` attaches the macro as `target_compile_definitions(ishmem-objects
+PRIVATE ...)`, and `src/ibgda_device_impl.h` is not part of the installed include tree
+(`$ISHMEM_DIR/include` ships only `ishmem.h`, `ishmemx.h`, `ishmem/*.h`). DeepEP's own
+translation units never see the bnxt code — it arrives as pre-compiled device bitcode in
+`libishmem.a`, so the attribute is fixed at iSHMEM build time. `setup.py` therefore only
+*detects* the bad configuration (`check_ishmem_bnxt_inlinable`) and prints a loud warning.
+
+### Other workarounds (not needed once NOINLINE=OFF, recorded for reference)
 
 | Attempt | Result |
 |---|---|
-| `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF` (already the default in `_build_ishmem.sh`) | Still outlined → still fails |
 | `IGC_FunctionControl=0` (default) | Fails (`NBarrierCnt` duplicate) |
-| `IGC_FunctionControl=4` (force-inline everything) | Gets past vISA, then `Abort was called at 528 line in .../memory_manager.cpp` — private-memory explosion from inlining the huge WQE emitters |
-| Whole-WG-participant NamedBarrier in `FaithfulDispatchRdmaSendKernel` (real DeepEP module) | Builds, then `parsing vISA inline assembly failed` at runtime → `===== FAIL tests/test_internode.py =====` (reverted) |
+| `IGC_FunctionControl=4` (force-inline everything) | Gets past vISA, then `Abort was called at 528 line in .../memory_manager.cpp` — private-memory explosion |
+| `IGC_SelectiveFunctionControl=1` | Obsolete; not a fix, do not set |
 
 ### A/B evidence
 
 `csrc/xpu/tools/test_nbarrier_ishmem_repro.cpp`, same source, same link, JIT (`spir64`):
 
-- NamedBarrier block compiled **out** (`#if 0`) → `[pe 0] out=42,43 (expect 42,43)` ✅
-- NamedBarrier block compiled **in** → `parsing vISA inline assembly failed` ❌
+| iSHMEM archive | Result |
+|---|---|
+| `NOINLINE=ON` | `parsing vISA inline assembly failed` ❌ |
+| `NOINLINE=OFF` | `[pe 0] out=42,43` / `[pe 1] out=42,43` ✅ (no stack-call warning) |
 
-### Consequence for the internode NORMAL fusion
+With `NOINLINE=OFF`, DeepEP rebuilds clean and `tests/docker-2node-v2` reports
+`===== PASS tests/test_internode.py =====`.
 
-Until this IGC/iSHMEM interaction is fixed upstream, the `csrc/xpu/internode.cpp`
-phase-split kernels **must stay phase-split**. Every kernel in that pipeline calls
-`ishmemx_putmem_nbi_subgroup` / `ishmemx_fence_qp` / `ishmemx_long_atomic_add_qp` /
-`ishmemx_barrier_all_work_group`, so all of them are in the blocked set.
+### Remaining consequence for the internode NORMAL fusion
 
-**Separately**, note that the current XPU internode NORMAL phase boundaries are
-**grid-scope or cross-PE** (whole-grid NVL `nvl_barrier`, `ishmemx_barrier_all_work_group`,
-and different grid shapes per phase: 1 WG vs `num_use_channels*num_qp_ch` WGs vs
-`num_rdma_ranks*num_qp_ch` WGs). NamedBarrier is a *within-work-group* sub-group-subset
-barrier and cannot replace any of them even once the toolchain issue is resolved. A true
-CUDA-parity re-fusion would additionally require re-introducing the CUDA sliding-window
-credit transport (`rdma_send_channel_{lock,tail,window}`, `forward_channel_{head,retired}`),
-which the XPU port deliberately replaced with an AMO-flag transport, and which depends on
-the forwarder **pull**-reading peer NVL buffers over IPC — unstable on BMG.
+The toolchain no longer blocks fusion, but a **separate, structural** obstacle stands:
+the current XPU internode NORMAL phase boundaries are **grid-scope or cross-PE**
+(whole-grid NVL `nvl_barrier`, `ishmemx_barrier_all_work_group`, and different grid shapes
+per phase: 1 WG vs `num_use_channels*num_qp_ch` WGs vs `num_rdma_ranks*num_qp_ch` WGs).
+NamedBarrier is a *within-work-group* sub-group-subset barrier and cannot replace any of
+them. A true CUDA-parity re-fusion would additionally require re-introducing the CUDA
+sliding-window credit transport (`rdma_send_channel_{lock,tail,window}`,
+`forward_channel_{head,retired}`), which the XPU port deliberately replaced with an AMO-flag
+transport, and which depends on the forwarder **pull**-reading peer NVL buffers over IPC —
+unstable on BMG. Re-fusion is thus a design decision, not a barrier substitution.
 
 ## Verification
 
@@ -149,7 +171,8 @@ mpirun -n 2 bash -c 'export ZE_AFFINITY_MASK=$MPI_LOCALRANKID;
 ```
 
 Expected once the toolchain is fixed: `[pe 0] out=42,43` / `[pe 1] out=42,43`.
-Today: `error: parsing vISA inline assembly failed`.
+Today (with `ISHMEMI_IBGDA_BNXT_NOINLINE=OFF`): passes as expected. With an archive built
+`NOINLINE=ON`: `error: parsing vISA inline assembly failed`.
 
 Add `IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=$PWD/igcdump` to capture the
 `*.errors.txt` / `*.inline.visaasm` evidence above.

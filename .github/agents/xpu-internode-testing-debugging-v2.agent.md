@@ -55,6 +55,23 @@ docker exec deepep-v2-node0 bash -lc "
 > build and link against the SAME tree the harness runs against, and re-verify
 > `md5sum build/ishmem-sycl-dlink/barrier.cpp.o` after switching archives.
 
+> **Always build iSHMEM via `_build_ishmem.sh`, then VERIFY the cmake cache.**
+> The script passes `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF`, which is required for SPIR-V
+> `NamedBarrier` to coexist with iSHMEM. The cmake **default is `ON`**, so any build
+> configured by hand silently produces an archive that makes NamedBarrier kernels die at
+> runtime with `More than 1 kernel attribute defined NBarrierCnt` →
+> `error: parsing vISA inline assembly failed`. Do not trust that the script was used —
+> check the cache:
+>
+> ```bash
+> docker exec deepep-v2-node0 grep ISHMEMI_IBGDA_BNXT_NOINLINE \
+>   /root/jiafuzha/ishmem_ibgda/build/CMakeCache.txt   # want: ...:BOOL=OFF
+> ```
+>
+> `setup.py` also emits a loud warning when it detects `ON`. A
+> `warning: Stack call has been detected` during the DeepEP device link is the other tell.
+> See `csrc/xpu/named_barrier_usage.md`.
+
 After building, `run.sh` will automatically sync the torch editable metadata from the stash (`/root/jiafuzha/.deepep-v2-torch-meta`) into both containers via its `sync_torch_metadata()` call. No manual sync step needed.
 
 ## 2. Build Verification (Shared Workspace)

@@ -96,34 +96,30 @@ templates on `kNumRDMARanks` and `NUM_MAX_NVL_PEERS` (=8) drive the whole layout
 
 ## 3. Sync primitives — the core of this migration
 
-> **BLOCKER (validated 2026-08-20): `NamedBarrier` CANNOT be used in any kernel that
-> also calls iSHMEM device functions on the current BMG/IGC/iSHMEM stack.**
-> Once `named_barrier_init()` is present, IGC stamps `.kernel_attr NBarrierCnt=N` on
-> the kernel body AND on every outlined vISA stack-call `.function` it emits for the
-> large iSHMEM IBGDA bnxt helpers (`emit_bnxt_wqe_nbi`, `bnxt_ring_doorbell`,
-> `bnxt_claim_sq_slot`, ...). vISA then rejects the module with
-> `Error Message: More than 1 kernel attribute defined NBarrierCnt`, surfacing at
-> runtime as `error: parsing vISA inline assembly failed`.
-> - `IGC_SelectiveFunctionControl=1` is **OBSOLETE** — do not set it.
-> - `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF` (in `_build_ishmem.sh`) does **not** fix it:
->   it only removes `noinline`, and IGC still outlines the helpers as stack calls
->   once they exceed its inline budget (`warning: Stack call has been detected`).
-> - `IGC_FunctionControl=0` → same failure; `IGC_FunctionControl=4` (force-inline) →
->   NEO abort from private-memory explosion.
->
-> **Consequence:** every kernel in the internode NORMAL pipeline calls iSHMEM, so the
-> whole pipeline is in the blocked set. Use whole-WG `sycl::group_barrier(group)` and
-> phase-split kernels until an upstream IGC fix (emit the attribute only on the kernel
-> routine) or an iSHMEM change (keep the bnxt helpers inlinable) lands. Evidence and a
-> standalone repro: `csrc/xpu/named_barrier_usage.md`,
+> **TOOLCHAIN REQUIREMENT (validated 2026-08-20): to use SPIR-V `NamedBarrier` in a kernel
+> that also calls iSHMEM device functions, `libishmem.a` MUST be built with
+> `-DISHMEMI_IBGDA_BNXT_NOINLINE=OFF`.**
+> With the CMake default (`ON`) the bnxt IBGDA helpers keep `__attribute__((noinline))`, so
+> IGC outlines them as vISA stack calls and stamps `.kernel_attr NBarrierCnt=N` on the kernel
+> body AND on every outlined `.function`. vISA then rejects the module with
+> `More than 1 kernel attribute defined NBarrierCnt`, surfacing at runtime as
+> `error: parsing vISA inline assembly failed`.
+> - Build it with `bash _build_ishmem.sh`, then **verify the cache, not the script**:
+>   `grep ISHMEMI_IBGDA_BNXT_NOINLINE <ishmem>/build/CMakeCache.txt` → must be `OFF`.
+>   `setup.py` (`check_ishmem_bnxt_inlinable`) also warns loudly when it is `ON`.
+> - After switching archives: `rm -rf build/ishmem-sycl-dlink` before rebuilding DeepEP.
+> - Passing `-DISHMEMI_IBGDA_BNXT_NOINLINE=` in DeepEP's own flags does NOTHING: the macro is
+>   `PRIVATE` to `ishmem-objects` and `ibgda_device_impl.h` is not installed, so the bnxt code
+>   reaches DeepEP only as pre-compiled device bitcode inside `libishmem.a`.
+> - `IGC_SelectiveFunctionControl=1` is obsolete; do not set it.
+> Evidence + standalone repro: `csrc/xpu/named_barrier_usage.md`,
 > `csrc/xpu/tools/test_nbarrier_ishmem_repro.cpp`.
 >
-> A second, INDEPENDENT blocker also applies: `csrc/xpu/internode.cpp` is not a
-> warp-specialized port awaiting subset barriers. It is a micro-kernel decomposition
-> with a different (AMO-flag, push-only) transport whose phase boundaries are
-> **grid-scope or cross-PE** — which a within-work-group subset barrier cannot express
-> regardless of the toolchain. Re-fusion is therefore a design decision, not a
-> mechanical barrier substitution.
+> A second, INDEPENDENT obstacle to re-fusion remains: `csrc/xpu/internode.cpp` is not a
+> warp-specialized port awaiting subset barriers. It is a micro-kernel decomposition with a
+> different (AMO-flag, push-only) transport whose phase boundaries are **grid-scope or
+> cross-PE** — which a within-work-group subset barrier cannot express regardless of the
+> toolchain. Re-fusion is therefore a design decision, not a mechanical barrier substitution.
 
 ### 3.1 Overview map
 
