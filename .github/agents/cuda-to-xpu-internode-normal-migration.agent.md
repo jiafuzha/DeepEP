@@ -996,3 +996,46 @@ same QP**. Any non-blocking-AMO patch must handle that collision; a naive per-la
 livelock there. The tail-credit site `:748` is single-lane (`lane_id == 0`) and is safe. Telemetry also
 shows the coordinator is cold (`coord tot` ≈ 1.5e9 vs forwarder 18e9 cycles), so this site is a
 correctness hazard rather than a perf opportunity.
+
+## §19. Measured run durations — use them as timeouts, and as a fast wedge detector
+
+I had been sizing `TIMEOUT_SEC` by guesswork (2400/3000 s) and polling with blind 600 s waits. Measured
+on freshly reset + health-gated hardware:
+
+| run | wall clock |
+|---|---|
+| production `.so`, full 64-config matrix + 4096-token perf | **68 s** |
+| same run on wedged HW | never finishes (hits whatever `TIMEOUT_SEC` is set) |
+| telemetry `.so` (`DEEP_EP_COMBINE_TELEMETRY=1`, per-call `queue.wait()` + D2H + `fprintf`) | ~30-50 min |
+| igub reset cycle (`--down` + `rmmod` + 45 s drain + `--up`) | ~60-75 s |
+
+### 19.1 The operational consequence: a long run is a WEDGE, not slow work
+
+A healthy production run is **68 s**. So `TIMEOUT_SEC=3000` never bought tolerance for a slow machine —
+it bought a **50-minute wait to discover the GPU was wedged**. Every rc=124 I hit cost ~40-50 min of
+dead time that a 300 s budget would have surfaced in 5.
+
+Recommended budgets:
+
+| scenario | `TIMEOUT_SEC` | agent `initial_wait` |
+|---|---|---|
+| production perf/correctness run | **300** (4.4× margin) | 120, then poll at 60 |
+| telemetry build | 3000 | 600 |
+| reset cycle | – | 180 |
+
+**Anything past ~150 s on a production build means the hardware is wedged.** Kill it, run the reset
+recipe + 4-GPU health gate, and re-run — do not wait it out.
+
+### 19.2 Retro-explanation of every rc=124 in this campaign
+
+- The first `rdma_chunk_size` sweep timed out at `TIMEOUT_SEC=2400` because it was accidentally running
+  the **telemetry** `.so` (reverted the `.inc` without rebuilding). Genuinely slow, not wedged.
+- The `QPS_PER_PE=1` leg and the `TIMEOUT_SEC=600` timing probe both ran on **non-reset** hardware and
+  wedged. On clean HW the identical run takes 68 s.
+
+Both classes are diagnosable in ~2 min with a 300 s budget. Neither justified a 40-minute wait.
+
+### 19.3 Rule
+
+Always run a production leg as: reset → 4-GPU health gate → `TIMEOUT_SEC=300`. If it exceeds that,
+treat it as a hardware wedge (golden rule 4), not as a measurement.
