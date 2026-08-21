@@ -1095,3 +1095,67 @@ quadratically, so at large N the `x_diff` check is effectively vacuous. The per-
 prints (errs 0.0078/0.0156 = 1-2 BF16 ULPs) appear in **passing** runs too and are diagnostics, not
 failures. This is **pre-existing** and out of scope (the file must stay byte-identical), but it means the
 x-correctness gate is much weaker on XPU than the CUDA reference and should not be leaned on.
+
+## §21. PRIORITY-1 RESULT: the instability is in DISPATCH, not combine — and it includes silent data loss
+
+Bisected with a bench selector (`DEEP_EP_BENCH_SEL` = `rt|disp|comb|all`) plus progress markers, so the
+last marker before a failure localises it. Every leg: full igub reset + 4-GPU health gate before launch,
+`TIMEOUT_SEC=300` per §19.
+
+| arm | tokens | result | failure marker |
+|---|---|---|---|
+| combine only | 4096 | **6/6 PASS** | – |
+| dispatch only | 4096 | **3/6 HANG** | always `entering dispatch` |
+| dispatch only | 2048 | 5/6 PASS, **1 CORRECTNESS FAILURE** | – |
+
+**The combine kernel is not the unstable one.** All my combine perf numbers (§17/§18) stand. The
+instability I had been attributing to hardware wedge lives in the **fused dispatch** path.
+
+### 21.1 Silent data loss at 2048 tokens — 65 whole tokens dropped
+
+The 2048 leg failed with `AssertionError: segment src_rank=3 values mismatch` from `check_data`:
+
+```
+[check_data FAIL rank=0] segment for src_rank=3 rows [2560,3386) err_sum=-1397760
+                         first_col_vals=[3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+```
+
+Decoding: the segment is 826 rows × 7168 hidden. Expected value 3 everywhere. If N elements are **zero**
+instead of 3, `err_sum = -3N` ⇒ N = 465 920 elements ⇒ **465 920 / 7168 = exactly 65.0 rows**.
+
+So the failure is **65 entire tokens never written** (left as allocator zeros), not numerical drift, not
+a partial/torn row. `first_col_vals` being all 3 confirms the surviving rows are perfectly correct — this
+is dropped whole tokens, i.e. a lost queue slot / lost credit, precisely the failure mode the
+`poll_load` split-producer bug produced and that a capped spin (`kFusedSpinCap`) `break`ing instead of
+failing would produce.
+
+### 21.2 Why this matters more than the remaining perf gap
+
+- The dispatch path intermittently **drops tokens without failing loudly** — at 4096 the sanity config
+  passed and the *bench* hung; at 2048 the sanity config caught it. Between those two, the 30.8× dispatch
+  speedup (`b231f1c` → `c804991`) was measured on a path that is not reliably correct.
+- Because `DEEP_EP_PERF_TOKENS` collapses the matrix to ONE config (§20.1), the routine perf runs have
+  very little chance of catching this. The single time it *was* caught, it was caught by the sanity
+  config, at the smaller token count.
+- Onset is token-count dependent (0/6 hangs at 2048 vs 3/6 at 4096), which fits a **wraparound/capacity
+  threshold** rather than a pure timing race.
+
+### 21.3 Next steps (not yet done)
+
+1. Re-run the full 64-config matrix several times to establish the true dispatch corruption rate — the
+   matrix, not the 2-config perf gate, is the instrument that catches this.
+2. Instrument `kFusedSpinCap` exhaustion in the dispatch kernel: any spin that hits its cap and `break`s
+   is a candidate for the lost credit. A cap-hit counter would confirm or exclude it in one run.
+3. Check queue head/tail wraparound arithmetic in the dispatch RDMA/NVL receivers at the 4096-token
+   capacity, and the decoupled `kRDMASenderCoordinator`'s `processed_tail` vs `last_issued_tail`
+   accounting (`internode_dispatch_fused.inc:625-631`) — it keeps multiple puts in flight, so a missed
+   credit there loses a whole chunk.
+4. 65 = 64+1 is suspiciously close to 4×16 (rdma chunk) and 8×8 (nvl chunk); worth checking whether the
+   loss is exactly one chunk plus one token.
+
+**Correction to a standing lead:** the Priority-2 suggestion to compare combine's `st_uc_global_v` /
+`ld_uc_global_v` against dispatch is **stale** — those were the `c0f322c` fix. Combine now uses
+`ld_nc_global_v` + `st_na_global_v` everywhere on the payload path (`:259, :264, :276, :287, :537-539`),
+identical hints to dispatch (`:509-511, :796-797, :945`), and combine's copy is additionally unrolled ×2
+where dispatch's is not. The 4.7× sender gap therefore persists *with identical, already-cached hints* —
+the cache-hint explanation for the residual gap is closed.

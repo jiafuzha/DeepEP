@@ -497,9 +497,23 @@ def test_main(args: argparse.Namespace,
         def _round_trip():
             buffer.dispatch(**perf_dispatch_args)
             buffer.combine(**perf_combine_args)
-        rt_avg, rt_min, rt_max = bench(_round_trip, num_warmups=10, num_tests=20)
-        d_avg, d_min, d_max = bench(lambda: buffer.dispatch(**perf_dispatch_args), num_warmups=10, num_tests=20)
-        c_avg, c_min, c_max = bench(lambda: buffer.combine(**perf_combine_args), num_warmups=10, num_tests=20)
+        _sel = os.getenv('DEEP_EP_BENCH_SEL', 'all')
+        _it = int(os.getenv('DEEP_EP_BENCH_ITERS', '20'))
+        _zero = (float('inf'), float('inf'), float('inf'))  # inf -> BW prints 0.0, no ZeroDivisionError
+        # Progress markers: the LAST one printed before a hang localises the hang.
+        def _mark(tag):
+            if local_rank == 0:
+                print(f'[BENCHMARK rank={rank}] entering {tag}', flush=True)
+        rt_avg, rt_min, rt_max = _zero
+        d_avg, d_min, d_max = _zero
+        c_avg, c_min, c_max = _zero
+        if _sel in ('all', 'rt'):
+            _mark('round_trip'); rt_avg, rt_min, rt_max = bench(_round_trip, num_warmups=10, num_tests=_it)
+        if _sel in ('all', 'disp'):
+            _mark('dispatch'); d_avg, d_min, d_max = bench(lambda: buffer.dispatch(**perf_dispatch_args), num_warmups=10, num_tests=_it)
+        if _sel in ('all', 'comb'):
+            _mark('combine'); c_avg, c_min, c_max = bench(lambda: buffer.combine(**perf_combine_args), num_warmups=10, num_tests=_it)
+        _mark('benches-done')
         rt_bytes = dispatch_bf16_rdma_send_bytes + combine_bf16_rdma_recv_bytes
         print(
             f'[PERF rank={rank}] num_tokens={num_tokens} hidden={hidden} '
