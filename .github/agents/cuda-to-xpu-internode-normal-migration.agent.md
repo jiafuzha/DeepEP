@@ -850,3 +850,87 @@ Remaining candidates, untested:
    unrolling is the way to buy more without registers;
 3. sender warp count: at `num_nvl_ranks=2`, six of eight NVL-sender warps exit
    immediately, so only 2 warps per even SM do all NVL payload work (section 15.4).
+
+## §17. The blocking-AMO hypothesis: mechanism REAL, magnitude BOUNDED (~5%), and empirically falsified as the bottleneck
+
+Hypothesis under test (from iSHMEM source analysis): `ishmemx_long_atomic_add_qp` is implemented as a
+*fetching* atomic (`ibgda_device_impl.h` maps `AMO_ADD` → `AMO_FETCH_ADD`) that polls the collapsed CQ
+`wc_counter` with no spin cap. Because the AMO's `wqe_idx` is claimed after the 230 KB payload put on the
+*same* QP, waiting for its CQE implicitly waits for the whole put to land — a de-facto per-chunk `quiet`
+on combine's producer critical path.
+
+### 17.1 Telemetry at 4096 tokens (244 rank-reports, 99.78% accounted)
+
+Two new counters split the send region (`put` = `putmem_nbi_subgroup` + subgroup barrier;
+`amo` = `fence_qp` + `long_atomic_add_qp` + barrier), plus `bar2` closes the previously-unaccounted 28%.
+
+| forwarder region | share of forwarder time |
+|---|---|
+| `waittail` (NVL producer starvation) | **34.32%** |
+| `bar2` (2nd `sync_large_warp`, sibling imbalance) | **29.52%** |
+| `copy` | 25.93% |
+| `waitspace` | 9.18% |
+| `send` | 0.84% |
+| accounted | 99.78% |
+
+NVL sender: wait **0.010%**, copy **97.74%**. RDMA receiver: wait 76.92%, copy 22.84%.
+
+### 17.2 Correcting the earlier 0.68% figure — the mechanism IS real
+
+`kDbgFwdSend` is summed over all 288 forwarder warps but only 1-in-12 (`sub_warp_id ==
+kWarpsPerForwarder-1`) issues a send. Undiluted, the send region is **10.09% of the *sending* warp's
+life**. Per chunk-send (134 chunk-sends/rank, clock 1.34 GHz):
+
+- `put` = **245 µs**
+- `amo` = **557 µs**  (66.2% of the send region)
+- 230 KB at dispatch's measured 6.23 GB/s wire rate = **37 µs**
+
+So the AMO costs ~15× the payload wire time — exactly the blocking-completion signature predicted.
+**The mechanism is confirmed.**
+
+Further, `waitspace` is NOT RDMA credit starvation: the predicted sibling stall
+(11 warps × 24 groups × per-sending-warp send time) = 1.65e9 cycles vs measured `waitspace` = 1.64e9.
+`waitspace` is almost entirely the 11 sibling sub-warps blocked behind their group's send.
+
+### 17.3 Why fixing it cannot pay: total attributable cost is ~10%, and it is off the critical path
+
+Total send-attributable forwarder time = `send` + `waitspace` = **10.02%**, of which the AMO share is
+**~6.5%**. That is a hard ceiling, set by arithmetic: at 4096 tokens there are only ~134 chunk-sends per
+rank (16 tokens/chunk across 24 (channel,dst) groups), so even an infinitely fast AMO removes a bounded
+amount of time.
+
+More decisively, **the NVL sender never waits (0.010%)** and is copy-busy 97.74% of its life. The sender
+lifetime is **44.8 ms of the 46.5 ms combine**; the remaining 1.7 ms is drain. Forwarder stalls therefore
+do not feed back into the sender, which is the critical path. Removing the AMO cost entirely can only
+attack part of that 1.7 ms drain tail.
+
+### 17.4 Empirical falsification: `rdma_chunk_size` sweep (zero code change)
+
+If the blocking AMO were the bottleneck, halving the number of chunk-sends should roughly halve its cost.
+Driver: `tests/perf_combine_chunk.py` (a copy of `test_internode.py` reading `DEEP_EP_RDMA_CHUNK`;
+`test_internode.py` itself is byte-identical/untouched), plus a `DEEP_EP_RDMA_CHUNK` passthrough in
+`tests/docker-2node-v2/run.sh`. 4096 tokens, hidden 7168, R=2, production build:
+
+| rdma_chunk_size | chunk-sends | combine(iso) µs | RDMA BW | vs 16 |
+|---|---|---|---|---|
+| 16 (default) | ~134 | **46316** | 1.2678 GB/s | — |
+| 32 | ~67 | 47391 | 1.2391 GB/s | **+2.3% slower** |
+| 64 | ~34 | 49284 | 1.1915 GB/s | **+6.4% slower** |
+
+Quartering the AMO count made combine **worse**, not better (larger chunks coarsen credit granularity and
+increase `waitspace`/`bar2` imbalance). Combined with the ±1.3% noise band, this rules out the blocking
+AMO as the bottleneck.
+
+### 17.5 Verdict
+
+The iSHMEM fetching-AMO mechanism is **real and worth fixing in iSHMEM on its own merits** (557 µs of
+blocking per chunk is indefensible for a fire-and-forget credit update, and it would matter for any
+workload with a high chunk-send rate — LL, or normal combine at much larger token counts). But for
+*this* bottleneck it is bounded at ~6.5% of forwarder time, sits off the critical path, and a chunk-count
+sweep falsifies it directly. **Do not spend hardware time on the iSHMEM AMO patch for the combine
+regression.**
+
+The bottleneck remains where §16 put it: **the NVL sender's peer-IPC copy**, 97.74% busy at ~1.9 GB/s
+while dispatch's structurally identical forwarder copy achieves ~8.9 GB/s. That 4.7× gap is the only
+remaining lead worth pursuing (candidates: wider LSC messages, engaging the 6 idle sender warps at
+`num_nvl_ranks=2`, traffic concurrency across the PCIe link).
