@@ -1,3 +1,17 @@
+> # ⚠️ KNOWN ISSUE — fused internode-normal default is NOT safe (2026-08-21)
+>
+> The fused, NamedBarrier warp-specialized internode-normal kernels documented here are the **default
+> at HEAD and are known to intermittently HANG and SILENTLY DROP TOKENS** at large token counts.
+>
+> Controlled A/B at 2048 tokens / hidden 7168, N=10 per arm, reset + health gate before each launch:
+> **fused (HEAD) 6/10 fail vs legacy (`b231f1c`) 0/10** — Fisher exact one-sided **p = 0.0054**.
+> One launch silently lost **exactly 65 whole tokens** (zeroed rows, surviving rows bit-correct).
+>
+> The 64-config matrix at its default size (32 tokens / hidden 1024) **passes 64/64 and is blind to
+> this**. Validate only at 2048+ tokens / hidden 7168 and report `k/N`.
+>
+> Full evidence: `.github/agents/cuda-to-xpu-internode-normal-migration.agent.md` §21 and §22.
+
 # NamedBarrier usage in XPU
 
 ## The Goal: Fused kernels with sub-group-subset barriers

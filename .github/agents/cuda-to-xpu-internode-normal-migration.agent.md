@@ -29,13 +29,47 @@ inventing new ones — the patterns encode hard-won CUDA-parity and BMG-specific
 | `csrc/cuda_kernels/internode_ll.cu` | `csrc/xpu/internode_ll.cpp` | **NVSHMEM/IBGDA → iSHMEM/IBGDA** symbol map, RDMA path vs P2P-fast-path selection, GridBarrier/`ishmem_barrier_all` replacement for `cg::this_grid().sync()`, memory-ordering fences. |
 | `csrc/cuda_kernels/internode.cu` | `csrc/xpu/internode.cpp` (+ `internode_{dispatch,combine,notify}_fused.inc`) | **COMPLETE** — see §1.1. |
 
-## 1.1 Migration status: COMPLETE (2026-08-20)
+> # ⚠️ KNOWN ISSUE — THE CURRENT DEFAULT IS NOT SAFE (2026-08-21)
+>
+> **The fused internode-normal path — the default at HEAD — intermittently HANGS and can SILENTLY
+> DROP TOKENS at large token counts.** Do not treat this branch as green. Do not ship this default.
+>
+> **Measured, controlled A/B** (identical `tests/`+harness, only `csrc/` swapped; full igub reset +
+> 4-GPU health gate before every launch; `NUM_TOKENS=2048 HIDDEN=7168`):
+>
+> | arm | PASS | HANG | fail rate |
+> |---|---|---|---|
+> | fused (HEAD) | 4 | 6 | **6/10 = 60%** |
+> | legacy (`b231f1c`) | 10 | 0 | **0/10** |
+>
+> Fisher exact one-sided **p = 0.0054** ⇒ this is a **regression introduced by the migration**, not
+> pre-existing and not run-to-run variance. See §22.
+>
+> **Silent data loss:** one launch at 2048/7168 lost **exactly 65 whole tokens** (zeroed rows,
+> surviving rows bit-correct) — `check_data` `err_sum=-1397760` over an 826×7168 segment. Corruption
+> is rarer than hangs (~1 in 30 fused launches) and is **silent**. See §21.1.
+>
+> **The standard gate is BLIND to this.** The 64-config matrix runs at 32 tokens / hidden 1024,
+> takes 64 s, and passes 64/64 while never entering the failing regime. Any prior "64/64 PASS" claim
+> — including in §13 — is a single sample of an intermittent path and is **not** evidence of
+> correctness. Validate only at **2048+ tokens / hidden 7168** with enough repeats to beat a 60%
+> base rate, and always report `k/N`.
+>
+> **No gating fallback exists at HEAD.** `2e99ecc` deleted the legacy micro-kernels (3090 → 447
+> lines) and `f494d97` removed the `DEEP_EP_INTERNODE_FUSED` gate, so defaulting OFF would require
+> reverting both. Root-causing is therefore the fastest route to a safe default.
+>
+> **Perf numbers in §13/§14 are PROVISIONAL** — measured on the unreliable path and conditioned on
+> non-hanging runs.
+
+## 1.1 Migration status: COMPLETE (2026-08-20) — SEE KNOWN ISSUE ABOVE
 
 The internode NORMAL path is now a fused, warp-specialized, CUDA-faithful port and is the
 **default** (the `DEEP_EP_INTERNODE_FUSED` env gate and all legacy phase-split micro-kernels
 were deleted; `internode.cpp` went 3090 → 447 lines with the kernels in three `.inc` files).
 `tests/docker-2node-v2` passes the full matrix (64 configs, BF16/FP8 × with/without top-k ×
-async × previous-event).
+async × previous-event) **at the matrix's default size only (32 tokens / hidden 1024), which is
+proven blind to the KNOWN ISSUE above.** At 2048 tokens / hidden 7168 this default fails 6/10.
 
 | CUDA kernel | XPU kernel | Barriers |
 |---|---|---|
@@ -528,7 +562,13 @@ ocloc compile -file <dump>.spv -spirv_input -device bmg
 Follow this file mechanically for every CUDA function you port; do not deviate from the
 established patterns unless a specific pattern is documented to fail in your build/HW.
 
-## 13. Measured perf after fusion (A/B baseline)
+## 13. Measured perf after fusion (A/B baseline) — ⚠️ PROVISIONAL, measured on the unreliable path
+
+> **All numbers in this section are PROVISIONAL.** They were measured on the fused default that §22
+> proves fails 6/10 at 2048 tokens / hidden 7168, so every figure here is **conditioned on the
+> surviving non-hanging runs** and each is a single sample. The "all PASS" validation referenced in
+> this section came from the 64-config matrix at 32 tokens / hidden 1024, which is proven blind to
+> the defect. Do not quote these as validated results until the regression in §21/§22 is fixed.
 
 Config: 2 nodes x 2 ranks (`R=2`), BF16, `num_experts=8`, `topk=2`, `hidden=7168`,
 `ISHMEM_IBGDA_DB_BATCH_SIZE=8`. Harness `tests/docker-2node-v2`, sweep driven by
