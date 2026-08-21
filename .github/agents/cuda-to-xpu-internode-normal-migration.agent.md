@@ -934,3 +934,65 @@ The bottleneck remains where §16 put it: **the NVL sender's peer-IPC copy**, 97
 while dispatch's structurally identical forwarder copy achieves ~8.9 GB/s. That 4.7× gap is the only
 remaining lead worth pursuing (candidates: wider LSC messages, engaging the 6 idle sender warps at
 `num_nvl_ranks=2`, traffic concurrency across the PCIe link).
+
+## §18. `ISHMEM_IBGDA_QPS_PER_PE` sweep at 4096 tokens — combine is QP-count-INSENSITIVE (third falsification), but dispatch gains ~14%
+
+Motivation: `deep_ep/buffer.py:260-291` sets `ISHMEM_IBGDA_QPS_PER_PE = 1` (setdefault) on the argument
+that the path is "NIC-latency-bound, not bandwidth-bound" and each extra QP channel adds "a full extra
+NIC round-trip on the critical path" (per-QP `fence_qp` + tail `long_atomic_add_qp`), with a measured
+monotonic round-trip penalty at NT=32 (3875.7 µs at C=1 → 4667.1 at C=16). If that mechanism dominated
+combine at 4096 tokens, combine should degrade monotonically in C.
+
+Because `QPS_PER_PE` is a `setdefault`, an explicit env override wins — pure env, no rebuild.
+All legs below: 4096 tokens, hidden 7168, R=2, production build, **igub reset + 4-GPU health gate before
+each leg**, `===== PASS =====`.
+
+| `QPS_PER_PE` | combine(iso) µs | combine RDMA BW | dispatch(iso) µs | dispatch RDMA BW |
+|---|---|---|---|---|
+| 1 | 46270 | 1.2691 GB/s | 9324 | 6.2977 GB/s |
+| 2 | 46900 | 1.2520 GB/s | **7983** | **7.3562 GB/s** |
+| 4 | 46299 | 1.2683 GB/s | **8040** | **7.3039 GB/s** |
+
+### 18.1 Combine: completely flat in C — the round-trip-per-chunk mechanism does not dominate
+
+46270 / 46900 / 46299 µs all sit inside the ±1.3% noise band. Adding QP channels — which by `buffer.py`'s
+own stated model adds a full extra NIC round trip per chunk to the critical path — moved combine by
+**nothing**. This is a third independent falsification of the blocking-AMO-dominates hypothesis, joining
+the telemetry bound (§17.2-17.3) and the `rdma_chunk_size` sweep (§17.4).
+
+Corollary for the arithmetic: the entire send region (put + fence + AMO) is 10.02% of forwarder time and
+sits off the critical path (NVL sender waits 0.010%). Doubling the AMO count therefore cannot exceed
+~+6.5%, and in fact registers as zero because the forwarder is not the critical path at all.
+
+### 18.2 The `buffer.py` C=1 conclusion is token-count-specific and is now WRONG for dispatch at 4096
+
+`buffer.py`'s study was tuned at small token counts (NT≤1024, latency-dominated). At 4096 tokens the
+trade inverts for **dispatch**: C=2 and C=4 are ~14% faster than C=1 (9324 → 7983/8040 µs, 6.30 → 7.36
+GB/s), reproducibly and well outside noise. Dispatch is bandwidth-bound at this size and genuinely
+benefits from QP striping, exactly as one would expect once the path stops being latency-dominated.
+
+Note this happens **today, with the blocking AMO still in place** — so it is not evidence for the AMO
+theory either; it is ordinary bandwidth striping.
+
+**Not changing the `buffer.py` default.** The C=1 choice remains correct at the small token counts it was
+tuned for, the default is load-bearing for the LL path, and `deep_ep/` is out of scope for this work. The
+actionable finding is that the optimal C is token-count-dependent and a future auto-tune could pick C≥2
+for large-token normal dispatch. That is a **dispatch** opportunity, not a combine one.
+
+### 18.3 Methodology warning — a wedged-HW artifact nearly produced a false positive
+
+The first C=2 measurement read **89336 µs (+93%)**, which looked like dramatic confirmation of the
+monotonic-penalty model. It was an artifact: that leg ran immediately after a C=1 leg that had hung
+(rc=124) inside the same loop, with no igub reset in between (golden rule 4 cascade). Re-run on freshly
+reset + health-gated hardware it read 46900 µs. C=4 measuring identical to C=1 is what exposed the
+non-monotonicity and prompted the re-test. **Every env-sweep leg must get its own reset + health gate;
+a single hung leg poisons every subsequent leg in the loop.**
+
+### 18.4 Patch-design constraint for any future iSHMEM AMO work
+
+`buffer.py` forces `qps_per_pe = 1` while the harness runs `kNumRDMARanks = 2`, so at the coordinator
+head-credit site `internode_combine_fused.inc:931` (`lane_id < kNumRDMARanks`) **both lanes target the
+same QP**. Any non-blocking-AMO patch must handle that collision; a naive per-lane watermark advance can
+livelock there. The tail-credit site `:748` is single-lane (`lane_id == 0`) and is safe. Telemetry also
+shows the coordinator is cold (`coord tot` ≈ 1.5e9 vs forwarder 18e9 cycles), so this site is a
+correctness hazard rather than a perf opportunity.
