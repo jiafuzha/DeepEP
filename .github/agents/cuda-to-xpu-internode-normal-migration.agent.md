@@ -789,3 +789,64 @@ Next avenue, in order of expected value:
    sender warps (as the forwarder already does for RDMA destinations) would give up
    to 4x more copy parallelism. Needs care: the queue-slot bookkeeping is currently
    per-warp, and the named-barrier budget is 8.
+
+## 16. Post-fix telemetry: the four forwarder counters (2048 tokens)
+
+Requested to discriminate between the remaining hypotheses in one run. Built with
+`DEEP_EP_COMBINE_TELEMETRY=1`, single perf size, `combine(iso) ~= 25.9 ms`.
+Counters are sums over all warps of a role (24 senders / 288 forwarders /
+192 receivers); per-warp totals are 31.3-34.4e6 cycles, and 34.3e6 / 25.9 ms
+=> ~1.32 GHz, i.e. **every role is resident for the whole kernel**.
+
+| role | total | breakdown |
+|---|---|---|
+| NVL sender (24) | 7.51e8 | **wait 0.01%**, **copy 97.70%** |
+| forwarder (288) | 9.58e9 | waitspace 7.26%, **waittail 39.72%**, copy 23.91%, **send 0.68%** |
+| RDMA receiver (192) | 6.61e9 | **wait 80.50%**, copy 19.30% |
+
+### What this settles
+
+- **`FwdSend` = 0.68%.** The entire iSHMEM issue path -- `ishmemx_putmem_nbi_subgroup`
+  (~230 KB), `ishmemx_fence_qp`, the tail `ishmemx_long_atomic_add_qp`, and both
+  bracketing `group_barrier`s -- costs **under 1%** of forwarder time. **iSHMEM is
+  exonerated as a perf factor in combine**, including `fence_qp` even if it turns out
+  to be a completion wait, and including doorbell batching (`ISHMEM_IBGDA_DB_BATCH_SIZE`
+  cannot matter at 0.68%).
+- **`FwdWaitSpace` = 7.26%.** RDMA credit starvation is minor, so the
+  "no send/produce decoupling => at most one RDMA write in flight per (channel,
+  dst_rdma_rank) with its latency exposed" hypothesis is **not** the dominant term.
+  It is a real structural difference from dispatch's `kRDMASenderCoordinator`, but it
+  is also CUDA-faithful (CUDA combine likewise issues the put inline in the forwarder
+  chunk loop, internode.cu:2107-2140) and it accounts for at most 7% here.
+- **`FwdWaitTail` = 39.72%** and **`RcvWait` = 80.50%** are starvation, and
+  **`SndWait` = 0.01% / `SndCopy` = 97.70%** identifies the single source. The causal
+  chain is unambiguous and one-directional:
+  `NVL sender copy (100% busy) -> forwarder waits on the NVL tail (40%) -> receiver
+  waits on the RDMA tail (80%)`.
+- Consistent with the three null experiments of section 15.3: fence frequency (C10),
+  poll throttling (C11) and residual uncached scalar stores (C12) all target the
+  stall side or per-access overhead, and none of them can move a producer that is
+  already 97.7% busy.
+
+### The one open number
+
+At 2048 tokens the 24 sender warps push 48.542 MB in 25.9 ms = **1.87 GB/s**
+(78 MB/s per warp; ~7.7e3 cycles per 512 B sub-group message with 2 in flight).
+Dispatch's forwarder performs the *same* operation -- lane-strided 16 B
+`ld_nc_global_v`/`st_na_global_v` into a peer's IPC buffer -- with the *same* 24 warps
+and a *non-unrolled* loop, and moves 48.542 MB in 5.48 ms = **8.9 GB/s**. So the P2P
+write path itself sustains ~9 GB/s with this warp count; combine's sender is 4.7x
+below that. Excluded so far: queue starvation (0.01% wait), cache-maintenance
+overhead (C10), co-resident poll contention (C11), residual uncached scalars (C12),
+and every sizing/partitioning parameter (section 15.1).
+
+Remaining candidates, untested:
+1. concurrency of the memory system: unlike dispatch, combine's NVL push runs
+   *simultaneously* with the forwarder's NVL read-back, the RDMA send and the RDMA
+   receive -- ~184 MB of traffic in 25.9 ms, of which ~78 MB crosses PCIe in both
+   directions on a link the NIC also uses;
+2. messages in flight per warp: the fix took this from 1 to 2 and bought 1.3-1.5x;
+   going to 4 destabilised the GPU. Wider LSC messages (32 B/lane) rather than deeper
+   unrolling is the way to buy more without registers;
+3. sender warp count: at `num_nvl_ranks=2`, six of eight NVL-sender warps exit
+   immediately, so only 2 warps per even SM do all NVL payload work (section 15.4).
