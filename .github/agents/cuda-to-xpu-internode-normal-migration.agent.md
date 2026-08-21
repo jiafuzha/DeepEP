@@ -1159,3 +1159,52 @@ failing would produce.
 identical hints to dispatch (`:509-511, :796-797, :945`), and combine's copy is additionally unrolled ×2
 where dispatch's is not. The 4.7× sender gap therefore persists *with identical, already-cached hints* —
 the cache-hint explanation for the residual gap is closed.
+
+## §22. DECISION-RELEVANT: the instability is a REGRESSION INTRODUCED BY THE MIGRATION
+
+Controlled A/B, identical harness/driver/test files (only `csrc/` swapped), full igub reset + 4-GPU
+health gate before **every** launch, N=10 per arm, `NUM_TOKENS=2048 HIDDEN=7168` (the regime that
+reproduces), classification PASS / HANG / CORRUPT.
+
+| arm | build | PASS | HANG | CORRUPT | fail rate |
+|---|---|---|---|---|---|
+| **fused (HEAD `194cf80`)** | fused warp-specialized, default | 4 | **6** | 0 | **6/10 = 60%** |
+| **legacy (`b231f1c`)** | phase-split, default | **10** | 0 | 0 | **0/10** |
+
+**Fisher exact, one-sided: p = 0.0054.** The difference is significant; this is not run-to-run variance.
+
+At `b231f1c` the fused kernels are still behind the `DEEP_EP_INTERNODE_FUSED` env gate, so the legacy arm
+is simply that build's default — no source edits were needed to select it, and `tests/` stayed at HEAD
+for both arms, isolating the variable to `csrc/`.
+
+### 22.1 Verdict
+
+The fused warp-specialized internode path introduced an intermittent failure that the legacy phase-split
+path does not exhibit: **60% hang rate at 2048 tokens / hidden 7168**, plus the separately observed
+silent 65-token data loss (§21.1). The legacy path was clean in 10/10 runs under identical conditions.
+
+**The fused default (`f494d97`) should be treated as not shippable in its current state.** The
+engineering options are (a) restore the `DEEP_EP_INTERNODE_FUSED` gate and default it OFF until fixed,
+or (b) revert the default flip. Either keeps a silently-corrupting kernel out of the default path while
+root-causing continues. This is a call for the humans; recording the evidence and the recommendation.
+
+### 22.2 Scope of what the regression invalidates
+
+- The **dispatch** 30.8× speedup and the fused round-trip table (§13) were measured on the unreliable
+  path. The numbers are reproducible but conditioned on non-hanging runs.
+- The **combine** work (§14, the 2.63× cache-policy fix) is unaffected in its own right — combine-only
+  benching was **6/6 clean** (§21) — but it ships inside the same fused default, so it inherits the gate
+  decision.
+- All prior "64/64 PASS" claims are **single samples of an intermittent path** and must not be read as
+  proof of correctness. At the default matrix size (32 tokens / hidden 1024) a full matrix run takes
+  64 s and passed 64/64 — i.e. the standard gate does **not** exercise the failing regime at all.
+
+### 22.3 Rate caveats (report k/N, never "passes")
+
+- Hang rate is strongly regime-dependent: 0/6 (dispatch-only bench) vs 6/10 (all three benches) at 2048;
+  3/6 at 4096 dispatch-only. More benching = more exposure, consistent with an accumulation/wraparound
+  threshold rather than a fixed per-launch probability.
+- CORRUPT is rarer than HANG: 1 observed corruption across ~30 fused launches vs many hangs. The single
+  corruption (65 tokens zeroed) is the more dangerous manifestation because it is **silent**.
+- The default-size 64-config matrix has **zero observed sensitivity** to this bug. Any future validation
+  of a fix must run at 2048+/7168 with N large enough to distinguish from a 60% base rate.
