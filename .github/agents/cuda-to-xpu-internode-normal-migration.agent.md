@@ -527,3 +527,65 @@ ocloc compile -file <dump>.spv -spirv_input -device bmg
 
 Follow this file mechanically for every CUDA function you port; do not deviate from the
 established patterns unless a specific pattern is documented to fail in your build/HW.
+
+## 13. Measured perf after fusion (A/B baseline)
+
+Config: 2 nodes x 2 ranks (`R=2`), BF16, `num_experts=8`, `topk=2`, `hidden=7168`,
+`ISHMEM_IBGDA_DB_BATCH_SIZE=8`. Harness `tests/docker-2node-v2`, sweep driven by
+`DEEP_EP_PERF_TOKENS`. "legacy" = commit `b231f1c` (phase-split micro-kernels default),
+"fused" = commit `c804991` (warp-specialized NamedBarrier kernels default).
+Both legs measured on the same clean hardware, back to back.
+
+Round-trip latency (us):
+
+| tokens | legacy | fused | speedup |
+|---|---|---|---|
+| 32 | 3897.3 | 1927.2 | 2.02x |
+| 64 | 6877.6 | 2615.8 | 2.63x |
+| 128 | 12994.3 | 5782.7 | 2.25x |
+| 512 | 52471.7 | 20227.4 | 2.59x |
+| 1024 | 103301.8 | 35922.7 | 2.88x |
+| 2048 | 204436.5 | 70359.9 | 2.91x |
+| 4096 | 414178.2 | 132573.9 | 3.12x |
+
+Dispatch, isolated (us) — this is where fusion pays off, and the win grows with size:
+
+| tokens | legacy | fused | speedup |
+|---|---|---|---|
+| 32 | 2922 | 1180 | 2.5x |
+| 64 | 5099 | 1289 | 4.0x |
+| 128 | 9825 | 1412 | 7.0x |
+| 512 | 36624 | 2365 | 15.5x |
+| 1024 | 72307 | 3442 | 21.0x |
+| 2048 | 143941 | 5487 | 26.2x |
+| 4096 | 287055 | 9319 | 30.8x |
+
+Fused dispatch RDMA bandwidth scales 0.39 -> 6.30 GB/s across the sweep (NVL 10.30 GB/s).
+
+Combine, isolated (us) — essentially unchanged by fusion:
+
+| tokens | legacy | fused | ratio |
+|---|---|---|---|
+| 32 | 1551 | 1230 | 1.26x |
+| 64 | 2360 | 1872 | 1.26x |
+| 128 | 4027 | 4935 | 0.82x |
+| 512 | 15177 | 17698 | 0.86x |
+| 1024 | 30194 | 32832 | 0.92x |
+| 2048 | 61306 | 64420 | 0.95x |
+| 4096 | 127833 | 122462 | 1.04x |
+
+### Interpretation / open bottleneck
+
+Combine bandwidth is flat at ~0.46-0.49 GB/s in **both** implementations, i.e. combine
+was already this slow before fusion — fusion did not regress it. After fusion, combine
+dominates: ~92% of round-trip time at 4096 tokens. This is a **pre-existing**, still
+uninvestigated bottleneck, not a fusion artifact.
+
+Suspects to investigate first in `csrc/xpu/internode_combine_fused.inc`:
+1. per-destination NamedBarrier serialization (one barrier per `dst_rdma_rank`),
+2. the serialized critical section over `dst_rdma_rank` introduced to avoid the
+   per-lane divergent-lock deadlock (see section on Xe lock-step sub-groups),
+3. forwarder spin loops,
+4. the uncached 16-byte payload store path.
+
+Do **not** attribute a future combine regression to fusion without re-running this A/B.
