@@ -1248,3 +1248,92 @@ root-causing continues. This is a call for the humans; recording the evidence an
   corruption (65 tokens zeroed) is the more dangerous manifestation because it is **silent**.
 - The default-size 64-config matrix has **zero observed sensitivity** to this bug. Any future validation
   of a fix must run at 2048+/7168 with N large enough to distinguish from a 60% base rate.
+
+---
+
+## 23. Root cause of the fused-dispatch hang: WORK-GROUP CO-RESIDENCY (occupancy), not queue wrap
+
+Two hypotheses were tested head-to-head on freshly-reset HW, one launch per reset, 4-GPU health gate
+before every launch, `TIMEOUT_SEC=300`, `tests/perf_combine_chunk.py` (byte-identical `tests/` otherwise),
+2 nodes x 2 ranks, num_tokens=2048, hidden=7168, BF16.
+
+### 23.1 DISPROVEN: the RDMA receive-queue wrap / half-depth sign-flip theory
+
+The theory: 65 lost tokens = 64+1 = half of `num_max_rdma_chunked_recv_tokens=128` + 1, i.e. a wrapped
+index comparison flipping sign at half depth. Probe: raise the RDMA recv queue to 256 via a new
+`DEEP_EP_RDMA_RECV` env (driver + `run.sh` `_add_opt_genv` whitelist + campaign passthrough). The
+`[queue-probe] rdma_chunk=16 rdma_recv_tokens=256` line was verified in every log.
+
+| `num_max_rdma_chunked_recv_tokens` | PASS | HANG | N |
+| --- | --- | --- | --- |
+| 128 (control, this session) | 3 | 1 | 4 |
+| 128 (control, §22 arm) | 4 | 6 | 10 |
+| **256** | **4** | **4** | **8** |
+
+Doubling the queue does not move the failure. **Hypothesis rejected.** A full line-by-line re-audit of
+the fused dispatch against CUDA `internode.cu` also found the queue arithmetic faithful: the producer
+flow-control gate (`.inc:477` vs CUDA `:644`), the 32-bit SLM release window (`.inc:563-583` vs CUDA
+`:725-748`), the coordinator's `processed_tail`/`last_issued_tail`/`% num_max_rdma_chunked_recv_tokens`
+accounting (`.inc:620-641` vs CUDA `:800-812`), the forwarder (`.inc:735-812` vs CUDA `:903-1005`) and
+the NVL receiver (`.inc:915-981` vs CUDA `:1098-1188`) are all equivalent.
+
+### 23.2 CONFIRMED: failure rate is monotone in `num_sms` (grid size)
+
+`num_sms` was made overridable (`DEEP_EP_NUM_SMS`, driver-side only; `tests/test_internode.py` untouched).
+Everything else held constant.
+
+| `num_sms` | work-groups | PASS | HANG | N | hang rate |
+| --- | --- | --- | --- | --- | --- |
+| 8  | 8  | 8 | 0 | 8  | **0%** |
+| 16 | 16 | 6 | 2 | 8  | 25% |
+| 24 (default) | 24 | 4 | 6 | 10 | **60%** |
+
+Fisher exact, `num_sms=8` vs the `num_sms=24` default: one-sided **p = 0.011**. Env application was
+verified independently of the classifier: at `num_sms=8` dispatch(iso) is 7635 us / 3.85 GB/s vs
+5494 us / 5.34 GB/s at 24, so the grid really changed.
+
+### 23.3 Mechanism
+
+The fused dispatch kernel launches `num_sms` work-groups of `(7 + 1 + 8) * 32 = 512` work-items and
+splits each channel across **two different work-groups**: `channel_id = sm_id / 2`, and
+`is_forwarder = (sm_id % 2 == 0)`. So the forwarder half of a channel lives in an even-numbered
+work-group and the RDMA-sender/NVL-receiver half in the odd-numbered one, and they **spin on each
+other** (`rdma_channel_tail`, `nvl_channel_tail`, `nvl_channel_head`). That makes the whole grid a
+producer/consumer network with **hard forward-progress dependencies across work-groups**, which is only
+correct if **all `num_sms` work-groups are simultaneously resident**. Intel GPUs give no such guarantee
+and do not preempt a spinning work-group, so once the grid exceeds what the device can co-schedule, a
+resident consumer spins on a producer that has not been dispatched. Depending on which spin is starved,
+it surfaces as either:
+- a **HANG** (the spin outlasts the 300 s harness timeout), or
+- **silent CORRUPTION** (`kFusedSpinCap = 2e8` is exceeded and the loop `break`s, leaving whole tokens
+  never copied - exactly the observed 65 zeroed rows, with all surviving rows bit-correct).
+
+This also explains everything the wrap theory could not: monotonicity in `num_sms`, token-count
+dependence (longer occupancy of each work-group widens the window), intermittency (co-residency is
+marginal, not deterministic - it depends on register/SLM-driven occupancy and on what else is on the
+device), and why the **legacy phase-split path at `b231f1c` is 0/10** - separate kernel launches per
+phase have no cross-work-group spin dependency, so occupancy can never deadlock them.
+
+CUDA gets away with the fused form because DeepEP sizes `num_sms` to the SM count of a 108/132-SM
+datacenter GPU. The BMG part here reports far fewer independent work-group slots for a 512-work-item,
+high-register kernel. The codebase **already knows this rule** for the LL path: `csrc/xpu/internode_ll.cpp:264-277`
+(`ll_put_wgs`) states "the ordered commit gate ... requires the producing sub-groups to be CO-RESIDENT
+(CUDA sizes its grid to num_sms for the same reason)" and clamps the grid to `max_compute_units`. The
+fused internode-normal port did not inherit that clamp.
+
+### 23.4 Direction of the fix
+
+Clamp the fused internode dispatch/combine grid to the device's co-residency capacity in
+`csrc/xpu/deep_ep_xpu.cpp` (where `num_channels = config.num_sms / 2` is computed), mirroring
+`ll_put_wgs()`: derive a maximum work-group count from
+`device.get_info<sycl::info::device::max_compute_units>()` and the actual occupancy of the fused kernel,
+and cap `num_channels` at half of it, with an env override. This keeps `Config.num_sms` as a request
+rather than a mandate. Validation must be at 2048+/7168 with N large enough to separate from a 60% base
+rate - the default-size 64-config matrix is proven blind (§22.3).
+
+### 23.5 Reproducer plumbing added
+
+- `tests/perf_combine_chunk.py` (driver copy only): `DEEP_EP_RDMA_RECV`, `DEEP_EP_NUM_SMS`.
+- `tests/docker-2node-v2/run.sh`: both added to the `_add_opt_genv` whitelist (a var not on that
+  whitelist is silently dropped - this has cost a whole sweep before).
+- `/tmp/corrcamp.sh`: passes both through; `TIMEOUT_SEC=300`.

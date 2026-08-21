@@ -332,6 +332,8 @@ run_test() {
     _add_opt_genv DEEP_EP_RDMA_CHUNK           "${DEEP_EP_RDMA_CHUNK:-}"
     _add_opt_genv DEEP_EP_BENCH_SEL            "${DEEP_EP_BENCH_SEL:-}"
     _add_opt_genv DEEP_EP_BENCH_ITERS          "${DEEP_EP_BENCH_ITERS:-}"
+    _add_opt_genv DEEP_EP_RDMA_RECV            "${DEEP_EP_RDMA_RECV:-}"
+    _add_opt_genv DEEP_EP_NUM_SMS             "${DEEP_EP_NUM_SMS:-}"
     _add_opt_genv IGC_ShaderDumpEnable         "${IGC_ShaderDumpEnable:-}"
     _add_opt_genv IGC_DumpToCustomDir          "${IGC_DumpToCustomDir:-}"
     # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)

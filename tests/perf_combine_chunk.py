@@ -232,7 +232,10 @@ def test_main(args: argparse.Namespace,
     _rcs = int(os.getenv('DEEP_EP_RDMA_CHUNK', '16'))
     if local_rank == 0:
         print(f'[chunk-probe] rdma_chunk_size={_rcs}', flush=True)
-    config = deep_ep.Config(num_sms, 8, nvl_buffer_size, _rcs, rdma_buffer_size)
+    _rrv = int(os.getenv('DEEP_EP_RDMA_RECV', str(rdma_buffer_size)))
+    if local_rank == 0:
+        print(f'[queue-probe] rdma_chunk={_rcs} rdma_recv_tokens={_rrv}', flush=True)
+    config = deep_ep.Config(num_sms, 8, nvl_buffer_size, _rcs, _rrv)
 
     # Test dispatch
     # noinspection PyShadowingNames
@@ -628,7 +631,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    num_sms = 24
+    num_sms = int(os.environ.get('DEEP_EP_NUM_SMS', 24))
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     nvl_bytes = int(os.environ.get('DEEP_EP_NVL_BYTES', int(2e9)))
