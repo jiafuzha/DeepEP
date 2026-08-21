@@ -1287,8 +1287,10 @@ Everything else held constant.
 | 8  | 8  | 8 | 0 | 8  | **0%** |
 | 16 | 16 | 6 | 2 | 8  | 25% |
 | 24 (default) | 24 | 4 | 6 | 10 | **60%** |
+| 32 | 32 | 2 | 4 | 6  | **67%** |
 
-Fisher exact, `num_sms=8` vs the `num_sms=24` default: one-sided **p = 0.011**. Env application was
+The relationship is monotone in both directions from the default: shrinking the grid removes the
+failure entirely, over-subscribing it makes the failure worse. Fisher exact, `num_sms=8` vs the `num_sms=24` default: one-sided **p = 0.011**. Env application was
 verified independently of the classifier: at `num_sms=8` dispatch(iso) is 7635 us / 3.85 GB/s vs
 5494 us / 5.34 GB/s at 24, so the grid really changed.
 
