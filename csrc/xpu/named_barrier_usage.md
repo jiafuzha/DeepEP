@@ -1,16 +1,24 @@
-> # ⚠️ KNOWN ISSUE — fused internode-normal default is NOT safe (2026-08-21)
+> # ✅ RESOLVED (2026-08-21) — fused internode-normal default is now clamped for co-residency
 >
-> The fused, NamedBarrier warp-specialized internode-normal kernels documented here are the **default
-> at HEAD and are known to intermittently HANG and SILENTLY DROP TOKENS** at large token counts.
+> **History (keep — this is a first-class rule for every fused/warp-specialized port).** The fused,
+> NamedBarrier warp-specialized internode-normal kernels documented here were the default at HEAD and
+> intermittently HUNG and SILENTLY DROPPED TOKENS (fused 6/10 fail vs legacy `b231f1c` 0/10 at
+> 2048 tok / hidden 7168, Fisher p = 0.0054; one launch lost exactly 65 whole tokens).
 >
-> Controlled A/B at 2048 tokens / hidden 7168, N=10 per arm, reset + health gate before each launch:
-> **fused (HEAD) 6/10 fail vs legacy (`b231f1c`) 0/10** — Fisher exact one-sided **p = 0.0054**.
-> One launch silently lost **exactly 65 whole tokens** (zeroed rows, surviving rows bit-correct).
+> **RULE: a fused kernel whose work-groups spin on each other MUST clamp its grid to the device's
+> work-group co-residency limit.** These kernels split every channel across two work-groups
+> (`channel_id = sm_id/2`, `is_forwarder = sm_id%2`) that spin on each other's queue counters. Intel
+> GPUs do not guarantee co-residency and do not preempt a spinning work-group, so an over-sized grid
+> starves a producer: hang, or a `kFusedSpinCap` break that silently drops whole tokens.
+> `csrc/xpu/internode_ll.cpp::ll_put_wgs()` states the same rule for the LL put grid.
 >
-> The 64-config matrix at its default size (32 tokens / hidden 1024) **passes 64/64 and is blind to
-> this**. Validate only at 2048+ tokens / hidden 7168 and report `k/N`.
+> Fixed by `internode::fused_max_coresident_sms()` (`csrc/xpu/internode.cpp`) +
+> `Buffer::fused_num_channels()`; post-fix 16/16 at 2048/7168, 10/10 at 4096/7168, 64/64 matrix.
 >
-> Full evidence: `.github/agents/cuda-to-xpu-internode-normal-migration.agent.md` §21 and §22.
+> The 64-config matrix at its default size (32 tokens / hidden 1024) is **blind** to this class of bug.
+> Validate only at 2048+ tokens / hidden 7168 and report `k/N`.
+>
+> Full evidence: `.github/agents/cuda-to-xpu-internode-normal-migration.agent.md` §21-§24.
 
 # NamedBarrier usage in XPU
 

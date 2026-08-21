@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <stdexcept>
 
 #include "xpu_kernels.hpp"
 
@@ -440,6 +443,140 @@ void combine_nvl_rdma(DataType type,
     }
 #else
     TORCH_CHECK(false, "combine_nvl_rdma requires DEEP_EP_ENABLE_ISHMEM");
+#endif
+}
+
+// ===========================================================================
+// Co-residency clamp for the fused internode grid.
+//
+// Both fused kernels split every channel across TWO work-groups
+// (`channel_id = sm_id / 2`, `is_forwarder = sm_id % 2`) which spin on each
+// other's queue counters (`rdma_channel_tail`, `nvl_channel_tail/head`).  That
+// makes the grid a producer/consumer network with hard forward-progress
+// dependencies ACROSS work-groups, which is only correct if every work-group is
+// simultaneously resident.  Intel GPUs give no such guarantee and do not preempt
+// a spinning work-group, so an over-sized grid starves a producer and surfaces
+// as a hang, or as a `kFusedSpinCap` break that silently drops whole tokens
+// (measured: 0/8 failures at num_sms=8, 2/8 at 16, 6/10 at 24, 4/6 at 32).
+//
+// `csrc/xpu/internode_ll.cpp::ll_put_wgs()` applies the same rule to the LL put
+// grid ("requires the producing sub-groups to be CO-RESIDENT"); this is the
+// internode-normal counterpart.
+//
+// The limit is derived, not guessed: `kernel_queue_specific::max_num_work_groups`
+// is the driver's own per-kernel occupancy answer (it accounts for the work-group
+// size, SLM footprint and register/GRF pressure of THAT kernel).  Dispatch and
+// combine have different occupancy, but `num_channels` is baked into the shared
+// RDMA/NVL buffer layout and into the tensors dispatch hands to combine, so a
+// single grid size must satisfy both: we take the min.
+// ===========================================================================
+namespace {
+
+template <typename KernelName>
+int query_max_coresident_wgs(sycl::queue& queue, int wg_size) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    try {
+        auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(queue.get_context(),
+                                                                             {queue.get_device()},
+                                                                             {sycl::get_kernel_id<KernelName>()});
+        auto kernel = bundle.get_kernel(sycl::get_kernel_id<KernelName>());
+        const size_t n = kernel.template ext_oneapi_get_info<syclex::info::kernel_queue_specific::max_num_work_groups>(
+            queue, sycl::range<3>(1, 1, static_cast<size_t>(wg_size)), 0);
+        return static_cast<int>(n);
+    } catch (const std::exception& e) {
+        // Fallback: hardware-thread arithmetic.  A work-group of `wg_size` at
+        // sub-group 32 needs `wg_size / 32` hardware threads, all on one Xe-core.
+        auto dev = queue.get_device();
+        int eu_count = 0, eu_per_ss = 0, threads_per_eu = 0;
+        try {
+            eu_count = static_cast<int>(dev.get_info<sycl::ext::intel::info::device::gpu_eu_count>());
+            eu_per_ss = static_cast<int>(dev.get_info<sycl::ext::intel::info::device::gpu_eu_count_per_subslice>());
+            threads_per_eu = static_cast<int>(dev.get_info<sycl::ext::intel::info::device::gpu_hw_threads_per_eu>());
+        } catch (...) {
+        }
+        if (eu_count <= 0 || eu_per_ss <= 0 || threads_per_eu <= 0)
+            return static_cast<int>(dev.get_info<sycl::info::device::max_compute_units>());
+        const int xe_cores = std::max(eu_count / eu_per_ss, 1);
+        const int threads_per_core = eu_per_ss * threads_per_eu;
+        const int threads_per_wg = std::max(wg_size / 32, 1);
+        return std::max(xe_cores * (threads_per_core / threads_per_wg), 1);
+    }
+}
+
+}  // namespace
+
+int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
+#ifdef DEEP_EP_ENABLE_ISHMEM
+    static std::mutex mtx;
+    static std::map<int, int> cache;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = cache.find(num_rdma_ranks);
+        if (it != cache.end()) return it->second;
+    }
+
+    const int dispatch_wg = DEEP_EP_FUSED_NUM_THREADS;
+    int dispatch_cap = 0, combine_cap = 0, combine_wg = 0;
+    switch (num_rdma_ranks) {
+        case 2:
+            combine_wg = (FusedCombineShape<2>::kForwarders + 1) * 32;
+            dispatch_cap = query_max_coresident_wgs<FusedDispatchKernel<2>>(queue, dispatch_wg);
+            combine_cap = query_max_coresident_wgs<FusedCombineKernel<2>>(queue, combine_wg);
+            break;
+        case 4:
+            combine_wg = (FusedCombineShape<4>::kForwarders + 1) * 32;
+            dispatch_cap = query_max_coresident_wgs<FusedDispatchKernel<4>>(queue, dispatch_wg);
+            combine_cap = query_max_coresident_wgs<FusedCombineKernel<4>>(queue, combine_wg);
+            break;
+        case 8:
+            // Combine is capped at 4 RDMA ranks by the BMG named-barrier limit, so
+            // only the dispatch kernel exists at R=8.
+            dispatch_cap = query_max_coresident_wgs<FusedDispatchKernel<8>>(queue, dispatch_wg);
+            combine_cap = dispatch_cap;
+            break;
+        default:
+            return 2;
+    }
+
+    int sms = std::min(dispatch_cap, combine_cap);
+
+    // EMPIRICAL SAFETY CAP.  On Arc Pro B60 (160 EU / 20 Xe-cores) the driver's own
+    // per-kernel answer is 20 work-groups for both fused kernels (1 per Xe-core), but
+    // measurement says 20 is NOT safe: at num_sms=20-24 the run still hangs, at 16 it
+    // hangs 2/8, and only at 8 is it clean (0/8, reproduced on two independent builds).
+    // So the driver bound is NECESSARY but not SUFFICIENT - something beyond raw
+    // co-residency also scales with the grid.  Until that is explained we ship the
+    // measured-safe value; `DEEP_EP_FUSED_MAX_SMS` overrides it for experiments.
+    constexpr int kEmpiricalSafeSms = 8;
+    if (sms > kEmpiricalSafeSms) sms = kEmpiricalSafeSms;
+
+    if (sms < 2) sms = 2;
+    sms -= (sms % 2);  // the grid is 2 work-groups per channel
+
+    const char* env = std::getenv("DEEP_EP_FUSED_MAX_SMS");
+    if (env != nullptr && env[0] != '\0') {
+        const int v = std::atoi(env);
+        if (v >= 2) {
+            std::fprintf(stderr,
+                         "[DeepEP] internode fused co-residency limit overridden by DEEP_EP_FUSED_MAX_SMS: "
+                         "%d (device-derived value was %d; dispatch=%d combine=%d)\n",
+                         v - (v % 2),
+                         sms,
+                         dispatch_cap,
+                         combine_cap);
+            sms = v - (v % 2);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        cache[num_rdma_ranks] = sms;
+    }
+    return sms;
+#else
+    (void)num_rdma_ranks;
+    (void)queue;
+    return 2;
 #endif
 }
 

@@ -120,6 +120,14 @@ struct SourceMeta {
 
 std::vector<uint8_t> get_unique_id();
 
+// Largest `num_sms` (work-group count) for which BOTH fused internode kernels are
+// guaranteed CO-RESIDENT on this device.  The fused kernels split every channel
+// across two work-groups that spin on each other's queue counters, so a grid the
+// device cannot co-schedule starves a producer and either hangs or silently drops
+// tokens.  Derived from the driver's per-kernel occupancy query; see the
+// definition in internode.cpp.  Always even and >= 2.
+int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue);
+
 int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode);
 
 void* alloc(size_t size, size_t alignment);

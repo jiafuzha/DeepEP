@@ -620,6 +620,34 @@ struct Buffer {
 
     int get_num_rdma_ranks() const { return num_rdma_ranks; }
 
+    // Number of channels for the FUSED internode path, clamped to what the device
+    // can co-schedule.  `Config::num_sms` is a REQUEST: the fused kernels split
+    // every channel across two work-groups that spin on each other, so a grid the
+    // device cannot hold resident starves a producer and either hangs or silently
+    // drops tokens.  See internode.cpp::fused_max_coresident_sms().
+    int fused_num_channels(const Config& config) {
+        const int requested = config.num_sms;
+        const int limit = internode::fused_max_coresident_sms(num_rdma_ranks, comm_stream.queue());
+        int sms = std::min(requested, limit);
+        if (sms < 2) sms = 2;
+        sms -= (sms % 2);
+        if (sms != requested && rank == 0) {
+            static int last_warned = -1;
+            if (last_warned != sms) {
+                last_warned = sms;
+                std::fprintf(stderr,
+                             "[DeepEP] WARNING: internode fused grid CLAMPED for work-group co-residency: "
+                             "requested num_sms=%d -> using %d (device co-resident limit). The fused kernels "
+                             "require every work-group to be simultaneously resident; an oversized grid hangs "
+                             "or silently drops tokens. Override with DEEP_EP_FUSED_MAX_SMS.\n",
+                             requested,
+                             sms);
+                std::fflush(stderr);
+            }
+        }
+        return sms / 2;
+    }
+
     int get_num_nvl_ranks() const { return num_nvl_ranks; }
 
     int get_rdma_rank() const { return global_rdma_mode ? rank : rdma_rank; }
@@ -1544,7 +1572,7 @@ struct Buffer {
         const int num_tokens = static_cast<int>(x.size(0));
         const int hidden = static_cast<int>(x.size(1));
         const int num_topk = topk_idx.has_value() ? static_cast<int>(topk_idx->size(1)) : 0;
-        const int num_channels = config.num_sms / 2;
+        const int num_channels = fused_num_channels(config);
         const int num_recv_tokens = cached_mode ? cached_num_recv_tokens : num_worst_tokens;
         const int num_rdma_recv_tokens = cached_mode ? cached_num_rdma_recv_tokens : num_worst_tokens;
         auto int_options = x.options().dtype(torch::kInt32);
@@ -1847,7 +1875,7 @@ struct Buffer {
                                     reserve_barrier_signals(3),  // base: Pack, base+1: NvlPush, base+2: Fwd
                                     rank,
                                     num_ranks,
-                                    config.num_sms / 2,
+                                    fused_num_channels(config),
                                     config.num_max_nvl_chunked_send_tokens,
                                     config.num_max_nvl_chunked_recv_tokens,
                                     comm_stream.queue());

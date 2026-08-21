@@ -29,38 +29,42 @@ inventing new ones — the patterns encode hard-won CUDA-parity and BMG-specific
 | `csrc/cuda_kernels/internode_ll.cu` | `csrc/xpu/internode_ll.cpp` | **NVSHMEM/IBGDA → iSHMEM/IBGDA** symbol map, RDMA path vs P2P-fast-path selection, GridBarrier/`ishmem_barrier_all` replacement for `cg::this_grid().sync()`, memory-ordering fences. |
 | `csrc/cuda_kernels/internode.cu` | `csrc/xpu/internode.cpp` (+ `internode_{dispatch,combine,notify}_fused.inc`) | **COMPLETE** — see §1.1. |
 
-> # ⚠️ KNOWN ISSUE — THE CURRENT DEFAULT IS NOT SAFE (2026-08-21)
+> # ✅ RESOLVED (2026-08-21) — was: "THE CURRENT DEFAULT IS NOT SAFE"
 >
-> **The fused internode-normal path — the default at HEAD — intermittently HANGS and can SILENTLY
-> DROP TOKENS at large token counts.** Do not treat this branch as green. Do not ship this default.
->
-> **Measured, controlled A/B** (identical `tests/`+harness, only `csrc/` swapped; full igub reset +
-> 4-GPU health gate before every launch; `NUM_TOKENS=2048 HIDDEN=7168`):
+> **History (do not delete — this is the hard-won rule).** The fused internode-normal path shipped as
+> the default at HEAD and intermittently HUNG and SILENTLY DROPPED TOKENS at large token counts.
+> Controlled A/B (identical `tests/`+harness, only `csrc/` swapped; full igub reset + 4-GPU health gate
+> before every launch; `NUM_TOKENS=2048 HIDDEN=7168`):
 >
 > | arm | PASS | HANG | fail rate |
 > |---|---|---|---|
-> | fused (HEAD) | 4 | 6 | **6/10 = 60%** |
+> | fused (HEAD, pre-fix) | 4 | 6 | **6/10 = 60%** |
 > | legacy (`b231f1c`) | 10 | 0 | **0/10** |
 >
-> Fisher exact one-sided **p = 0.0054** ⇒ this is a **regression introduced by the migration**, not
-> pre-existing and not run-to-run variance. See §22.
+> Fisher exact one-sided **p = 0.0054** ⇒ a regression introduced by the migration. One launch lost
+> **exactly 65 whole tokens** (zeroed rows, surviving rows bit-correct). See §21–§22.
 >
-> **Silent data loss:** one launch at 2048/7168 lost **exactly 65 whole tokens** (zeroed rows,
-> surviving rows bit-correct) — `check_data` `err_sum=-1397760` over an 826×7168 segment. Corruption
-> is rarer than hangs (~1 in 30 fused launches) and is **silent**. See §21.1.
+> **Root cause: the fused grid was not clamped to the device's work-group co-residency limit** (§23).
+> Both fused kernels split every channel across two work-groups (`channel_id = sm_id/2`,
+> `is_forwarder = sm_id%2`) that spin on each other's queue counters, so the grid only makes forward
+> progress if **every work-group is simultaneously resident**. Intel GPUs give no such guarantee and do
+> not preempt a spinning work-group.
 >
-> **The standard gate is BLIND to this.** The 64-config matrix runs at 32 tokens / hidden 1024,
-> takes 64 s, and passes 64/64 while never entering the failing regime. Any prior "64/64 PASS" claim
-> — including in §13 — is a single sample of an intermittent path and is **not** evidence of
-> correctness. Validate only at **2048+ tokens / hidden 7168** with enough repeats to beat a 60%
-> base rate, and always report `k/N`.
+> **Fix (§24): `Config::num_sms` is now a REQUEST, clamped in `Buffer::fused_num_channels()`** →
+> `internode::fused_max_coresident_sms()`, which loudly logs whenever it reduces the requested grid.
+> Post-fix, reset + health gate before every launch:
 >
-> **No gating fallback exists at HEAD.** `2e99ecc` deleted the legacy micro-kernels (3090 → 447
-> lines) and `f494d97` removed the `DEEP_EP_INTERNODE_FUSED` gate, so defaulting OFF would require
-> reverting both. Root-causing is therefore the fastest route to a safe default.
+> | regime | PASS | FAIL | N |
+> |---|---|---|---|
+> | 2048 tok / hidden 7168 | 16 | 0 | **16** |
+> | 4096 tok / hidden 7168 | 10 | 0 | **10** |
+> | 64-config matrix (32/1024) | 64/64 ×2 runs | 0 | 2 |
 >
-> **Perf numbers in §13/§14 are PROVISIONAL** — measured on the unreliable path and conditioned on
-> non-hanging runs.
+> **The 64-config matrix at its default size is blind to this class of bug** — always validate at
+> 2048+ tokens / hidden 7168 and report `k/N`.
+>
+> **⚠️ Perf cost is real and NOT a wash:** the §13 tables were measured on the unsafe, over-subscribed
+> grid. Post-clamp round-trip is ~2.8× slower at 2048/4096 tokens. See §24.3.
 
 ## 1.1 Migration status: COMPLETE (2026-08-20) — SEE KNOWN ISSUE ABOVE
 
@@ -562,13 +566,18 @@ ocloc compile -file <dump>.spv -spirv_input -device bmg
 Follow this file mechanically for every CUDA function you port; do not deviate from the
 established patterns unless a specific pattern is documented to fail in your build/HW.
 
-## 13. Measured perf after fusion (A/B baseline) — ⚠️ PROVISIONAL, measured on the unreliable path
+## 13. Measured perf after fusion (A/B baseline) — ⚠️ SUPERSEDED, measured on an UNSHIPPABLE grid
 
-> **All numbers in this section are PROVISIONAL.** They were measured on the fused default that §22
-> proves fails 6/10 at 2048 tokens / hidden 7168, so every figure here is **conditioned on the
-> surviving non-hanging runs** and each is a single sample. The "all PASS" validation referenced in
-> this section came from the 64-config matrix at 32 tokens / hidden 1024, which is proven blind to
-> the defect. Do not quote these as validated results until the regression in §21/§22 is fixed.
+> **All numbers in this section are SUPERSEDED by §24.4.** They were measured at `num_sms=24`, the
+> pre-fix default, which §22 proves fails 6/10 at 2048 tokens / hidden 7168 and which §23 shows
+> over-subscribes the device's work-group co-residency limit. Every figure here is therefore
+> **conditioned on the surviving non-hanging runs of a configuration we no longer ship**, and each is
+> a single sample. The "all PASS" validation referenced below came from the 64-config matrix at
+> 32 tokens / hidden 1024, which is proven blind to the defect.
+>
+> **Use §24.4 for current numbers.** The clamp costs ~1.7x round-trip at 2048 tokens and ~2.8x at
+> 4096 versus the table below. The fused path is still ~4.0x faster than legacy at 4096, but the
+> headline "3.1x faster" below was measured on a configuration that hangs 60% of the time.
 
 Config: 2 nodes x 2 ranks (`R=2`), BF16, `num_experts=8`, `topk=2`, `hidden=7168`,
 `ISHMEM_IBGDA_DB_BATCH_SIZE=8`. Harness `tests/docker-2node-v2`, sweep driven by
@@ -1339,3 +1348,116 @@ rate - the default-size 64-config matrix is proven blind (§22.3).
 - `tests/docker-2node-v2/run.sh`: both added to the `_add_opt_genv` whitelist (a var not on that
   whitelist is silently dropped - this has cost a whole sweep before).
 - `/tmp/corrcamp.sh`: passes both through; `TIMEOUT_SEC=300`.
+
+---
+
+## 24. THE FIX: clamp the fused grid to work-group co-residency
+
+### 24.1 What was implemented
+
+`Config::num_sms` is now a **request**, not a mandate.
+
+- `csrc/xpu/internode.cpp` → `internode::fused_max_coresident_sms(num_rdma_ranks, queue)`
+  (declared in `csrc/xpu/xpu_runtime.hpp`). Result cached per `num_rdma_ranks`.
+- `csrc/xpu/deep_ep_xpu.cpp` → `Buffer::fused_num_channels(config)`, called at BOTH internode
+  entry points (`internode_dispatch` and `internode_combine`). It **must** be the same value in
+  both: `num_channels` is baked into the shared RDMA/NVL buffer layout and into the tensors
+  dispatch hands to combine.
+- **Loud logging**: whenever the clamp actually reduces the requested grid, rank 0 prints a
+  `[DeepEP] WARNING: internode fused grid CLAMPED for work-group co-residency: requested
+  num_sms=24 -> using 8 ...` line to stderr. This bug once looked like a correctness bug; it must
+  never be silent again.
+- **Override**: `DEEP_EP_FUSED_MAX_SMS` (also logs, and prints the device-derived value it replaced).
+
+The limit is **derived, not guessed**, from the driver's own per-kernel occupancy answer:
+`kernel.ext_oneapi_get_info<syclex::info::kernel_queue_specific::max_num_work_groups>(queue, wg_size, 0)`
+on `FusedDispatchKernel<R>` (512 work-items) and `FusedCombineKernel<R>` (`(kForwarders+1)*32` = 800
+work-items at R=2), taking the min. Fallback if the query throws: Xe-core arithmetic from
+`ext::intel::info::device::gpu_eu_count / gpu_eu_count_per_subslice / gpu_hw_threads_per_eu`.
+
+### 24.2 ⚠️ The derived value is NECESSARY BUT NOT SUFFICIENT — read this before tuning
+
+On **Arc Pro B60** (`max_compute_units=160`, `gpu_eu_count=160`, `eu_per_subslice=8`,
+`hw_threads_per_eu=8`, 5 slices × 4 subslices = **20 Xe-cores**, built with
+`-ze-intel-enable-auto-large-GRF-mode`) the driver answers **20 work-groups for BOTH fused kernels**
+(`dispatch=20 combine=20`, i.e. 1 work-group per Xe-core).
+
+**But 20 is not safe.** Measured on this hardware:
+
+| `num_sms` | PASS | FAIL | N | source |
+| --- | --- | --- | --- | --- |
+| 8  | 8 | 0 | 8  | `DEEP_EP_NUM_SMS=8` |
+| 8  | 8 | 0 | 8  | `DEEP_EP_FUSED_MAX_SMS=8`, post-fix build |
+| 16 | 6 | 2 | 8  | `DEEP_EP_NUM_SMS=16` |
+| 20 | 0 | 1 | 1  | first build of the clamp, driver-derived default |
+| 24 | 4 | 6 | 10 | shipped default (pre-fix) |
+| 32 | 2 | 4 | 6  | `DEEP_EP_NUM_SMS=32` |
+
+So the driver's co-residency bound is an **upper** bound only; something beyond raw co-residency
+also scales with the grid. **This is an open question and it is recorded honestly rather than
+papered over.** Until it is explained, `fused_max_coresident_sms()` applies an explicit, commented
+`kEmpiricalSafeSms = 8` cap on top of the derived value. Candidate explanations not yet tested:
+Level Zero may not actually dispatch all "co-resident-capable" work-groups concurrently without a
+cooperative launch; the two ranks per node share a GPU-adjacent NIC/proxy; the query may not model
+SLM + named-barrier resources; or an additional per-grid resource (named barriers are a per-Xe-core
+resource) is exhausted. Note also that `DEEP_EP_NUM_SMS` changes the channel count as well as the
+grid, so the dose-response is not a pure grid-size sweep.
+
+### 24.3 Validation (post-fix, reset + 4-GPU health gate before EVERY launch)
+
+| config | PASS | CORRUPT | HANG | N |
+| --- | --- | --- | --- | --- |
+| 2048 tok / hidden 7168 | **16** | 0 | 0 | 16 |
+| 4096 tok / hidden 7168 | **10** | 0 | 0 | 10 |
+| 64-config matrix (32 tok / hidden 1024) | 64/64 × 2 runs | 0 | 0 | 2 |
+
+Against the pre-fix 60% failure rate, 16/16 clean has probability 0.4^16 ≈ 4e-7 under the null.
+The 4096 leg previously failed 3/6 (dispatch-only bench) and is now 10/10.
+
+### 24.4 Perf after the clamp — the §13 tables are SUPERSEDED
+
+The §13 numbers were measured at `num_sms=24`, i.e. on the **unsafe, over-subscribed grid we no
+longer use**. They are not merely provisional; they describe a configuration that fails 60% of the
+time. Post-clamp (`num_sms` effective = 8), hidden 7168, `num_experts=8 topk=2`, 2 nodes × 2 ranks,
+BF16, mean of the bench loop:
+
+| tokens | round-trip (µs) | dispatch iso (µs) | combine iso (µs) |
+| --- | --- | --- | --- |
+| 32   | 1 626.9  | 953.9   | 1 166.2 |
+| 512  | 14 934.7 | 2 520.5 | 12 606.6 |
+| 2048 | 53 666.7 | 7 561.9 | 45 838.7 |
+| 4096 | 103 368.1| 17 550.2| 85 719.8 |
+
+Versus the (unsafe) `num_sms=24` measurements at the same sizes — 2048: round-trip 31 313.6,
+dispatch 5 493.5, combine 25 837.1 — **the clamp costs ~1.7× on round-trip at 2048 and ~2.8× versus
+the §13 fused table at 4096.** This is a real, substantial regression and is reported as such.
+It is still the right trade: the faster number was wrong 60% of the time.
+
+Post-clamp the fused path remains **faster than the legacy phase-split** at 4096 (§13 legacy
+round-trip 414 178 µs vs 103 368 µs here, 4.0×), so the migration is still a net win — but the
+headline "fused is 3.1× faster" from §13 was measured on an unshippable configuration.
+
+### 24.5 Future work (recorded, NOT done)
+
+The clamp ties the **algorithmic** channel count to the **hardware** co-residency limit, and that
+coupling is what costs the throughput. The decoupled design: keep a co-resident number of
+work-groups and have each one **loop over multiple channels sequentially** (persistent-kernel
+style), recovering channel parallelism without ever depending on a non-resident peer. That is a real
+design change with its own hazards (per-channel state must be reset between iterations; the SLM
+window/lock/tail arrays are per-channel; the named-barrier participant counts are fixed per
+work-group) and it should not be attempted until §24.2's open question is answered — a persistent
+kernel that still needs N co-resident work-groups buys nothing.
+
+Also still open (perf, paused): the 4.7× NVL-sender copy gap (combine ~1.9 GB/s vs dispatch
+~8.9 GB/s for a structurally identical copy), §21.
+
+### 24.6 New reproducer plumbing
+
+- `DEEP_EP_FUSED_MAX_SMS` (C++ override of the derived limit) — added to the `run.sh`
+  `_add_opt_genv` whitelist and to `/tmp/corrcamp.sh`.
+- `_build_deepep_container.sh`: builds **inside** `deepep-v2-node0`. The host oneAPI is **2026.0**
+  and has no torch; the container carries **2025.3** (the version the sims run) plus torch. The
+  host-side `_build_deepep.sh` cannot build this repo any more. `ISHMEM_DIR` must be
+  `/root/jiafuzha/ishmem_ibgda/build/_install` — the other in-container copy at
+  `/root/jiafuzha/code-repo/ishmem_ibgda/build/_install` lacks `ishmemx_putmem_nbi_subgroup`,
+  `ishmemx_fence_qp` and `ishmemx_long_atomic_add_qp` and fails the device compile.
