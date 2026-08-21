@@ -41,6 +41,17 @@ SYCL_EXTERNAL inline void plain_store(T* ptr, T value) {
 
 SYCL_EXTERNAL inline void visa_spin_hint() {}
 
+// Device timestamp (SPIR-V OpReadClockKHR, CrossDevice scope). Diagnostic only:
+// used by the DEEP_EP_COMBINE_TELEMETRY build to attribute kernel time to
+// stall-vs-copy regions. Not referenced by production builds.
+inline __attribute__((always_inline)) uint64_t dev_clock() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+    return __spirv_ReadClockKHR(0);
+#else
+    return 0;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // SPMD named barrier (parity for CUDA `bar.sync <id>, <count>`).
 //

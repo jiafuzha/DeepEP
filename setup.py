@@ -209,6 +209,12 @@ if __name__ == '__main__':
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         sycl_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
+    if os.getenv('DEEP_EP_COMBINE_TELEMETRY', '0') == '1':
+        # Diagnostic-only build: per-warp-role cycle attribution inside the fused
+        # internode combine kernel (stall vs copy). Never enable for production.
+        cxx_flags.append('-DDEEP_EP_COMBINE_TELEMETRY')
+        sycl_flags.append('-DDEEP_EP_COMBINE_TELEMETRY')
+
     extra_compile_args = {
         'cxx': cxx_flags,
         'sycl': sycl_flags,
