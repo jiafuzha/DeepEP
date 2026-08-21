@@ -581,11 +581,121 @@ was already this slow before fusion — fusion did not regress it. After fusion,
 dominates: ~92% of round-trip time at 4096 tokens. This is a **pre-existing**, still
 uninvestigated bottleneck, not a fusion artifact.
 
-Suspects to investigate first in `csrc/xpu/internode_combine_fused.inc`:
-1. per-destination NamedBarrier serialization (one barrier per `dst_rdma_rank`),
-2. the serialized critical section over `dst_rdma_rank` introduced to avoid the
-   per-lane divergent-lock deadlock (see section on Xe lock-step sub-groups),
-3. forwarder spin loops,
-4. the uncached 16-byte payload store path.
+Suspects investigated (see section 14 for the resolution):
+1. per-destination NamedBarrier serialization (one barrier per `dst_rdma_rank`)
+   — **ruled out** at `R=2` (only `nb_d0`/`nb_d1` live),
+2. ~~the serialized critical section over `dst_rdma_rank`~~ — **THIS SUSPECT WAS WRONG.**
+   Combine has no such critical section: the forwarder assigns
+   `dst_rdma_rank = warp_id / Shape::kWarpsPerForwarder`, so every forwarder warp owns
+   its own destination and they run in parallel, exactly matching CUDA. The serialized
+   `dst_rdma_rank` critical section was a **dispatch** issue, not a combine one.
+3. forwarder spin loops — a **symptom**, not the cause (see 14),
+4. the uncached 16-byte payload store path — **this was the root cause.**
 
 Do **not** attribute a future combine regression to fusion without re-running this A/B.
+
+## 14. Combine root cause + fix: payload cache policy and MLP (RESOLVED)
+
+### Evidence (measure first)
+
+A build-time-gated device telemetry harness was added to
+`csrc/xpu/internode_combine_fused.inc` (`#ifdef DEEP_EP_COMBINE_TELEMETRY`, enabled with
+`DEEP_EP_COMBINE_TELEMETRY=1 python3 setup.py build_ext --inplace`; the gate lives in
+`setup.py`). It uses `dev_clock()` (`__spirv_ReadClockKHR(0)`, added to
+`csrc/xpu/xpu_kernels.hpp`) to attribute cycles per warp role into a device counter
+buffer that the host dumps after the kernel. `ReadClockKHR` is an intrinsic, not an
+outlined call, so it does **not** trip the NamedBarrier ICE.
+
+At 4096 tokens the attribution was unambiguous:
+
+| role (warps) | total cycles | wait | copy |
+|---|---|---|---|
+| NVL sender (24) | 3.59e9 | 1.3e5 (**0.004%**) | 3.55e9 (**98.7%**) |
+| forwarder (288) | 43.4e9 | 4% space + **40% tail** | 25% |
+| RDMA receiver (192) | 30.3e9 | **78%** | 22% |
+
+Per-warp totals (~150e6 cycles) / 122 ms => ~1.3 GHz, i.e. per-warp total ~= kernel wall
+time: every role is resident for the whole kernel. **The NVL sender never stalls and
+spends ~100% of the kernel inside its payload push loop** (~18 900 cycles ~= 14.5 us per
+512-byte sub-group store). The forwarder `waittail` and receiver `wait` are downstream
+consequences of that producer, not independent bottlenecks.
+
+### Root cause
+
+Combine's payload path used **fully uncached** LSC accesses — `ld_uc_global_v` /
+`st_uc_global_v` (`lsc_{load,store}.ugm.uc.uc`) — which bypass both L1 and L3, so each
+16 B/lane access is a full-latency memory transaction. Because those helpers are
+`asm volatile`, the compiler cannot software-pipeline them either, so exactly **one**
+512 B sub-group message is in flight per warp at a time.
+
+Dispatch — on the same hardware, doing the *same* operations (NVL P2P push into a peer's
+IPC buffer, RDMA staging read by the NIC) — uses `ld_nc_global_v` (`.uc.ca`, cached
+non-coherent) + `st_na_global_v` (`.wb.wb`, cached write-back) throughout
+(`internode_dispatch_fused.inc:509-511, 795-797, 945`) and reaches 10.3 GB/s NVL /
+6.3 GB/s RDMA. That is a direct in-tree A/B precedent.
+
+The header comment C5 already *claimed* payload reads went through `ld_nc_global_v` while
+the code did the opposite — the uncached accesses were an un-reverted debugging shotgun.
+
+### Why cached payload is correct
+
+Verified against the actual fence placement (do not assume this — re-verify if you move
+fences). The producer writes payload, then issues
+`sycl::atomic_fence(release, system)` + `lsc_fence_sysrel()`
+(`lsc_fence.ugm.evict.sysrel`, an L3 flush to the system domain), and only then publishes
+the tail via `uc_store`. The consumer `poll_load`s the tail, then does
+`sycl::atomic_fence(acquire, system)` + `lsc_fence_sysacq()`
+(`lsc_fence.ugm.invalidate.sysacq`) before touching payload. That release/acquire pairing
+was already present everywhere in combine (sender before the `ch_tail` store; forwarder
+per token and before `ishmemx_putmem_nbi`; receiver per token), so the uncached payload
+accesses were pure redundancy.
+
+`poll_load()` (uncached load max'd with a cached atomic load) remains **required for
+counters** — that is the split-producer bug of section 6.0 (remote IBGDA AMO lands in
+memory, local `atomic_ref::fetch_add` lands in cache) and is untouched by this work.
+
+### The fix (three changes, measured one at a time)
+
+1. NVL sender payload store `st_uc_global_v` -> `st_na_global_v`.
+2. `fused_combine_token` payload load `ld_uc_global_v` -> `ld_nc_global_v` and output
+   store `st_uc_global_v` -> `st_na_global_v`.
+3. Memory-level parallelism in the NVL sender copy:
+   `UNROLLED_GROUP_COPY(2, lane_id, 32, hidden_int4, dst, src, ld_nc_global_v, st_na_global_v)`
+   — 2 loads issued before the first store, so 2 messages are in flight per warp.
+
+Isolated combine (us), same hardware, clean between legs:
+
+| tokens | before (`a0dce51`) | +#1 | +#2 | +#3 (final) | total |
+|---|---|---|---|---|---|
+| 32 | 1230 | 1021 | 913 | 893 | 1.38x |
+| 64 | 1872 | 1544 | 1326 | 1264 | 1.48x |
+| 128 | 4935 | 3783 | 3160 | 2599 | 1.90x |
+| 512 | 17698 | 13748 | 11794 | 8672 | 2.04x |
+| 1024 | 32832 | 25296 | 20029 | 14157 | 2.32x |
+| 2048 | 64420 | 49188 | 37441 | 25906 | 2.49x |
+| 4096 | 122096 | 92206 | 68313 | 46479 | **2.63x** |
+
+Round-trip at 4096 tokens: 132588 -> 56166 us (**2.36x**). Combine RDMA BW at 4096:
+0.481 -> 1.263 GB/s (NVL send 2.065 GB/s). Dispatch is unchanged (~9300 us @ 6.3 GB/s) — the changes are
+combine-local. Correctness: full 64-config matrix `===== PASS =====`.
+
+### Rejected optimizations (do not retry blindly)
+
+- **NVL sender `UNROLLED_GROUP_COPY(4, ...)`**: faster (512 tokens 7301 us vs 8672; 1024 11994 vs 14157) but
+  **hung twice at 4096 tokens** with `dmesg` `Engine reset: engine_class=ccs` on two GPUs.
+  U=2 is the conservative safe point. The exact mechanism (spill-induced watchdog trip vs
+  P2P write-queue overrun) was not isolated.
+- **Unrolling `fused_combine_token`'s reduce loop by 2**: correctness passed but the bench
+  never completed in 2400 s with **no** engine reset in `dmesg` — a massive slowdown, i.e.
+  register spilling. The reduce loop needs `values[2][8]` + `v[2]` + `b[2]` of extra live
+  state in a kernel already built with `-ze-intel-enable-auto-large-GRF-mode`. Reverted;
+  see the "C9 (REJECTED)" comment in the `.inc`.
+
+**Register pressure is the hard ceiling on further unrolling in this kernel.** Unroll the
+straight copy (no accumulators), never the reduce.
+
+### Not verified
+
+- `R=4` is compile-validated only (the harness is 2 nodes x 2 GPUs).
+- The residual forwarder `waittail` / receiver `wait` fractions were not re-profiled after
+  the fix; the remaining ~5x gap vs dispatch is still open.
