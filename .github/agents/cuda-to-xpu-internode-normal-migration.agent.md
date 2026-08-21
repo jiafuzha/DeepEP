@@ -699,3 +699,93 @@ straight copy (no accumulators), never the reduce.
 - `R=4` is compile-validated only (the harness is 2 nodes x 2 GPUs).
 - The residual forwarder `waittail` / receiver `wait` fractions were not re-profiled after
   the fix; the remaining ~5x gap vs dispatch is still open.
+
+## 15. Line-by-line logic diff: XPU combine vs CUDA combine
+
+Full audit of `csrc/xpu/internode_combine_fused.inc` against
+`csrc/cuda_kernels/internode.cu` `combine` (L1716-2277) plus the host path
+(`csrc/xpu/internode.cpp` `combine_nvl_rdma`, `csrc/xpu/xpu_runtime.hpp` `Config`,
+`tests/test_internode.py:231`). Motivation: rule out a semantic/algorithmic
+divergence as the cause of the flat combine bandwidth. **Result: no algorithmic
+divergence found. Every sizing, partitioning and cadence parameter is bit-identical
+to CUDA.** The differences that do exist are all memory-model / platform mappings.
+
+### 15.1 Sizing and partitioning: VERIFIED EQUIVALENT
+
+| # | CUDA | XPU | Consequence | Verdict |
+|---|---|---|---|---|
+| 1 | `Config(num_sms, nvl_send, nvl_recv, rdma_send, rdma_recv)` from `test_internode.py:231` = `(24, 8, 512, 16, 128)` | identical struct in `xpu_runtime.hpp:53`, same `align_up(rdma_recv, rdma_send)` normalisation and the same 4 `TORCH_CHECK`s | none | equivalent |
+| 2 | `num_channels = gridDim.x / 2`, grid `= num_channels * 2` | `num_sms = num_channels * 2`, `channel_id = sm_id / 2`, `is_forwarder_sm = sm_id % 2` | none | equivalent |
+| 3 | `kNumCombineForwarderWarps = 24` (:2307) | `DEEP_EP_COMBINE_FWD_WARPS 24` | none | equivalent |
+| 4 | `kNumWarpsPerForwarder = max(24/R,1)`, `kNumForwarders = R*that`, `kNumRDMAReceivers = kNumForwarders - 8` (:1713-1715) | `FusedCombineShape` with the identical three expressions | at R=2: 12/24/16 both sides | equivalent |
+| 5 | block `= (kNumForwarders+1)*32` = 800 | same | none | equivalent |
+| 6 | `get_num_bytes_per_token(hidden_int4,0,0,num_topk)` (:42) | `fused_combine_num_bytes_per_token` = same `align_up(hidden_int4*16 + sizeof(SourceMeta) + num_topk*4, 16)` | no padding inflation | equivalent |
+| 7 | `num_max_nvl_chunked_recv_tokens_per_rdma = nvl_recv / kNumRDMARanks` (:1781) | identical | 256 slots both | equivalent |
+| 8 | sender chunk `min(num_max_nvl_chunked_send_tokens, end-start)` = 8 tokens (:1877) | identical | equivalent chunk size | equivalent |
+| 9 | forwarder chunk loop `token_start_idx += num_max_rdma_chunked_send_tokens` = 16 tokens; RDMA msg = `num_chunked_tokens * num_bytes_per_token` (~229 KB) (:2009/:2117) | identical | RDMA ops are NOT undersized | equivalent |
+| 10 | forwarder sub-warp stride `token_idx += kNumWarpsPerForwarder` (:2044) | `+= Shape::kWarpsPerForwarder` | equivalent | equivalent |
+| 11 | receiver stride `token_idx += kNumRDMAReceivers` (:2004) | `+= Shape::kRDMAReceivers` | equivalent | equivalent |
+| 12 | payload lane stride `i += 32` in `combine_token` | same | equivalent | equivalent |
+| 13 | `dst_rdma_rank = warp_id / kNumWarpsPerForwarder` | same | **each forwarder warp owns its own destination; there is NO serialized critical section** (section 13's suspect #2 was wrong) | equivalent |
+| 14 | warp-role shuffle `(warp_id + channel_id) % N` | same for both sender and forwarder | equivalent | equivalent |
+| 15 | `get_channel_task_range` = `ceil_div` + two `min`s (`utils.cuh:434`) | identical (`xpu_kernels.hpp:326`) | equivalent | equivalent |
+| 16 | head-release cadence: coordinator RDMA head AMO only when `min_head >= last + num_max_rdma_chunked_send_tokens`; NVL head store whenever `min_head > last` | identical predicates | credit-release cadence matches | equivalent |
+| 17 | tail publish cadence: sender publishes `ch_tail` once per outer chunk iteration; forwarder AMOs the RDMA tail once per 16-token chunk | identical | equivalent | equivalent |
+
+### 15.2 Divergences (all memory-model / platform, none algorithmic)
+
+| # | CUDA does | XPU does | Perf consequence | Verdict |
+|---|---|---|---|---|
+| D1 | multi-stage async TMA (`kNumStages=2`, `mbarrier`) for both sender and forwarder payload | lane-strided 16 B LSC copies (conversion note C1), now 2-way unrolled in the sender | **the real cost**: only 2 messages in flight per warp vs TMA's decoupled pipeline. Unroll 4 was faster but caused `ccs` engine resets | **divergent, dominant, partially mitigated** |
+| D2 | one TMA store publishes the whole token (payload + SourceMeta + topk weights) | three separate stores: 896x16 B payload, 1 SourceMeta, `num_topk` scalars | more messages per token | divergent, measured **null** (see 15.3 C12) |
+| D3 | `ld_acquire_sys_global` for queue counters (an L2 hit) | `poll_load` = uncached LSC load **+** system-scope acquire atomic (2 memory transactions) | required by the split-producer bug (section 6.0); doubles spin cost | divergent, **necessary** |
+| D4 | acquire *load* orders one thread; no cache maintenance | `atomic_fence(acquire,system)` + `lsc_fence.ugm.invalidate.sysacq` per token in forwarder and receiver | a full L1/L3 invalidate per token that CUDA never performs | divergent, measured **null** (15.3 C10) |
+| D5 | `__nanosleep(NUM_WAIT_NANOSECONDS)` (500 ns) at the end of every coordinator iteration (:2278) | no backoff anywhere | unthrottled polling shares the work-group (= one Xe-core) with the copying warps | divergent, measured **null** (15.3 C11) |
+| D6 | `st_relaxed_sys_global` for the NVL head credit | `uc_store` + `atomic_fence(release,system)` + `lsc_fence.ugm.evict.sysrel`, inside the `for i < R` loop | an L3 evict per head update where CUDA has none; coordinator-only, off the critical path | divergent, harmless (untested) |
+| D7 | `clock64()` timeout + `trap()` | bounded spins (`kFusedSpinCap = 2e8`), `break` on overrun | a wedge degrades to wrong results instead of a trap; the coordinator's counter is cumulative for the whole kernel, not per wait | divergent, correctness-visibility only |
+| D8 | `volatile __shared__` for `forwarder_nvl_head` / `retired` | `sycl::atomic_ref<work_group, acq_rel>` on SLM | slightly heavier SLM ops in the coordinator scan | divergent, harmless |
+| D9 | 9 barriers usable (`kNumRDMARanks + 2 <= 16`) | 8 named barriers max on BMG; `nb_d4..nb_d7` aliased to `nb_d0`, R capped at 4 | none at R<=4; blocks R=8 | divergent, documented limit |
+| D10 | `bfloat16` HW convert instructions | inline RNE bit manipulation (note C7) | avoids the vISA stack-call ICE; a few ALU ops per element | divergent, required |
+| D11 | `cached_notify` launched async on the same stream | `queue.wait()` + `ishmem_barrier_all()` **twice** around clean/notify | two host-side 4-PE collectives per combine call; a fixed cost, significant only at small token counts (combine at 32 tokens is 893 us total) | divergent, dispatch does the same, not size-scaling |
+
+### 15.3 Follow-up experiments after the section-14 fix: three consecutive NULL results
+
+Each built and measured separately on freshly-reset hardware. Noise band established
+by re-running the unchanged committed build: combine(iso) @512 tokens
+= 8672 / 8642 us, @1024 = 14157 / 14240 us, i.e. **+/-1.3%**.
+
+| id | change | 512 tok | 1024 tok | verdict |
+|---|---|---|---|---|
+| — | committed baseline (section 14) | 8672 / 8642 | 14157 / 14240 | reference |
+| C10 | issue the acquire fence + `lsc_fence_sysacq` only when the tail was actually re-read (D4) | 8630 | (leg hung) | **null**, reverted |
+| C11 | restore CUDA's `__nanosleep` as `dev_backoff()` in the coordinator + throttle the forwarder/receiver poll loops (D5) | 8562 | (leg hung) | **null**, reverted |
+| C12 | sender's topk-weight `uc_store` -> plain cached store (D2) | 8646 | 14207 | **null**, reverted |
+
+All three are inside the noise band. C10 and C11 each saw the 1024-token leg hang
+(rc=124) at the same point; the restored baseline then passed the same leg, so the
+hangs are the usual accumulated-HW flakiness, not the changes — but neither change
+earned the risk.
+
+### 15.4 Conclusion
+
+The flat-then-fixed combine bandwidth was **entirely** a memory-hint problem
+(section 14), not a semantic one. After that fix the residual gap is D1: the sender
+warps push 16 B/lane with only 2 messages in flight, where CUDA overlaps a
+multi-stage TMA pipeline. Evidence that this — and not waiting — is what is left:
+
+- telemetry: NVL sender warps stall **0.004%** of their cycles and copy **98.7%**;
+- the three "stall-side" fixes above (fence frequency, poll throttling) moved nothing;
+- removing residual uncached scalar stores moved nothing;
+- the win that *did* land (2.63x) came entirely from cache policy + 2-way unroll,
+  i.e. from making each message cheaper and doubling the messages in flight.
+
+Next avenue, in order of expected value:
+1. more messages in flight per sender warp without more registers — wider LSC
+   messages (e.g. 32 B/lane `d32x8`) rather than deeper unrolling, since unroll 4
+   destabilised the GPU while unroll 2 was a clean 1.3-1.5x;
+2. more sender warps: at `num_nvl_ranks=2` six of the eight NVL-sender warps exit
+   immediately (`dst_nvl_rank >= num_nvl_ranks`), so only 2 warps per even SM do all
+   the NVL payload work. Splitting each destination across a "large warp" of idle
+   sender warps (as the forwarder already does for RDMA destinations) would give up
+   to 4x more copy parallelism. Needs care: the queue-slot bookkeeping is currently
+   per-warp, and the named-barrier budget is 8.
