@@ -1039,3 +1039,59 @@ Both classes are diagnosable in ~2 min with a 300 s budget. Neither justified a 
 
 Always run a production leg as: reset → 4-GPU health gate → `TIMEOUT_SEC=300`. If it exceeds that,
 treat it as a hardware wedge (golden rule 4), not as a measurement.
+
+## §20. Where the 68 s actually goes — only ~3.5 s is measurement, and there is a REAL intermittent hang
+
+Challenged on "it should not take so long", I instrumented the harness (wall-clock stamps on every log
+line) and my own driver copy (`tests/perf_combine_chunk.py`). Measured phase budget of a healthy
+4096-token run:
+
+| phase | wall clock |
+|---|---|
+| driver load, NIC gate, MPI/container start, buffer create | 13 s |
+| `[layout]` bench | 2 s |
+| **test-side dispatch + `check_data` region (pre-combine)** | **43.6 s** |
+| `buffer.combine()` kernel call | **0.10 s** |
+| validation math (`calc_diff`, per-token err, asserts) | **0.12 s** |
+| `DEEP_EP_PERF` benches (round_trip + dispatch + combine, 30 iters each) | ~3.4 s |
+| teardown | ~6 s |
+
+**Only ~3.5 s of the 68 s is actual measurement.** The single dominant cost (43.6 s, 64%) is the test's
+own dispatch + `check_data` section at 4096 tokens — 8192×7168 reductions, per-rank `.item()`
+synchronisations, and dtype conversions. It is **test overhead, not kernel time**: the combine kernel
+call itself is 0.10 s and the validation math 0.12 s.
+
+Two hypotheses I formed and **disproved** by measurement: that the cost was `calc_diff`'s
+double-precision 470 MB reductions (it is 0.115 s), and that it was the combine kernel (0.10 s). What
+remains unlocalised inside the 43.6 s is the dispatch test + `check_data` loop specifically; I did not
+narrow further.
+
+### 20.1 `DEEP_EP_PERF_TOKENS` runs are NOT the 64-config matrix — my "PASS" claims were weaker than stated
+
+`test_internode.py:633`: `DEEP_EP_PERF_TOKENS` does `os.environ.setdefault('DEEP_EP_MIN', '1')`, which
+shrinks the 32-combination sweep to ONE deterministic sanity config. So every perf run in §17/§18 emits
+exactly **2 `passed` lines (one config, printed by both node-local rank 0s), not 64**. Those runs are a
+sanity gate, not full validation. The genuine 64-config matrix was run separately at `c0f322c`.
+
+### 20.2 A real intermittent hang in the perf-bench phase — do NOT keep filing this as "HW wedge"
+
+Across four consecutive runs of the *identical* command on **freshly igub-reset, health-gated** hardware
+with an unchanged `.so`: **PASS (68 s), HANG, HANG, PASS (68 s)**. All hangs occur *after* the
+correctness config prints ` passed`, i.e. inside the `DEEP_EP_PERF` bench loop at 4096 tokens
+(round_trip / dispatch / combine, 30 iterations each).
+
+This materially weakens the golden-rule-4 "accumulated hardware wedge" attribution I had been applying:
+a reset immediately preceding the run does not prevent it, and a healthy run can directly follow a hung
+one. **~50% failure rate at 4096 tokens is a real robustness problem in the measured path and should be
+treated as a live suspect (code or iSHMEM), not written off as environmental.** It also means every
+perf number in §17/§18 came from the surviving ~50% of runs — the numbers are reproducible and mutually
+consistent, but they are conditioned on non-hanging runs.
+
+### 20.3 Consequence for the tolerance question
+
+`test_internode.py:428-431` applies an XPU-only tolerance `tol = max(5e-6, 6e-4 * scale)` with
+`scale = max(1, (num_tokens/32)**2)` — at N=32 that is 6e-4 vs CUDA's 5e-6 (~120× looser), and it grows
+quadratically, so at large N the `x_diff` check is effectively vacuous. The per-token `[x ALSO WRONG]`
+prints (errs 0.0078/0.0156 = 1-2 BF16 ULPs) appear in **passing** runs too and are diagnostics, not
+failures. This is **pre-existing** and out of scope (the file must stay byte-identical), but it means the
+x-correctness gate is much weaker on XPU than the CUDA reference and should not be leaned on.

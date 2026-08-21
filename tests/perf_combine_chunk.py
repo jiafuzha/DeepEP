@@ -228,6 +228,7 @@ def test_main(args: argparse.Namespace,
 
     # Config
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
+    _t_cfg0 = time.time()
     _rcs = int(os.getenv('DEEP_EP_RDMA_CHUNK', '16'))
     if local_rank == 0:
         print(f'[chunk-probe] rdma_chunk_size={_rcs}', flush=True)
@@ -406,8 +407,12 @@ def test_main(args: argparse.Namespace,
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
                         combine_args.update({'previous_event': buffer.capture()})
+                    print(f'[PHASE rank={rank}] pre_combine_elapsed={time.time()-_t_cfg0:.3f}s', flush=True) if local_rank==0 else None
+                    _t_cmb0 = time.time()
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
+                    torch.xpu.synchronize() if device_type == 'xpu' else None
+                    _t_cmb1 = time.time()
                     check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if is_rand else x
                     x_diff = calc_diff(check_x, ref_x)
@@ -432,6 +437,10 @@ def test_main(args: argparse.Namespace,
                         scale = max(1.0, (num_tokens / 32.0) ** 2)
                         tol = 5e-4 * (num_tokens / 32.0) if current_x is x_pure_rand_e4m3 else max(5e-6, 6e-4 * scale)
                         assert x_diff < tol, f'x_diff={x_diff:.6e} > {tol:.6e} on rank={rank}'
+                        if local_rank == 0:
+                            torch.xpu.synchronize()
+                            print(f'[PHASE rank={rank}] combine_call={_t_cmb1-_t_cmb0:.3f}s '
+                                  f'validation_math={time.time()-_t_cmb1:.3f}s', flush=True)
                     else:
                         assert x_diff < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
                     if with_topk:
