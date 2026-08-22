@@ -1,19 +1,30 @@
-> # ✅ RESOLVED (2026-08-21) — fused internode-normal default is now clamped for co-residency
+> # ✅ RESOLVED (2026-08-22) — cause is per-QP contention; fixed with ONE IBGDA QP PER CHANNEL
 >
 > **History (keep — this is a first-class rule for every fused/warp-specialized port).** The fused,
 > NamedBarrier warp-specialized internode-normal kernels documented here were the default at HEAD and
 > intermittently HUNG and SILENTLY DROPPED TOKENS (fused 6/10 fail vs legacy `b231f1c` 0/10 at
 > 2048 tok / hidden 7168, Fisher p = 0.0054; one launch lost exactly 65 whole tokens).
 >
-> **RULE: a fused kernel whose work-groups spin on each other MUST clamp its grid to the device's
-> work-group co-residency limit.** These kernels split every channel across two work-groups
-> (`channel_id = sm_id/2`, `is_forwarder = sm_id%2`) that spin on each other's queue counters. Intel
-> GPUs do not guarantee co-residency and do not preempt a spinning work-group, so an over-sized grid
-> starves a producer: hang, or a `kFusedSpinCap` break that silently drops whole tokens.
-> `csrc/xpu/internode_ll.cpp::ll_put_wgs()` states the same rule for the LL put grid.
+> **RULE (corrected 2026-08-22): give every channel its OWN IBGDA QP.** The first fix clamped the
+> grid for work-group co-residency, and it worked — but for the wrong reason. Three experiments
+> (playbook §24.2.1) showed co-residency is NOT the mechanism: 24-27 work-groups at 4 channels is
+> 13/13 clean even when residency is denied for 3x `kFusedSpinCap`; a standalone probe co-schedules
+> 128/128 work-groups of 512 WI; and at the SAME grid of 24, `QPS_PER_PE=16` is 6/6 clean while the
+> old `QPS_PER_PE=1` is 2/6 (Fisher p = 0.030). With one QP per PE every channel's RDMA sender drives
+> the same send queue; the failure appears at ~12 channels/QP (6/QP and 4/QP are clean). The grid
+> clamp only helped because fewer channels means fewer sharers.
 >
-> Fixed by `internode::fused_max_coresident_sms()` (`csrc/xpu/internode.cpp`) +
-> `Buffer::fused_num_channels()`; post-fix 16/16 at 2048/7168, 10/10 at 4096/7168, 64/64 matrix.
+> Fixed by `deep_ep/buffer.py` (normal-internode branch now sets `ISHMEM_IBGDA_QPS_PER_PE` =
+> `clamp_pow2(num_qps_per_rank)` = 16, `setdefault`; the LL branch keeps C=1) plus a QP-aware
+> `internode::fused_max_coresident_sms()`. Shipped default: num_sms=20 / 10 channels / 16 QPs —
+> **16/16 at 2048/7168, 8/8 at 4096/7168, 64/64 matrix**, and 2.33x FASTER at 2048 tokens than the
+> grid clamp it replaces (23.1 ms vs 53.7 ms round-trip).
+>
+> These kernels still split every channel across two work-groups (`channel_id = sm_id/2`,
+> `is_forwarder = sm_id%2`) that spin on each other's queue counters, and `kFusedSpinCap` still
+> `break`s rather than hangs — so a starved producer can still surface as silently dropped tokens.
+> `csrc/xpu/internode_ll.cpp::ll_put_wgs()` documents the co-residency rule for the LL put grid; it
+> is a real constraint there, it just was not this bug.
 >
 > The 64-config matrix at its default size (32 tokens / hidden 1024) is **blind** to this class of bug.
 > Validate only at 2048+ tokens / hidden 7168 and report `k/N`.
