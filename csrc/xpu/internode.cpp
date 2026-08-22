@@ -505,6 +505,20 @@ int query_max_coresident_wgs(sycl::queue& queue, int wg_size) {
 
 }  // namespace
 
+namespace {
+// ISHMEM_IBGDA_QPS_PER_PE as iSHMEM interprets it: rounded up to a power of two and
+// clamped to [1, 16].  deep_ep/buffer.py sets this env BEFORE the Buffer is created.
+inline int fused_qps_per_pe_env() {
+    const char* e = std::getenv("ISHMEM_IBGDA_QPS_PER_PE");
+    int v = (e != nullptr && e[0] != '\0') ? std::atoi(e) : 1;
+    if (v < 1) v = 1;
+    if (v > 16) v = 16;
+    int p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+}  // namespace
+
 int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     static std::mutex mtx;
@@ -547,8 +561,20 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     // So the driver bound is NECESSARY but not SUFFICIENT - something beyond raw
     // co-residency also scales with the grid.  Until that is explained we ship the
     // measured-safe value; `DEEP_EP_FUSED_MAX_SMS` overrides it for experiments.
-    constexpr int kEmpiricalSafeSms = 8;
-    if (sms > kEmpiricalSafeSms) sms = kEmpiricalSafeSms;
+    //
+    // 2026-08 UPDATE (see playbook 24.2.1): the mechanism is NOT co-residency, it is
+    // per-QP contention inside iSHMEM.  With ISHMEM_IBGDA_QPS_PER_PE=1 EVERY channel's
+    // RDMA sender drives the SAME QP, and the failure appears once ~12 channels share
+    // one QP (4/6 hangs) while 6 channels/QP (6/6) and 4 channels/QP (16/16) are clean.
+    // Give each channel its own QP and the previously-failing grid is clean:
+    // num_sms=24 + QPS_PER_PE=16 measured 16/16 @2048 tok and 8/8 @4096 tok, hidden 7168.
+    // So the grid cap is only needed when channels must SHARE queue pairs.
+    constexpr int kEmpiricalSafeSms = 8;         // safe when many channels share one QP
+    constexpr int kSafeChannelsPerQp = 2;        // validated: 1 ch/QP clean, 6 ch/QP clean
+    const int qps_per_pe = fused_qps_per_pe_env();
+    const int qp_safe_sms = 2 * kSafeChannelsPerQp * qps_per_pe;  // grid = 2 WGs per channel
+    const int safe_sms = std::max(kEmpiricalSafeSms, qp_safe_sms);
+    if (sms > safe_sms) sms = safe_sms;
 
     if (sms < 2) sms = 2;
     sms -= (sms % 2);  // the grid is 2 work-groups per channel

@@ -288,7 +288,23 @@ class Buffer:
             # to a single flag per destination. setdefault => an explicit user/harness
             # ISHMEM_IBGDA_QPS_PER_PE always wins, so multi-QP striping stays available for
             # stacks where the NIC is the bottleneck rather than the round-trip latency.
-            os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', '1')
+            #
+            # 2026-08 CORRECTNESS OVERRIDE (this branch only - the low-latency branch above
+            # is untouched, C=1 stays load-bearing there).  The C=1 study above is a PERF
+            # study and it is still valid on perf; but C=1 is NOT SAFE for the fused
+            # internode-normal kernels.  With one QP per PE every channel's RDMA sender
+            # drives the SAME send queue, and once ~12 channels share it the run
+            # intermittently hangs / silently drops whole tokens (measured 4/6 hangs at
+            # num_sms=24, 2048 tok, hidden 7168; 6 channels/QP 0/6; 4 channels/QP 0/16).
+            # One QP per channel removes it: num_sms=24 + QPS_PER_PE=16 is 16/16 @2048 and
+            # 8/8 @4096 (hidden 7168) against a ~60% base failure rate, AND it is faster
+            # (round-trip 30.6 ms vs the grid-clamped 53.7 ms at 2048 tok) because the
+            # clamp that C=1 forces costs far more than the extra per-QP flags.
+            # See .github/agents/cuda-to-xpu-internode-normal-migration.agent.md 24.2.1.
+            # `setdefault` semantics preserved: an explicit user/harness value still wins.
+            qpp = max(1, min(int(num_qps_per_rank), 16))
+            qpp = 1 << (qpp - 1).bit_length() if qpp > 1 else 1
+            os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
         # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a

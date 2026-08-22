@@ -1458,6 +1458,75 @@ Fisher exact, same build, one-sided **p = 0.030**; pooled with the pre-fix 6/10 
    before the default changes, and `buffer.py` is out of scope for this workstream (the QP count is
    set there).
 
+### 24.2.2 Falsified: the iSHMEM leader-gate chain is NOT the deadlock
+
+The natural follow-on hypothesis was iSHMEM's **ordered-commit gate**: slots are claimed with
+`fetch_add` on `nic_wq_cnt`, then the claimer spins `while (commit != base)` — **uncapped, strict
+equality** (`ibgda_device_impl.h` put_nbi_warp ~:2250 and `emit_direct_wqe_skeleton` ~:905), plus an
+uncapped SQ-wrap CQ-backpressure spin in `rdma_atomic64` (~:2481). With one shared QP the producer
+holding `base-1` is a **different work-group**, so this is a cross-work-group forward-progress
+dependency. Both mechanism and the fit to the data are real — but it is **not what hangs**:
+
+| build (num_sms=24, QPS=1, 2048 tok / 7168) | PASS | HANG | N |
+| --- | --- | --- | --- |
+| production | 2 | 4 | 6 |
+| + gate diagnostics (print after 20M spin iters) | 3 | 3 | 6 |
+| + gate diagnostics **and BREAK** after 50M iters at all three spins | 3 | 3 | 6 |
+
+Breaking every uncapped SQ spin leaves the hang rate unchanged. **Positive control:** rebuilt with
+the threshold at 1 000 iterations, a single passing run emitted **360** `[IBGDA-GATE-STUCK]` lines
+(`base=586 commit=582 nwqes=4` …) — so the instrumentation, the device `printf` and the gate spin
+itself all work, and under normal contention the gate never exceeds ~50M iterations.
+**Caveat, stated plainly:** device `printf` is flushed at kernel completion, so a hanging kernel's
+messages are lost; the break arm is what carries the weight (if the gate held the deadlock,
+releasing it would let the kernel finish). Residual possibility: an out-of-order publish caused by
+the break could produce a *downstream* NIC-error hang that masks the rescue. To fully close that
+would need hang-time host-visible state (USM marker) or `gdb-oneapi`, not `printf`.
+
+The instrumentation was reverted; `libishmem.a` is back to the canonical archive
+(`build/_install/lib/libishmem.a:1787231137000000000:29716510`, barrier `.cpp.o` md5
+`13e1f807bddaaa3099d1d62bde881393`). So the *mechanism* of per-QP contention is established by the
+QP A/B, but the precise stall site inside iSHMEM is **still open**.
+
+### 24.2.3 THE FIX: one QP per channel — correctness AND throughput
+
+`deep_ep/buffer.py` no longer pins `ISHMEM_IBGDA_QPS_PER_PE=1` on the **normal-internode branch**
+(the low-latency branch is untouched — C=1 stays load-bearing there). It now uses the same
+`clamp_pow2(num_qps_per_rank)` rule as the LL branch (24 → 16), still via `setdefault` so an
+explicit user/harness value wins. `internode.cpp::fused_max_coresident_sms()` became QP-aware:
+the grid cap is `max(kEmpiricalSafeSms=8, 2 * kSafeChannelsPerQp(=2) * qps_per_pe)`, still capped by
+the driver's co-residency answer — so with 16 QPs the requested grid is no longer cut to 8, and with
+QPS=1 the old safe 8 is preserved. Shipped default is now **num_sms=20 (10 channels), QPS=16**.
+
+**Validation of the SHIPPED default** (reset + 4-GPU health gate before every launch):
+
+| config | PASS | CORRUPT | HANG | N |
+| --- | --- | --- | --- | --- |
+| 2048 tok / hidden 7168 | **16** | 0 | 0 | 16 |
+| 4096 tok / hidden 7168 | **8** | 0 | 0 | 8 |
+| 64-config matrix (32 tok / 1024) | 64/64 | 0 | 0 | 1 |
+
+Plus, before the default flip, at `FUSED_MAX_SMS=24` + `QPS=16`: **16/16 @2048, 8/8 @4096**.
+Against the ~60% base failure rate, 16/16 has p ≈ 4e-7.
+
+**Perf — the clamp regression is not just recovered, it is beaten** (hidden 7168, round-trip µs):
+
+| tokens | clamped num_sms=8, QPS=1 (24.4) | **new default (20 / QPS=16)** | speedup |
+| --- | --- | --- | --- |
+| 32 | 1 626.9 | **1 487.3** | 1.09x |
+| 512 | 14 934.7 | **8 083.9** | 1.85x |
+| 2048 | 53 666.7 | **23 053.5** | 2.33x |
+| 4096 | 103 368.1 | **42 753.7** | 2.42x |
+
+At 2048 this is also **1.36x faster than the old UNSAFE `num_sms=24`, QPS=1 configuration**
+(31 313.6 µs) that the §13 tables were measured on — so correctness and throughput moved the same
+way. Dispatch iso at 4096 is 7 960 µs (7.38 GB/s RDMA send, 12.06 GB/s NVL recv).
+
+**Rule for the playbook:** on this stack a fused/warp-specialized internode kernel needs **one
+IBGDA QP per channel**. Channels sharing a QP is a correctness hazard whose onset is ~12 channels
+per QP (6/QP and 4/QP measured clean), not merely a perf knob. Prefer raising `QPS_PER_PE` over
+shrinking the grid — shrinking the grid costs 2.3x throughput to buy the same safety.
+
 ### 24.3 Validation (post-fix, reset + 4-GPU health gate before EVERY launch)
 
 | config | PASS | CORRUPT | HANG | N |

@@ -636,10 +636,10 @@ struct Buffer {
             if (last_warned != sms) {
                 last_warned = sms;
                 std::fprintf(stderr,
-                             "[DeepEP] WARNING: internode fused grid CLAMPED for work-group co-residency: "
-                             "requested num_sms=%d -> using %d (device co-resident limit). The fused kernels "
-                             "require every work-group to be simultaneously resident; an oversized grid hangs "
-                             "or silently drops tokens. Override with DEEP_EP_FUSED_MAX_SMS.\n",
+                             "[DeepEP] WARNING: internode fused grid CLAMPED: requested num_sms=%d -> using %d. "
+                             "Too many channels would share one IBGDA QP, which intermittently hangs or silently "
+                             "drops tokens (playbook 24.2.1). Raise ISHMEM_IBGDA_QPS_PER_PE (one QP per channel "
+                             "removes the clamp entirely) or override with DEEP_EP_FUSED_MAX_SMS.\n",
                              requested,
                              sms);
                 std::fflush(stderr);
