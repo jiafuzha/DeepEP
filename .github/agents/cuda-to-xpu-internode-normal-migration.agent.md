@@ -1762,3 +1762,63 @@ outside that. Anything that stalls >10 min at one config is a genuine hang, not 
   shorter than the workload.
 - `run.sh` forwards env only via the explicit `_add_opt_genv` whitelist — a new debug var silently
   does nothing until it is added there (bitten 4×).
+
+---
+
+## 26. AUTHORITATIVE PERF RE-BASELINE (post-§25) — §13 / §24.4 are both SUPERSEDED
+
+Measured 2026-08-22 on the shipped default (20 SMs / 10 channels / `QPS_PER_PE=16`) **after** the
+padded-`x` fix (`5a7d53f`). Every earlier perf table in this document predates either the QP
+default flip or that fix — and combine was previously pushing ~710 **pad rows** per block, so those
+combine numbers measured inflated traffic. Use ONLY the table below.
+
+Harness: `tests/docker-2node-v2`, perf mode, hidden 7168, `num_experts=8`, `topk=2`,
+2 nodes × 2 ranks, BF16, reset + clean state between runs. Values are rank 0; ranks agree to <1%.
+
+| tokens | dispatch iso (µs) | combine iso (µs) | **combine/dispatch** | disp nvl_recv | comb nvl_send | disp rdma_send | comb rdma_recv |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 32   | 968   | 865    | **0.89** | 0.74 | 0.83 | 0.47 | 0.53 |
+| 64   | 1 083 | 1 149  | 1.06 | 1.46 | 1.37 | 0.85 | 0.80 |
+| 128  | 1 220 | 2 219  | 1.82 | 2.47 | 1.35 | 1.51 | 0.83 |
+| 512  | 2 220 | 6 880  | 3.10 | 5.30 | 1.72 | 3.30 | 1.07 |
+| 1024 | 3 050 | 12 850 | 4.21 | 7.95 | 1.89 | 4.81 | 1.14 |
+| 2048 | 4 466 | 22 850 | 5.12 | 10.85 | 2.12 | 6.57 | 1.28 |
+| 4096 | 7 968 | 41 900 | **5.26** | 12.31 | 2.34 | 7.37 | 1.40 |
+
+(bandwidths in GB/s; round-trip at 4096 is 47 588 µs.)
+
+### 26.1 What the shape of this curve rules OUT
+
+**The framing "the NVL sender peer-IPC copy is slow" is WRONG and should be retired.** Combine is
+degraded by the same ~5.3x on *both* legs at identical byte counts — `nvl_send` 2.34 vs dispatch
+`nvl_recv` 12.31, **and** `rdma_recv` 1.40 vs dispatch `rdma_send` 7.37. A defective peer-IPC copy
+loop cannot explain the RDMA leg. Look for a **common upstream serializer**.
+
+**It is a scaling ceiling, not fixed overhead.** At 32 tokens combine is *faster* than dispatch
+(0.89x); the ratio then climbs monotonically and saturates ~5.2x. Combine's bandwidth **plateaus
+at ~2.3 GB/s NVL / ~1.4 GB/s RDMA** while dispatch keeps climbing. Something in combine stops
+scaling once the pipeline is full — a per-token serialization, a fixed-width stage, or a queue
+depth too shallow to hide latency.
+
+Consistent with the existing telemetry at 4096: **`FwdWaitTail` 34.32% + 2nd barrier 29.52% = 64%**
+of forwarder time is wait/barrier, while `FwdCopy` is only 25.93% and `FwdSend` 0.84%. The copy is
+not where the time goes.
+
+### 26.2 Copy-loop hypotheses already FALSIFIED — do not re-open without new evidence
+
+- **Unroll factor.** `internode_combine_fused.inc:552` uses `UNROLLED_GROUP_COPY(2, ...)` while its
+  own C9 comment claims x4 (stale comment, worth fixing for hygiene). Irrelevant to perf:
+  **dispatch uses no unroll at all** — a plain lane-strided loop at
+  `internode_dispatch_fused.inc:823-825` — and is 5x faster.
+- **Per-token `sycl::group_barrier(sg)` inside the copy loop** (`:558`). **Dispatch has the
+  identical barrier** at `:826`. Not the gap.
+- **Cache hints.** Both use `ld_nc_global_v` / `st_na_global_v`. Closed earlier.
+
+### 26.3 Where to look next
+1. What `FwdWaitTail` actually waits on, and whether the producer is the true limiter.
+2. Which barrier the 29.5% is, and whether combine has a sync dispatch lacks.
+3. Chunk/queue sizing limiting in-flight tokens (`num_max_nvl_chunked_send_tokens`,
+   `num_max_rdma_chunked_*`) — a shallower effective pipeline plateaus exactly like this.
+4. Warp-role allocation: count warps doing useful work per role in each kernel.
+5. Diff against `csrc/cuda_kernels/internode.cu` combine (L1716) for a **lost pipelining/overlap
+   stage** — same family as the §25 bug: a faithful-looking port that dropped a structural property.
