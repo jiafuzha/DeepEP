@@ -1532,6 +1532,20 @@ Against the ~60% base failure rate, 16/16 has p ≈ 4e-7.
 > `force_db=true`" note is source-derived, and doorbell batching is mechanically adjacent to the
 > per-QP contention this section establishes.
 >
+> **UPDATE — RESOLVED, see §25. The "rate-reducing rather than curative" inference above was
+> WRONG.** The 2×2 factorial settled it: `DB_BATCH_SIZE` carries none of the effect (A1≡A2,
+> A3≡A4 — the "inert" claim now has direct experimental support), and **test mode carries 100%**
+> (perf 8/8 PASS vs full matrix 0/8, p ≈ 1e-4). It was never probabilistic: the full matrix runs
+> the `without top-k` leg's **cached dispatch**, a code path the reduced perf mode structurally
+> cannot reach, and that path fed combine a **padded** `x`. Deterministic bug, not a residual
+> scheduling hazard — see §25. **This does not rehabilitate the tables above**: they were measured
+> in a mode that could not exercise the cached dispatch, which is exactly why the bug escaped.
+>
+> Still genuinely open: whether `QPS_PER_PE=16` is *required* now that the pad-row bug is fixed,
+> or whether the QP=1 hangs in §24.2.1 were a second, independent failure mode. The QP A/B stands
+> on its own perf-mode evidence and QPS=16 is also 2.3x faster, so the default is justified either
+> way — but the correctness *necessity* of QP=16 has not been re-tested post-§25.
+>
 > **Gate rule this cost us:** a correctness gate MUST run the **full matrix at 2048+/hidden 7168
 > with no `DEEP_EP_PERF_TOKENS`**, because `DEEP_EP_PERF_TOKENS` silently sets `DEEP_EP_MIN=1` and
 > makes the run near-blind to correctness. Never validate a fix in perf mode.
@@ -1722,8 +1736,20 @@ count lives in the prefix-sum tensors. CUDA could conflate the two; XPU cannot.
 Every run reports `64 passed` lines (the full matrix, values checked). Fisher exact on the
 full-matrix 2048 leg: 9/9 vs 0/8 ⇒ p ≈ 2e-5.
 
-**Healthy full-matrix wall-clock at 2048/7168 (asked for and never previously measured): ~80 s**
-(≈40 s of that is the first-launch SPIR-V JIT of the fused kernels; the remaining 63 configs are
+**INDEPENDENTLY RE-VERIFIED (separate operator, separate driver script, containers + `/dev/shm` +
+IPC sockets cleaned before every run), using the byte-for-byte invocation that hung 2/2 pre-fix —
+no SMS/QPS/`DB_BATCH`/`DEEP_EP_PERF_TOKENS` overrides of any kind:**
+
+| config | result | wall |
+| --- | --- | --- |
+| full 64-config matrix, 2048 tok / hidden 7168 | **5/5 PASS**, `64 passed` lines each | 69–71 s |
+| full 64-config matrix, 4096 tok / hidden 7168 | **2/2 PASS**, `64 passed` lines each | 72 s |
+
+Combined with the table above: **20/20 post-fix vs 0/10 pre-fix.** This independent leg is the one
+that matters — the §24.3 failure was precisely a fix validated only by the party that wrote it, in
+a mode of its own choosing.
+
+**Healthy full-matrix wall-clock at 2048/7168 (asked for and never previously measured): ~80 s**(≈40 s of that is the first-launch SPIR-V JIT of the fused kernels; the remaining 63 configs are
 ~0.5 s each). At 4096/7168 it is also ~80 s. The harness adds ~4 min/launch of reset + health gate
 outside that. Anything that stalls >10 min at one config is a genuine hang, not slowness.
 
