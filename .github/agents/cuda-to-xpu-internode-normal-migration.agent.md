@@ -1822,3 +1822,78 @@ not where the time goes.
 4. Warp-role allocation: count warps doing useful work per role in each kernel.
 5. Diff against `csrc/cuda_kernels/internode.cu` combine (L1716) for a **lost pipelining/overlap
    stage** — same family as the §25 bug: a faithful-looking port that dropped a structural property.
+
+## §26 Combine throughput: the NVL-sender warp deficit (2026-08, FIXED, `1a68632`)
+
+Question: combine was ~5.3x slower than dispatch at 4096 tokens and its bandwidth
+plateaued (~2.3 GB/s NVL, ~1.4 GB/s RDMA) while dispatch kept scaling (12.3 / 7.4).
+
+### §26.1 Attribution vs N (telemetry build, `-DDEEP_EP_COMBINE_TELEMETRY`)
+Per-warp-role cycle attribution, hidden 7168, 2 nodes x 2 ranks, 20 SMs / 10 channels:
+
+| ntok | combine snd copy% | snd wait% | snd cyc/tok | dispatch snd cyc/tok (70 warps) | dispatch fwd cyc/tok (20 warps) |
+|---|---|---|---|---|---|
+| 32 | 91.5 | 0.3 | 32k | 31k | 12.6k |
+| 512 | 97.7 | 0.0 | 181k | 114k | 20.4k |
+| 4096 | 97.8 | 0.0 | 158k | 77k | 23.6k |
+
+All roles' `tot / live-warps` agree (~5.5e7 cyc at 4096) => the NVL sender runs for
+the whole kernel and is **97.8% copy, 0.0% credit wait**.  It IS the critical path;
+the forwarder's `FwdWaitTail` and the receiver's 80-90% wait are STARVATION, not the
+cause.  This **falsifies the chunk/queue-sizing hypothesis** (a queue-depth limit
+would show up as sender wait).
+
+### §26.2 What is NOT the lever (all measured, all negative)
+- **Unroll depth.** 2 -> 8 gave 158k -> 146k cyc/tok (-8%).  `UNROLLED_GROUP_COPY(2)`
+  is fine; the C9 "x4" comment was stale (fixed in `8702f10`).
+- **Compiler serialization by the `asm volatile` LSC helpers.** A plain C++ `dst4[k] =
+  src[k]` loop (fully schedulable by IGC) was 226k cyc/tok, **43% WORSE**.  The LSC
+  helpers are not the problem.
+- **The peer-IPC (P2P MMIO) write.** Split the sender telemetry by
+  `dst_nvl_rank == nvl_rank`: self 163k vs peer 155k cyc/tok in combine, 23.9k vs
+  23.7k in the dispatch forwarder.  **Destination type is irrelevant in both kernels**
+  -- this kills the "slow peer copy" story that survived earlier falsification rounds.
+- Per-token `uc_store` of topk weights: not even executed in the perf bench
+  (`num_topk == 0` there), so it cannot explain the perf numbers.
+
+### §26.3 Root cause
+Per-warp streaming throughput is pinned near **0.115 GB/s regardless of code form**.
+The gap is therefore pure producer parallelism:
+- dispatch RDMA sender: partitions **by token** across `DEEP_EP_FUSED_SENDER_WARPS = 7`
+  warps/channel => **70 live warps**, and broadcasts one load to up to 2 destinations.
+- combine NVL sender: partitioned **by destination** (`dst_nvl_rank = warp_id`, warps
+  `>= num_nvl_ranks` return) => **20 live warps**, 6 of 8 slots idle at num_nvl_ranks=2.
+3.5x fewer warps x ~1.5x less amortization ~= the observed 5.3x.
+Per int4 element the two are identical (~87 cycles), which is the confirming detail.
+
+### §26.4 Fix
+`snd_split = min(kNumRDMARanks, NUM_MAX_NVL_PEERS / num_nvl_ranks)` sub-warps per
+destination; sub-warp `s` owns RDMA lanes `l` with `l % snd_split == s`.  Safe with
+**no new synchronisation and no extra named barrier** (the budget stays at 6 of 8)
+because every queue resource is already per-RDMA-lane: token range
+(`gbl_channel_prefix_matrix[(rdma, nvl, channel)]`), head, tail (`ch_tail + lane_id`)
+and slot region (`current_rdma_idx * per_rdma + ...`).  Override:
+`DEEP_EP_COMBINE_SND_SPLIT`.
+
+Isolated combine (us): 865/1149/2219/6880/12850/22850/41900 ->
+875/988/1688/2994/4801/6481/11713 for tokens 32/64/128/512/1024/2048/4096
+(**3.58x at 4096**); combine/dispatch ratio 5.26 -> 1.44.
+Gate: full 64-config matrix, no `DEEP_EP_PERF_TOKENS`, reset + 4-GPU health gate per
+launch: **8/8 @2048/7168 and 3/3 @4096/7168**, 64 `passed` lines each.
+
+**Caveat / future work:** this is a **no-op on a full 8-GPU node** (`snd_split == 1`
+when `num_nvl_ranks == 8`); it recovers slots that are only idle when
+`num_nvl_ranks < 8`.  Scaling combine's producer stage at N=8 needs token-range
+splitting WITHIN one (dst, rdma) queue, which does require cooperative slot claiming
+-- not attempted.  Note the same 1:1 mapping exists in CUDA `internode.cu:1849`, so
+this is a small-NVL-deployment win rather than a port-fidelity bug.
+
+### §26.5 Build trap (cost one full build+run cycle)
+setuptools dependency-checks only the `.cpp` files, **not** the `.inc` files they
+`#include`.  A pure-`.inc` edit is silently NOT recompiled and you get a stale `.so`
+that looks freshly built.  `_build_deepep_container.sh` now `touch`es
+`csrc/xpu/*.cpp` first; verify a new build with
+`strings deep_ep_cpp*.so | grep <new-format-string>`.
+Also: `dev_clock()` (`__spirv_ReadClockKHR`) is not volatile, so IGC may sink/hoist
+the reads -- one telemetry build produced negative cycle deltas.  Cross-check any
+suspicious attribution against the `[PERF ...]` wall-clock numbers.
