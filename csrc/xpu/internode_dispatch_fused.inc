@@ -295,6 +295,25 @@ void launch_fused_dispatch(void* recv_x,
 
     const int num_sms = num_channels * 2;
 
+    // ---- §24.2 discriminator: OCCUPANCY PADDING (diagnostic only, default off) ----
+    // `num_sms` and `num_channels` are perfectly collinear (grid = 2 * channels), so a
+    // DEEP_EP_NUM_SMS sweep can never tell "too many work-groups" apart from "too many
+    // channels".  `DEEP_EP_FUSED_PAD_WGS=N` appends N work-groups that do NOTHING but
+    // hold their slot for `DEEP_EP_FUSED_PAD_CYCLES` GPU cycles and exit.  They touch no
+    // memory and depend on nothing, so they cannot themselves hang or corrupt - they only
+    // add co-residency pressure at a FIXED channel count.
+    static const int pad_wgs_env = [] {
+        const char* e = std::getenv("DEEP_EP_FUSED_PAD_WGS");
+        return (e != nullptr && e[0] != '\0') ? std::max(std::atoi(e), 0) : 0;
+    }();
+    static const uint64_t pad_cycles_env = [] {
+        const char* e = std::getenv("DEEP_EP_FUSED_PAD_CYCLES");
+        return (e != nullptr && e[0] != '\0') ? static_cast<uint64_t>(std::atoll(e)) : 30000000ull;
+    }();
+    const int pad_wgs = pad_wgs_env;
+    const int total_wgs = num_sms + pad_wgs;
+    const uint64_t pad_cycles = pad_cycles_env;
+
     queue.submit([&](sycl::handler& cgh) {
         // CUDA internode.cu:558-560 (RDMA sender warp synchronization state).
         sycl::local_accessor<int, 1> smem_lock(sycl::range<1>{static_cast<size_t>(kNumRDMARanks)}, cgh);
@@ -305,10 +324,20 @@ void launch_fused_dispatch(void* recv_x,
         sycl::local_accessor<int, 1> smem_fwd_retired(sycl::range<1>{static_cast<size_t>(NUM_MAX_NVL_PEERS)}, cgh);
 
         cgh.parallel_for<FusedDispatchKernel<kNumRDMARanks>>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * kNumThreads), sycl::range<1>(kNumThreads)),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(total_wgs) * kNumThreads), sycl::range<1>(kNumThreads)),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
                 auto sg = item.get_sub_group();
-                const int sm_id = static_cast<int>(item.get_group(0));
+                const int raw_sm_id = static_cast<int>(item.get_group(0));
+                // §24.2 padding work-group: hold the slot, touch nothing, then retire.
+                // Pads take the LOW work-group ids so the hardware gives them their slots
+                // FIRST - that is what actually denies co-residency to the real ones.
+                if (raw_sm_id < pad_wgs) {
+                    const uint64_t t0 = dev_clock();
+                    while (dev_clock() - t0 < pad_cycles) {
+                    }
+                    return;
+                }
+                const int sm_id = raw_sm_id - pad_wgs;
                 const int thread_id = static_cast<int>(item.get_local_id(0));
                 const int warp_id = static_cast<int>(sg.get_group_linear_id());
                 const int lane_id = static_cast<int>(sg.get_local_linear_id());

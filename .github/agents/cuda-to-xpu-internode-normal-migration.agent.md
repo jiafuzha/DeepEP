@@ -1394,14 +1394,69 @@ On **Arc Pro B60** (`max_compute_units=160`, `gpu_eu_count=160`, `eu_per_subslic
 | 32 | 2 | 4 | 6  | `DEEP_EP_NUM_SMS=32` |
 
 So the driver's co-residency bound is an **upper** bound only; something beyond raw co-residency
-also scales with the grid. **This is an open question and it is recorded honestly rather than
-papered over.** Until it is explained, `fused_max_coresident_sms()` applies an explicit, commented
+also scales with the grid. **RESOLVED — see §24.2.1: the mechanism is NOT co-residency but single-QP IBGDA contention.** Until it is explained, `fused_max_coresident_sms()` applies an explicit, commented
 `kEmpiricalSafeSms = 8` cap on top of the derived value. Candidate explanations not yet tested:
 Level Zero may not actually dispatch all "co-resident-capable" work-groups concurrently without a
 cooperative launch; the two ranks per node share a GPU-adjacent NIC/proxy; the query may not model
 SLM + named-barrier resources; or an additional per-grid resource (named barriers are a per-Xe-core
 resource) is exhausted. Note also that `DEEP_EP_NUM_SMS` changes the channel count as well as the
 grid, so the dose-response is not a pure grid-size sweep.
+
+### 24.2.1 ⚠️ RESOLVED (2026-08): it is **NOT co-residency** — it is **single-QP IBGDA contention**
+
+The §24.2 open question is answered, and the answer **contradicts the co-residency story**. Three
+independent experiments, all on the same build, reset + 4-GPU health gate before every launch:
+
+**(a) Grid size alone does NOT trigger it (pad-work-group discriminator).**
+`DEEP_EP_FUSED_PAD_WGS=N` / `DEEP_EP_FUSED_PAD_CYCLES=C` (`internode_dispatch_fused.inc`) append N
+work-groups that take the **LOW** work-group ids (so the hardware gives them their slots FIRST),
+touch no memory, spin `C` GPU cycles and retire. They add pure co-residency pressure at a **fixed
+channel count**. Real work-groups are then re-indexed `sm_id = raw_sm_id - pad_wgs`.
+
+| arm | grid | channels | pad cycles | PASS | FAIL | N |
+| --- | --- | --- | --- | --- | --- | --- |
+| clamp 8 + PAD=16 | 24 WGs | 4 | 3e7 (~12 ms) | 8 | 0 | 8 |
+| clamp 8 + PAD=16 | 24 WGs | 4 | 6e8 (~250 ms) | 2 | 0 | 2 |
+| clamp 8 + PAD=19 | 27 WGs | 4 | 6e8 (~250 ms) | 3 | 0 | 3 |
+| **clamp 24 + PAD=0 (control)** | 24 WGs | **12** | — | 2 | **4** | 6 |
+
+At PAD=19 at most **one** real work-group can be resident and the denial lasts ~250 ms, i.e. **3×
+longer than `kFusedSpinCap` = 2e8 cycles (~83 ms)** — and it still never hangs or corrupts. A grid
+of 24-27 work-groups is clean at 4 channels and fails 4/6 at 12 channels. **Failures track channel
+count, not grid size.**
+
+**(b) The runtime co-schedules far more work-groups than the driver's `max_num_work_groups`.**
+Standalone probe `/tmp/probe_res.cpp` (every WG bumps a global counter then spins until it sees all
+of them or ~80 ms elapses; the max value observed is a lower bound on true concurrency): a 512-WI
+kernel reaches **128/128 concurrent** at 0, 8 KiB, 32 KiB and 64 KiB of SLM per WG. So
+`max_num_work_groups = 20` is a **capability/occupancy estimate, not a scheduling limit**, and
+raw co-residency was never the binding constraint at 24 WGs.
+
+**(c) The actual trigger: N channels sharing ONE IBGDA QP.** `deep_ep/buffer.py` pins
+`ISHMEM_IBGDA_QPS_PER_PE=1` (setdefault) for the normal internode path — so **every channel's RDMA
+sender drives the same QP**, and pressure on that QP's send queue scales with the channel count.
+Forcing one QP per channel removes the failure entirely at the previously-failing grid:
+
+| config (2048 tok / hidden 7168) | PASS | HANG | N |
+| --- | --- | --- | --- |
+| `FUSED_MAX_SMS=24` (12 ch), `QPS_PER_PE=1` (default) | 2 | **4** | 6 |
+| `FUSED_MAX_SMS=24` (12 ch), `QPS_PER_PE=16` | **6** | 0 | 6 |
+
+Fisher exact, same build, one-sided **p = 0.030**; pooled with the pre-fix 6/10 at the same config,
+**10/16 vs 0/6, p = 0.012**.
+
+**Consequences.**
+1. `kEmpiricalSafeSms = 8` works, but for the wrong reason: it limits the grid, which limits the
+   channel count, which limits per-QP pressure. It is a **proxy fix**, not the root fix.
+2. The mechanism to audit next is the **uncapped SQ-wrap backpressure spin** in
+   `ishmem_ibgda/src/ibgda_device_impl.h` (~:2481-2491, fires only once `wqe_idx >= nic_wq_slots`)
+   and the cross-work-group WQE-index reservation on a shared QP — a lost/over-subscribed WQ slot
+   there is exactly a hang whose probability grows with the number of concurrent producers.
+3. **Throughput may be recoverable**: `num_sms=24` + `QPS_PER_PE=16` measured round-trip
+   **30 612 µs** vs the clamped default's **53 667 µs** at 2048/7168 (dispatch iso 4 765 vs 7 562 µs)
+   — a **1.75×** win, 6/6 clean. This is NOT yet shipped: it needs N≥16 at 2048 and a 4096 leg
+   before the default changes, and `buffer.py` is out of scope for this workstream (the QP count is
+   set there).
 
 ### 24.3 Validation (post-fix, reset + 4-GPU health gate before EVERY launch)
 
