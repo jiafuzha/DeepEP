@@ -1893,6 +1893,18 @@ Isolated combine (us): 865/1149/2219/6880/12850/22850/41900 ->
 Gate: full 64-config matrix, no `DEEP_EP_PERF_TOKENS`, reset + 4-GPU health gate per
 launch: **8/8 @2048/7168 and 3/3 @4096/7168**, 64 `passed` lines each.
 
+**INDEPENDENTLY RE-VERIFIED** (separate operator, separate driver script, containers +
+`/dev/shm` + IPC sockets cleaned before every run, no overrides):
+
+| | correctness | combine iso | round-trip |
+| --- | --- | --- | --- |
+| full matrix 2048/7168 | **3/3 PASS**, 64 `passed` each | 6 423 µs (was 22 850) = **3.56x** | 10 714 µs (was 25 452) = 2.38x |
+| full matrix 4096/7168 | **1/1 PASS**, 64 `passed` | 11 611 µs (was 41 900) = **3.61x** | 19 014 µs (was 47 588) = **2.50x** |
+| 512/7168 | — | 2 996 µs (was 6 880) = 2.30x | 4 712 µs |
+
+Dispatch iso unchanged (7 877 µs vs 7 968 at 4096), confirming the change is isolated to the
+combine sender as intended. Numbers reproduce the agent's to within 1%.
+
 **Caveat / future work:** this is a **no-op on a full 8-GPU node** (`snd_split == 1`
 when `num_nvl_ranks == 8`); it recovers slots that are only idle when
 `num_nvl_ranks < 8`.  Scaling combine's producer stage at N=8 needs token-range
