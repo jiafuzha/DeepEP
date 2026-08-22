@@ -74,6 +74,8 @@ enum FusedCombineDbgSlot {
     kDbgSndWait,
     kDbgSndCopy,
     kDbgSndTokens,
+    kDbgSndCopySelf,
+    kDbgSndTokSelf,
     kDbgFwdTotal,
     kDbgFwdWaitSpace,
     kDbgFwdWaitTail,
@@ -334,6 +336,16 @@ void launch_fused_combine(void* combined_x,
     const int hidden_bytes = hidden_int4 * static_cast<int>(sizeof(int4_t));
     const int num_bytes_per_token = fused_combine_num_bytes_per_token(hidden_int4, num_topk);
     const int num_max_nvl_chunked_recv_tokens_per_rdma = num_max_nvl_chunked_recv_tokens / kNumRDMARanks;
+    // §26.4: extra NVL-sender warps per destination (see the kNVLSender comment).
+    // Bounded by the RDMA-rank count (one sub-warp per owned RDMA lane at most) and
+    // by the NUM_MAX_NVL_PEERS warp slots the role layout reserves for senders.
+    int snd_split = NUM_MAX_NVL_PEERS / num_nvl_ranks;
+    if (snd_split > kNumRDMARanks) snd_split = kNumRDMARanks;
+    if (snd_split < 1) snd_split = 1;
+    if (const char* e = std::getenv("DEEP_EP_COMBINE_SND_SPLIT")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= snd_split) snd_split = v;
+    }
     const unsigned qps_per_pe = fused_qps_per_pe();
     const int num_sms = num_channels * 2;
 
@@ -342,6 +354,9 @@ void launch_fused_combine(void* combined_x,
     if (dbg_slot == nullptr) dbg_slot = sycl::malloc_device<uint64_t>(kDbgNumSlots, queue);
     queue.memset(dbg_slot, 0, kDbgNumSlots * sizeof(uint64_t)).wait();
     uint64_t* const dbg = dbg_slot;
+    const int snd_unroll = fused_copy_unroll("DEEP_EP_COMBINE_SND_UNROLL", 2);
+    const int snd_plain = (std::getenv("DEEP_EP_COMBINE_SND_PLAIN") != nullptr &&
+                           std::atoi(std::getenv("DEEP_EP_COMBINE_SND_PLAIN")) != 0) ? 1 : 0;
 #else
     uint64_t* dbg = nullptr;
     (void)dbg;
@@ -446,8 +461,17 @@ void launch_fused_combine(void* combined_x,
 
                 // =====================================================================
                 if (warp_role == kNVLSender) {
-                    const int dst_nvl_rank = warp_id;
-                    if (dst_nvl_rank >= num_nvl_ranks) return;  // deviation C2
+                    // §26.4: the NVL sender is the combine critical path and is limited by
+                    // how many warps stream `x` out of DRAM (measured: a fixed ~0.115 GB/s
+                    // per warp regardless of unroll depth or code form).  The original 1:1
+                    // warp->destination mapping leaves NUM_MAX_NVL_PEERS - num_nvl_ranks
+                    // warp slots idle.  `snd_split` sub-warps per destination each own a
+                    // DISJOINT subset of the RDMA lanes (lane i <=> RDMA rank i), and every
+                    // queue resource is already per-RDMA-lane (token range, head, tail, slot
+                    // region), so the split needs no extra synchronisation.
+                    const int dst_nvl_rank = warp_id % num_nvl_ranks;
+                    const int snd_sub = warp_id / num_nvl_ranks;
+                    if (warp_id >= num_nvl_ranks * snd_split) return;  // deviation C2
 
                     void* dst_buffer_ptr = buffer_ptrs[dst_nvl_rank];
                     void* local_buffer_ptr = buffer_ptrs[nvl_rank];
@@ -457,7 +481,8 @@ void launch_fused_combine(void* combined_x,
 
                     // CUDA :1849-1855
                     int token_start_idx = 0, token_end_idx = 0;
-                    if (lane_id < kNumRDMARanks) {
+                    const bool lane_owned = (lane_id < kNumRDMARanks) && ((lane_id % snd_split) == snd_sub);
+                    if (lane_owned) {
                         const int prefix_idx = (lane_id * num_nvl_ranks + dst_nvl_rank) * num_channels + channel_id;
                         // The end of the LAST (rank, channel) block is the total number of
                         // tokens this rank actually received in the dispatch.  `num_tokens`
@@ -497,11 +522,11 @@ void launch_fused_combine(void* combined_x,
 #endif
                         while (true) {
                             const int num_used_slots = cached_channel_tail_idx - cached_channel_head_idx;
-                            is_lane_ready = lane_id < kNumRDMARanks && token_start_idx < token_end_idx &&
+                            is_lane_ready = lane_owned && token_start_idx < token_end_idx &&
                                             num_max_nvl_chunked_recv_tokens_per_rdma - num_used_slots >=
                                                 num_max_nvl_chunked_send_tokens;
                             if (sycl::any_of_group(sg, is_lane_ready)) break;
-                            if (lane_id < kNumRDMARanks && token_start_idx < token_end_idx)
+                            if (lane_owned && token_start_idx < token_end_idx)
                                 cached_channel_head_idx = poll_load(ch_head + lane_id);
                             if (++spins > kFusedSpinCap) break;
                         }
@@ -512,6 +537,7 @@ void launch_fused_combine(void* combined_x,
                         // CUDA :1904-1946
                         for (int i = 0; i < kNumRDMARanks; ++i) {
                             current_rdma_idx = (current_rdma_idx + 1) % kNumRDMARanks;
+                            if ((current_rdma_idx % snd_split) != snd_sub) continue;
                             const int skip = sycl::select_from_group(
                                 sg, ((token_start_idx >= token_end_idx) || (!is_lane_ready)) ? 1 : 0, current_rdma_idx);
                             if (skip) continue;
@@ -549,15 +575,42 @@ void launch_fused_combine(void* combined_x,
                                 // 2 loads before the first store overlaps 2 message latencies
                                 // (this is the replacement for CUDA's multi-stage TMA
                                 // pipeline, conversion note C1).
-                                // NOTE (§26.2): the unroll is NOT what separates this kernel
-                                // from dispatch.  The dispatch forwarder
-                                // (internode_dispatch_fused.inc:823-825) uses a plain
-                                // lane-strided loop with NO unroll and is ~5x faster at the
-                                // same byte count, so do not "tune" this factor expecting a
-                                // win -- the combine bottleneck is upstream of the copy.
+                                // NOTE (§26.3): the unroll depth is NOT the lever.  Measured
+                                // on BMG at hidden 7168 (telemetry build, cycles/token in the
+                                // NVL sender): unroll 2 = 158k, unroll 8 = 146k (-8%), a plain
+                                // C++ `dst4[k] = src[k]` loop = 226k (+43%, WORSE).  Per-warp
+                                // copy throughput is pinned near 0.115 GB/s regardless of code
+                                // form, and the destination does not matter either (self vs
+                                // P2P-peer measured within 5% of each other).  The only lever
+                                // that moves this kernel is the NUMBER of streaming warps --
+                                // see the `snd_split` comment at the top of kNVLSender.
+#ifndef DEEP_EP_COMBINE_TELEMETRY
                                 UNROLLED_GROUP_COPY(2, lane_id, 32, hidden_int4,
                                                     reinterpret_cast<int4_t*>(dst), src,
                                                     ld_nc_global_v, st_na_global_v);
+#else
+                                {
+                                    int4_t* dst4 = reinterpret_cast<int4_t*>(dst);
+                                    if (snd_plain) {
+                                        // Plain C++ 16B copy: fully schedulable by IGC, unlike the
+                                        // `asm volatile` LSC helpers which cannot be software-pipelined.
+                                        _Pragma("unroll 4")
+                                        for (int k = lane_id; k < hidden_int4; k += 32) dst4[k] = src[k];
+                                    } else if (snd_unroll == 1) {
+                                        for (int k = lane_id; k < hidden_int4; k += 32)
+                                            st_na_global_v(dst4 + k, ld_nc_global_v(src + k));
+                                    } else if (snd_unroll == 4) {
+                                        UNROLLED_GROUP_COPY(4, lane_id, 32, hidden_int4, dst4, src,
+                                                            ld_nc_global_v, st_na_global_v);
+                                    } else if (snd_unroll == 8) {
+                                        UNROLLED_GROUP_COPY(8, lane_id, 32, hidden_int4, dst4, src,
+                                                            ld_nc_global_v, st_na_global_v);
+                                    } else {
+                                        UNROLLED_GROUP_COPY(2, lane_id, 32, hidden_int4, dst4, src,
+                                                            ld_nc_global_v, st_na_global_v);
+                                    }
+                                }
+#endif
                                 if (lane_id == num_topk)
                                     *reinterpret_cast<SourceMeta*>(dst + hidden_bytes) = src_meta[token_idx];
                                 if (lane_id < num_topk)
@@ -575,7 +628,7 @@ void launch_fused_combine(void* combined_x,
                         // CUDA :1949-1952: move queue tail (release)
                         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                         lsc_fence_sysrel();
-                        if (lane_id < kNumRDMARanks && is_lane_ready) uc_store(ch_tail + lane_id, cached_channel_tail_idx);
+                        if (is_lane_ready) uc_store(ch_tail + lane_id, cached_channel_tail_idx);
                         sycl::group_barrier(sg);
                     }
 #ifdef DEEP_EP_COMBINE_TELEMETRY
@@ -584,6 +637,10 @@ void launch_fused_combine(void* combined_x,
                         fused_dbg_add(dbg, kDbgSndWait, dbg_wait);
                         fused_dbg_add(dbg, kDbgSndCopy, dbg_copy);
                         fused_dbg_add(dbg, kDbgSndTokens, dbg_tok);
+                        if (dst_nvl_rank == nvl_rank) {
+                            fused_dbg_add(dbg, kDbgSndCopySelf, dbg_copy);
+                            fused_dbg_add(dbg, kDbgSndTokSelf, dbg_tok);
+                        }
                         fused_dbg_add(dbg, kDbgWarps, 1);
                     }
 #endif
@@ -1010,7 +1067,8 @@ void launch_fused_combine(void* combined_x,
         std::fprintf(stderr,
                      "[COMBINE-DBG tokens=%d hidden=%d] snd(tot=%llu wait=%llu copy=%llu tok=%llu) "
                      "fwd(tot=%llu waitspace=%llu waittail=%llu copy=%llu send=%llu tok=%llu) "
-                     "rcv(tot=%llu wait=%llu copy=%llu tok=%llu) coord(tot=%llu)\n",
+                     "rcv(tot=%llu wait=%llu copy=%llu tok=%llu) coord(tot=%llu) sndwarps=%llu "
+                     "sndself(copy=%llu tok=%llu)\n",
                      num_combined_tokens, hidden, (unsigned long long)h[kDbgSndTotal],
                      (unsigned long long)h[kDbgSndWait], (unsigned long long)h[kDbgSndCopy],
                      (unsigned long long)h[kDbgSndTokens], (unsigned long long)h[kDbgFwdTotal],
@@ -1018,7 +1076,9 @@ void launch_fused_combine(void* combined_x,
                      (unsigned long long)h[kDbgFwdCopy], (unsigned long long)h[kDbgFwdSend],
                      (unsigned long long)h[kDbgFwdTokens], (unsigned long long)h[kDbgRcvTotal],
                      (unsigned long long)h[kDbgRcvWait], (unsigned long long)h[kDbgRcvCopy],
-                     (unsigned long long)h[kDbgRcvTokens], (unsigned long long)h[kDbgCoordTotal]);
+                     (unsigned long long)h[kDbgRcvTokens], (unsigned long long)h[kDbgCoordTotal],
+                     (unsigned long long)h[kDbgWarps], (unsigned long long)h[kDbgSndCopySelf],
+                     (unsigned long long)h[kDbgSndTokSelf]);
     }
 #endif
 #endif

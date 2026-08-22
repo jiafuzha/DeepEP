@@ -183,9 +183,46 @@ inline unsigned fused_qps_per_pe() {
     return static_cast<unsigned>(p);
 }
 
+// Diagnostic knob (§26.3): memory-level parallelism of the payload copy loops.
+// The producer loops read `x` from DRAM and store into a peer/RDMA buffer; with
+// only `U` loads in flight per lane the loop is latency-bound.  Values 1/2/4/8.
+inline int fused_copy_unroll(const char* name, int dflt) {
+    const char* e = std::getenv(name);
+    int v = (e != nullptr && e[0] != '\0') ? std::atoi(e) : dflt;
+    if (v != 1 && v != 2 && v != 4 && v != 8) v = dflt;
+    return v;
+}
+
 // Bounded spin so a lost NIC completion surfaces as a diagnostic instead of a hang.
 constexpr uint64_t kFusedSpinCap = 200000000ull;
 constexpr int kFusedIntMax = 2147483647;
+
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+// Diagnostic-only (-DDEEP_EP_COMBINE_TELEMETRY): the SAME attribution the fused
+// combine carries, added to dispatch so the two kernels' per-token copy cost can
+// be compared directly on identical hardware (see playbook 26).
+enum FusedDispatchDbgSlot {
+    kDDbgSndTotal = 0,   // RDMA sender warp: whole-role cycles
+    kDDbgSndCopy,        // ... spent in the payload broadcast copy
+    kDDbgSndTokens,      // ... tokens copied
+    kDDbgSndWarps,       // number of live RDMA sender warps
+    kDDbgFwdTotal,       // NVL forwarder warp: whole-role cycles
+    kDDbgFwdWait,        // ... spent waiting for an RDMA chunk
+    kDDbgFwdCopy,        // ... spent in the RDMA->NVL copy
+    kDDbgFwdTokens,      // ... tokens copied
+    kDDbgFwdCopySelf,
+    kDDbgFwdTokSelf,
+    kDDbgFwdWarps,       // number of live NVL forwarder warps
+    kDDbgNumSlots,
+};
+inline __attribute__((always_inline)) void fused_disp_dbg_add(uint64_t* dbg, int slot, uint64_t v) {
+    if (dbg == nullptr) return;
+    sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                     sycl::access::address_space::global_space>
+        r(dbg[slot]);
+    r.fetch_add(v);
+}
+#endif
 
 // CUDA internode.cu:446 launch bounds: (7 + 1 + 8) * 32 = 512 work-items.
 #define DEEP_EP_FUSED_SENDER_WARPS 7
@@ -314,6 +351,18 @@ void launch_fused_dispatch(void* recv_x,
     const int total_wgs = num_sms + pad_wgs;
     const uint64_t pad_cycles = pad_cycles_env;
 
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+    static uint64_t* disp_dbg_slot = nullptr;
+    if (disp_dbg_slot == nullptr) disp_dbg_slot = sycl::malloc_device<uint64_t>(kDDbgNumSlots, queue);
+    queue.memset(disp_dbg_slot, 0, kDDbgNumSlots * sizeof(uint64_t)).wait();
+    uint64_t* const ddbg = disp_dbg_slot;
+    const int dsnd_unroll = fused_copy_unroll("DEEP_EP_DISP_SND_UNROLL", 1);
+    const int dsnd_plain = (std::getenv("DEEP_EP_DISP_SND_PLAIN") != nullptr &&
+                            std::atoi(std::getenv("DEEP_EP_DISP_SND_PLAIN")) != 0) ? 1 : 0;
+#else
+    uint64_t* ddbg = nullptr;
+    (void)ddbg;
+#endif
     queue.submit([&](sycl::handler& cgh) {
         // CUDA internode.cu:558-560 (RDMA sender warp synchronization state).
         sycl::local_accessor<int, 1> smem_lock(sycl::range<1>{static_cast<size_t>(kNumRDMARanks)}, cgh);
@@ -431,6 +480,10 @@ void launch_fused_dispatch(void* recv_x,
                 // Role: kRDMASender  (CUDA internode.cu:582-748)
                 // =========================================================
                 if (warp_role == kRDMASender) {
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                    const uint64_t ddbg_t0 = dev_clock();
+                    uint64_t ddbg_copy = 0, ddbg_tok = 0;
+#endif
                     int token_start_idx, token_end_idx;
                     get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
@@ -533,12 +586,44 @@ void launch_fused_dispatch(void* recv_x,
 
                         // Copy `x` (16B granularity) broadcast to every destination.
                         {
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            const uint64_t ddbg_c0 = dev_clock();
+#endif
                             const int4_t* src4 = reinterpret_cast<const int4_t*>(x) + static_cast<int64_t>(token_idx) * hidden_int4;
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            if (dsnd_plain) {
+                                _Pragma("unroll 4")
+                                for (int i = lane_id; i < hidden_int4; i += 32) {
+                                    const int4_t v = src4[i];
+                                    for (int j = 0; j < num_topk_ranks; ++j)
+                                        reinterpret_cast<int4_t*>(dst_send_buffers[j])[i] = v;
+                                }
+                            } else if (dsnd_unroll > 1) {
+                                const int U = dsnd_unroll;  // 2/4/8
+                                int i = lane_id;
+                                int4_t v[8];
+                                for (; i + 32 * U <= hidden_int4; i += 32 * U) {
+                                    for (int u = 0; u < U; ++u) v[u] = ld_nc_global_v(src4 + i + u * 32);
+                                    for (int u = 0; u < U; ++u)
+                                        for (int j = 0; j < num_topk_ranks; ++j)
+                                            st_na_global_v(reinterpret_cast<int4_t*>(dst_send_buffers[j]) + i + u * 32, v[u]);
+                                }
+                                for (; i < hidden_int4; i += 32) {
+                                    const int4_t vv = ld_nc_global_v(src4 + i);
+                                    for (int j = 0; j < num_topk_ranks; ++j)
+                                        st_na_global_v(reinterpret_cast<int4_t*>(dst_send_buffers[j]) + i, vv);
+                                }
+                            } else
+#endif
                             for (int i = lane_id; i < hidden_int4; i += 32) {
                                 const int4_t v = ld_nc_global_v(src4 + i);
                                 for (int j = 0; j < num_topk_ranks; ++j)
                                     st_na_global_v(reinterpret_cast<int4_t*>(dst_send_buffers[j]) + i, v);
                             }
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            ddbg_copy += dev_clock() - ddbg_c0;
+                            ddbg_tok += (num_topk_ranks > 0) ? 1 : 0;
+#endif
                         }
                         for (int i = 0; i < num_topk_ranks; ++i) dst_send_buffers[i] += hidden_bytes;
 
@@ -614,6 +699,14 @@ void launch_fused_dispatch(void* recv_x,
                             sycl::group_barrier(sg);
                         }
                     }
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                    if (lane_id == 0) {
+                        fused_disp_dbg_add(ddbg, kDDbgSndTotal, dev_clock() - ddbg_t0);
+                        fused_disp_dbg_add(ddbg, kDDbgSndCopy, ddbg_copy);
+                        fused_disp_dbg_add(ddbg, kDDbgSndTokens, ddbg_tok);
+                        fused_disp_dbg_add(ddbg, kDDbgSndWarps, 1);
+                    }
+#endif
                 }
                 // =========================================================
                 // Role: kRDMASenderCoordinator (CUDA internode.cu:748-843)
@@ -722,6 +815,10 @@ void launch_fused_dispatch(void* recv_x,
                         return;
                     }
 
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                    const uint64_t ddbg_ft0 = dev_clock();
+                    uint64_t ddbg_fwait = 0, ddbg_fcopy = 0, ddbg_ftok = 0;
+#endif
                     int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
                     if (lane_id < kNumRDMARanks) {
                         uint64_t spins = 0;
@@ -778,6 +875,9 @@ void launch_fused_dispatch(void* recv_x,
                         // Find next source RDMA rank (round-robin).
                         {
                             uint64_t spins = 0;
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            const uint64_t ddbg_w0 = dev_clock();
+#endif
                             while (true) {
                                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                                 if (sycl::select_from_group(sg, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
@@ -791,6 +891,9 @@ void launch_fused_dispatch(void* recv_x,
                                 }
                                 if (++spins > kFusedSpinCap) break;
                             }
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            ddbg_fwait += dev_clock() - ddbg_w0;
+#endif
                         }
                         const int src_rdma_head = sycl::select_from_group(sg, cached_rdma_channel_head, src_rdma_rank);
                         int src_rdma_tail = sycl::select_from_group(sg, cached_rdma_channel_tail, src_rdma_rank);
@@ -820,11 +923,18 @@ void launch_fused_dispatch(void* recv_x,
                                 nvl_channel_x.buffer() + static_cast<size_t>(dst_slot_idx) * num_bytes_per_token;
 
                             // D1: TMA replaced by sub-group cooperative 16B copy.
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            const uint64_t ddbg_c0 = dev_clock();
+#endif
                             const int n16 = num_bytes_per_token / static_cast<int>(sizeof(int4_t));
                             for (int k = lane_id; k < n16; k += 32)
                                 st_na_global_v(reinterpret_cast<int4_t*>(dst_shifted) + k,
                                                ld_nc_global_v(reinterpret_cast<const int4_t*>(shifted) + k));
                             sycl::group_barrier(sg);
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                            ddbg_fcopy += dev_clock() - ddbg_c0;
+                            ++ddbg_ftok;
+#endif
 
                             if ((++num_tokens_sent) == num_max_nvl_chunked_send_tokens) src_rdma_tail = i + 1;
                         }
@@ -849,6 +959,19 @@ void launch_fused_dispatch(void* recv_x,
                             r(smem_fwd_retired[dst_nvl_rank]);
                         r.store(1);
                     }
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+                    if (lane_id == 0) {
+                        fused_disp_dbg_add(ddbg, kDDbgFwdTotal, dev_clock() - ddbg_ft0);
+                        fused_disp_dbg_add(ddbg, kDDbgFwdWait, ddbg_fwait);
+                        fused_disp_dbg_add(ddbg, kDDbgFwdCopy, ddbg_fcopy);
+                        fused_disp_dbg_add(ddbg, kDDbgFwdTokens, ddbg_ftok);
+                        fused_disp_dbg_add(ddbg, kDDbgFwdWarps, 1);
+                        if (dst_nvl_rank == nvl_rank) {
+                            fused_disp_dbg_add(ddbg, kDDbgFwdCopySelf, ddbg_fcopy);
+                            fused_disp_dbg_add(ddbg, kDDbgFwdTokSelf, ddbg_ftok);
+                        }
+                    }
+#endif
                 }
                 // =========================================================
                 // Role: kForwarderCoordinator (CUDA internode.cu:1013-1054)
@@ -1011,5 +1134,21 @@ void launch_fused_dispatch(void* recv_x,
                 }
             });
     });
+#ifdef DEEP_EP_COMBINE_TELEMETRY
+    {
+        queue.wait();
+        uint64_t h[kDDbgNumSlots] = {0};
+        queue.memcpy(h, ddbg, sizeof(h)).wait();
+        std::fprintf(stderr,
+                     "[DISPATCH-DBG tokens=%d hidden_int4=%d] snd(tot=%llu copy=%llu tok=%llu warps=%llu) "
+                     "fwd(tot=%llu wait=%llu copy=%llu tok=%llu warps=%llu) fwdself(copy=%llu tok=%llu)\n",
+                     num_tokens, hidden_int4, (unsigned long long)h[kDDbgSndTotal],
+                     (unsigned long long)h[kDDbgSndCopy], (unsigned long long)h[kDDbgSndTokens],
+                     (unsigned long long)h[kDDbgSndWarps], (unsigned long long)h[kDDbgFwdTotal],
+                     (unsigned long long)h[kDDbgFwdWait], (unsigned long long)h[kDDbgFwdCopy],
+                     (unsigned long long)h[kDDbgFwdTokens], (unsigned long long)h[kDDbgFwdWarps],
+                     (unsigned long long)h[kDDbgFwdCopySelf], (unsigned long long)h[kDDbgFwdTokSelf]);
+    }
+#endif
 #endif
 }

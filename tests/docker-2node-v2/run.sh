@@ -341,6 +341,11 @@ run_test() {
     _add_opt_genv DEEP_EP_FUSED_MAX_SMS       "${DEEP_EP_FUSED_MAX_SMS:-}"
     _add_opt_genv DEEP_EP_FUSED_PAD_WGS       "${DEEP_EP_FUSED_PAD_WGS:-}"
     _add_opt_genv DEEP_EP_FUSED_PAD_CYCLES    "${DEEP_EP_FUSED_PAD_CYCLES:-}"
+    _add_opt_genv DEEP_EP_COMBINE_SND_SPLIT   "${DEEP_EP_COMBINE_SND_SPLIT:-}"
+    _add_opt_genv DEEP_EP_COMBINE_SND_PLAIN   "${DEEP_EP_COMBINE_SND_PLAIN:-}"
+    _add_opt_genv DEEP_EP_DISP_SND_PLAIN      "${DEEP_EP_DISP_SND_PLAIN:-}"
+    _add_opt_genv DEEP_EP_COMBINE_SND_UNROLL  "${DEEP_EP_COMBINE_SND_UNROLL:-}"
+    _add_opt_genv DEEP_EP_DISP_SND_UNROLL     "${DEEP_EP_DISP_SND_UNROLL:-}"
     _add_opt_genv IGC_ShaderDumpEnable         "${IGC_ShaderDumpEnable:-}"
     _add_opt_genv IGC_DumpToCustomDir          "${IGC_DumpToCustomDir:-}"
     # Normal internode auto-provisions ISHMEM_IBGDA_QPS_PER_PE = clamp_pow2(num_channels)
