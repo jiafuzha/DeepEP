@@ -271,6 +271,18 @@ def test_main(args: argparse.Namespace,
     _async_modes = (False, ) if _min else (False, True)
     _x_variants = (x, ) if _min else (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3)
     _topk_variants = (True, ) if _min else (False, True)
+    # DEEP_EP_SEL_X / DEEP_EP_SEL_TOPK: bisect a SINGLE cell of the sweep (driver copy
+    # only; tests/test_internode.py is untouched).  SEL_X in {rand,x,rand8,x8}.
+    _sel_x = os.getenv('DEEP_EP_SEL_X')
+    _sel_topk = os.getenv('DEEP_EP_SEL_TOPK')
+    if _sel_x:
+        _x_variants = ({'rand': x_pure_rand, 'x': x, 'rand8': x_pure_rand_e4m3, 'x8': x_e4m3}[_sel_x], )
+        _prev_modes = (False, )
+        _async_modes = (False, )
+    if _sel_topk is not None:
+        _topk_variants = (_sel_topk == '1', )
+        _prev_modes = (False, )
+        _async_modes = (False, )
 
     for previous_mode in _prev_modes:
         for async_mode in _async_modes:
@@ -392,7 +404,10 @@ def test_main(args: argparse.Namespace,
                         assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
-                    if not with_topk:
+                    # DEEP_EP_SKIP_CACHED=1 skips this block (bisect of the
+                    # `without top-k` hang: cached-dispatch vs topk-less combine).
+                    if not with_topk and not os.getenv('DEEP_EP_SKIP_CACHED'):
+                        print(f'[PHASE rank={rank}] cached_dispatch begin', flush=True)
                         dispatch_args = {'x': current_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
                         if previous_mode:
                             dispatch_args.update({'previous_event': buffer.capture()})
@@ -401,6 +416,16 @@ def test_main(args: argparse.Namespace,
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if not is_rand:
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
+                        print(f'[PHASE rank={rank}] cached_dispatch end recv_x.shape={tuple(recv_x.shape)}', flush=True)
+
+                    # DEEP_EP_EXTRA_DISPATCH=1: issue a SECOND *non-cached* dispatch
+                    # (full args, fresh handle discarded) to discriminate
+                    # "cached-mode dispatch" from "any second dispatch".
+                    if os.getenv('DEEP_EP_EXTRA_DISPATCH'):
+                        print(f'[PHASE rank={rank}] extra_dispatch begin', flush=True)
+                        _xd = buffer.dispatch(**dispatch_args)
+                        _xd[5].current_stream_wait() if async_mode else ()
+                        print(f'[PHASE rank={rank}] extra_dispatch end', flush=True)
 
                     # Test combine
                     bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device_type)
@@ -410,7 +435,7 @@ def test_main(args: argparse.Namespace,
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
                         combine_args.update({'previous_event': buffer.capture()})
-                    print(f'[PHASE rank={rank}] pre_combine_elapsed={time.time()-_t_cfg0:.3f}s', flush=True) if local_rank==0 else None
+                    print(f'[PHASE rank={rank}] pre_combine_elapsed={time.time()-_t_cfg0:.3f}s combine_x.shape={tuple(recv_x.shape)} handle_recv={None if recv_gbl_rank_prefix_sum is None else int(recv_gbl_rank_prefix_sum[-1].item())}', flush=True)
                     _t_cmb0 = time.time()
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()

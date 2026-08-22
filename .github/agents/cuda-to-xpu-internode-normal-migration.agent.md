@@ -1556,6 +1556,10 @@ shrinking the grid — shrinking the grid costs 2.3x throughput to buy the same 
 
 ### 24.3 Validation (post-fix, reset + 4-GPU health gate before EVERY launch)
 
+> ✅ **RESOLVED in §25:** the default-invocation hang was a *separate, deterministic* bug (padded
+> `x` rows fed to combine by the cached dispatch), not a residual of the QP hazard. The default
+> invocation now passes 9/9 at 2048/7168 and 4/4 at 4096/7168 — see §25.5.
+>
 > ⚠️ **Same overclaim applies to this table — see the boxed warning in §24.2.1.** These runs were
 > all in reduced perf mode (`DEEP_EP_PERF_TOKENS` ⇒ `DEEP_EP_MIN=1`) with `DB_BATCH_SIZE=8`. The
 > plain default full-matrix invocation at 2048/7168 hangs 2/2. Treat the numbers below as valid
@@ -1617,3 +1621,118 @@ Also still open (perf, paused): the 4.7× NVL-sender copy gap (combine ~1.9 GB/s
   `/root/jiafuzha/ishmem_ibgda/build/_install` — the other in-container copy at
   `/root/jiafuzha/code-repo/ishmem_ibgda/build/_install` lacks `ishmemx_putmem_nbi_subgroup`,
   `ishmemx_fence_qp` and `ishmemx_long_atomic_add_qp` and fails the device compile.
+
+## 25. THE REAL BUG BEHIND THE "SHIPPED DEFAULT HANGS" REPORT: padded `x` rows in combine
+
+### 25.1 What was reported and what it really was
+
+After §24.3 shipped, an independent run of the **plain default** invocation
+(`tests/docker-2node-v2/run.sh` at 2048 tok / hidden 7168, no overrides) hung **2/2**, while every
+validation run in §24.3 passed. The two configurations differed in exactly two variables — test
+mode (`DEEP_EP_PERF_TOKENS` ⇒ `DEEP_EP_MIN=1`, one config, vs the full 64-config matrix) and
+`ISHMEM_IBGDA_DB_BATCH_SIZE`. A 2×2 factorial settled it (2048 tok / hidden 7168, shipped default
+kernel config, reset + 4-GPU health gate before EVERY launch, hang judged by **log-mtime stall**,
+not rc):
+
+| cell | test mode | `DB_BATCH` | PASS | HANG | N | wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| A1 | perf (`DEEP_EP_PERF_TOKENS`) | 8 | **4** | 0 | 4 | 80 s |
+| A2 | perf | unset | **4** | 0 | 4 | 80 s |
+| A3 | full 64-config matrix | 8 | 0 | **4** | 4 | ~465 s (stall-killed) |
+| A4 | full 64-config matrix | unset | 0 | **4** | 4 | ~465–485 s (stall-killed) |
+
+⇒ **`DB_BATCH_SIZE` carries none of the effect** (A1≡A2, A3≡A4) — the playbook's "inert" claim now
+has direct experimental support. **The test mode carries 100% of it** (8/8 vs 0/8, Fisher p ≈ 1e-4).
+So it was never a probabilistic scheduling/QP hazard at all: it is a **deterministic bug in a code
+path the reduced mode never executes**.
+
+### 25.2 Bisect: the trigger is the `without top-k` leg, specifically its CACHED dispatch
+
+Single-cell selector added to the driver copy `tests/perf_combine_chunk.py`
+(`DEEP_EP_SEL_X` ∈ {rand,x,rand8,x8}, `DEEP_EP_SEL_TOPK` ∈ {0,1}) so one matrix cell can be run in
+the fast (80 s) reduced mode. All cells 2048 tok / hidden 7168, reset + gate per launch:
+
+| cell | selector | PASS | HANG | N |
+| --- | --- | --- | --- | --- |
+| B1 (= A2) | `x`, top-k | 4 | 0 | 4 |
+| B2 | `x`, **no** top-k | 0 | **3** | 3 |
+| B3 | `x_pure_rand`, top-k | **3** | 0 | 3 |
+| B4 | `x_pure_rand`, **no** top-k (the matrix's FIRST config) | 0 | **3** | 3 |
+| C1 | `x`, no top-k, **cached dispatch skipped** (`DEEP_EP_SKIP_CACHED=1`) | **3** | 0 | 3 |
+| C3 | `x`, top-k, **extra NON-cached second dispatch** (`DEEP_EP_EXTRA_DISPATCH=1`) | **3** | 0 | 3 |
+
+`with_topk=False` carries it completely (`x_pure_rand` is irrelevant: B3 passes). Within that leg,
+`test_internode.py` runs a **cached dispatch** (`buffer.dispatch(x, handle=handle)`) that no other
+leg runs — C1 removes it and the hang vanishes; C3 shows a *second* dispatch is not the problem, so
+it is **cached mode specifically**.
+
+Per-rank phase instrumentation showed all 4 ranks *completing* the cached dispatch and then hanging
+in **combine**, with the smoking gun in the shapes:
+
+```
+[PHASE rank=0] cached_dispatch end recv_x.shape=(4096, 7168)
+[PHASE rank=0] pre_combine_elapsed=44.9s combine_x.shape=(4096, 7168) handle_recv=3386
+```
+
+### 25.3 ROOT CAUSE: `num_tokens = x.size(0)` is the PADDED row count, not the received-token count
+
+- On XPU `test_internode.py` always passes `num_worst_tokens = num_tokens * num_topk`, so the
+  non-cached dispatch returns a **padded** `recv_x` (4096 rows) and a **padded** `recv_src_meta`.
+  The test truncates `recv_x` itself to `recv_gbl_rank_prefix_sum[-1]` (≈3386) — but the *handle*
+  stays padded.
+- `Buffer.internode_dispatch`'s cached branch takes `num_recv_tokens = recv_src_meta.size(0)` ⇒ the
+  cached dispatch returns **4096** rows, and the test feeds that straight into `combine`.
+- `internode_combine` sets `num_tokens = x.size(0)`, and the fused combine's **NVL sender** used it
+  as the end of the LAST `(rank, channel)` block
+  (`internode_combine_fused.inc`, `token_end_idx = (prefix_idx == num_channels*num_ranks-1) ?
+  num_tokens : gbl_channel_prefix_matrix[prefix_idx+1]`, CUDA `internode.cu:1849-1855`).
+- Result: the sender pushes ~710 **pad rows** the receiver never expects. The NVL queue never
+  drains, the receiver never advances, both spin → **deterministic hang** (capped spins simply
+  turn it into a silent drop instead).
+- In CUDA this never fires because `x.size(0)` is always the exact received-token count
+  (`num_worst_tokens` is not used on the cached→combine path there). The padding is an
+  XPU-only accommodation, and the port inherited CUDA's assumption unchanged.
+
+### 25.4 THE FIX (commit: "internode-normal: combine must use the real received-token count")
+
+Pass the dispatch's `recv_gbl_rank_prefix_sum` (already in the handle, index 6) down to the combine
+kernel and use `gbl_rank_prefix_sum[num_ranks-1]` — the **exact** received-token count, available
+device-side with **no host sync** — instead of `num_tokens`:
+
+- `deep_ep/buffer.py::internode_combine` — forward `gbl_rank_prefix_sum` (already unpacked).
+- `csrc/xpu/deep_ep_xpu.cpp::internode_combine` — new `const torch::Tensor& gbl_rank_prefix_sum`.
+- `csrc/xpu/xpu_runtime.hpp`, `csrc/xpu/internode.cpp::combine_nvl_rdma`,
+  `internode_combine_fused.inc::launch_fused_combine` — new `const int* gbl_rank_prefix_sum`.
+- NVL sender: `total_recv_tokens = gbl_rank_prefix_sum ? gbl_rank_prefix_sum[num_ranks-1]
+  : num_tokens`, last block ends there, and both start/end are `min()`-clamped to it (defensive:
+  a stale prefix matrix can no longer walk past the real data either).
+
+**RULE for the playbook: in the fused kernels never use a tensor's row count as a logical token
+count.** `x.size(0)` is an *allocation* size and may be padded (`num_worst_tokens`); the logical
+count lives in the prefix-sum tensors. CUDA could conflate the two; XPU cannot.
+
+### 25.5 Validation (post-fix, reset + 4-GPU health gate before EVERY launch, `k/N`)
+
+| config | PASS | CORRUPT | HANG | N | pre-fix |
+| --- | --- | --- | --- | --- | --- |
+| B2/C2 cell (`x`, no top-k, 2048/7168, reduced mode) | **4** | 0 | 0 | 4 | 0/7 |
+| **full 64-config matrix, 2048 tok / hidden 7168, DEFAULT invocation** | **9** | 0 | 0 | 9 | 0/8 |
+| **full 64-config matrix, 4096 tok / hidden 7168, DEFAULT invocation** | **4** | 0 | 0 | 4 | n/a |
+
+Every run reports `64 passed` lines (the full matrix, values checked). Fisher exact on the
+full-matrix 2048 leg: 9/9 vs 0/8 ⇒ p ≈ 2e-5.
+
+**Healthy full-matrix wall-clock at 2048/7168 (asked for and never previously measured): ~80 s**
+(≈40 s of that is the first-launch SPIR-V JIT of the fused kernels; the remaining 63 configs are
+~0.5 s each). At 4096/7168 it is also ~80 s. The harness adds ~4 min/launch of reset + health gate
+outside that. Anything that stalls >10 min at one config is a genuine hang, not slowness.
+
+### 25.6 Methodological notes worth keeping
+
+- **A reduced/"minimal" test mode is not a validation gate.** `DEEP_EP_MIN` skips the cached
+  dispatch entirely, so the §24.3 "16/16" table could never have caught this. Always land the
+  final `k/N` with the *as-shipped default invocation*.
+- Hang-vs-slow must be judged by **log mtime advancing**, never by rc or by a timeout that is
+  shorter than the workload.
+- `run.sh` forwards env only via the explicit `_add_opt_genv` whitelist — a new debug var silently
+  does nothing until it is added there (bitten 4×).

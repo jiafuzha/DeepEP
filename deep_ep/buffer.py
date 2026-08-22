@@ -1022,6 +1022,7 @@ class Buffer:
         combined_x, combined_topk_weights, event = self.runtime.internode_combine(x, topk_weights, bias_0, bias_1, src_meta,
                                                                                   is_combined_token_in_rank, rdma_channel_prefix_matrix,
                                                                                   rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
+                                                                                  gbl_rank_prefix_sum,
                                                                                   send_rdma_head, send_nvl_head, config,
                                                                                   getattr(previous_event, 'event',
                                                                                           None), async_finish, allocate_on_comm_stream)

@@ -1781,6 +1781,7 @@ struct Buffer {
         const torch::Tensor& rdma_channel_prefix_matrix,
         const torch::Tensor& rdma_rank_prefix_sum,
         const torch::Tensor& gbl_channel_prefix_matrix,
+        const torch::Tensor& gbl_rank_prefix_sum,
         const torch::Tensor& combined_rdma_head,
         const torch::Tensor& combined_nvl_head,
         const Config& config,
@@ -1803,6 +1804,7 @@ struct Buffer {
         check_xpu_tensor(rdma_channel_prefix_matrix, "rdma_channel_prefix_matrix");
         check_xpu_tensor(rdma_rank_prefix_sum, "rdma_rank_prefix_sum");
         check_xpu_tensor(gbl_channel_prefix_matrix, "gbl_channel_prefix_matrix");
+        check_xpu_tensor(gbl_rank_prefix_sum, "gbl_rank_prefix_sum");
         check_xpu_tensor(combined_rdma_head, "combined_rdma_head");
         check_xpu_tensor(combined_nvl_head, "combined_nvl_head");
         TORCH_CHECK(config.num_sms % 2 == 0, "config.num_sms must be even");
@@ -1862,6 +1864,7 @@ struct Buffer {
                                     rdma_channel_prefix_matrix.data_ptr<int>(),
                                     rdma_rank_prefix_sum.data_ptr<int>(),
                                     gbl_channel_prefix_matrix.data_ptr<int>(),
+                                    gbl_rank_prefix_sum.data_ptr<int>(),
                                     num_tokens,
                                     num_combined_tokens,
                                     hidden,
@@ -1890,6 +1893,7 @@ struct Buffer {
                             rdma_channel_prefix_matrix,
                             rdma_rank_prefix_sum,
                             gbl_channel_prefix_matrix,
+                            gbl_rank_prefix_sum,
                             combined_rdma_head,
                             combined_nvl_head,
                             combined_x}) {

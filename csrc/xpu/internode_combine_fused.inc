@@ -310,6 +310,7 @@ void launch_fused_combine(void* combined_x,
                           const int* rdma_channel_prefix_matrix,
                           const int* rdma_rank_prefix_sum,
                           const int* gbl_channel_prefix_matrix,
+                          const int* gbl_rank_prefix_sum,
                           int num_tokens,
                           int num_combined_tokens,
                           int hidden,
@@ -458,10 +459,24 @@ void launch_fused_combine(void* combined_x,
                     int token_start_idx = 0, token_end_idx = 0;
                     if (lane_id < kNumRDMARanks) {
                         const int prefix_idx = (lane_id * num_nvl_ranks + dst_nvl_rank) * num_channels + channel_id;
-                        token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
+                        // The end of the LAST (rank, channel) block is the total number of
+                        // tokens this rank actually received in the dispatch.  `num_tokens`
+                        // (= x.size(0)) is NOT that number when the dispatch padded its
+                        // output to `num_worst_tokens` (always the case on XPU) and the
+                        // caller did not truncate `x` - e.g. the cached-dispatch ->
+                        // combine sequence in test_internode.py's `without top-k` leg,
+                        // which fed combine a 4096-row x while only ~3386 tokens were
+                        // received.  Sending the pad rows makes the NVL sender push
+                        // tokens the receiver never expects -> the queue never drains and
+                        // the collective hangs.  `gbl_rank_prefix_sum[num_ranks - 1]` is
+                        // the exact received-token count, available device-side (no host
+                        // sync), so use it whenever it is supplied.
+                        const int total_recv_tokens =
+                            (gbl_rank_prefix_sum != nullptr) ? gbl_rank_prefix_sum[num_ranks - 1] : num_tokens;
+                        token_start_idx = sycl::min(gbl_channel_prefix_matrix[prefix_idx], total_recv_tokens);
                         token_end_idx = (prefix_idx == num_channels * num_ranks - 1)
-                                            ? num_tokens
-                                            : gbl_channel_prefix_matrix[prefix_idx + 1];
+                                            ? total_recv_tokens
+                                            : sycl::min(gbl_channel_prefix_matrix[prefix_idx + 1], total_recv_tokens);
                     }
                     sycl::group_barrier(sg);
 

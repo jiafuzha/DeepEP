@@ -359,6 +359,7 @@ void combine_nvl_rdma(DataType type,
                       const int* rdma_channel_prefix_matrix,
                       const int* rdma_rank_prefix_sum,
                       const int* gbl_channel_prefix_matrix,
+                      const int* gbl_rank_prefix_sum,
                       int num_tokens,
                       int num_combined_tokens,
                       int hidden,
@@ -418,6 +419,7 @@ void combine_nvl_rdma(DataType type,
         launch_fused_combine<R>(combined_x, combined_topk_weights, x, topk_weights, bias_0, bias_1,               \
                                 combined_rdma_head, combined_nvl_head, static_cast<const SourceMeta*>(src_meta),       \
                                 rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix,           \
+                                gbl_rank_prefix_sum,                                                                  \
                                 num_tokens, num_combined_tokens, hidden, num_topk, rdma_buffer_ptr,                    \
                                 num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,   \
                                 num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, rank, num_ranks,     \
