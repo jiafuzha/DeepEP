@@ -542,13 +542,19 @@ void launch_fused_combine(void* combined_x,
                                 // peer is provided by the release fence + lsc_fence_sysrel()
                                 // that precedes the ch_tail publish below, which is the same
                                 // pairing dispatch relies on.
-                                // C9: unrolled x4 for memory-level parallelism.  Every LSC
+                                // C9: unrolled x2 for memory-level parallelism.  Every LSC
                                 // helper is an `asm volatile`, so the compiler may not
                                 // software-pipeline the plain lane-strided loop: one 512B
                                 // message per sub-group would be in flight at a time.  Issuing
-                                // 4 loads before the first store overlaps 4 message latencies
+                                // 2 loads before the first store overlaps 2 message latencies
                                 // (this is the replacement for CUDA's multi-stage TMA
                                 // pipeline, conversion note C1).
+                                // NOTE (§26.2): the unroll is NOT what separates this kernel
+                                // from dispatch.  The dispatch forwarder
+                                // (internode_dispatch_fused.inc:823-825) uses a plain
+                                // lane-strided loop with NO unroll and is ~5x faster at the
+                                // same byte count, so do not "tune" this factor expecting a
+                                // win -- the combine bottleneck is upstream of the copy.
                                 UNROLLED_GROUP_COPY(2, lane_id, 32, hidden_int4,
                                                     reinterpret_cast<int4_t*>(dst), src,
                                                     ld_nc_global_v, st_na_global_v);
