@@ -336,7 +336,7 @@ void launch_fused_combine(void* combined_x,
     const int hidden_bytes = hidden_int4 * static_cast<int>(sizeof(int4_t));
     const int num_bytes_per_token = fused_combine_num_bytes_per_token(hidden_int4, num_topk);
     const int num_max_nvl_chunked_recv_tokens_per_rdma = num_max_nvl_chunked_recv_tokens / kNumRDMARanks;
-    // §26.4: extra NVL-sender warps per destination (see the kNVLSender comment).
+    // §27.4: extra NVL-sender warps per destination (see the kNVLSender comment).
     // Bounded by the RDMA-rank count (one sub-warp per owned RDMA lane at most) and
     // by the NUM_MAX_NVL_PEERS warp slots the role layout reserves for senders.
     int snd_split = NUM_MAX_NVL_PEERS / num_nvl_ranks;
@@ -461,7 +461,7 @@ void launch_fused_combine(void* combined_x,
 
                 // =====================================================================
                 if (warp_role == kNVLSender) {
-                    // §26.4: the NVL sender is the combine critical path and is limited by
+                    // §27.4: the NVL sender is the combine critical path and is limited by
                     // how many warps stream `x` out of DRAM (measured: a fixed ~0.115 GB/s
                     // per warp regardless of unroll depth or code form).  The original 1:1
                     // warp->destination mapping leaves NUM_MAX_NVL_PEERS - num_nvl_ranks

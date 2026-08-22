@@ -1767,6 +1767,12 @@ outside that. Anything that stalls >10 min at one config is a genuine hang, not 
 
 ## 26. AUTHORITATIVE PERF RE-BASELINE (post-§25) — §13 / §24.4 are both SUPERSEDED
 
+> **NOTE:** the combine column below is itself superseded by **§27** (`1a68632`), which recovers
+> up to 3.58x of it. Keep this table as the *diagnostic baseline* — it is the measurement that
+> identified the bottleneck — but quote §27 for current combine numbers.
+> ⚠️ §27's win applies only when `num_nvl_ranks < 8`; on a full 8-GPU node it is a no-op and the
+> combine numbers below still stand.
+
 Measured 2026-08-22 on the shipped default (20 SMs / 10 channels / `QPS_PER_PE=16`) **after** the
 padded-`x` fix (`5a7d53f`). Every earlier perf table in this document predates either the QP
 default flip or that fix — and combine was previously pushing ~710 **pad rows** per block, so those
@@ -1814,21 +1820,27 @@ not where the time goes.
   identical barrier** at `:826`. Not the gap.
 - **Cache hints.** Both use `ld_nc_global_v` / `st_na_global_v`. Closed earlier.
 
-### 26.3 Where to look next
+### 26.3 Where to look next — ✅ ANSWERED in §27
 1. What `FwdWaitTail` actually waits on, and whether the producer is the true limiter.
+   → **It is starvation, not the cause.** The NVL sender showed 97.8% copy / **0.0% credit wait**.
 2. Which barrier the 29.5% is, and whether combine has a sync dispatch lacks.
+   → Also downstream starvation behind the same sender.
 3. Chunk/queue sizing limiting in-flight tokens (`num_max_nvl_chunked_send_tokens`,
    `num_max_rdma_chunked_*`) — a shallower effective pipeline plateaus exactly like this.
+   → **FALSIFIED**: a queue-depth limit would show as sender *wait*, and wait was 0.0%.
 4. Warp-role allocation: count warps doing useful work per role in each kernel.
+   → **THIS WAS IT.** Dispatch partitions by *token* (70 live warps); combine partitioned by
+   *destination* (20 live warps, 6 of 8 slots idle). See §27.
 5. Diff against `csrc/cuda_kernels/internode.cu` combine (L1716) for a **lost pipelining/overlap
    stage** — same family as the §25 bug: a faithful-looking port that dropped a structural property.
+   → Not a port-fidelity bug: CUDA has the same 1:1 mapping at `internode.cu:1849`.
 
-## §26 Combine throughput: the NVL-sender warp deficit (2026-08, FIXED, `1a68632`)
+## 27. COMBINE THROUGHPUT: the NVL-sender warp deficit (2026-08, FIXED, `1a68632`)
 
 Question: combine was ~5.3x slower than dispatch at 4096 tokens and its bandwidth
 plateaued (~2.3 GB/s NVL, ~1.4 GB/s RDMA) while dispatch kept scaling (12.3 / 7.4).
 
-### §26.1 Attribution vs N (telemetry build, `-DDEEP_EP_COMBINE_TELEMETRY`)
+### 27.1 Attribution vs N (telemetry build, `-DDEEP_EP_COMBINE_TELEMETRY`)
 Per-warp-role cycle attribution, hidden 7168, 2 nodes x 2 ranks, 20 SMs / 10 channels:
 
 | ntok | combine snd copy% | snd wait% | snd cyc/tok | dispatch snd cyc/tok (70 warps) | dispatch fwd cyc/tok (20 warps) |
@@ -1843,7 +1855,7 @@ the forwarder's `FwdWaitTail` and the receiver's 80-90% wait are STARVATION, not
 cause.  This **falsifies the chunk/queue-sizing hypothesis** (a queue-depth limit
 would show up as sender wait).
 
-### §26.2 What is NOT the lever (all measured, all negative)
+### 27.2 What is NOT the lever (all measured, all negative)
 - **Unroll depth.** 2 -> 8 gave 158k -> 146k cyc/tok (-8%).  `UNROLLED_GROUP_COPY(2)`
   is fine; the C9 "x4" comment was stale (fixed in `8702f10`).
 - **Compiler serialization by the `asm volatile` LSC helpers.** A plain C++ `dst4[k] =
@@ -1856,7 +1868,7 @@ would show up as sender wait).
 - Per-token `uc_store` of topk weights: not even executed in the perf bench
   (`num_topk == 0` there), so it cannot explain the perf numbers.
 
-### §26.3 Root cause
+### 27.3 Root cause
 Per-warp streaming throughput is pinned near **0.115 GB/s regardless of code form**.
 The gap is therefore pure producer parallelism:
 - dispatch RDMA sender: partitions **by token** across `DEEP_EP_FUSED_SENDER_WARPS = 7`
@@ -1866,7 +1878,7 @@ The gap is therefore pure producer parallelism:
 3.5x fewer warps x ~1.5x less amortization ~= the observed 5.3x.
 Per int4 element the two are identical (~87 cycles), which is the confirming detail.
 
-### §26.4 Fix
+### 27.4 Fix
 `snd_split = min(kNumRDMARanks, NUM_MAX_NVL_PEERS / num_nvl_ranks)` sub-warps per
 destination; sub-warp `s` owns RDMA lanes `l` with `l % snd_split == s`.  Safe with
 **no new synchronisation and no extra named barrier** (the budget stays at 6 of 8)
@@ -1888,7 +1900,7 @@ splitting WITHIN one (dst, rdma) queue, which does require cooperative slot clai
 -- not attempted.  Note the same 1:1 mapping exists in CUDA `internode.cu:1849`, so
 this is a small-NVL-deployment win rather than a port-fidelity bug.
 
-### §26.5 Build trap (cost one full build+run cycle)
+### 27.5 Build trap (cost one full build+run cycle)
 setuptools dependency-checks only the `.cpp` files, **not** the `.inc` files they
 `#include`.  A pure-`.inc` edit is silently NOT recompiled and you get a stale `.so`
 that looks freshly built.  `_build_deepep_container.sh` now `touch`es
