@@ -1509,6 +1509,33 @@ QPS=1 the old safe 8 is preserved. Shipped default is now **num_sms=20 (10 chann
 Plus, before the default flip, at `FUSED_MAX_SMS=24` + `QPS=16`: **16/16 @2048, 8/8 @4096**.
 Against the ~60% base failure rate, 16/16 has p ≈ 4e-7.
 
+> ### ⚠️ 2026-08-22 — THE ABOVE VALIDATION IS OVERCLAIMED. DO NOT CITE IT AS "AS-SHIPPED".
+>
+> Every one of those 2048/4096 launches carried **`DEEP_EP_PERF_TOKENS=<tok>`**, which sets
+> `DEEP_EP_MIN=1` and collapses `test_internode.py` to **2 configs + the perf bench** (2 `passed`
+> lines, not 64) — *and* **`ISHMEM_IBGDA_DB_BATCH_SIZE=8`**, which is not a default. The 64-config
+> matrix was only ever run at **32 tok / hidden 1024**, a regime §21 proves is BLIND to this bug
+> class. So the shipped default was validated at the right *kernel configuration*
+> (20 SMs / 10 channels / 16 QPs) but at the **wrong workload**.
+>
+> An independent run of the **plain default invocation** (full 64-config matrix, 2048 tok /
+> hidden 7168, no `DB_BATCH`, no SMS/QPS overrides) **HANGS: 2/2**. Evidence it is a true hang and
+> not a timeout: with `TIMEOUT_SEC=5400` the run sat **763 s with `passed_lines=0`** and the log
+> **mtime did not advance for 12 minutes**, stalled on the *first* config — the same first config
+> that completes well inside 300 s in perf mode.
+>
+> Therefore the one-QP-per-channel change is, on current evidence, **rate-reducing rather than
+> curative** (consistent with §24.2.2 still being OPEN: the mechanism is established, the stall
+> site is not). Two uncontrolled variables separate the passing and hanging runs — **test mode**
+> (perf vs full matrix) and **`DB_BATCH_SIZE`** (8 vs unset). A 2×2 factorial is in flight to
+> attribute it. Note `DB_BATCH_SIZE` must NOT be assumed inert here: the "inert because
+> `force_db=true`" note is source-derived, and doorbell batching is mechanically adjacent to the
+> per-QP contention this section establishes.
+>
+> **Gate rule this cost us:** a correctness gate MUST run the **full matrix at 2048+/hidden 7168
+> with no `DEEP_EP_PERF_TOKENS`**, because `DEEP_EP_PERF_TOKENS` silently sets `DEEP_EP_MIN=1` and
+> makes the run near-blind to correctness. Never validate a fix in perf mode.
+
 **Perf — the clamp regression is not just recovered, it is beaten** (hidden 7168, round-trip µs):
 
 | tokens | clamped num_sms=8, QPS=1 (24.4) | **new default (20 / QPS=16)** | speedup |
@@ -1528,6 +1555,11 @@ per QP (6/QP and 4/QP measured clean), not merely a perf knob. Prefer raising `Q
 shrinking the grid — shrinking the grid costs 2.3x throughput to buy the same safety.
 
 ### 24.3 Validation (post-fix, reset + 4-GPU health gate before EVERY launch)
+
+> ⚠️ **Same overclaim applies to this table — see the boxed warning in §24.2.1.** These runs were
+> all in reduced perf mode (`DEEP_EP_PERF_TOKENS` ⇒ `DEEP_EP_MIN=1`) with `DB_BATCH_SIZE=8`. The
+> plain default full-matrix invocation at 2048/7168 hangs 2/2. Treat the numbers below as valid
+> **only** for that reduced configuration.
 
 | config | PASS | CORRUPT | HANG | N |
 | --- | --- | --- | --- | --- |
