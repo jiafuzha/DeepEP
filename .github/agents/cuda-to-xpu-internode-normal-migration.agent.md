@@ -20,6 +20,11 @@ inventing new ones — the patterns encode hard-won CUDA-parity and BMG-specific
 - `nvshmem_ishmem_api_mapping.txt` (repo root) — full symbol mapping table.
 - `csrc/xpu/named_barrier_usage.md` — NamedBarrier semantics + IGC pitfalls.
 - `csrc/xpu/root_group_cooperative_launch.md` — grid-sync replacements.
+- `csrc/xpu/internode_normal_design.md` — **design/implementation reference for the
+  finished port**: warp roles, named-barrier counts, the D1–D6/C1–C6 deviation list,
+  queue protocol, the full configuration surface, the current perf table, and the
+  open perf questions. Start here for a perf review; this playbook is the *history*
+  of how the port was reached, that document is the *state* it reached.
 
 ## 1. Sources of truth for this migration
 
