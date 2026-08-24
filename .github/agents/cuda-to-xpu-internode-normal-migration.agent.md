@@ -1921,3 +1921,33 @@ that looks freshly built.  `_build_deepep_container.sh` now `touch`es
 Also: `dev_clock()` (`__spirv_ReadClockKHR`) is not volatile, so IGC may sink/hoist
 the reads -- one telemetry build produced negative cycle deltas.  Cross-check any
 suspicious attribution against the `[PERF ...]` wall-clock numbers.
+
+### 27.6 Full token sweep on the shipped default (2026-08-24, post-`1a68632`)
+
+Independent sweep, `tests/docker-2node-v2`, perf mode, hidden 7168, `topk=2`, `num_experts=8`,
+2 nodes x 2 ranks, shipped default (20 SMs / 10 channels / `QPS_PER_PE=16`), containers +
+`/dev/shm` + IPC sockets cleaned before every run. **8/8 PASS**, ~70 s wall each. Rank 0 shown.
+
+| tokens | round-trip (us) | dispatch iso (us) | combine iso (us) | comb/disp | nvl_send GB/s | rdma_recv GB/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32   | 1 361.6  | 949.3   | 818.8    | **0.86** | 0.88 | 0.56 |
+| 64   | 1 607.3  | 1 092.2 | 943.2    | 0.86 | 1.67 | 0.97 |
+| 128  | 2 296.9  | 1 252.9 | 1 458.6  | 1.16 | 2.20 | 1.26 |
+| 256  | 3 173.0  | 1 537.8 | 2 015.4  | 1.31 | 3.10 | 1.82 |
+| 512  | 4 714.6  | 2 224.6 | 2 959.6  | 1.33 | 3.99 | 2.48 |
+| 1024 | 7 378.6  | 3 038.4 | 4 761.8  | 1.57 | 4.97 | 3.08 |
+| 2048 | 10 649.2 | 4 485.0 | 6 400.5  | 1.43 | 7.58 | 4.59 |
+| 4096 | 19 055.2 | 7 958.8 | 11 595.8 | **1.46** | 8.28 | 5.06 |
+
+**vs the §26 pre-fix baseline** (same harness/config): combine iso improves 3.57x at 2048
+(22 850 -> 6 400) and **3.61x at 4096** (41 900 -> 11 596); round-trip improves 2.39x and
+**2.50x**. Dispatch iso is unchanged within noise (7 959 vs 7 968 at 4096), confirming the change
+is isolated to the combine sender.
+
+The pathological **scaling ceiling is gone**: combine/dispatch now stays in 0.86-1.57x across the
+whole range instead of climbing 0.89 -> 5.26x, and combine's bandwidth keeps scaling with N
+(nvl_send 0.88 -> 8.28 GB/s) rather than plateauing at ~2.3 GB/s.
+
+Reminder: this is perf mode (`DEEP_EP_PERF_TOKENS` => `DEEP_EP_MIN=1`), which is **blind to
+correctness**. Correctness is gated separately by the full 64-config matrix (§27.4 / §25.5).
+Reminder 2: the §27 win is a **no-op at `num_nvl_ranks == 8`**.
