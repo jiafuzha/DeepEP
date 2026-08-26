@@ -571,6 +571,30 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     // Give each channel its own QP and the previously-failing grid is clean:
     // num_sms=24 + QPS_PER_PE=16 measured 16/16 @2048 tok and 8/8 @4096 tok, hidden 7168.
     // So the grid cap is only needed when channels must SHARE queue pairs.
+    //
+    // 2026-08 UPDATE #2 (design doc §6.4, CLOSED).  The "num_sms=24 is clean" result above
+    // is a CORRECTNESS observation and was mis-read as a throughput opportunity.  It is not:
+    // exceeding the driver's co-residency answer is a large REGRESSION.  Measured on
+    // Arc Pro B60 (driver bound = 20), 2048 tok / hidden 7168 / QPS_PER_PE=16, rank 0
+    // round-trip | dispatch | combine in us:
+    //
+    //     num_sms=12   15541.2 | 5332.6 | 10823.1
+    //     num_sms=16   12065.7 | 4630.5 |  7579.4
+    //     num_sms=20   10644.8 | 4513.4 |  6369.2   <-- driver bound, BEST
+    //     num_sms=24   14097.5 | 4765.7 |  9577.8   (+32% round-trip, +50% combine)
+    //
+    // The curve is unimodal and peaks EXACTLY at the driver bound.  Mechanism: the fused
+    // path runs 2 work-groups per channel that spin on each OTHER (sender <-> forwarder).
+    // Once the grid exceeds what the device can hold resident, some channel has one WG
+    // scheduled and its partner not, so the resident WG burns its Xe-core spinning on a
+    // partner that cannot run until it yields.  That is a scheduling deadlock avoided only
+    // by kFusedSpinCap, and it costs far more than the extra channels buy.  Below the bound
+    // the kernel is warp-starved instead (fewer streaming warps, see design doc §6.1/§6.2),
+    // which is why 16 and 12 also lose.
+    //
+    // CONCLUSION: the driver bound is NECESSARY *and* SUFFICIENT *and* OPTIMAL.  Do not
+    // raise it.  `DEEP_EP_FUSED_MAX_SMS` remains available for experiments but now warns
+    // when it is pushed past the device-derived value.
     constexpr int kEmpiricalSafeSms = 8;         // safe when many channels share one QP
     constexpr int kSafeChannelsPerQp = 2;        // validated: 1 ch/QP clean, 6 ch/QP clean
     const int qps_per_pe = fused_qps_per_pe_env();
@@ -585,14 +609,28 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     if (env != nullptr && env[0] != '\0') {
         const int v = std::atoi(env);
         if (v >= 2) {
+            const int forced = v - (v % 2);
             std::fprintf(stderr,
                          "[DeepEP] internode fused co-residency limit overridden by DEEP_EP_FUSED_MAX_SMS: "
                          "%d (device-derived value was %d; dispatch=%d combine=%d)\n",
-                         v - (v % 2),
+                         forced,
                          sms,
                          dispatch_cap,
                          combine_cap);
-            sms = v - (v % 2);
+            if (forced > sms) {
+                // Measured +32% round-trip / +50% combine at 24 vs the bound of 20; see the
+                // §6.4 table above.  Oversubscribing the fused grid makes paired sender and
+                // forwarder work-groups fight for the same Xe-core.
+                std::fprintf(stderr,
+                             "[DeepEP] WARNING: DEEP_EP_FUSED_MAX_SMS=%d EXCEEDS the device co-residency "
+                             "bound of %d. The fused path runs 2 mutually-spinning work-groups per channel, "
+                             "so an oversubscribed grid is a large SLOWDOWN (measured +32%% round-trip at "
+                             "24 vs 20 on a 20-Xe-core part), not a speedup. Expect a regression.\n",
+                             forced,
+                             sms);
+            }
+            std::fflush(stderr);
+            sms = forced;
         }
     }
 

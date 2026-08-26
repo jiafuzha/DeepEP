@@ -319,11 +319,11 @@ queue resource is already per-RDMA-lane. Measured **3.56×–3.61×** (combine
 plus cooperative slot claiming. Not attempted. This is the main structural item
 for review.
 
-### 6.2 Per-warp streaming ceiling ~0.115 GB/s
+### 6.2 Per-warp streaming ceiling ~0.115 GB/s — **the "6.8× gap" was an artifact**
 
-Per-warp payload streaming is pinned around 0.115 GB/s essentially regardless of
-code form, which is why aggregate bandwidth tracks live-warp count so closely and
-plateaus around 2.3 GB/s. **Do not re-open the following — all measured, all dead:**
+Per-warp payload streaming is pinned around 0.115–0.19 GB/s essentially regardless of
+code form, which is why aggregate bandwidth tracks live-warp count so closely.
+**Do not re-open the following — all measured, all dead:**
 
 - Unroll depth: 2→8 gave only −8 %; dispatch uses **no unroll** and was 5× faster.
 - Per-token `group_barrier` in the copy loop: dispatch has the identical barrier.
@@ -334,33 +334,211 @@ plateaus around 2.3 GB/s. **Do not re-open the following — all measured, all d
 - Work-group co-residency (128/128 concurrent WGs achieved at 64 KiB SLM).
 - The three uncapped iSHMEM SQ spins — breaking all three left the hang rate
   unchanged, with a working positive control.
+- **L1-cacheable source load (NEW, 2026-08).** The NVL sender reads `x` with
+  `ld_nc_global_v` = `lsc_load.ugm.uc.ca`, i.e. L1 bypass. Unlike every other payload
+  read in these kernels, `x` is an ordinary *local, coherent* torch tensor (never
+  NIC-delivered, never peer-written), so a fully-cached `.ca.ca` load is legal there and
+  was expected to restore L1 coalescing/prefetch. **Measured neutral**: combine
+  6397.0 µs (`.ca.ca`) vs 6458.7 µs (`.uc.ca`) @2048 tok / hidden 7168 — ~1 %, inside the
+  6369–6459 µs run-to-run band. The L1 hint is not the lever; the code was reverted.
 
-The dispatch-vs-combine per-token cycle gap (23.9 k vs 163 k) is ~6.8× and is
-**not** explained by any of the above. That gap is the most valuable unexplained
-number in this document.
+#### The dispatch-vs-combine cycle gap does not exist per-warp
 
-### 6.3 Open iSHMEM stall site (per-QP contention)
+The previous edition of this document called the 23.9 k vs 163 k cyc/tok ratio "the most
+valuable unexplained number in this document". **It is a telemetry normalization artifact
+and is now retracted.** Normalising the *same* shipped run by live warp count instead:
 
-Mechanism established: onset at ~12 channels/QP; 4 and 6 channels/QP clean.
-Remaining candidates, none confirmed:
+| kernel | aggregate | live streaming warps | **GB/s per warp** |
+|---|---|---|---|
+| dispatch (`nvl_recv`) | 10.77 GB/s | 8/WG × 10 ch = 80 | **0.135** |
+| combine (`nvl_send`) | 7.62 GB/s | 4/WG × 10 ch = 40 | **0.191** |
 
-1. Uncapped CQ poll at `ibgda_device_impl.h:2624-2645`.
-   `ishmemx_long_atomic_add_qp` silently maps to a **fetching** AMO (`~:2923`):
-   557 µs vs 37 µs on the wire.
-2. `claim_ibuf_slot` exhaustion → silent host-proxy fallback.
-3. Shared `ibuf_base_addr` bug at `ibgda.cpp:1064-1075`.
-4. Possibly DeepEP's own spin.
+Per-warp throughput is the same to within measurement noise — combine is *not* less
+efficient per warp, it simply runs **half as many streaming warps**. Confirmed directly by
+sweeping `DEEP_EP_COMBINE_SND_SPLIT` (2048 tok / hidden 7168):
 
-Needs `gdb-oneapi`; device `printf` is lost when a kernel hangs.
-A parked design for a non-fetching `ishmemx_long_atomic_add_qp_nbi` exists
-(`ishmem-nbi-amo-patch-design.md`) and would address candidate (1) directly.
+| `snd_split` | live sender warps | `nvl_send` GB/s | GB/s per warp |
+|---|---|---|---|
+| 1 | 20 | 2.65 | 0.132 |
+| 2 (shipped) | 40 | 7.63 | 0.191 |
 
-### 6.4 Can the SM clamp be raised?
+Doubling the warps gave **2.9×** the bandwidth — slightly *superlinear*, because more
+concurrent warps also hide more memory latency.
 
-`kEmpiricalSafeSms = 8` predates the QP-contention diagnosis. With `QPS_PER_PE=16`
-the `qp_safe` term dominates anyway, but the shipped default is `num_sms=20` while
-`num_sms=24` has been measured clean 16/16 @2048 and 8/8 @4096. Raising the default
-is the cheapest available throughput knob and should be decided in review.
+> **Model: aggregate NVL bandwidth ≈ live_warp_count × ~0.15 GB/s, and the only lever is
+> the warp count.** The ~0.15 GB/s/warp figure is a genuine per-warp memory-level-
+> parallelism ceiling common to *both* kernels, not a combine-specific defect.
+
+This makes §6.2 and §6.1 the same open item, and bounds the remaining upside: at the
+production `num_nvl_ranks = 8` shape `snd_split` is already 1 and there are **no idle
+sender warp slots left**, so the idle-slot opportunity exists only at small NVL widths.
+Going further requires token-range splitting *within* one `(dst, rdma)` queue, which needs
+ordered tail publication across warps — and the obvious implementation (a hand-rolled SLM
+arrival counter) is exactly the construct §2.2 records as deadlocking on this stack. A
+named barrier would be required, and the barrier budget is already near the IGC ICE cliff.
+
+### 6.3 iSHMEM per-QP stall site — **root cause CONFIRMED; CLOSED as a perf item (§6.3.1)**
+
+Previously four candidates, "none confirmed". The mechanism is now traced end-to-end, and
+it is candidate (1); candidates (2) and (3) are *consequences* of the same path, not
+independent bugs.
+
+**The chain.** DeepEP publishes every RDMA queue tail with
+`ishmemx_fence_qp` + `ishmemx_long_atomic_add_qp` (deviation C4). In iSHMEM:
+
+```
+ishmemx_long_atomic_add_qp                       (src/amo.cpp:339)
+  -> ishmemi_ibgda_device_amo_nonfetch<long, AMO_ADD>
+  -> ishmemi_ibgda_device_amo_fetch<long, AMO_FETCH_ADD>   (ibgda_device_impl.h:2923)
+  -> ishmemi_ibgda_device_rdma_atomic64(ATOMIC_FA, ...)    (ibgda_device_impl.h:2460)
+```
+
+`amo_nonfetch` has **no non-fetching implementation at all** — every "non-fetch" op is
+unconditionally rewritten to its fetching equivalent and the result is written into a
+`dummy` the caller discards. `rdma_atomic64` then:
+
+1. claims an ibuf slot for the NIC to DMA the fetched result into (→ candidate 2:
+   `claim_ibuf_slot` exhaustion returns `false` and silently falls back to the host proxy —
+   but that slot only exists *because* of the fetch);
+2. posts the WQE and rings the doorbell;
+3. **Step 4: blocks polling the collapsed CQ with an explicitly uncapped spin** —
+   the in-source comment reads *"No spin cap -- a bounded cap silently drops flags"*;
+4. reads the result out of ibuf — the value DeepEP throws away.
+
+So **each tail publish is a synchronous full network round-trip** (post → NIC → remote →
+CQE → poll) where DeepEP only ever needed a fire-and-forget increment. That is the
+557 µs vs 37 µs on the wire.
+
+**Why it degrades with channels-per-QP.** The CQ polled in step 3 is a *collapsed* CQ,
+one per QP: a single `wc_counter` at `nic_cq_buf + 0x3C`. Every channel sharing that QP
+blocks on the same counter waiting for its own `target_wc`. Because the counter only ever
+reports the most recent completion, a waiter whose CQE is collapsed past never observes
+its own target and — with no spin cap — **spins forever**. That is precisely the measured
+signature: clean at 4 and 6 channels/QP, 4/6 hangs at ~12 channels/QP. It is a hang, not a
+slowdown, exactly as reported.
+
+**Why the shipped config is safe.** `ISHMEM_IBGDA_QPS_PER_PE=16` (§4.1) gives ~1 channel
+per QP at the shipped 10 channels, so no two channels share a collapsed CQ. This is why
+that setting is documented as a *correctness requirement rather than a tuning knob* — the
+reason is now known.
+
+**The fix, and why it is not landed here.** DeepEP does not need an atomic at all:
+`rdma_channel_tail.buffer(rdma_rank)` is indexed by the **source** RDMA rank, so each
+`(dst_pe, channel, src_rdma_rank)` tail has exactly **one writer**, and that writer already
+tracks the absolute value in `last_issued_tail`. A plain 8-byte RDMA **write** of the
+absolute tail, on the same QP, is sufficient — RC in-order gives the same
+"flag-after-payload" guarantee the AMO relied on, with no ibuf slot, no CQ poll and no
+collapsed-CQ hazard. It would address candidates 1–3 at once and is a DeepEP-side change,
+so it needs no iSHMEM rebuild (preserving archive parity, §2.2).
+
+The two iSHMEM entry points that would make this a one-line change are **declared but
+never implemented** — `ishmemx_putmem_nbi_qp` and `ishmemx_putmem_signal_qp` exist only as
+prototypes in `src/ishmemx.h` (2348, 2352) with no definition in any `.cpp`. The only
+implemented QP-pinned put is the sub-group collective `ishmemx_putmem_nbi_subgroup`, so a
+DeepEP-side fix must (a) restructure the single-lane publish into a sub-group-collective
+call, and (b) add an 8-byte staging slot in the symmetric heap, since an RDMA write source
+must be NIC-registered memory and `last_issued_tail` is a register. That is a protocol
+change to the most hang-prone path in the port and needs a full intermittency campaign
+(k/N over many runs) to land safely — deliberately **not** attempted in the same pass as
+the measurements above.
+
+A parked design for a non-fetching `ishmemx_long_atomic_add_qp_nbi`
+(`ishmem-nbi-amo-patch-design.md`) attacks the same root cause from the iSHMEM side, but
+requires rebuilding `libishmem.a` and therefore re-validating archive parity for the LL
+path as well.
+
+#### 6.3.1 Is the blocking AMO actually a throughput bottleneck? — **NO (measured)**
+
+The fix above was scoped but deliberately not landed, because a direct measurement shows
+the blocking AMO **is not on the throughput critical path** at the shipped configuration.
+
+The test issues one tail-publish AMO per RDMA chunk, and chunks are counted in *tokens*,
+so `num_max_rdma_chunked_send_tokens` is a direct control on the **AMO count** at fixed
+byte volume. `Config` now honours `DEEP_EP_RDMA_CHUNK` / `DEEP_EP_NVL_CHUNK`
+(`xpu_runtime.hpp`) purely so this can be varied without editing a caller — the frozen
+`tests/test_internode.py` hardcodes `Config(num_sms, 8, nvl, 16, rdma)`.
+
+If the blocking AMO dominated, **halving the AMO count should reduce dispatch time**.
+It does the opposite. Dispatch(iso), 2048 tokens, hidden 1024 (chosen because the
+byte-independent floor is ~80% of dispatch there, so the effect is amplified):
+
+| `rdma_chunk` | 4 | 8 | **16 (shipped)** | 32 | 64 |
+| --- | --- | --- | --- | --- | --- |
+| dispatch(iso) µs | 6980.9 | 3381.1 | **2030.1** | 2434.1 | 3430.2 |
+
+A clean unimodal curve peaking **exactly at the shipped value**, with 4× fewer AMOs
+(`64`) being **69% slower**. The AMO count is therefore not what sets the floor;
+**pipelining granularity** is. Larger chunks make the sender accumulate longer before
+publishing, starving the forwarder; smaller chunks lose per-chunk efficiency.
+
+This also explains the "557 µs vs 37 µs" figure that motivated §6.3: it is an aggregate
+over a microbenchmark, not a per-op cost on this path. At the test shape there are only
+~7 AMOs per channel and channels run concurrently, so even a pessimistic 10 µs round-trip
+contributes ~70 µs to a ~4500 µs dispatch (~1.5%).
+
+**Conclusion — §6.3 is CLOSED as a performance item.** The root-cause analysis above
+remains correct and is still the reason `ISHMEM_IBGDA_QPS_PER_PE=16` is a *correctness*
+requirement (it keeps ~1 channel/QP, avoiding the collapsed-CQ hang). But replacing the
+AMO with an RDMA write is a **robustness / configuration-simplification** change, not a
+throughput win, and must not be justified on perf grounds. Given it is a protocol change
+to the most hang-prone path in the port, the cost/benefit does not support landing it.
+
+#### 6.3.2 Side result: the chunk-size optimum is shape-dependent
+
+The same sweep at the headline shape (2048 tokens, hidden 7168) puts the optimum at
+`rdma_chunk=8`, not 16. Two independent samples each, run-to-run spread ±9 µs:
+
+| | round-trip µs | dispatch(iso) µs | combine(iso) µs |
+| --- | --- | --- | --- |
+| `rdma_chunk=16` (shipped) | 10644.8 / 10659.0 | 4513.4 / 4506.8 | 6369.2 / 6409.3 |
+| `rdma_chunk=8` | 10444.7 / 10426.0 | **4334.9 / 4344.0** | 6361.1 / 6353.1 |
+| `rdma_chunk=32` | 12096.7 | 5194.1 | 7004.0 |
+
+`nvl_chunk` is flatter and the shipped value is already near-optimal (combine, hidden
+7168): `4` → 6381.8 µs, **`8` (shipped)** → ~6389 µs, `16` → 7088.7 µs.
+
+The two knobs compose. Best measured configuration at hidden 7168,
+`rdma_chunk=8 nvl_chunk=4`: round-trip **10242.5 µs (-3.8%)**, dispatch **4301.0 µs
+(-4.6%)**, combine 6326.8 µs (-1.0%). Verified 64/64 on the correctness gate.
+
+**The shipped defaults are deliberately left unchanged.** The optimum inverts with shape
+(16 wins at hidden 1024, 8 wins at hidden 7168), and every number here comes from a
+`num_nvl_ranks=2, kNumRDMARanks=2` rig — exactly the configuration §6.2 warns does not
+generalise to the production `nvl=8` shape. These are tuning data and a knob, not a new
+default; re-run the sweep on the target shape before changing anything.
+
+### 6.4 Can the SM clamp be raised? — **CLOSED: no, 20 is optimal**
+
+`kEmpiricalSafeSms = 8` predates the QP-contention diagnosis and is dead at the shipped
+`QPS_PER_PE=16` (`qp_safe = 2·2·16 = 64` dominates the `max()`), so the binding
+constraint is the **driver co-residency query**, which answers **20** on Arc Pro B60
+(= its Xe-core count). The open question was whether to push past it, on the strength of
+`num_sms=24` having been measured *clean*.
+
+**Measured, and the answer is no.** `num_sms=24` is correct but 32 % SLOWER. Sweep at
+2048 tok / hidden 7168 / `QPS_PER_PE=16`, rank 0, via `DEEP_EP_FUSED_MAX_SMS`:
+
+| num_sms | round-trip µs | dispatch µs | combine µs | vs. 20 |
+|---|---|---|---|---|
+| 12 | 15541.2 | 5332.6 | 10823.1 | +46 % |
+| 16 | 12065.7 | 4630.5 | 7579.4 | +13 % |
+| **20** (driver bound, shipped) | **10644.8** | **4513.4** | **6369.2** | — |
+| 24 | 14097.5 | 4765.7 | 9577.8 | **+32 %** |
+
+The curve is unimodal and peaks **exactly** at the driver bound. Mechanism: the fused path
+runs **two mutually-spinning work-groups per channel** (sender ↔ forwarder). Once the grid
+exceeds what the device holds resident, some channel has one WG scheduled and its partner
+not, so the resident WG burns its Xe-core spinning on a partner that cannot run until it
+yields — a scheduling deadlock survivable only because of `kFusedSpinCap`. Below the bound
+the kernel is warp-starved instead (§6.1/§6.2), which is why 16 and 12 also lose.
+
+> **The earlier "24 is clean 16/16" result was a *correctness* observation and was
+> mis-read as a throughput opportunity.** Correct and fast are different questions.
+
+**Resolution.** Ship the driver bound unchanged. `fused_max_coresident_sms()` now emits an
+explicit WARNING when `DEEP_EP_FUSED_MAX_SMS` is pushed above the device-derived value.
+`kEmpiricalSafeSms` is retained because it is *not* dead at low `QPS_PER_PE` (at
+`QPS_PER_PE=1` it is what clamps the grid to 8).
 
 ### 6.5 Reduced-precision residuals
 

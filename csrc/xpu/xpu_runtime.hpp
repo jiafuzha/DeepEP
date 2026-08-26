@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>
@@ -50,6 +51,22 @@ dtype_t align_up(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
+// Diagnostic-only override for the chunk sizes baked into a `Config`.
+//
+// The high-throughput internode path issues one RDMA tail-publish AMO per RDMA
+// chunk and one NVL flag update per NVL chunk, so the chunk sizes set the
+// *per-chunk overhead count* independently of the byte volume. Being able to
+// vary them without editing a caller is what lets us separate "bandwidth" from
+// "fixed per-chunk cost" when profiling (design doc SS6.3). Unset by default, so
+// shipped behaviour is exactly whatever the caller passed in.
+inline int config_env_override(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0')
+        return fallback;
+    const int parsed = std::atoi(raw);
+    return parsed > 0 ? parsed : fallback;
+}
+
 struct Config {
     int num_sms;
     int num_max_nvl_chunked_send_tokens;
@@ -67,17 +84,24 @@ struct Config {
           num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
           num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
           num_max_rdma_chunked_recv_tokens(num_max_rdma_chunked_recv_tokens) {
+        // Apply the diagnostic overrides before validation so that an override
+        // can never smuggle an illegal chunk size past the checks below.
+        const int nvl_send = config_env_override("DEEP_EP_NVL_CHUNK", num_max_nvl_chunked_send_tokens);
+        const int rdma_send = config_env_override("DEEP_EP_RDMA_CHUNK", num_max_rdma_chunked_send_tokens);
+        this->num_max_nvl_chunked_send_tokens = nvl_send;
+        this->num_max_rdma_chunked_send_tokens = rdma_send;
+
         TORCH_CHECK(num_sms >= 0, "num_sms must be non-negative");
-        TORCH_CHECK(num_max_nvl_chunked_send_tokens > 0, "num_max_nvl_chunked_send_tokens must be positive");
+        TORCH_CHECK(nvl_send > 0, "num_max_nvl_chunked_send_tokens must be positive");
         TORCH_CHECK(num_max_nvl_chunked_recv_tokens > 0, "num_max_nvl_chunked_recv_tokens must be positive");
-        TORCH_CHECK(num_max_nvl_chunked_send_tokens < num_max_nvl_chunked_recv_tokens,
+        TORCH_CHECK(nvl_send < num_max_nvl_chunked_recv_tokens,
                     "num_max_nvl_chunked_send_tokens must be smaller than num_max_nvl_chunked_recv_tokens");
-        TORCH_CHECK(num_max_rdma_chunked_send_tokens > 0, "num_max_rdma_chunked_send_tokens must be positive");
+        TORCH_CHECK(rdma_send > 0, "num_max_rdma_chunked_send_tokens must be positive");
         TORCH_CHECK(num_max_rdma_chunked_recv_tokens > 0, "num_max_rdma_chunked_recv_tokens must be positive");
-        this->num_max_rdma_chunked_recv_tokens = align_up<int>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
-        TORCH_CHECK(num_max_rdma_chunked_send_tokens < this->num_max_rdma_chunked_recv_tokens,
+        this->num_max_rdma_chunked_recv_tokens = align_up<int>(num_max_rdma_chunked_recv_tokens, rdma_send);
+        TORCH_CHECK(rdma_send < this->num_max_rdma_chunked_recv_tokens,
                     "num_max_rdma_chunked_send_tokens must be smaller than aligned RDMA recv tokens");
-        TORCH_CHECK(num_max_rdma_chunked_send_tokens <= this->num_max_rdma_chunked_recv_tokens / 2,
+        TORCH_CHECK(rdma_send <= this->num_max_rdma_chunked_recv_tokens / 2,
                     "num_max_rdma_chunked_send_tokens must be at most half of RDMA recv tokens");
     }
 

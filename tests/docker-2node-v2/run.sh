@@ -330,6 +330,7 @@ run_test() {
     _add_opt_genv DEEP_EP_DBG_DROP             "${DEEP_EP_DBG_DROP:-}"
     _add_opt_genv DEEP_EP_SKIP_WARMUP          "${DEEP_EP_SKIP_WARMUP:-}"
     _add_opt_genv DEEP_EP_RDMA_CHUNK           "${DEEP_EP_RDMA_CHUNK:-}"
+    _add_opt_genv DEEP_EP_NVL_CHUNK            "${DEEP_EP_NVL_CHUNK:-}"
     _add_opt_genv DEEP_EP_BENCH_SEL            "${DEEP_EP_BENCH_SEL:-}"
     _add_opt_genv DEEP_EP_BENCH_ITERS          "${DEEP_EP_BENCH_ITERS:-}"
     _add_opt_genv DEEP_EP_SEL_X                "${DEEP_EP_SEL_X:-}"
