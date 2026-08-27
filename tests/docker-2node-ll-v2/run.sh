@@ -49,7 +49,8 @@ NODE1_PORT=2331
 # DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
 DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
 DEEP_EP_RDMA_BYTES="${DEEP_EP_RDMA_BYTES:-67108864}"  # 64 MiB
-ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"  # 256 MiB
+# Empty => auto-sized from NUM_TOKENS/HIDDEN below (256 MiB floor). A user-set value wins.
+ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-}"
 
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -61,6 +62,22 @@ HIDDEN="${HIDDEN:-7168}"
 NUM_TOPK="${NUM_TOPK:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
+
+# Auto-size the iSHMEM symmetric heap from the problem shape. The LL symmetric
+# buffers scale linearly with num_max_dispatch_tokens_per_rank, so the old flat
+# 256 MiB default hard-fails above ~256 tokens: at NUM_TOKENS=1024 / HIDDEN=7168 /
+# NUM_EXPERTS=8 the buffer alone is 477 MB and allocation aborts with
+# "ishmem_align failed for 477102336 bytes". Reserve next_pow2(tokens*hidden*2*48)
+# with a 256 MiB floor, which covers 32..4096 tokens (1024 -> 1 GiB, 2048 -> 2 GiB,
+# 4096 -> 4 GiB) while leaving small shapes at the original 256 MiB.
+if [ -z "$ISHMEM_SYMMETRIC_SIZE" ]; then
+    _sym_need=$(( NUM_TOKENS * HIDDEN * 2 * 48 ))
+    _sym=268435456
+    while [ "$_sym" -lt "$_sym_need" ]; do _sym=$(( _sym * 2 )); done
+    ISHMEM_SYMMETRIC_SIZE="$_sym"
+    echo "===== ISHMEM_SYMMETRIC_SIZE auto-sized to $ISHMEM_SYMMETRIC_SIZE bytes "\
+         "(NUM_TOKENS=$NUM_TOKENS HIDDEN=$HIDDEN) ====="
+fi
 
 # Auto-default the IBGDA multi-QP count to one QP per LOCAL expert (the LL send
 # kernels key the destination QP by the local expert index), rounded up to a
@@ -406,13 +423,17 @@ run_test() {
         -e ISHMEM_DIR="$ISHMEM_DIR" \
         -e ISHMEM_IBGDA_DB_MODE="${ISHMEM_IBGDA_DB_MODE:-0}" \
         -e ISHMEM_IBGDA_QPS_PER_PE="${ISHMEM_IBGDA_QPS_PER_PE:-1}" \
-        -e ISHMEM_IBGDA_DB_BATCH_SIZE="${ISHMEM_IBGDA_DB_BATCH_SIZE:-0}" \
+        -e ISHMEM_IBGDA_DB_BATCH_SIZE="${ISHMEM_IBGDA_DB_BATCH_SIZE:-8}" \
         -e ISHMEM_IBGDA_STATS_DIR="${ISHMEM_IBGDA_STATS_DIR:-}" \
         -e DEEP_EP_TEST_DEBUG="${DEEP_EP_TEST_DEBUG:-0}" \
         -e DEEP_EP_SYNC_DBG="${DEEP_EP_SYNC_DBG:-0}" \
         -e DEEP_EP_LL_POLL_CAP="${DEEP_EP_LL_POLL_CAP:-}" \
         -e DEEP_EP_LL_MAX_PUT_KB="${DEEP_EP_LL_MAX_PUT_KB:-}" \
         -e DEEP_EP_LL_NUM_WGS="${DEEP_EP_LL_NUM_WGS:-}" \
+        -e DEEP_EP_LL_SEND_WGS="${DEEP_EP_LL_SEND_WGS:-}" \
+        -e DEEP_EP_LL_SEND_TOK_SPLIT="${DEEP_EP_LL_SEND_TOK_SPLIT:-}" \
+        -e DEEP_EP_LL_SEND_TEAM_BARRIER="${DEEP_EP_LL_SEND_TEAM_BARRIER:-}" \
+        -e DEEP_EP_LL_REDUCE_WGS="${DEEP_EP_LL_REDUCE_WGS:-}" \
         -e DEEP_EP_LL_FUSED_WGS="${DEEP_EP_LL_FUSED_WGS:-}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
@@ -451,7 +472,7 @@ run_test() {
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
                 -genv ISHMEM_IBGDA_QPS_PER_PE ${ISHMEM_IBGDA_QPS_PER_PE:-1} \
-                -genv ISHMEM_IBGDA_DB_BATCH_SIZE ${ISHMEM_IBGDA_DB_BATCH_SIZE:-0} \
+                -genv ISHMEM_IBGDA_DB_BATCH_SIZE ${ISHMEM_IBGDA_DB_BATCH_SIZE:-8} \
                 -genv ISHMEM_IBGDA_QUIET_SKIP_DRAIN ${ISHMEM_IBGDA_QUIET_SKIP_DRAIN:-1} \
                 -genv ISHMEM_IBGDA_DB_MODE \"\${ISHMEM_IBGDA_DB_MODE:-0}\" \
                 -genv ISHMEM_IBGDA_STATS_DIR \"\${ISHMEM_IBGDA_STATS_DIR:-}\" \
@@ -489,6 +510,10 @@ run_test() {
                 -genv DEEP_EP_LL_POLL_CAP \"\${DEEP_EP_LL_POLL_CAP:-50000000}\" \
                 -genv DEEP_EP_LL_MAX_PUT_KB \"\${DEEP_EP_LL_MAX_PUT_KB:-}\" \
                 -genv DEEP_EP_LL_NUM_WGS \"\${DEEP_EP_LL_NUM_WGS:-}\" \
+                -genv DEEP_EP_LL_SEND_WGS \"\${DEEP_EP_LL_SEND_WGS:-}\" \
+                -genv DEEP_EP_LL_SEND_TOK_SPLIT \"\${DEEP_EP_LL_SEND_TOK_SPLIT:-}\" \
+                -genv DEEP_EP_LL_SEND_TEAM_BARRIER \"\${DEEP_EP_LL_SEND_TEAM_BARRIER:-}\" \
+                -genv DEEP_EP_LL_REDUCE_WGS \"\${DEEP_EP_LL_REDUCE_WGS:-}\" \
                 -genv DEEP_EP_LL_FUSED_WGS \"\${DEEP_EP_LL_FUSED_WGS:-}\" \
                 -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \

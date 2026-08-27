@@ -187,6 +187,205 @@ this: `DEEP_EP_LL_SEND_WGS=16` vs `8` at 256 tokens is identical (~5250 µs) bec
 per-QP put throughput is fixed by the gate. Hence the send kernels default to
 `num_sms` and the win comes entirely from the **consume** side.
 
+> **Refinement (see §3.2.1).** "Splitting cannot help" applies to the send **grid**
+> (more work-groups = more *non-co-resident* producers, which is exactly what the
+> gate stalls on). It does **not** apply to adding more posting warps *inside* an
+> already-resident work-group — those are precisely the producers the gate can
+> drain. `DEEP_EP_LL_SEND_TOK_SPLIT` exploits that and is worth 1.05–1.08×.
+
+### 3.2.1 Send-side token split (`DEEP_EP_LL_SEND_TOK_SPLIT`) — SHIPPED
+
+**Problem.** `LLDispatchSendKernel` originally walked **one token per whole-work-group
+iteration**:
+
+```
+for (t = sm_id; t < num_tokens; t += send_wgs) {
+    <all 32 warps cooperatively cast token t into rdma_x[t]>
+    group_barrier(whole WG);
+    if (warp_id < num_topk) <put token t to topk_idx[t][warp_id]'s expert slot>
+}
+```
+
+At the usual `num_topk = 2` that leaves **30 of 32 warps idle for the entire put
+phase**, and the whole WG is serialized on one token at a time. This is the direct
+analogue of the normal-path combine warp starvation (`internode_normal_design.md`
+§6.1.1).
+
+**Fix.** Split the WG into `tok_split` casting **teams** of `team_warps =
+num_warps/tok_split` warps; team `g` casts token `base + g` and then **issues that same
+token's top-k puts**, warp `team_warp` taking `k = team_warp, team_warp+team_warps, …`.
+Live put warps rise from `num_topk` to `tok_split * min(team_warps, num_topk)`.
+
+Because a team both produces and consumes its own token, teams are fully independent
+and the cap is the warp count itself (`tok_split <= num_warps`) rather than
+`num_warps/num_topk`. The barrier stays a **whole-WG** `group_barrier` — every warp
+reaches it every iteration, since the loop bound depends only on the WG-uniform `base`
+— so this does *not* need the warp-group-SUBSET barrier of §4; see §3.2.2 for why the
+subset barrier is both unavailable *and* unnecessary here.
+
+**Why it is correct.** Dispatch slots are handed out by an unordered
+`slot_counter.fetch_add`, and the receiver recovers each token's identity from the
+message header (`hdr[0] == src token index`) via `packed_recv_src_info`. Slot **order**
+therefore carries no meaning — the send grid already stripes tokens
+nondeterministically — so reordering puts within the WG is a no-op for correctness.
+(Contrast the normal path, where the consumer uses a precomputed `combined_nvl_head`
+slot map and slot assignment must be preserved exactly.)
+
+**Auto default.** `tok_split = clamp(num_tokens / send_wgs, 1, num_warps / 4)`.
+Two bounds: (a) splitting further than there are tokens to feed the teams leaves teams
+idle; (b) a team must keep at least **4 sub-groups**, because a token's cast is a
+hidden-sized strided quantise and casting it with too few sub-groups starves the load
+pipeline and dominates the iteration (see the `tok_split=32` row in §3.2.2). At
+`num_warps=32, send_wgs=8` this picks `4 / 8 / 8 / 8` for `nt = 32 / 64 / 128 / 256`,
+matching the per-size optimum measured in §3.2.2.
+
+**Measured** (2-node BMG, `H=7168 TOPK=2 E=8 NUM_PROCESSES=2`, `send_wgs=8`,
+dispatch+combine round-trip `avg_t` µs; `s1` == pre-change baseline):
+
+| tokens | s1 (base) | s2 | s4 | s8 | s16 | **auto** | speedup |
+|---|---|---|---|---|---|---|---|
+| 32  | 339.1  | 330.4  | **319.9** | 337.7  | 355.0  | 323.3 (split=4)  | **1.05×** |
+| 64  | 584.3  | 559.4  | 549.0  | **545.6** | 561.9  | 544.5 (split=8)  | **1.07×** |
+| 128 | 1057.6 | 1008.9 | 982.8  | 985.8  | **980.0** | 979.3 (split=16) | **1.08×** |
+| 256 | 2240.5 | 2147.9 | 2114.9 | 2107.7 | **2101.6** | 2103.7 (split=16)| **1.06×** |
+
+Bandwidth over the same points: 3.46→3.63, 4.39→4.71, 5.06→5.46, 4.87→5.19 GB/s.
+`s1` reproduces the pre-change baseline to <0.5%, confirming the `tok_split == 1` path
+is a faithful no-op. Correctness (in-test hash + `calc_diff` asserts) passed on all 26
+runs, including 3 independent repeats at 128/256.
+
+**Stacking with `ISHMEM_IBGDA_DB_BATCH_SIZE=8`.** The token split removes *cast/put*
+serialization; batching doorbells removes *per-put doorbell* overhead. They are
+independent levers and compose additively (avg_t µs, same shapes):
+
+| tokens | split=1 dbb=0 (base) | split=1 dbb=8 | auto dbb=0 | **auto dbb=8** | combined |
+|---|---|---|---|---|---|
+| 32  | 339.1  | 332.7  | 323.3  | **312.1**  | **1.09×** |
+| 64  | 584.3  | 538.0  | 544.5  | **516.9**  | **1.13×** |
+| 128 | 1057.6 | 984.8  | 979.3  | **935.1**  | **1.13×** |
+| 256 | 2240.5 | 2031.0 | 2103.7 | **1932.2** | **1.16×** |
+
+Bandwidth at `auto dbb=8`: 3.76 / 4.96 / 5.72 / 5.65 GB/s (vs 3.46 / 4.39 / 5.06 /
+4.87 baseline). Isolated contributions are −4.7…−7.4% (split) and −1.9…−9.3% (dbb=8),
+summing to −8.0…−13.8% together — i.e. neither lever masks the other, consistent with
+them attacking different serialization points. All runs passed the in-test correctness
+asserts.
+
+`ISHMEM_IBGDA_DB_BATCH_SIZE` is a **harness/runtime** env var (default `0` in
+`tests/docker-2node-ll-v2/run.sh`), not a DeepEP knob. `8` is recommended for the
+32–256-token LL regime. Note the separate scale constraint recorded in the repo
+instructions: at ≥2048 tokens `0` deadlocks and `64` is required — so the optimum is
+token-count dependent and the harness default was left at `0` rather than changed
+globally.
+
+**Large token counts (1024 / 2048 / 4096).** Both levers keep working at scale; the
+auto split saturates at `tok_split=16` (all 32 put warps live) for every size ≥128.
+Run-to-run `avg_t` variance is severe at 1024 (a repeated baseline gave 14066 vs 10056 µs
+while `min_t` reproduced to 1.3%), so `min_t` is the reliable metric here and both are
+listed. Values are rank-0 µs; baseline = `split=1 dbb=0`, best of two repeats.
+
+| tokens | metric | base | auto dbb=0 | **auto dbb=8** | auto dbb=64 | total |
+|---|---|---|---|---|---|---|
+| 1024 | `min_t` | 8835.3  | 8205.2  | **7644.9**  | 7529.8  | **1.16×** |
+| 1024 | `avg_t` | 10056.4 | 9092.5  | **8561.5**  | 11411.1 | **1.18×** |
+| 2048 | `min_t` | 17746.9 | 16564.6 | **15221.5** | 15075.7 | **1.17×** |
+| 2048 | `avg_t` | 19470.5 | 17923.0 | **15879.6** | 16468.2 | **1.23×** |
+| 4096 | `min_t` | 36250.2 | 33806.7 | **30226.3** | 30209.8 | **1.20×** |
+| 4096 | `avg_t` | 36600.7 | 35320.8 | **31099.1** | 34041.6 | **1.18×** |
+
+Bandwidth: 4.41 / 4.56 / 4.86 GB/s baseline → **5.18 / 5.59 / 5.72 GB/s** at `auto dbb=8`.
+The token split alone is worth a consistent ~1.07–1.08× on `min_t` at all three sizes,
+so it generalizes beyond the 32–256 regime.
+
+Two corrections to the older guidance recorded in the repo instructions:
+
+* **`ISHMEM_IBGDA_DB_BATCH_SIZE=0` does not deadlock at ≥2048 tokens** on this build —
+  all runs passed. What it *does* show is a very long tail (`max_t` 90390 µs vs
+  `min_t` 33807 µs at 4096). The old "0 deadlocks at scale" note appears to describe a
+  superseded iSHMEM archive.
+* **`8` beats `64` at every size**, contrary to "64 is required at ≥2048". The two tie on
+  `min_t` (within 0.1–1.5%), but `64` has markedly worse tail/average behaviour
+  (`avg_t` 11411 vs 8562 µs at 1024, 34042 vs 31099 µs at 4096). So `8` is the single
+  best setting across the whole 32–4096 range, which removes the token-count-dependence
+  that was the reason for not changing the harness default.
+
+**Buffer sizing at ≥1024 tokens.** The harness default `ISHMEM_SYMMETRIC_SIZE=268435456`
+(256 MiB) is too small: at `nt=1024, H=7168, E=8` the LL buffer alone is 477 MB and
+allocation fails with `RuntimeError: ishmem_align failed for 477102336 bytes`. Demand is
+linear in `num_max_dispatch_tokens_per_rank`; `ISHMEM_SYMMETRIC_SIZE=4294967296` (4 GiB)
+covers 1024–4096. This is a pre-existing harness default, unrelated to the token split.
+
+**Why the split gain is only ~6% (vs 32–55% on the normal path).** LL at these sizes is
+dominated by RDMA/QP serialization, not by warp throughput: with `E=8` over 4 ranks
+`num_local_experts = 2`, so `ISHMEM_IBGDA_QPS_PER_PE = 2` (§5.4) — only two QPs carry
+all traffic, and the QP count is structurally capped because a combine payload must
+ride its expert's own QP for RC flag-after-payload ordering. Filling the idle put warps
+removes the *cast/put serialization* but cannot widen the QP bottleneck. Round-trip time
+still scales ~linearly with token count with roughly flat bandwidth, which is the
+signature of a serialization limit rather than a fixed-latency floor.
+
+**Not applicable to the other sub-kernels.** `LLCombineSendKernel` already stripes
+tokens across all 32 sub-warps (`token_idx = begin + sub_warp_id; += num_warps_per_group`),
+and `LLDispatchRecvKernel` / `LLCombineReduceKernel` are likewise fully token-parallel
+(the reduce additionally oversubscribes to `min(4*CU, 512)` WGs). `LLDispatchSendKernel`
+was the only sub-kernel with idle warp slots.
+
+### 3.2.2 Per-team sub-group-SUBSET barrier — ATTEMPTED, DOES NOT WORK (negative result)
+
+BMG *can* express a sub-group-SUBSET barrier via SPIR-V NamedBarrier (see
+`named_barrier_usage.md`, and the working use in `internode_combine_fused.inc`), so the
+obvious refinement to §3.2.1 is to replace the whole-WG `group_barrier` between cast and
+put with a **per-team** barrier of `team_warps` sub-groups. Motivation: a whole-WG
+barrier couples every team to the *slowest* team each iteration, and put latency is
+highly variable because `ishmemx_putmem_nbi_subgroup` waits on the IBGDA per-QP ordered
+commit gate.
+
+This was implemented and measured. **It does not work, and it would not have helped
+anyway.** Two independent findings:
+
+**(a) The named barriers cannot be instantiated in this kernel — it faults at launch.**
+Merely materialising the `named_barrier_init()` handles makes `LLDispatchSendKernel`
+die with `SIGSEGV` on the very first dispatch, *even when the barrier is never taken*
+(`DEEP_EP_LL_SEND_TEAM_BARRIER=0`) — the crash is immediately after the kernel-config
+log line, before any progress. This was verified to be caused by the handles alone:
+compiling the identical kernel with the handles `#if`-ed out (everything else unchanged)
+passes and performs normally. Both a runtime arrive-count and a compile-time literal
+arrive-count fault identically, and the build emits no `Stack call has been detected`
+warning, so this is *not* the bf16-conversion collision documented in
+`named_barrier_usage.md` — that one was fixed here by `ll_bf16_to_float()` (a
+bit-manipulation `bit_cast<float>(uint32_t(bits) << 16)` instead of the
+`sycl::ext::oneapi::bfloat16` conversion operator, which outlines to
+`__devicelib_ConvertBF16ToFINTEL`). Something else in this kernel — most likely the
+FP8 (`c10::Float8_e4m3fn`) conversion or the iSHMEM put path — still outlines and
+collides with the `NBarrierCnt` kernel attribute. The code is kept behind
+`DEEP_EP_LL_TEAM_NB` (off) for a future retry against a newer IGC.
+
+**(b) The barrier is not the bottleneck — the cast width is.** The cleanest possible
+version of the same idea needs *no* barrier at all: at `tok_split = num_warps` each team
+is a **single sub-group**, which is lock-stepped, so the same warp casts and puts its
+token with zero cross-warp synchronisation and teams are completely decoupled. That
+configuration is by far the **worst** measured:
+
+| `tok_split` | `team_warps` | cast→put barrier | nt=32 | nt=64 | nt=128 | nt=256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 8 | whole-WG | **314.3** | **510.1** | 939.8 | 1952.7 |
+| 8 | 4 | whole-WG | 324.3 | 516.4 | **927.3** | **1927.2** |
+| 16 | 2 | whole-WG | 351.5 | 539.1 | 943.0 | 1948.0 |
+| 32 | 1 | **none** | 551.2 | 768.9 | 1198.6 | 2128.8 |
+| *auto* | *4/8/8/8* | whole-WG | 315.4 | 516.8 | 929.7 | 1921.3 |
+
+(`avg_t` µs, round trip, 2-node BMG, `H=7168 TOPK=2 E=8 NUM_PROCESSES=2`,
+`ISHMEM_IBGDA_DB_BATCH_SIZE=8`.)
+
+Removing the barrier entirely costs **1.1–1.75×**, i.e. narrowing the cast team hurts
+far more than any barrier saving could recover. Since a per-team barrier is only
+*possible* for `tok_split <= 8` (the IGC named-barrier budget is ~8 handles) and the
+optimum already sits at `tok_split = 4…8` where teams are 4–8 warps wide and the
+whole-WG barrier is cheap, there is no configuration in which the subset barrier could
+pay for itself.
+
+**Decision:** keep the whole-WG `group_barrier`. Record this as closed.
+
 ### 3.3 The kernel boundary also removes the finish-counter
 
 The fused dispatch used a per-expert finish-counter (each send bumped it, the
@@ -256,6 +455,7 @@ scope only for genuine cross-PE/NIC paths (flag flush, `rdma_recv_count` /
 | Env var | Default | Scope | Guidance |
 |---|---|---|---|
 | `DEEP_EP_LL_SEND_WGS` | `num_sms` (= `num_experts`) | dispatch send grid | Raising it rarely helps (commit-gate bound) and **must not exceed resident WG capacity** — a spinning producer trips the GuC watchdog → `DEVICE_LOST`. Keep at default unless profiling shows cast-bound headroom. |
+| `DEEP_EP_LL_SEND_TOK_SPLIT` | `clamp(num_tokens/send_wgs, 1, num_warps/num_topk)` | dispatch send: tokens in flight per WG | Number of casting teams the send WG is split into; raises live put warps from `num_topk` to `tok_split*num_topk`. See §3.2.1. The auto default is optimal at 32–256 tokens; override only to A/B. `1` restores the pre-split behaviour. |
 | `DEEP_EP_LL_REDUCE_WGS` | `min(4*CU, 512)` capped by work-items | combine reduce grid (`ll_consume_wgs`) | The main scaling lever for combine. Increase toward the cap as `num_tokens`/`hidden` grow so the reduce is fully token-parallel; too small ⇒ long grid-stride loops. |
 | `DEEP_EP_LL_PUT_WGS` | device CU count | `ll_put_wgs` base for send-grid sizing | Rarely changed; underlies `ll_send_wgs`. |
 | `DEEP_EP_LL_POLL_CAP` | large (`ll_poll_cap`) | flag-wait spin cap | Bounds spins on a missing cross-PE flag; on timeout the slot is treated as 0 tokens (graceful). A too-large cap masks a wedge instead of failing fast; a too-small cap risks undercount. |

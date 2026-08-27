@@ -542,6 +542,18 @@ inline void ll_calc_fp8_scales(float amax, float& scale, float& scale_inv, bool 
 // (internode_ll.cu:217). Writes fp8 bytes to `dst_fp8` (contiguous, stride hidden)
 // and one scale_inv float per 128-block to `dst_scales` (num_scales floats). The
 // amax is reduced across the whole sub-group per block (32 lanes x per_lane = 128).
+// Stack-call-free bf16 -> float. `sycl::ext::oneapi::bfloat16`'s conversion
+// operators lower to the EXTERNAL devicelib symbols __devicelib_ConvertBF16ToFINTEL
+// / __devicelib_ConvertFToBF16INTEL, which IGC materializes as vISA stack calls. Any
+// outlined .function in a kernel that also uses SPIR-V NamedBarrier gets
+// `.kernel_attr NBarrierCnt` stamped on it a second time and vISA rejects the
+// duplicate ("IGC: internal compiler error"). Doing the widening by hand keeps the
+// send kernel stack-call-free so the per-team NamedBarrier can be used.
+// See csrc/xpu/named_barrier_usage.md "Known limitations on BMG".
+inline __attribute__((always_inline)) float ll_bf16_to_float(uint16_t bits) {
+    return sycl::bit_cast<float>(static_cast<uint32_t>(bits) << 16);
+}
+
 // kStoreUC selects uc_store (self write-through into the symmetric recv region so a
 // later uc_load reader observes it) vs a plain cached store (remote send staging,
 // flushed by a system-release fence before the RDMA put).
@@ -560,7 +572,7 @@ inline void coop_cast_bf16_to_fp8(uint8_t* dst_fp8,
         float vals[8];
         float amax = 1.0e-4f;  // kFP8Margin
         for (int j = 0; j < per_lane; ++j) {
-            const float fv = static_cast<float>(src[base + lane * per_lane + j]);
+            const float fv = ll_bf16_to_float(src[base + lane * per_lane + j]);
             vals[j] = fv;
             amax = sycl::fmax(amax, sycl::fabs(fv));
         }
@@ -594,7 +606,7 @@ inline void coop_cast_bf16_to_fp8(uint8_t* dst_fp8,
 // (cached) stores; the caller issues a system-release fence before the RDMA put.
 inline void cast_token_fp8_strided(uint8_t* dst_fp8,
                                    float* dst_scales,
-                                   const sycl::ext::oneapi::bfloat16* src,
+                                   const uint16_t* src,
                                    int num_scales,
                                    bool round_scale,
                                    const sycl::sub_group& sg,
@@ -608,7 +620,7 @@ inline void cast_token_fp8_strided(uint8_t* dst_fp8,
         float vals[8];
         float amax = 1.0e-4f;  // kFP8Margin
         for (int j = 0; j < per_lane; ++j) {
-            const float fv = static_cast<float>(src[base + lane * per_lane + j]);
+            const float fv = ll_bf16_to_float(src[base + lane * per_lane + j]);
             vals[j] = fv;
             amax = sycl::fmax(amax, sycl::fabs(fv));
         }
@@ -831,6 +843,87 @@ void dispatch_bf16(void* packed_recv_x,
         if (v > 0) send_wgs = v;
     }
 
+    // ---- Send-side TOKEN SPLIT (DEEP_EP_LL_SEND_TOK_SPLIT) ----------------------
+    // The original send loop walked ONE token per whole-work-group iteration: all
+    // `num_warps` (32) warps cast the token cooperatively, hit a whole-WG barrier,
+    // and then only warps `warp_id < num_topk` issued the IBGDA put. With the usual
+    // num_topk=2 that leaves 30 of 32 warps idle for the entire put phase, and the
+    // whole WG is serialized on one token at a time.
+    //
+    // Splitting the WG into `tok_split` casting TEAMS of `num_warps/tok_split` warps
+    // each, with team `g` casting token `base + g`, keeps every warp busy in the cast
+    // phase (identical aggregate work: tok_split tokens x fewer WIs each) and raises
+    // put parallelism from `num_topk` to `tok_split * num_topk` warps. Crucially the
+    // barrier stays a WHOLE-WG `group_barrier` -- every warp reaches it every
+    // iteration -- so this does NOT need the warp-group-SUBSET barrier that BMG
+    // cannot express (see the num_warp_groups==1 guard above).
+    //
+    // This is safe because dispatch slots are handed out by an unordered
+    // `slot_counter.fetch_add`, and the receiver recovers each token's identity from
+    // the message header (hdr[0] == src token index) via packed_recv_src_info. Slot
+    // ORDER therefore carries no meaning (the send grid already stripes tokens
+    // nondeterministically), so reordering puts within the WG is a no-op for
+    // correctness.
+    //
+    // Unlike DEEP_EP_LL_SEND_WGS (a closed negative result: extra work-groups are
+    // extra NON-co-resident producers, which the IBGDA per-QP ordered commit gate
+    // stalls on), the extra posters here live in the SAME already-resident WG, which
+    // is exactly the case the commit gate can drain.
+    // Each team now issues its OWN token's top-k puts (warp `team_warp` takes
+    // k = team_warp, team_warp+team_warps, ...), so a team no longer needs num_topk
+    // warps and the cap is the warp count itself. tok_split == num_warps gives
+    // one-warp teams, which need no cast->put barrier at all.
+    const int tok_split_max = num_warps;
+    // Auto default, two bounds:
+    //  (a) never partition further than there are tokens to feed the teams -- with
+    //      `send_wgs` work-groups each covering `tok_split` tokens per iteration, a
+    //      split above num_tokens/send_wgs just leaves teams idle;
+    //  (b) never shrink a team below kMinTeamWarps sub-groups. A token's cast is a
+    //      hidden-sized strided copy/quantise; casting it with too few sub-groups
+    //      starves the load pipeline and dominates the iteration. Measured
+    //      (H7168/topk=2/E=8, avg_t us at nt=32/64/128/256):
+    //        tok_split= 4 -> 314 / 510 / 940 / 1953   (team_warps=8)
+    //        tok_split= 8 -> 324 / 516 /*927*/ /*1927*/ (team_warps=4)
+    //        tok_split=16 -> 351 / 539 /  943 / 1948   (team_warps=2)
+    //        tok_split=32 -> 551 / 769 / 1199 / 2129   (team_warps=1, barrier-free)
+    //      i.e. the barrier is NOT the bottleneck -- cast width is. Capping teams at
+    //      >= 4 warps makes the heuristic pick 4/8/8/8, matching the per-size optimum.
+    constexpr int kMinTeamWarps = 4;
+    const int tok_split_auto_max = std::max(1, std::min(tok_split_max, num_warps / kMinTeamWarps));
+    int tok_split = std::max(1, std::min(num_tokens / std::max(send_wgs, 1), tok_split_auto_max));
+    if (const char* ts = std::getenv("DEEP_EP_LL_SEND_TOK_SPLIT")) {
+        const int v = std::atoi(ts);
+        if (v > 0) tok_split = v;
+    }
+    tok_split = std::max(1, std::min(tok_split, tok_split_max));
+    while (tok_split > 1 && (num_warps % tok_split) != 0) --tok_split;  // even teams
+    const int team_warps = num_warps / tok_split;
+    const int team_threads = team_warps * 32;
+    const int topk_div = std::max(num_topk, 1);
+    // NOTE: a per-team sub-group-SUBSET barrier (SPIR-V NamedBarrier) was implemented
+    // and measured here and does NOT work: merely instantiating the named-barrier
+    // handles in this kernel makes it fault at launch (SIGSEGV on the first dispatch),
+    // with or without the barrier being taken, and with compile-time arrive-counts.
+    // See csrc/xpu/named_barrier_usage.md "Known limitations" -- this kernel still
+    // contains outlined devicelib calls (FP8 conversion / the iSHMEM put path) that
+    // collide with the NBarrierCnt kernel attribute. The whole-WG barrier is legal here
+    // anyway because the loop bound depends only on the WG-uniform `base`, so every
+    // warp executes the same iteration count; and the tok_split=32 row above shows a
+    // fully barrier-FREE configuration is much slower, so the barrier is not the
+    // bottleneck. The gated code is kept behind DEEP_EP_LL_TEAM_NB for future retry.
+    {
+        static int logged = -1;
+        if (logged != tok_split) {
+            logged = tok_split;
+            std::fprintf(stderr,
+                         "[DeepEP] LL dispatch send: tok_split=%d (max %d) team_warps=%d "
+                         "live put warps/WG=%d of %d cast->put barrier=%s\n",
+                         tok_split, tok_split_max, team_warps,
+                         tok_split * std::min(team_warps, topk_div), num_warps,
+                         team_warps == 1 ? "NONE (1-warp teams)" : "whole-WG");
+        }
+    }
+
     // ---- Kernel 1: cast + put every token to its top-k experts (no counting). ----
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for<LLDispatchSendKernel>(
@@ -845,6 +938,38 @@ void dispatch_bf16(void* packed_recv_x,
                 // No counter warp in the split: ALL warps cast cooperatively.
                 const int caster_tid = warp_id * 32 + lane;
                 const int num_caster_threads = num_warps * 32;
+                // Casting team this warp belongs to (see DEEP_EP_LL_SEND_TOK_SPLIT).
+                // tok_split==1 collapses to team_id=0 / team_warp=warp_id / team_tid=caster_tid.
+                const int team_id = warp_id / team_warps;
+                const int team_warp = warp_id % team_warps;
+                const int team_tid = team_warp * 32 + lane;
+                (void)caster_tid;
+                (void)num_caster_threads;
+                (void)topk_div;
+                // IGC requires every NamedBarrier handle to be a plain SSA local
+                // materialized before any control flow, so all 8 are created
+                // unconditionally and the team's one is selected below.
+#if defined(DEEP_EP_LL_TEAM_NB) && defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+                auto* nb0 = ::named_barrier_init(4);
+                auto* nb1 = ::named_barrier_init(4);
+                auto* nb2 = ::named_barrier_init(4);
+                auto* nb3 = ::named_barrier_init(4);
+                auto* nb4 = ::named_barrier_init(4);
+                auto* nb5 = ::named_barrier_init(4);
+                auto* nb6 = ::named_barrier_init(4);
+                auto* nb7 = ::named_barrier_init(4);
+                auto* nb_team = nb0;
+                switch (team_id & 7) {
+                    case 1: nb_team = nb1; break;
+                    case 2: nb_team = nb2; break;
+                    case 3: nb_team = nb3; break;
+                    case 4: nb_team = nb4; break;
+                    case 5: nb_team = nb5; break;
+                    case 6: nb_team = nb6; break;
+                    case 7: nb_team = nb7; break;
+                    default: break;
+                }
+#endif
 
                 // Block 0 cleans the opposite-parity rdma_recv_count (CUDA next_clean).
                 if (sm_id == 0 && warp_id == 0) {
@@ -853,44 +978,76 @@ void dispatch_bf16(void* packed_recv_x,
                         uc_store<long>(&rdma_recv_count[i * 2 + clean_parity], 0L);
                 }
 
-                // Token loop striped across the send grid. Each iteration is a whole-WG
-                // cooperative cast followed by a whole-WG barrier; warp `warp_id < num_topk`
-                // then puts the finished message to topk_idx[token, warp_id]'s expert slot.
-                for (int t = sm_id; t < num_tokens; t += send_wgs) {
+                // Token loop striped across the send grid. Each team casts its OWN token
+                // and then issues that token's top-k puts, so a team never depends on
+                // another team's cast (see `team_warps == 1` below).
+                for (int base = sm_id * tok_split; base < num_tokens; base += send_wgs * tok_split) {
+                    // ---- Cast phase: team `team_id` casts token `base + team_id`. ----
+                    const int t = base + team_id;
                     uint8_t* msg = rdma_x + static_cast<size_t>(t) * msg_bytes;
-                    int* hdr = reinterpret_cast<int*>(msg);
-                    const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
-                        static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes);
-                    const int dst_expert = (warp_id < num_topk)
-                        ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + warp_id]) : -1;
-                    if (caster_tid == 0) hdr[0] = t;  // CUDA rdma_x_src_idx
-                    if (use_fp8) {
-                        cast_token_fp8_strided(msg + sizeof(int) * 4,
-                                               reinterpret_cast<float*>(msg + scales_off),
-                                               src_bf16, num_scales, round_scale, sg, lane, sg_size,
-                                               warp_id, num_warps);
-                    } else {
-                        coop_copy_bytes(msg + sizeof(int) * 4, reinterpret_cast<const uint8_t*>(src_bf16),
-                                        payload_bytes, caster_tid, num_caster_threads);
+                    if (t < num_tokens) {
+                        int* hdr = reinterpret_cast<int*>(msg);
+                        const auto* src_bf16 = reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(
+                            static_cast<const uint8_t*>(x) + static_cast<size_t>(t) * hidden_bytes);
+                        if (team_tid == 0) hdr[0] = t;  // CUDA rdma_x_src_idx
+                        if (use_fp8) {
+                            cast_token_fp8_strided(msg + sizeof(int) * 4,
+                                                   reinterpret_cast<float*>(msg + scales_off),
+                                                   reinterpret_cast<const uint16_t*>(src_bf16),
+                                                   num_scales, round_scale, sg, lane, sg_size,
+                                                   team_warp, team_warps);
+                        } else {
+                            coop_copy_bytes(msg + sizeof(int) * 4, reinterpret_cast<const uint8_t*>(src_bf16),
+                                            payload_bytes, team_tid, team_threads);
+                        }
                     }
                     // Device-scope release: make the cast bytes NIC-visible (HBM/L2 via PCIe
                     // P2P) before the doorbell. WG-scope group_barrier alone does not (F2).
                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-                    sycl::group_barrier(group);
-                    if (dst_expert >= 0 && dst_expert < num_experts) {
-                        const int dst_rank = dst_expert / num_local_experts;
-                        const int le = dst_expert % num_local_experts;
-                        int slot = 0;
-                        if (lane == 0) {
-                            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                             sycl::access::address_space::global_space> sc(slot_counter[dst_expert]);
-                            slot = sc.fetch_add(1);
-                        }
-                        slot = sycl::group_broadcast(sg, slot, 0);
-                        const size_t dst_slot =
-                            (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot;
-                        uint8_t* dst = rdma_recv_x + dst_slot * msg_bytes;
-                        if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
+                    // Cast->put rendezvous. With `team_warps == 1` the SAME sub-group both
+                    // casts and puts the token, and a sub-group is lock-stepped, so NO
+                    // cross-warp barrier is needed at all and teams run fully independently.
+                    // Otherwise the token's bytes are produced by `team_warps` sub-groups and
+                    // consumed by that same set, which needs a sub-group-SUBSET barrier; BMG
+                    // can express one via SPIR-V NamedBarrier, but not in THIS kernel (the FP8
+                    // cast performs bfloat16 conversions, which outline to devicelib stack
+                    // calls and collide with NBarrierCnt -- see named_barrier_usage.md
+                    // "Known limitations"). So team_warps > 1 falls back to the whole-WG
+                    // barrier, which is legal here because the loop bound depends only on the
+                    // WG-uniform `base` and hence every warp executes the same iteration count.
+                    if (team_warps > 1) {
+#if defined(DEEP_EP_LL_TEAM_NB)
+                        // NOTE: any flag guarding this must be odr-used on BOTH the host
+                        // and device passes, otherwise the two lambda layouts disagree
+                        // ("Unexpected kernel lambda size"). Keep such tests outside the
+                        // __SYCL_DEVICE_ONLY__ guard.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+                        ::work_group_named_barrier(nb_team, kNamedBarrierGlobalFence);
+#endif
+#else
+                        sycl::group_barrier(group);
+#endif
+                    }
+                    // ---- Put phase: the casting team issues its own token's top-k puts,
+                    // warp `team_warp` taking k = team_warp, team_warp+team_warps, ... ----
+                    if (t < num_tokens) {
+                        for (int k = team_warp; k < num_topk; k += team_warps) {
+                            const int dst_expert =
+                                static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + k]);
+                            if (dst_expert < 0 || dst_expert >= num_experts) continue;
+                            const int dst_rank = dst_expert / num_local_experts;
+                            const int le = dst_expert % num_local_experts;
+                            if (ll_rank_masked(mask_buffer_ptr, dst_rank)) continue;
+                            int slot = 0;
+                            if (lane == 0) {
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space> sc(slot_counter[dst_expert]);
+                                slot = sc.fetch_add(1);
+                            }
+                            slot = sycl::group_broadcast(sg, slot, 0);
+                            const size_t dst_slot =
+                                (static_cast<size_t>(le) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot;
+                            uint8_t* dst = rdma_recv_x + dst_slot * msg_bytes;
                             if (dst_rank == rank)
                                 coop_copy_bytes_store_uc(dst, msg, used_bytes, lane, sg_size);
                             else
