@@ -343,6 +343,7 @@ run_test() {
     _add_opt_genv DEEP_EP_FUSED_PAD_WGS       "${DEEP_EP_FUSED_PAD_WGS:-}"
     _add_opt_genv DEEP_EP_FUSED_PAD_CYCLES    "${DEEP_EP_FUSED_PAD_CYCLES:-}"
     _add_opt_genv DEEP_EP_COMBINE_SND_SPLIT   "${DEEP_EP_COMBINE_SND_SPLIT:-}"
+    _add_opt_genv DEEP_EP_COMBINE_TOK_SPLIT   "${DEEP_EP_COMBINE_TOK_SPLIT:-}"
     _add_opt_genv DEEP_EP_COMBINE_SND_PLAIN   "${DEEP_EP_COMBINE_SND_PLAIN:-}"
     _add_opt_genv DEEP_EP_DISP_SND_PLAIN      "${DEEP_EP_DISP_SND_PLAIN:-}"
     _add_opt_genv DEEP_EP_COMBINE_SND_UNROLL  "${DEEP_EP_COMBINE_SND_UNROLL:-}"

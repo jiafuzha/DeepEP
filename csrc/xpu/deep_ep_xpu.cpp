@@ -627,7 +627,8 @@ struct Buffer {
     // drops tokens.  See internode.cpp::fused_max_coresident_sms().
     int fused_num_channels(const Config& config) {
         const int requested = config.num_sms;
-        const int limit = internode::fused_max_coresident_sms(num_rdma_ranks, comm_stream.queue());
+        bool qp_bound = false;
+        const int limit = internode::fused_max_coresident_sms(num_rdma_ranks, comm_stream.queue(), &qp_bound);
         int sms = std::min(requested, limit);
         if (sms < 2) sms = 2;
         sms -= (sms % 2);
@@ -635,13 +636,28 @@ struct Buffer {
             static int last_warned = -1;
             if (last_warned != sms) {
                 last_warned = sms;
-                std::fprintf(stderr,
-                             "[DeepEP] WARNING: internode fused grid CLAMPED: requested num_sms=%d -> using %d. "
-                             "Too many channels would share one IBGDA QP, which intermittently hangs or silently "
-                             "drops tokens (playbook 24.2.1). Raise ISHMEM_IBGDA_QPS_PER_PE (one QP per channel "
-                             "removes the clamp entirely) or override with DEEP_EP_FUSED_MAX_SMS.\n",
-                             requested,
-                             sms);
+                if (qp_bound) {
+                    std::fprintf(stderr,
+                                 "[DeepEP] WARNING: internode fused grid CLAMPED by QP SHARING: requested "
+                                 "num_sms=%d -> using %d. Too many channels would share one IBGDA QP, which "
+                                 "intermittently hangs or silently drops tokens (playbook 24.2.1). Raise "
+                                 "ISHMEM_IBGDA_QPS_PER_PE (one QP per channel removes the clamp entirely).\n",
+                                 requested,
+                                 sms);
+                } else {
+                    // NOT a misconfiguration: this is the device co-residency bound, and
+                    // design doc §6.4 measured it to be the THROUGHPUT OPTIMUM as well
+                    // (num_sms=24 is +32% round-trip vs 20 on a 20-Xe-core part). Informational.
+                    std::fprintf(stderr,
+                                 "[DeepEP] NOTE: internode fused grid clamped to the DEVICE CO-RESIDENCY bound: "
+                                 "requested num_sms=%d -> using %d (ISHMEM_IBGDA_QPS_PER_PE=%s is NOT the "
+                                 "limiter here). This is expected and is also the measured throughput optimum "
+                                 "(design doc §6.4); no action needed. Override with DEEP_EP_FUSED_MAX_SMS only "
+                                 "for experiments.\n",
+                                 requested,
+                                 sms,
+                                 std::getenv("ISHMEM_IBGDA_QPS_PER_PE") ? std::getenv("ISHMEM_IBGDA_QPS_PER_PE") : "1");
+                }
                 std::fflush(stderr);
             }
         }

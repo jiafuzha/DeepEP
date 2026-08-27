@@ -521,14 +521,18 @@ inline int fused_qps_per_pe_env() {
 }
 }  // namespace
 
-int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
+int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue, bool* qp_bound_out) {
 #ifdef DEEP_EP_ENABLE_ISHMEM
     static std::mutex mtx;
     static std::map<int, int> cache;
+    static std::map<int, bool> qp_bound_cache;
     {
         std::lock_guard<std::mutex> lock(mtx);
         auto it = cache.find(num_rdma_ranks);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end()) {
+            if (qp_bound_out != nullptr) *qp_bound_out = qp_bound_cache[num_rdma_ranks];
+            return it->second;
+        }
     }
 
     const int dispatch_wg = DEEP_EP_FUSED_NUM_THREADS;
@@ -555,6 +559,11 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     }
 
     int sms = std::min(dispatch_cap, combine_cap);
+
+    std::fprintf(stderr,
+                 "[DeepEP] fused co-residency query: dispatch_wg=%d cap=%d | combine_wg=%d cap=%d\n",
+                 dispatch_wg, dispatch_cap, combine_wg, combine_cap);
+    std::fflush(stderr);
 
     // EMPIRICAL SAFETY CAP.  On Arc Pro B60 (160 EU / 20 Xe-cores) the driver's own
     // per-kernel answer is 20 work-groups for both fused kernels (1 per Xe-core), but
@@ -600,7 +609,13 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     const int qps_per_pe = fused_qps_per_pe_env();
     const int qp_safe_sms = 2 * kSafeChannelsPerQp * qps_per_pe;  // grid = 2 WGs per channel
     const int safe_sms = std::max(kEmpiricalSafeSms, qp_safe_sms);
-    if (sms > safe_sms) sms = safe_sms;
+    // Record WHICH bound is binding so the caller's warning can attribute the clamp
+    // correctly.  At the shipped QPS_PER_PE=16 the QP term is 64 and never binds; the
+    // clamp is the device co-residency query, which §6.4 measured to be the OPTIMUM.
+    // The old warning unconditionally blamed QP sharing, which sent readers chasing a
+    // non-existent ISHMEM_IBGDA_QPS_PER_PE misconfiguration.
+    const bool qp_bound = (sms > safe_sms);
+    if (qp_bound) sms = safe_sms;
 
     if (sms < 2) sms = 2;
     sms -= (sms % 2);  // the grid is 2 work-groups per channel
@@ -637,11 +652,14 @@ int fused_max_coresident_sms(int num_rdma_ranks, sycl::queue& queue) {
     {
         std::lock_guard<std::mutex> lock(mtx);
         cache[num_rdma_ranks] = sms;
+        qp_bound_cache[num_rdma_ranks] = qp_bound;
     }
+    if (qp_bound_out != nullptr) *qp_bound_out = qp_bound;
     return sms;
 #else
     (void)num_rdma_ranks;
     (void)queue;
+    if (qp_bound_out != nullptr) *qp_bound_out = false;
     return 2;
 #endif
 }

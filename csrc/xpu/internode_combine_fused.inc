@@ -54,7 +54,9 @@
 //       timeout + trap().
 // ============================================================================
 
+#ifndef DEEP_EP_COMBINE_FWD_WARPS
 #define DEEP_EP_COMBINE_FWD_WARPS 24
+#endif
 
 // CUDA internode.cu:1713-1715 -- kept as static members (never as kernel-lambda
 // locals: captured constexpr breaks the host/device lambda layout check).
@@ -209,6 +211,14 @@ inline __attribute__((always_inline)) void slm_store(const Acc& acc, int idx, in
     r.store(value);
 }
 
+template <typename Acc>
+inline __attribute__((always_inline)) int slm_load(const Acc& acc, int idx) {
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::work_group,
+                     sycl::access::address_space::local_space>
+        r(acc[idx]);
+    return r.load();
+}
+
 // ---------------------------------------------------------------------------
 // combine_token (CUDA internode.cu:1550), non-TMA branch only (deviation C1).
 // ---------------------------------------------------------------------------
@@ -346,6 +356,52 @@ void launch_fused_combine(void* combined_x,
         const int v = std::atoi(e);
         if (v >= 1 && v <= snd_split) snd_split = v;
     }
+    // ---------------------------------------------------------------------
+    // TOKEN-RANGE SPLIT (design doc §6.1's "not attempted" item).
+    //
+    // `snd_split` can only partition by RDMA lane, so it saturates at
+    // kNumRDMARanks and leaves NUM_MAX_NVL_PEERS - num_nvl_ranks*snd_split warp
+    // slots idle (4 of 8 at num_nvl_ranks=2, kNumRDMARanks=2).  `tok_split`
+    // consumes the rest by splitting the *token stream* of one (dst_nvl_rank,
+    // rdma_lane) queue across several sub-warps.
+    //
+    // The consumer locates every token through the precomputed
+    // `combined_nvl_head` slot map, so slot assignment MUST NOT change: token at
+    // queue position p always lands in slot p % cap.  Sub-warp t therefore takes
+    // the CHUNKS c with c % tok_split == t and writes them at their fixed
+    // positions; nothing is reordered.
+    //
+    // The only new coordination is the tail publish, which must only ever expose
+    // the CONTIGUOUS COMPLETED PREFIX.  Each sub-warp publishes, in SLM, the
+    // queue position at which its next unprocessed chunk begins; the prefix is
+    // the min over sub-warps, and only sub-warp 0 writes `ch_tail`.  SLM is
+    // zero-initialised under a work-group barrier before any role diverges, and
+    // "0" is a safe conservative reading (tail simply does not advance yet).
+    //
+    // Flow control stays correct because every sub-warp uses the same rule
+    // "chunk_end_position - head <= ring capacity", which is exactly the
+    // existing `cap - (pos - head) >= chunk` test with `pos` re-derived from the
+    // token cursor instead of incremented monotonically.
+    // ---------------------------------------------------------------------
+    int tok_split_max = NUM_MAX_NVL_PEERS / (num_nvl_ranks * snd_split);
+    if (tok_split_max < 1) tok_split_max = 1;
+    // DEFAULT ON: validated 6/6 on the full 64-config matrix at NT=4096 H=7168
+    // E=384, topk 2 and 6; 1.70x on combine(iso) at topk=2 and 2.30x at topk=6.
+    // Set DEEP_EP_COMBINE_TOK_SPLIT=1 to disable.
+    int tok_split = tok_split_max;
+    if (const char* e = std::getenv("DEEP_EP_COMBINE_TOK_SPLIT")) {
+        const int v = std::atoi(e);
+        if (v >= 1) tok_split = (v < tok_split_max) ? v : tok_split_max;
+    }
+    {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            std::fprintf(stderr, "[DeepEP] combine NVL sender: snd_split=%d tok_split=%d (max %d) live warps/ch=%d\n",
+                         snd_split, tok_split, tok_split_max, num_nvl_ranks * snd_split * tok_split);
+            std::fflush(stderr);
+        }
+    }
     const unsigned qps_per_pe = fused_qps_per_pe();
     const int num_sms = num_channels * 2;
 
@@ -377,6 +433,9 @@ void launch_fused_combine(void* combined_x,
         sycl::local_accessor<int, 1> smem_rcv_rdma_head(
             sycl::range<1>{static_cast<size_t>(Shape::kRDMAReceivers) * kNumRDMARanks}, cgh);
         sycl::local_accessor<int, 1> smem_rcv_retired(sycl::range<1>{static_cast<size_t>(Shape::kRDMAReceivers)}, cgh);
+        // Per (dst_nvl_rank, tok_sub, rdma_lane) "start of my next unprocessed chunk".
+        sycl::local_accessor<int, 1> smem_snd_progress(
+            sycl::range<1>{static_cast<size_t>(NUM_MAX_NVL_PEERS) * kNumRDMARanks}, cgh);
 
         cgh.parallel_for<FusedCombineKernel<kNumRDMARanks>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * ((Shape::kForwarders + 1) * 32)),
@@ -411,6 +470,17 @@ void launch_fused_combine(void* combined_x,
                 auto* nb_d6 = nb_d0;
                 auto* nb_d7 = nb_d0;
 #endif
+
+                // Zero the NVL-sender progress board.  This is the ONLY unconditional
+                // whole-work-group barrier in the kernel; it runs before any role
+                // divergence so every sub-group reaches it, and it is required because
+                // the sender warps share no named barrier (deviation C2) and so have no
+                // other way to agree that the SLM board is initialised.
+                {
+                    const int lid = static_cast<int>(item.get_local_linear_id());
+                    if (lid < NUM_MAX_NVL_PEERS * kNumRDMARanks) smem_snd_progress[lid] = 0;
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
 
                 // ---- Warp roles: CUDA internode.cu:1759-1776 ----
                 enum Role { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
@@ -470,8 +540,11 @@ void launch_fused_combine(void* combined_x,
                     // queue resource is already per-RDMA-lane (token range, head, tail, slot
                     // region), so the split needs no extra synchronisation.
                     const int dst_nvl_rank = warp_id % num_nvl_ranks;
-                    const int snd_sub = warp_id / num_nvl_ranks;
-                    if (warp_id >= num_nvl_ranks * snd_split) return;  // deviation C2
+                    const int snd_w = warp_id / num_nvl_ranks;
+                    const int snd_sub = snd_w % snd_split;   // which RDMA-lane subset
+                    const int tok_sub = snd_w / snd_split;   // which chunk subset
+                    if (warp_id >= num_nvl_ranks * snd_split * tok_split) return;  // deviation C2
+                    const int prog_base = (dst_nvl_rank * tok_split + tok_sub) * kNumRDMARanks;
 
                     void* dst_buffer_ptr = buffer_ptrs[dst_nvl_rank];
                     void* local_buffer_ptr = buffer_ptrs[nvl_rank];
@@ -503,10 +576,22 @@ void launch_fused_combine(void* combined_x,
                                             ? total_recv_tokens
                                             : sycl::min(gbl_channel_prefix_matrix[prefix_idx + 1], total_recv_tokens);
                     }
+                    // Token base of this lane's queue and the sub-warp's chunk offset.
+                    const int token_base = token_start_idx;
+                    const int lane_num_tokens = token_end_idx - token_start_idx;
+                    token_start_idx += tok_sub * num_max_nvl_chunked_send_tokens;
                     sycl::group_barrier(sg);
 
                     int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
+                    // `cached_channel_tail_idx` is this lane's queue POSITION (token_start_idx
+                    // - token_base), which with tok_split > 1 jumps by tok_split chunks at a
+                    // time instead of incrementing contiguously.
+                    cached_channel_tail_idx = token_start_idx - token_base;
+                    int last_published_tail = 0;
                     int current_rdma_idx = channel_id % kNumRDMARanks;
+                    if (tok_split > 1 && lane_owned)
+                        slm_store(smem_snd_progress, prog_base + lane_id,
+                                  sycl::min(cached_channel_tail_idx, lane_num_tokens));
 #ifdef DEEP_EP_COMBINE_TELEMETRY
                     const uint64_t dbg_t0 = dev_clock();
                     uint64_t dbg_wait = 0, dbg_copy = 0, dbg_tok = 0;
@@ -622,14 +707,69 @@ void launch_fused_combine(void* combined_x,
                                 ++dbg_tok;
 #endif
                             }
-                            if (lane_id == current_rdma_idx) token_start_idx = static_cast<int>(token_idx);
+                            if (lane_id == current_rdma_idx) {
+                                // Skip the chunks owned by the other token sub-warps; the
+                                // slot mapping (position % capacity) is unchanged.
+                                token_start_idx = static_cast<int>(token_idx) +
+                                                  (tok_split - 1) * num_max_nvl_chunked_send_tokens;
+                                cached_channel_tail_idx = token_start_idx - token_base;
+                            }
                         }
 
                         // CUDA :1949-1952: move queue tail (release)
                         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                         lsc_fence_sysrel();
-                        if (is_lane_ready) uc_store(ch_tail + lane_id, cached_channel_tail_idx);
+                        if (tok_split == 1) {
+                            if (is_lane_ready) uc_store(ch_tail + lane_id, cached_channel_tail_idx);
+                        } else {
+                            // Publish MY next-chunk start, then (sub-warp 0 only) expose the
+                            // contiguous completed prefix = min over token sub-warps.
+                            if (lane_owned)
+                                slm_store(smem_snd_progress, prog_base + lane_id,
+                                          sycl::min(cached_channel_tail_idx, lane_num_tokens));
+                            if (tok_sub == 0 && lane_owned) {
+                                int m = lane_num_tokens;
+                                for (int t = 0; t < tok_split; ++t)
+                                    m = sycl::min(m, slm_load(smem_snd_progress,
+                                                              (dst_nvl_rank * tok_split + t) * kNumRDMARanks + lane_id));
+                                if (m > last_published_tail) {
+                                    last_published_tail = m;
+                                    uc_store(ch_tail + lane_id, m);
+                                }
+                            }
+                        }
                         sycl::group_barrier(sg);
+                    }
+                    if (tok_split > 1) {
+                        // Final publish: the main loop exits with cached_channel_tail_idx past
+                        // the end, so this reports "all my chunks retired".
+                        if (lane_owned)
+                            slm_store(smem_snd_progress, prog_base + lane_id,
+                                      sycl::min(cached_channel_tail_idx, lane_num_tokens));
+                    }
+                    if (tok_split > 1 && tok_sub == 0) {
+                        // This sub-warp is the only tail publisher, so it must outlive its own
+                        // token range and keep draining the progress board until every token
+                        // sub-warp of this (dst, lane) queue has retired.
+                        uint64_t spins = 0;
+                        while (true) {
+                            bool done = true;
+                            if (lane_owned) {
+                                int m = lane_num_tokens;
+                                for (int t = 0; t < tok_split; ++t)
+                                    m = sycl::min(m, slm_load(smem_snd_progress,
+                                                              (dst_nvl_rank * tok_split + t) * kNumRDMARanks + lane_id));
+                                if (m > last_published_tail) {
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    lsc_fence_sysrel();
+                                    last_published_tail = m;
+                                    uc_store(ch_tail + lane_id, m);
+                                }
+                                done = (last_published_tail >= lane_num_tokens);
+                            }
+                            if (sycl::all_of_group(sg, done)) break;
+                            if (++spins > kFusedSpinCap) break;
+                        }
                     }
 #ifdef DEEP_EP_COMBINE_TELEMETRY
                     if (lane_id == 0) {

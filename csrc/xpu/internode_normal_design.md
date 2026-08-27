@@ -238,6 +238,7 @@ count.
 |---|---|---|
 | `DEEP_EP_FUSED_MAX_SMS` | device-derived | Overrides the co-residency/QP clamp (§4.3). Rounded down to even. Logs to stderr when used. |
 | `DEEP_EP_COMBINE_SND_SPLIT` | `min(kNumRDMARanks, 8/num_nvl_ranks)` | Combine NVL-sender sub-warps per destination (§6.1). |
+| `DEEP_EP_COMBINE_TOK_SPLIT` | `8/(num_nvl_ranks*snd_split)` (**ON**) | Combine NVL-sender sub-warps per *token stream* within one queue (§6.1.1). `=1` disables. |
 | `DEEP_EP_COMBINE_SND_PLAIN` / `DEEP_EP_DISP_SND_PLAIN` | off | Diagnostic: plain C++ copy loop instead of the LSC-intrinsic one. Measured **43 % worse**; diagnostic only. |
 | `DEEP_EP_FUSED_PAD_WGS` / `DEEP_EP_FUSED_PAD_CYCLES` | off | Diagnostic occupancy padding. |
 | `DEEP_EP_NVL_BYTES` / `DEEP_EP_RDMA_BYTES` | — | Buffer sizing for the harness. |
@@ -284,6 +285,67 @@ hidden 7168, topk 2, experts 8, 4 ranks / 2 nodes, post-`snd_split`:
 Correctness: **31 clean full-matrix runs** (64/64 configs each) at 2048 and 4096
 tokens, hidden 7168.
 
+### 5.1 MoE-realistic shapes, and the `tok_split` A/B (2026-08-26)
+
+The table above is `num_experts=8`. At a realistic MoE fan-out
+(**NT=4096, hidden 7168, num_experts=384**, 4 ranks / 2 nodes, `num_nvl_ranks=2`,
+`kNumRDMARanks=2`) combine dominated the round-trip — 57 % at topk=2 and 63 % at
+topk=6. Same-session A/B of the shipped default against the immediately-preceding
+build (only `DEEP_EP_COMBINE_TOK_SPLIT`, §6.1.1, differs), rank 0, µs:
+
+| shape | metric | before | after | speedup |
+|---|---|---|---|---|
+| topk=2 | round-trip | 16 536.5 | **13 432.7** | **1.23×** |
+| topk=2 | round-trip (min) | 16 248.1 | 13 047.5 | 1.25× |
+| topk=2 | dispatch iso | 7 347.1 | 7 303.1 | 1.01× (unchanged, as intended) |
+| topk=2 | combine iso | 9 431.4 | **6 275.3** | **1.50×** |
+| topk=6 | round-trip | 24 121.5 | **16 408.4** | **1.47×** |
+| topk=6 | round-trip (min) | 23 782.6 | 15 962.1 | 1.49× |
+| topk=6 | dispatch iso | 9 350.4 | 9 311.1 | 1.00× |
+| topk=6 | combine iso | 15 265.4 | **7 310.5** | **2.09×** |
+
+Combine bandwidth at topk=2: `nvl_send` 9.38 → **14.26 GB/s**, `rdma_recv`
+6.16 → **9.36 GB/s**. Combine's share of round-trip drops 57 %→47 % (topk=2) and
+63 %→45 % (topk=6); **dispatch is now the larger half at topk=6.**
+
+Correctness of the shipped default at these shapes: **6/6 clean full 64-config
+matrix runs** (3 at topk=2, 3 at topk=6, NT=4096 hidden 7168 experts 384, no
+`DEEP_EP_PERF_TOKENS`), plus 3/3 more with the knob forced explicitly.
+
+> ⚠️ Run-to-run noise at these shapes is **6–13 %**, far wider than the ±1.3 % band
+> quoted elsewhere in this document for hidden 1024. **Always A/B within one
+> session**; a cross-session comparison at NT=4096 is not interpretable.
+
+#### 5.2 Chunk knobs at NT=4096 / hidden 7168 (not shipped)
+
+`DEEP_EP_RDMA_CHUNK=8 DEEP_EP_NVL_CHUNK=4` is worth a further ~2.4 % on top
+(rt 13 061, dispatch 6 790) by helping **dispatch** only; combine is flat under
+every chunk setting tried. Left unshipped: §6.3.2 shows the optimum inverts at
+hidden 1024, so this would have to be a shape-conditioned default and the gain
+does not justify the conditioning risk yet.
+
+| label (topk=2) | rt | dispatch | combine |
+|---|---|---|---|
+| shipped (rdma16 / nvl8) | 13 378 | 7 317 | 6 303 |
+| rdma8 | 13 370 | 6 910 | 6 576 |
+| **rdma8 nvl4** | **13 061** | **6 790** | 6 479 |
+| rdma8 nvl16 | 13 721 | 6 875 | 6 989 |
+| rdma4 | 16 235 | 7 773 | 8 622 |
+
+`num_sms` remains optimal at the driver bound of 20 **after** the change
+(16 → rt 14 763, 24 → rt 15 533), i.e. §6.4 still holds.
+
+#### 5.3 Why topk=6 costs more than topk=2 — not pathological
+
+topk=6 moves ~1.9× the combine traffic of topk=2 (higher fan-in: ~24 576 vs
+~6 144 received tokens per rank). Post-`tok_split` combine scales 6 275 → 7 311 µs,
+i.e. **sub-linearly** in that traffic, so there is no topk-specific pathology left
+to chase. Before `tok_split` the same ratio was 9 431 → 15 265 µs (1.62×), which is
+what made topk=6 look like a separate regression — it was the warp deficit biting
+harder under more traffic. The per-token `uc_store` of `topk_weights`
+(`num_topk` uncached stores per token) was the suspected culprit and is **not**
+implicated by these numbers; it was left alone.
+
 ## 6. Known bottlenecks and open questions for review
 
 ### 6.1 The structural asymmetry — dispatch partitions by token, combine by destination
@@ -318,6 +380,98 @@ queue resource is already per-RDMA-lane. Measured **3.56×–3.61×** (combine
 **Open:** scaling *within* one `(dst, rdma)` queue requires token-range splitting
 plus cooperative slot claiming. Not attempted. This is the main structural item
 for review.
+
+#### 6.1.1 CLOSED (2026-08-26): token-range split — `DEEP_EP_COMBINE_TOK_SPLIT`, ON by default
+
+The "not attempted" item above is now implemented and **shipped ON**.
+
+`snd_split` can only partition by RDMA lane, so it saturates at
+`min(NUM_MAX_NVL_PEERS/num_nvl_ranks, kNumRDMARanks)` = 2 at the 2×2 shape,
+leaving 4 of 8 sender warp slots idle. `tok_split` recovers them by partitioning
+the **token stream** of one `(dst_nvl_rank, rdma_lane, channel)` queue:
+
+```
+tok_split_max = NUM_MAX_NVL_PEERS / (num_nvl_ranks * snd_split)   // = 2 here
+snd_w    = warp_id / num_nvl_ranks
+snd_sub  = snd_w % snd_split         // which RDMA lanes I own
+tok_sub  = snd_w / snd_split         // which token chunks I own
+live warps/channel = num_nvl_ranks * snd_split * tok_split        // 4 -> 8
+```
+
+**Slot mapping is unchanged**, which is mandatory: the consumer locates every
+token through the precomputed `combined_nvl_head` map, so token at queue position
+`p` must land in slot `p % capacity`. Sub-warp `t` simply takes the chunks
+`c` with `c % tok_split == t` and writes them at their *fixed* positions
+(`token_start_idx += tok_sub*chunk` initially, then `+= tok_split*chunk`).
+
+The only new coordination is the **tail publish**, which must expose only the
+contiguous completed prefix:
+
+- New SLM board `smem_snd_progress[NUM_MAX_NVL_PEERS * tok_split][kNumRDMARanks]`.
+- Each sub-warp publishes *the start of its next unprocessed chunk* (publishing
+  "end of last completed chunk" is **wrong** — verified by hand-tracing
+  `tok_split=2, CH=8, N=20`).
+- Only `tok_sub == 0` writes `ch_tail`, with `min` over the `tok_split` entries,
+  monotone-guarded by `last_published_tail`.
+- Every sub-warp must publish **both** a pre-loop and a post-loop value. Without
+  the pre-loop publish, a sub-warp whose range is empty (`tok_sub*CH >= N`) never
+  enters the loop, leaves 0 on the board, and the `min` pins the tail at 0 → hang.
+- `tok_sub == 0` must **outlive its own token range**: after its loop it runs a
+  bounded drain loop republishing the min until it reaches `lane_num_tokens`,
+  otherwise the other sub-warps' final tokens are never announced.
+- The board needs an **unconditional whole-work-group `item.barrier()` at kernel
+  entry** to zero it. Combine's NVL-sender warps participate in *no* named barrier
+  (deviation C2), so they have no other way to agree it is initialised. Reading a
+  stale 0 is safe (the tail merely does not advance yet), so the barrier only has
+  to establish "not garbage".
+
+Flow control is unchanged in form: `capacity - (position - head) >= chunk`, with
+`position` re-derived from the token cursor rather than incremented monotonically.
+No deadlock — a sub-warp holding a higher chunk index waits on `head`, which is
+advanced by the consumer once the lower-index chunks (strictly smaller position
+bounds) are drained.
+
+`DEEP_EP_COMBINE_TOK_SPLIT=1` restores the previous behaviour bit-for-bit.
+
+**Also measured:** `snd_split=1, tok_split=4` (same 8 live warps, purely token
+partitioned) is **worse** than `snd_split=2, tok_split=2` — rt 13 974 vs 13 378 µs.
+Prefer lane partitioning where it is available; use token splitting only to fill
+what is left.
+
+#### 6.1.2 NEGATIVE RESULT: the same trick on DISPATCH's forwarder does NOT pay
+
+Dispatch telemetry (4096 tok, hidden 7168, 10 channels) shows
+`kRDMAAndNVLForwarder` is the **longest-lived** dispatch role — 11.5e6 cyc/warp vs
+7.2e6 for the RDMA sender, i.e. it spans the whole kernel — is 66% copy / 17% wait,
+and has the *identical* idle-slot pathology (`target_rank = (warp_id+channel_id) %
+NUM_MAX_NVL_PEERS`, active only when `< num_nvl_ranks` → **2 of 8 slots live**).
+The naive projection was dispatch 7.5 ms → ~4.7 ms.
+
+It was implemented (sub-warp 0 runs the control loop alone and publishes the
+chunk's `(rdma_slot, nvl_slot)` pairs through SLM; the group then copies them
+`fwd_split`-strided, two named-barrier arrivals per *chunk*) and measured:
+
+| config | rt | dispatch(iso) | combine(iso) |
+|---|---|---|---|
+| `fwd_split=1` | 13 414.8 | 7 297.7 | 6 352.2 |
+| `fwd_split=4` (4× the live forwarder warps) | 13 308.1 | **7 203.8** | 6 265.8 |
+
+**1.3% — inside noise.** Quadrupling the forwarder warps did essentially nothing,
+so the dispatch forwarder is **not warp-count-bound**; its long lifetime is
+waiting on RDMA arrival rate, not on copy throughput. The telemetry "66% copy"
+figure therefore includes stalls on data that has not landed yet and must not be
+read as copy-bound.
+
+Worse, the restructure **broke correctness even at `fwd_split=1`** (the supposedly
+identical path): `topk_weights diff=1.15e-04` on the `with top-k` config of the
+full matrix, reproducible, absent from both the pristine baseline and a build
+carrying only the combine change. **The change was reverted in full.** Do not
+re-attempt it without a decisive reason — the payoff ceiling is ~1%.
+
+> Method note: the bisect that established this was worth its cost — pristine
+> baseline PASS 64/64, combine-change-only PASS 64/64, combine+dispatch FAIL. A
+> "should be bit-identical" claim about a restructured loop is not evidence.
+
 
 ### 6.2 Per-warp streaming ceiling ~0.115 GB/s — **the "6.8× gap" was an artifact**
 
@@ -531,6 +685,20 @@ exceeds what the device holds resident, some channel has one WG scheduled and it
 not, so the resident WG burns its Xe-core spinning on a partner that cannot run until it
 yields — a scheduling deadlock survivable only because of `kFusedSpinCap`. Below the bound
 the kernel is warp-starved instead (§6.1/§6.2), which is why 16 and 12 also lose.
+
+> **CLOSED SUB-QUESTION (2026-08-26): can the bound be raised by SHRINKING the work-group?**
+> No. The obvious follow-on — since `num_sms` is capped by a *per-kernel occupancy* query,
+> shrink `DEEP_EP_COMBINE_FWD_WARPS` (24 → 16 → 12 → 8) so the combine WG shrinks from 800
+> work-items and the driver hands back a bigger number — was falsified without a single
+> rebuild sweep, by printing both caps:
+> ```
+> [DeepEP] fused co-residency query: dispatch_wg=512 cap=20 | combine_wg=800 cap=20
+> ```
+> The query returns **20 for both**, a 512-work-item kernel and an 800-work-item one. It is
+> reporting the **Xe-core count** (160 EU / 8 per subslice = 20), not a work-group-size-
+> sensitive occupancy. Shrinking the work-group cannot raise it, so this whole avenue is
+> dead. `DEEP_EP_COMBINE_FWD_WARPS` was left `#ifndef`-wrappable (harmless) but there is no
+> reason to sweep it. **Print both caps before theorising about the clamp.**
 
 > **The earlier "24 is clean 16/16" result was a *correctness* observation and was
 > mis-read as a throughput opportunity.** Correct and fast are different questions.
