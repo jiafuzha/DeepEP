@@ -346,6 +346,22 @@ def test_main(num_tokens: int,
         f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
         flush=True)
     if get_accelerator_device_type() == 'xpu':
+        # Split D vs C timing via XPU events (no kineto on XPU).
+        if os.environ.get('DEEP_EP_SPLIT_DC', '0') == '1':
+            def _dispatch_only():
+                buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                            use_fp8=True, async_finish=False, return_recv_hook=False)
+            recv_x, recv_count, handle, event, hook = \
+                buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                            use_fp8=True, async_finish=False, return_recv_hook=False)
+            def _combine_only():
+                buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                           use_logfmt=use_logfmt, return_recv_hook=False)
+            d_avg, d_min, d_max = bench(_dispatch_only)
+            c_avg, c_min, c_max = bench(_combine_only)
+            print(f'[rank {rank}] DISPATCH-only avg={d_avg*1e6:.2f} min={d_min*1e6:.2f} us | COMBINE-only avg={c_avg*1e6:.2f} min={c_min*1e6:.2f} us', flush=True)
         return hash_value
 
     # Separate profiling

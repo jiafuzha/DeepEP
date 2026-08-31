@@ -81,7 +81,7 @@ fi
 
 # Auto-default the IBGDA multi-QP count to one QP per LOCAL expert (the LL send
 # kernels key the destination QP by the local expert index), rounded up to a
-# power of 2 and clamped [1,16]. This drives each expert's RDMA on an independent
+# power of 2 and clamped [1,128]. This drives each expert's RDMA on an independent
 # QP instead of serializing all experts through QP 0 -> ~27-30% lower LL latency
 # (2.07 -> ~2.8 GB/s) at 512..4096 tokens. A user-set ISHMEM_IBGDA_QPS_PER_PE wins.
 _ll_total_ranks=$((NUM_PROCESSES * 2))
@@ -89,7 +89,7 @@ _ll_num_local_experts=$(( NUM_EXPERTS / (_ll_total_ranks > 0 ? _ll_total_ranks :
 [ "$_ll_num_local_experts" -lt 1 ] && _ll_num_local_experts=1
 _ll_qpp=1
 while [ "$_ll_qpp" -lt "$_ll_num_local_experts" ]; do _ll_qpp=$((_ll_qpp * 2)); done
-[ "$_ll_qpp" -gt 16 ] && _ll_qpp=16
+[ "$_ll_qpp" -gt 128 ] && _ll_qpp=128
 ISHMEM_IBGDA_QPS_PER_PE="${ISHMEM_IBGDA_QPS_PER_PE:-$_ll_qpp}"
 
 # Optional clean-env reset before each test run. On this BMG + mlx5 stack a
@@ -435,6 +435,10 @@ run_test() {
         -e DEEP_EP_LL_SEND_TEAM_BARRIER="${DEEP_EP_LL_SEND_TEAM_BARRIER:-}" \
         -e DEEP_EP_LL_REDUCE_WGS="${DEEP_EP_LL_REDUCE_WGS:-}" \
         -e DEEP_EP_LL_FUSED_WGS="${DEEP_EP_LL_FUSED_WGS:-}" \
+        -e DEEP_EP_SPLIT_DC="${DEEP_EP_SPLIT_DC:-0}" \
+        -e DEEP_EP_QPP_DBG="${DEEP_EP_QPP_DBG:-0}" \
+        -e DEEP_EP_LL_NUM_WARPS="${DEEP_EP_LL_NUM_WARPS:-}" \
+        -e DEEP_EP_LL_DROP_FENCE="${DEEP_EP_LL_DROP_FENCE:-}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
@@ -467,7 +471,7 @@ run_test() {
                 -hosts $NODE0_CONTAINER,$NODE1_CONTAINER \
                 -genv ISHMEM_IB_ENABLE_IBGDA 1 \
                 -genv ISHMEM_IBGDA_DIRECT_DOORBELL ${ISHMEM_IBGDA_DIRECT_DOORBELL:-1} \
-                -genv ISHMEM_ENABLE_GPU_IPC 0 \
+                -genv ISHMEM_ENABLE_GPU_IPC ${ISHMEM_ENABLE_GPU_IPC:-1} \
                 -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \
                 -genv ISHMEM_SYMMETRIC_SIZE $ISHMEM_SYMMETRIC_SIZE \
                 -genv ZE_ENABLE_PCI_ID_DEVICE_ORDER 1 \
@@ -515,6 +519,10 @@ run_test() {
                 -genv DEEP_EP_LL_SEND_TEAM_BARRIER \"\${DEEP_EP_LL_SEND_TEAM_BARRIER:-}\" \
                 -genv DEEP_EP_LL_REDUCE_WGS \"\${DEEP_EP_LL_REDUCE_WGS:-}\" \
                 -genv DEEP_EP_LL_FUSED_WGS \"\${DEEP_EP_LL_FUSED_WGS:-}\" \
+                -genv DEEP_EP_SPLIT_DC \"\${DEEP_EP_SPLIT_DC:-0}\" \
+                -genv DEEP_EP_QPP_DBG \"\${DEEP_EP_QPP_DBG:-0}\" \
+                -genv DEEP_EP_LL_NUM_WARPS \"\${DEEP_EP_LL_NUM_WARPS:-}\" \
+                -genv DEEP_EP_LL_DROP_FENCE \"\${DEEP_EP_LL_DROP_FENCE:-}\" \
                 -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \

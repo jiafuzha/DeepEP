@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <c10/util/Float8_e4m3fn.h>
 
 #include "xpu_kernels.hpp"
@@ -260,6 +261,73 @@ inline int ll_flag_sender_fence() {
     }
     return 1;
 }
+
+// C2: skip fence_qp in the flag-AMO paths. With ISHMEM_IBGDA_QPS_PER_PE_CAP<<num_local_experts
+// many per-expert fence_qp calls fence the SAME underlying QP redundantly. Since the payload
+// put and the flag AMO share the same le -> same underlying QP, RC ordering already guarantees
+// the AMO lands after the puts on that QP. Empirically shows ~0.2% impact at E=384 -- kept off
+// by default. DEEP_EP_LL_DROP_FENCE=1 enables.
+// The per-QP fence between the dispatch payload put and the flag AMO is redundant by
+// construction, so it is dropped by default (set DEEP_EP_LL_DROP_FENCE=0 to restore it):
+//   1. Both the payload `ishmemx_putmem_nbi_subgroup(..., qp=le)` and the flag
+//      `ishmemx_long_atomic_add_qp(..., qp=le)` target the SAME QP, and an RC QP consumes
+//      its send-queue WQEs in strict order, so the payload necessarily lands first.
+//   2. `ishmemx_long_atomic_add_qp` lowers to AMO_FETCH_ADD -> ishmemi_ibgda_device_rdma_atomic64,
+//      which rings the doorbell UNCONDITIONALLY at producer index wqe_idx+1. That publishes
+//      every earlier WQE on the QP, including payload puts posted with force_db=false.
+//   3. That same call is a *fetching* atomic: it blocks polling for its own completion,
+//      which is strictly stronger than the fence it replaces.
+// Work-group sizing for the LL dispatch/combine kernels. The CUDA geometry uses a fixed 32
+// warps (a 1024-work-item WG) per channel. On XPU the grid is num_experts work-groups, so
+// once num_experts exceeds the device's compute units the WGs over-subscribe the SMs and a
+// 1024-work-item WG throttles occupancy badly. Measured on 160 CUs, topk=2, nt=32:
+//   E=384: 32w 820us | 16w 718us | 8w 578us | 4w 590us
+//   E=320: 32w 741us | 16w 744us | 8w 553us
+//   E=8  : 32w 323us | 16w 325us |  8w 348us   (grid fits: fewer warps only costs parallelism)
+// So keep CUDA-parity 32 warps while the grid fits in the CUs, and drop to 8 warps once it
+// over-subscribes. DEEP_EP_LL_NUM_WARPS overrides. Callers require num_warps > num_topk (and > 1).
+inline int ll_num_warps(int num_topk, int num_experts, int num_device_sms) {
+    int w;
+    const char* env = std::getenv("DEEP_EP_LL_NUM_WARPS");
+    if (env != nullptr && env[0] != '\0' && std::atoi(env) > 0) {
+        w = std::atoi(env);
+    } else if (num_device_sms <= 0 || num_experts <= num_device_sms) {
+        w = 32;
+    } else {
+        w = 8;
+    }
+    // Round DOWN to a power of two, then honour num_topk + 1 <= num_warps and the [2,32] range.
+    int p = 1;
+    while ((p << 1) <= w) p <<= 1;
+    w = p;
+    while (w <= num_topk) w <<= 1;
+    if (w < 2) w = 2;
+    if (w > 32) w = 32;
+    return w;
+}
+
+inline bool ll_drop_fence() {
+    const char* env = std::getenv("DEEP_EP_LL_DROP_FENCE");
+    return env == nullptr || env[0] != '0';
+}
+
+// Channel packing: the dispatch-recv and combine-send kernels launch ONE work-group of
+// `num_warps*32` (=1024) work-items per CHANNEL (== per responsible expert), so the grid
+// is num_experts. At E=384 that is 384 x 1024 = 393K work-items for, at nt=32/topk=2,
+// only 64 token-sends of real work -- the rest is per-channel fixed cost. Packing C
+// channels into each work-group cuts the grid to ceil(num_experts/C) while performing
+// exactly the same per-channel work, which isolates (and, if it is the bottleneck,
+// removes) per-work-group launch/occupancy overhead.
+//
+// DEEP_EP_LL_PACK_CHANNELS: 0/unset => auto (C = ceil(num_experts / num_device_sms), so
+// C==1 and behaviour is bit-identical whenever num_experts <= num_device_sms); >0 => forced C.
+inline int ll_pack_channels(int num_experts, int num_device_sms) {
+    int c = 0;
+    if (const char* env = std::getenv("DEEP_EP_LL_PACK_CHANNELS")) c = std::atoi(env);
+    if (c <= 0) c = (num_experts + std::max(num_device_sms, 1) - 1) / std::max(num_device_sms, 1);
+    return std::max(1, std::min(c, std::max(num_experts, 1)));
+}
+
 
 // Number of work-groups for the coop warp-put payload kernel. The ordered
 // commit gate in ishmemx_putmem_nbi_subgroup requires the producing sub-groups to be
@@ -770,8 +838,8 @@ void dispatch_bf16(void* packed_recv_x,
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
     const bool recv_uncached = (flag_recv_acq == 0);
-    const int dispatch_parity = cur_parity & 1;
-    const int num_recv_channels = num_local_experts * num_ranks;
+    const bool drop_fence = ll_drop_fence();  // C2
+    const int dispatch_parity = cur_parity & 1;    const int num_recv_channels = num_local_experts * num_ranks;
     const int dst_scale_stride = use_ue8m0 ? ((num_scales + 3) / 4) : num_scales;
     auto* dst_scale_float = static_cast<float*>(packed_recv_x_scales);
     auto* dst_scale_int = static_cast<int32_t*>(packed_recv_x_scales);
@@ -783,34 +851,20 @@ void dispatch_bf16(void* packed_recv_x,
     // ~num_experts co-resident WGs (cheap), and the per-expert finish-counter completes
     // among those co-resident blocks -- so NO separate counting kernel is needed.
     const int num_device_sms = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
-    int num_warp_groups = (num_experts + num_device_sms - 1) / std::max(num_device_sms, 1);
-    if (num_warp_groups < 1) num_warp_groups = 1;
-    int num_warps_per_group = 32 / num_warp_groups;
-    if (num_warps_per_group < 1) num_warps_per_group = 1;
+    // Enable E > SMs: force num_warp_groups=1 and let the grid over-subscribe SMs.
+    // (Correct but not tight; the lost phase-split kernel was the tighter version.)
+    int num_warp_groups = 1;
+    int num_warps_per_group = ll_num_warps(num_topk, num_experts, num_device_sms);
     const int num_warps = num_warp_groups * num_warps_per_group;           // sub-groups per WG
-    const int num_sms = (num_experts + num_warp_groups - 1) / num_warp_groups;  // grid (work-groups)
+    const int num_sms = num_experts;                                        // grid (work-groups)
     const int wg_size = num_warps * 32;
     TORCH_CHECK(num_topk + 1 <= num_warps, "LL dispatch requires num_warps > num_topk");
     TORCH_CHECK(num_warps_per_group > 1, "LL dispatch requires num_warps_per_group > 1 (recv overlap)");
-    // IMPORTANT: this fused XPU kernel is correct ONLY for num_warp_groups == 1 (i.e.
-    // num_experts <= num_device_sms; on Arc B60 max_compute_units==160). CUDA supports
-    // num_warp_groups 1..15 because its in-kernel rendezvous are WARP-GROUP-scoped named
-    // barriers (`bar.sync warp_group_id+N, num_warps_per_group*32`), which only the warps of
-    // ONE warp group must reach. BMG cannot reliably express a warp-group-SUBSET barrier (the
-    // same forward-progress/named-barrier limitation as the F1 caster barrier), so this port
-    // substitutes a WHOLE-WORK-GROUP `sycl::group_barrier(group)`. With num_warp_groups > 1
-    // that (a) over-synchronizes across independent warp groups, and (b) DEADLOCKS at the
-    // recv-phase barrier, which sits inside `if (responsible_expert_idx < num_experts)`: when
-    // num_sms*num_warp_groups > num_experts the last work-group has warp groups that skip the
-    // guard (and thus the whole-WG barrier) while their peers block forever. Fail loud here
-    // instead of silently hanging. The proper fix is the phase-split kernels, which make each
-    // warp group its OWN work-group (grid = num_sms*num_warp_groups, wg = num_warps_per_group
-    // *32) so the whole-WG barrier naturally becomes the warp-group barrier.
+    // IMPORTANT: this fused XPU kernel is correct ONLY for num_warp_groups == 1.
+    // (num_warp_groups is forced to 1 above; guard retained.)
     TORCH_CHECK(num_warp_groups == 1,
-                "XPU LL dispatch currently supports only num_experts <= max_compute_units "
-                "(num_warp_groups == 1); got num_experts=", num_experts, ", num_device_sms=",
-                num_device_sms, " -> num_warp_groups=", num_warp_groups,
-                ". num_warp_groups>1 requires the warp-group-per-workgroup phase-split kernels.");
+                "XPU LL dispatch requires num_warp_groups == 1 (forced above); got ",
+                num_warp_groups);
 
     // Zero caller outputs + workspace.
     queue.memset(packed_recv_count, 0, static_cast<size_t>(num_local_experts) * sizeof(int));
@@ -837,7 +891,11 @@ void dispatch_bf16(void* packed_recv_x,
     // MUST NOT exceed the device's resident WG capacity (a spinning producer WG trips the
     // GuC watchdog -> GT reset). The token-parallel recv copy stays on num_experts WGs
     // (32 sub-warps each) which already saturates the copy for these sizes.
-    int send_wgs = num_sms;
+    // Cap the send grid at num_device_sms: send_wgs > SMs just over-subscribes without
+    // helping token-parallel puts, which cost is dominated by NIC throughput. At E>SMs
+    // this saves (num_experts - num_device_sms) WGs of pure launch overhead per dispatch.
+    int send_wgs = std::min(num_sms, num_device_sms);
+    const int pack_channels = ll_pack_channels(num_experts, num_device_sms);
     if (const char* se = std::getenv("DEEP_EP_LL_SEND_WGS")) {
         const int v = std::atoi(se);
         if (v > 0) send_wgs = v;
@@ -1060,11 +1118,26 @@ void dispatch_bf16(void* packed_recv_x,
     });
 
     // ---- Kernel 2: post count flags (phase A) then poll + copy messages (phase B). ----
+    // Channel packing (see ll_pack_channels): each work-group owns `pack_channels`
+    // consecutive channels instead of exactly one, shrinking the grid from num_experts to
+    // recv_wgs. Phase A is run for ALL owned channels FIRST, then a whole-WG barrier, then
+    // phase B for all owned channels. That "post every flag before polling any flag"
+    // ordering is strictly safer than the unpacked kernel (it cannot deadlock against a
+    // peer that has not yet reached the channel we are waiting on).
+    const int recv_wgs = (num_experts + pack_channels - 1) / pack_channels;
+    {
+        static int logged_pc = -1;
+        if (logged_pc != pack_channels) {
+            logged_pc = pack_channels;
+            std::fprintf(stderr, "[DeepEP] LL pack_channels=%d -> dispatch recv grid %d (was %d)\n",
+                         pack_channels, recv_wgs, num_experts);
+        }
+    }
     queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> shared_recv_cnt(sycl::range<1>(std::max(num_warp_groups, 1)), cgh);
         sycl::local_accessor<int, 1> shared_recv_begin(sycl::range<1>(std::max(num_warp_groups, 1)), cgh);
         cgh.parallel_for<LLDispatchRecvKernel>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * wg_size), sycl::range<1>(wg_size)),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(recv_wgs) * wg_size), sycl::range<1>(wg_size)),
             [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                 auto group = item.get_group();
                 auto sg = item.get_sub_group();
@@ -1074,7 +1147,13 @@ void dispatch_bf16(void* packed_recv_x,
                 const int sg_size = static_cast<int>(sg.get_local_range()[0]);
                 const int warp_group_id = warp_id / num_warps_per_group;
                 const int sub_warp_id = warp_id % num_warps_per_group;
-                const int responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+                // Channel `ch` of this work-group. All of sm_id/pack_channels/ch are
+                // work-group-uniform, so every barrier below is reached by every warp.
+                //
+                // Pass A: post the count flag for EVERY channel this work-group owns before
+                // polling any of them.
+                for (int ch = 0; ch < pack_channels; ++ch) {
+                const int responsible_expert_idx = sm_id * pack_channels + ch;
 
                 // ---- Phase A: count tokens this rank sent to responsible_expert_idx and
                 // post the count flag (-count-1). The kernel boundary already guarantees all
@@ -1094,7 +1173,8 @@ void dispatch_bf16(void* packed_recv_x,
                                 sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                                 uc_store<long>(&rdma_recv_count[slot], static_cast<long>(-cnt - 1));
                             } else {
-                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
+                                if (!drop_fence)
+                                    ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
                                 ll_sender_flush(flag_sender_fence);
                                 ishmemx_long_atomic_add_qp(&rdma_recv_count[slot], static_cast<long>(-cnt - 1),
                                                            dst_rank, static_cast<unsigned int>(le));
@@ -1102,11 +1182,16 @@ void dispatch_bf16(void* packed_recv_x,
                         }
                     }
                 }
-                // Make the SELF-channel count (src_rank==rank, written above by THIS WG)
+                }  // end pass A channel loop
+                // Make the SELF-channel counts (src_rank==rank, written above by THIS WG)
                 // visible to phase B's poll below. Cross-rank channels are remote (landed via
                 // AMO) and need no barrier. This is the intra-WG substitute for the fused
                 // kernel's grid barrier between send and recv on the self path.
                 sycl::group_barrier(group);
+
+                // Pass B: poll + copy for every channel this work-group owns.
+                for (int ch = 0; ch < pack_channels; ++ch) {
+                const int responsible_expert_idx = sm_id * pack_channels + ch;
 
                 // ============================ RECV PHASE (Phase B) ============================
                 // Each WG's warp group `warp_group_id` handles channel responsible_expert_idx
@@ -1186,6 +1271,9 @@ void dispatch_bf16(void* packed_recv_x,
                         }
                     }
                 }
+                // Barrier before the next owned channel reuses shared_recv_cnt/_begin.
+                sycl::group_barrier(group);
+                }  // end pass B channel loop
             });
     });
 #endif
@@ -1236,6 +1324,7 @@ void combine_bf16(void* combined_x,
     const int flag_lsc_mode = ll_flag_lsc_mode();
     const int flag_sender_fence = ll_flag_sender_fence();
     const int flag_recv_acq = ll_flag_recv_acq();
+    const bool drop_fence = ll_drop_fence();  // C2
 
     // --- PHASE-SPLIT combine (was a single fused kernel with cg::this_grid().sync()).
     // Geometry MIRRORS the faithful dispatch: grid = num_sms BIG blocks of
@@ -1252,26 +1341,18 @@ void combine_bf16(void* combined_x,
     {
         // CUDA launch geometry (internode_ll.cu::combine host code).
         const int num_device_sms = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
-        int num_warp_groups = (num_experts + num_device_sms - 1) / std::max(num_device_sms, 1);
-        if (num_warp_groups < 1) num_warp_groups = 1;
-        int num_warps_per_group = 32 / num_warp_groups;
-        if (num_warps_per_group < 1) num_warps_per_group = 1;
+        int num_warp_groups = 1;
+        int num_warps_per_group = ll_num_warps(num_topk, num_experts, num_device_sms);
         const int num_warps = num_warp_groups * num_warps_per_group;
-        const int num_sms = (num_experts + num_warp_groups - 1) / num_warp_groups;
+        const int num_sms = num_experts;
+        const int pack_channels = ll_pack_channels(num_experts, num_device_sms);
+        const int send_wgs_c = (num_experts + pack_channels - 1) / pack_channels;
         const int wg_size = num_warps * 32;
+        (void)num_device_sms;
         TORCH_CHECK(num_warps_per_group > 1, "LL combine requires num_warps_per_group > 1");
-        // See the matching guard in the dispatch path: this fused combine kernel is correct
-        // ONLY for num_warp_groups == 1 (num_experts <= num_device_sms). CUDA uses warp-group-
-        // scoped named barriers (`bar.sync warp_group_id+1, num_warps_per_group*32`); BMG cannot
-        // express a warp-group-subset barrier, so this port uses a whole-WG group_barrier. With
-        // num_warp_groups > 1 that over-synchronizes across warp groups and diverges from CUDA's
-        // per-warp-group rendezvous. Fail loud instead of running an unfaithful/unsafe geometry.
-        // The phase-split kernels (warp-group-per-workgroup) are the proper fix.
         TORCH_CHECK(num_warp_groups == 1,
-                    "XPU LL combine currently supports only num_experts <= max_compute_units "
-                    "(num_warp_groups == 1); got num_experts=", num_experts, ", num_device_sms=",
-                    num_device_sms, " -> num_warp_groups=", num_warp_groups,
-                    ". num_warp_groups>1 requires the warp-group-per-workgroup phase-split kernels.");
+                    "XPU LL combine requires num_warp_groups == 1 (forced above); got ",
+                    num_warp_groups);
 
         const size_t reduce_work = static_cast<size_t>(num_combined_tokens) * hidden;
         // atomic_clean_flag (CUDA): reuse the dispatch-only slot_counter region (a single
@@ -1292,7 +1373,7 @@ void combine_bf16(void* combined_x,
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<LLCombineSendKernel>(
-                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(num_sms) * wg_size), sycl::range<1>(wg_size)),
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs_c) * wg_size), sycl::range<1>(wg_size)),
                 [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     auto group = item.get_group();
                     auto sg = item.get_sub_group();
@@ -1302,7 +1383,7 @@ void combine_bf16(void* combined_x,
                     const int sg_size = static_cast<int>(sg.get_local_range()[0]);
                     const int warp_group_id = warp_id / num_warps_per_group;
                     const int sub_warp_id = warp_id % num_warps_per_group;
-                    const int responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+                    (void)warp_group_id;
 
                     // ============================ SEND PHASE ============================
                     // Clean the OPPOSITE-parity combine_flag receive slots (CUDA next_clean),
@@ -1322,6 +1403,12 @@ void combine_bf16(void* combined_x,
                             cf.fetch_add(num_experts);
                         }
                     }
+
+                    // Pass A: for every channel this work-group owns, do the token sends and
+                    // post the arrival flag. All sends/flags are issued before ANY flag wait
+                    // (pass B), so packing cannot deadlock against a peer.
+                    for (int ch = 0; ch < pack_channels; ++ch) {
+                    const int responsible_expert_idx = sm_id * pack_channels + ch;
 
                     // Issue per-token IBGDA sends for this responsible expert. Each sub-warp
                     // owns a stride of this expert's tokens; it copies the token's hidden row
@@ -1399,7 +1486,8 @@ void combine_bf16(void* combined_x,
                                 sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
                                 uc_store<long>(&combine_flag_i[slot], 1L);
                             } else {
-                                ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
+                                if (!drop_fence)
+                                    ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
                                 ll_sender_flush(flag_sender_fence);
                                 ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
                                                            static_cast<unsigned int>(le));
@@ -1409,6 +1497,12 @@ void combine_bf16(void* combined_x,
                                          sycl::access::address_space::global_space> cf(clean_flag[0]);
                         cf.fetch_add(-1);
                     }
+                    }  // end pass A channel loop
+
+                    // Pass B: now that every owned channel's payload + flag has been posted,
+                    // wait for the inbound flags.
+                    for (int ch = 0; ch < pack_channels; ++ch) {
+                    const int responsible_expert_idx = sm_id * pack_channels + ch;
 
                     // ---- Recv-flag wait (CombineWait): responsible expert, sub-warp 0 lane 0.
                     // Skip self owners (flag set locally) and masked ranks.
@@ -1424,6 +1518,7 @@ void combine_bf16(void* combined_x,
                             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
                         }
                     }
+                    }  // end pass B channel loop
 
                     // ---- Kernel boundary below (== CUDA cg::this_grid().sync()): once this
                     // send/flag kernel exits, every expert flag has been observed and all
