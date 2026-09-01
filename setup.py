@@ -96,6 +96,34 @@ def check_ishmem_bnxt_inlinable(ishmem_dir):
         return
 
 
+def assert_ishmem_has_nbi_amo(archive_path, ishmem_dir):
+    # csrc/xpu/internode_ll.cpp calls ishmemx_long_atomic_add_nbi_qp() (the low-latency
+    # combine flag post). That symbol only exists in an iSHMEM build carrying the NBI AMO
+    # API; against an older archive the failure surfaces only at SYCL DEVICE-LINK time as
+    # an unresolved-symbol error with no hint about which archive is at fault -- and on
+    # this stack "wrong libishmem.a" is already the single most common way to lose a day
+    # (it has previously caused both a 29x LL slowdown and DEVICE_LOST). Fail early and
+    # name the fix instead.
+    try:
+        out = subprocess.run(['nm', '-g', str(archive_path)],
+                             capture_output=True, text=True, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return  # nm unavailable; let the device link speak for itself
+    if not out or 'atomic_add_nbi_qp' in out:
+        return
+    raise SystemExit(
+        '\n' + '=' * 78 + '\n'
+        'iSHMEM archive lacks the NBI AMO API (ishmemx_*_atomic_add_nbi_qp).\n'
+        f'  archive:    {archive_path}\n'
+        f'  ISHMEM_DIR: {ishmem_dir}\n'
+        'The low-latency combine flag post needs it: the blocking atomic polls a CQE per\n'
+        'flag, and at E=384 that is 288 serialized round-trips per rank per iteration\n'
+        '(~10-20 ms, a ~14x avg_t/min_t blow-up). Point ISHMEM_DIR at an iSHMEM build that\n'
+        'includes the NBI AMO, then force re-extraction:\n'
+        '  rm -rf build/ishmem-sycl-dlink\n'
+        + '=' * 78 + '\n')
+
+
 def extract_archive_objects_for_sycl_dlink(archive_path, output_dir):
     archive_path = Path(archive_path).resolve()
     output_dir = Path(output_dir).resolve()
@@ -195,6 +223,7 @@ if __name__ == '__main__':
             if ishmem_archive.exists():
                 assert_ishmem_archive_fresh(ishmem_archive, ishmem_dir)
                 check_ishmem_bnxt_inlinable(ishmem_dir)
+                assert_ishmem_has_nbi_amo(ishmem_archive, ishmem_dir)
                 sycl_dlink_objects = extract_archive_objects_for_sycl_dlink(ishmem_archive, Path('build') / 'ishmem-sycl-dlink')
                 append_sycl_dlink_objects(sycl_dlink_objects)
         else:

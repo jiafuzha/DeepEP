@@ -742,12 +742,197 @@ bytes ~= num_experts * tokens * (msg_bytes + 2*hidden_bytes)   [~ E*nt*(6*hidden
 
 The original formula was `tokens*hidden*2*48`, whose magic `48` is exactly
 `6*num_experts` at `E=8` — it **ignored the expert count** and so undersized by up to
-48× at `E=384` (`ishmem_align failed for 529156992 bytes` at nt=32). It is now
-`tokens*hidden*8*num_experts` (1.28–1.40× headroom over the true layout), rounded up
-to a **64 MiB multiple rather than the next power of two** — iSHMEM does not require a
-power-of-two heap, and the pow2 ramp doubled an already-oversized reservation, which
-§5.7 shows is actively harmful. `E=8` sizing is unchanged in practice (nt=32 → the
-256 MiB floor; nt=4096 → 1792 MiB, down from 4096 MiB).
+48× at `E=384` (`ishmem_align failed for 529156992 bytes` at nt=32). It was then
+`tokens*hidden*8*num_experts`, which fixed the expert-count blindness but kept a flat
+1.28–1.40× headroom — harmless at small shapes, but at `E=384`/nt=1024 that reserves
+**21 GiB for a 15.77 GiB need**, i.e. the sizer itself triggers the over-commit trap
+this very section warns about.
+
+The sizer now evaluates the **exact layout formula above with a 12% margin**, so
+headroom is a consistent 1.13–1.14× at every shape (`E=384`/nt=1024: 21 → 17.75 GiB), and
+rounds up to a **64 MiB multiple rather than the next power of two** — iSHMEM does not
+require a power-of-two heap, and the pow2 ramp doubled an already-oversized
+reservation. Validate it against the runtime's own `xpu_layout_bytes:` line, which it
+should exceed by only the margin plus alignment padding. `E=8` sizing is unchanged in
+practice (nt=32 → the 256 MiB floor; nt=4096 → 1792 MiB, down from 4096 MiB).
+
+### 5.9 Current token-scaling baseline (E=8, topk=2, H7168, 4 ranks, 2026-09)
+
+Post-vectorized-reduce, auto-sized heap, correctness checking ON. All 7 points PASS
+with 0 `DEVICE_LOST`. `peak BW` is `min_t`-based and is the trustworthy column.
+
+| tokens | heap | `avg_t` | `min_t` | avg BW | peak BW | `min_t` scaling |
+|---|---|---|---|---|---|---|
+| 32   | 256 MiB  | 227 µs¹   | 218 µs   | 5.17 GB/s | 5.38 GB/s | — |
+| 64   | 256 MiB  | 381 µs    | 348 µs   | 6.74 GB/s | 7.37 GB/s | 1.60× |
+| 128  | 256 MiB  | 579 µs    | 562 µs   | 9.25 GB/s | 9.52 GB/s | 1.61× |
+| 256  | 256 MiB  | 1129 µs   | 1094 µs  | 9.67 GB/s | 9.98 GB/s | 1.95× |
+| 1024 | 448 MiB  | 4360 µs²  | 4201 µs  | 10.16 GB/s | 10.54 GB/s | 3.84× (4× tok) |
+| 2048 | 896 MiB  | 10082 µs³ | 8282 µs  | 8.81 GB/s | 10.73 GB/s | 1.97× |
+| 4096 | 1792 MiB | 17077 µs  | 16388 µs | 10.42 GB/s | **10.86 GB/s** | 1.98× |
+
+Scaling is **~1.95–1.98× per token doubling from nt=128 up** (bandwidth-bound linear at
+fixed hidden), with peak BW saturating at **~10.9 GB/s**. The sub-linear 1.60× at
+32→64→128 is the token-independent fixed cost being amortized. Combine BW (min-based)
+now runs 5.8 → 12.2 GB/s across the sweep, versus the ~4.7–4.9 GB/s plateau before §5.8.
+
+¹/²/³ **The skew tail (§5.8) fired at 3 of these 7 points**, inflating `avg_t` only:
+¹ nt=32 measured 620 µs avg / 5.6 ms max in the sweep run; the quoted 227 µs is from a
+5-run A/B where 4/5 landed at 227–230 µs (`min_t` 218 µs agrees in both).
+² nt=1024 first gave 5104 µs avg with a 23 ms outlier; a re-run was tight at 4360 µs.
+³ nt=2048 tails in **both** runs (max 65–98 ms) — its `avg_t` is the least trustworthy
+number in the table, while its `min_t` is stable across runs (8282 / 8412 µs).
+
+This is the single strongest argument for fixing the cross-rank flag-wait skew stall:
+it is not a small-shape curiosity, it perturbs the average at nearly half the sweep.
+
+### 5.10 Token-scaling at a large expert count (E=384, topk=2, H7168, 4 ranks, 2026-09)
+
+Same build/config as §5.9, only `NUM_EXPERTS` raised 8 → 384 (i.e. `E > SMs`, §5.6).
+All feasible points PASS with 0 `DEVICE_LOST`.
+
+| tokens | heap | `avg_t` | `min_t` | `max_t` | avg BW | peak BW | dispatch `min` | combine `min` |
+|---|---|---|---|---|---|---|---|---|
+| 32  | 576 MiB  | 488 µs  | 476 µs  | 507 µs  | 2.41 GB/s | 2.47 GB/s | 184 µs | 287 µs |
+| 64  | 1152 MiB | 568 µs  | 542 µs  | 598 µs  | 4.52 GB/s | 4.73 GB/s | 202 µs | 333 µs |
+| 128 | 2304 MiB | 722 µs  | 701 µs  | 755 µs  | 7.41 GB/s | 7.63 GB/s | 253 µs | 425 µs |
+| 256 | 4544 MiB | 1176 µs | 1149 µs | 1248 µs | 9.29 GB/s | **9.50 GB/s** | 376 µs | 693 µs |
+
+Two observations that contrast sharply with the E=8 baseline in §5.9:
+
+1. **Scaling is sub-linear (1.14× → 1.29× → 1.64× per token doubling)**, the opposite of
+   E=8's clean ~1.97×. This is expected and healthy: at E=384 the kernel carries a large
+   token-**independent** floor (384 channels of per-expert fixed cost — flag waits, count
+   exchange, channel setup), so the ~476 µs at nt=32 is dominated by that floor and extra
+   tokens are increasingly close to free. Peak BW consequently climbs 2.47 → 9.50 GB/s as
+   the floor amortizes, approaching the ~10.9 GB/s ceiling E=8 reaches at nt=4096.
+2. **Every point is tight** (`max_t` within 6% of `avg_t`) — the skew tail did **not** fire
+   anywhere in this sweep, whereas it perturbed 3 of 7 points at E=8. Plausibly the larger
+   per-expert fixed cost paces the ranks and hides the skew, the same masking effect the
+   slow scalar reduce used to provide (§5.8).
+
+**nt ≥ 1024 is infeasible at E=384 on a 22.7 GiB card — an arithmetic ceiling, not a bug.**
+The LL layout is `E*nt*(msg + 2*hb) + nt*msg` (§5.7) and is *topk-independent*, so:
+
+| tokens | LL layout | verdict |
+|---|---|---|
+| 1024 | 15.77 GiB | over-commits: leaves 3.55 GiB free vs **5.25 GiB** `packed_recv_x` per live copy |
+| 2048 | 31.5 GiB  | layout **alone** exceeds the 22.71 GiB card |
+| 4096 | 63.1 GiB  | layout **alone** exceeds the 22.71 GiB card |
+
+nt=1024 does not fail loudly — it exhibits exactly the §5.7 signature: the run keeps
+"working" while xe evicts to system RAM over the bcs engine, ~100× slower, and looks
+indistinguishable from a hang. The `LL VRAM budget` warning added for §5.7 is what
+identifies it; **trust that warning rather than debugging it as an RDMA stall.** No heap
+size rescues nt=1024: even at the minimum viable 16.40 GiB heap the free VRAM is short of
+what several live `packed_recv_x` copies need.
+
+---
+
+### 5.11 Token-scaling at E=384, **topk=6** (H7168, 4 ranks, 2026-09)
+
+Same build/config as §5.10, only `NUM_TOPK` raised 2 → 6. The layout is
+topk-independent, so heaps are identical to §5.10 and all four points fit. All PASS,
+0 `DEVICE_LOST`.
+
+| tokens | heap | `avg_t` | `min_t` | `max_t` | avg BW | peak BW | dispatch `min` | combine `min` |
+|---|---|---|---|---|---|---|---|---|
+| 32  | 576 MiB  | 645 µs  | 622 µs  | 669 µs   | 6.13 GB/s | 6.36 GB/s | 226 µs | 394 µs |
+| 64  | 1152 MiB | 902 µs  | 875 µs  | 942 µs   | 9.01 GB/s | 9.30 GB/s | 302 µs | 530 µs |
+| 128 | 2304 MiB | 1616 µs | 1574 µs | 1665 µs  | 10.20 GB/s | 10.47 GB/s | 516 µs | 1012 µs |
+| 256 | 4544 MiB | **24498 µs**¹ | 2618 µs | 100365 µs | 1.35 GB/s | **12.67 GB/s** | 900 µs | 1419 µs |
+
+nt=32 lands at 645 µs against the 644 µs measured independently in §5.8 — a useful
+confirmation that these numbers are reproducible run-to-run.
+
+`min_t` scales cleanly (1.41× → 1.80× → 1.66× per doubling) and peak BW rises
+monotonically to **12.67 GB/s**, the highest figure recorded on this stack (above the
+~10.9 GB/s E=8 ceiling of §5.9 — more topk means more payload amortizing the same
+per-expert floor). **Every `min_t` in this table is healthy; the problem is confined to
+`avg_t` at nt=256.**
+
+¹ **The nt=256 combine stall — a distinct, reproducible, and much more severe
+manifestation than the §5.9 tail.** Combine `avg`/`min` = **14.6×** (20243 / 1419 µs),
+versus 1.03–1.04× at topk=6/nt=128 and at topk=2/nt=256. Dispatch is untouched
+(avg 916 vs min 900 µs — rock solid across every run). What has been ruled out, with
+evidence, so this is not re-litigated:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| VRAM over-commit / eviction (§5.7) | compare budget lines | **Ruled out** — 16.90 GiB *free*, and the footprint is byte-identical to topk=2/nt=256, which is tight. Only topk differs. |
+| Hardware wedge | `DEVICE_LOST`, `dmesg` | **Ruled out** — 0 and 0; both runs PASS. |
+| Send-queue depth exhaustion | `QPS_PER_PE` | **Ruled out** — already 128 (96 local experts), so ~16 sends/QP. |
+| Caused by the vectorized reduce (§5.8) | `DEEP_EP_LL_REDUCE_VEC=1` | **Ruled out** — stall persists on the legacy scalar path (avg 14869 / min 4439 µs). |
+| Random tail | re-run | **Ruled out** — reproducible; combine `avg` 20243 then 19870 µs, `min` 1419 then 1436 µs. |
+
+Two further clues for whoever fixes this. First, the *absolute* stall is ~10–19 ms in
+both reduce modes, i.e. a fixed additive cost rather than a multiple of the work — so
+it is a wait, not slow compute. Second, in the fused runs **all four ranks report
+`avg_t` agreeing to within 2 µs** (40769.61 / 40769.89 / 40770.96 / 40769.02), which
+means the ranks enter and leave the stall *together*: a genuine collective wait, not
+per-rank jitter. That is the signature of the cross-rank flag-wait skew stall, and
+nt=256/topk=6 is by far the best reproducer found so far — **use it as the test case**,
+since it fires on nearly every iteration instead of ~1 in 5.
+
+---
+
+### 5.12 Root cause of the cross-rank flag-wait stall, and the NBI fix (2026-09)
+
+The §5.11 stall is now **explained and largely fixed**. Root cause: the combine posted
+each arrival flag with the *blocking* `ishmemx_long_atomic_add_qp`, which polls a CQE
+before returning. One flag is posted per `(local_expert, dst_rank)`, so at E=384 on 4
+ranks that is **96 × 3 = 288 serialized RDMA round-trips per rank per iteration**. That
+serialization *is* the 10–20 ms stall, and it explains both the magnitude and the
+"all ranks agree to within 2 µs" signature (every rank pays the same queue).
+
+Two independent falsifications pin it down — neither is a confirmation test:
+
+| Probe | Expected if theory X | Observed | Conclusion |
+|---|---|---|---|
+| Raise `DEEP_EP_LL_POLL_CAP` to 1e6 | if the stall were a receiver *timeout*, correctness holds and time drops | **correctness FAILED** | flags *do* arrive; they are merely posted slowly. Timeout theory dead. |
+| Collapse 288 posts → 3 (`FLAG_AGG`) | if cost scales with flag *count*, stall vanishes | stall vanished (avg/min 10.3× → 1.03×) | cost is per-post round-trips, confirming the root cause. |
+
+**The fix: `DEEP_EP_LL_FLAG_NBI_AMO`, now ON by default.** A new iSHMEM entry point
+`ishmemx_long_atomic_add_nbi_qp` is the blocking atomic *minus* the CQE poll and ibuf
+result read; slot claim, WQE build, and ordered commit + doorbell are byte-identical, so
+the unconditional-doorbell property is preserved. No flush, barrier, or quiet is needed:
+
+1. Payload (`ishmemx_putmem_nbi_subgroup`) and flag both target **the same QP** (`qp=le`),
+   and an RC QP consumes WQEs in strict order — so flag-after-payload is free.
+2. The NBI AMO rings the doorbell unconditionally, publishing all earlier WQEs on that QP.
+3. The receiver spin-polls the flag, so the sender never needs to learn when it landed.
+4. The two-parity slot scheme leaves a full iteration of slack before any slot is reused.
+
+Measured on the rebuilt canonical archive (all PASS, 0 `DEVICE_LOST`):
+
+| Shape | blocking (`=0`) | **NBI (default)** | Δ |
+|---|---|---|---|
+| E=8, topk=2, nt=32 (regression guard) | 233.4 µs | 232.7 µs | parity |
+| E=384, topk=6, nt=32 | 638.8 µs | **545.0 µs** | **−14.7 %** |
+| E=384, topk=6, nt=128 | 1616 µs | **1568 µs** | −3 % |
+
+**Why flag *aggregation* was rejected**, despite being the only thing that fully removes
+the stall: it collapses the flags onto QP 0 while payloads still span QPs 0–95, which
+destroys the same-QP ordering argument above and therefore forces a mandatory quiet. That
+costs a fixed ~2.3 ms, regressing every small shape (E=8/nt=32 229 → 775 µs;
+E=384/topk=6/nt=32 645 → 2967 µs). It is kept only as an experimental knob
+(`DEEP_EP_LL_FLAG_AGG`, default OFF); do not enable it as a general setting.
+
+Two notes for future work. (a) A *silent-corruption* hazard was found and fixed in the
+iSHMEM ibuf allocator while adding the NBI path: the NBI AMO parks its discarded result
+in ibuf slot 0, but `claim_ibuf_slot()` still handed slot 0 out to fetch-type AMOs, which
+could then read another operation's value. Slot 0 is now reserved (allocation starts at
+1, release refuses 0, `num_slots >= 2` required). (b) The **nt=256 stall is reduced but
+not eliminated** — `min_t` improves (combine 1436 → 1052 µs) yet `avg/min` is still
+~10–16×. With NBI on, `DEEP_EP_LL_TIME_PHASES` shows `reduce_us` steady at 680–800 µs
+while `send_us` spikes to ~978 ms **in pairs of consecutive iterations**. Queue-depth
+exhaustion is ruled out: `peer_ctx` is indexed per-`(pe, qp_idx)`, so with
+`num_qps_per_pe = 128` (confirmed at runtime) there are only ~17 WQEs per QP. The paired
+pattern points at the two-parity slot scheme — the `clean_flag` wait or the recv-flag
+wait — rather than the flag post. That is the open question. Concretely, nt=256 with the
+default ON still PASSes with 0 `DEVICE_LOST` and improves end-to-end (avg 24498 →
+**20645 µs**, −16 %; peak BW 12.67 → **13.14 GB/s**, the best recorded on this stack),
+but `avg/min` remains ~8× (min 2526 µs, max 194 ms) — so the residual wait is real.
 
 ---
 

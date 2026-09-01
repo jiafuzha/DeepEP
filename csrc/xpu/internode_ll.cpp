@@ -313,6 +313,61 @@ inline bool ll_drop_fence() {
     return env == nullptr || env[0] != '0';
 }
 
+// DEEP_EP_LL_FLAG_NBI_AMO: use the genuine non-blocking atomic add for flag posts.
+// DEFAULT ON — set DEEP_EP_LL_FLAG_NBI_AMO=0 to fall back to the blocking atomic.
+//
+// ROOT CAUSE this fixes: the blocking `ishmemx_long_atomic_add_qp` polls a CQE for every
+// flag. The combine posts one flag per (local_expert, dst_rank) = 96 x 3 = 288 serialized
+// RDMA round-trips per rank per iteration, which is the measured 10-20 ms cross-rank stall
+// at E=384 (avg_t/min_t up to 14.6x). Proven by two falsifications: raising the poll cap
+// FAILED correctness (so flags do arrive -- they are merely posted slowly, killing the
+// timeout theory), and collapsing 288 posts to 3 made the stall vanish entirely.
+//
+// The new iSHMEM API `ishmemx_long_atomic_add_nbi_qp` is the blocking one minus the CQE
+// poll and ibuf result read. Steps 1-3 (slot claim, WQE build, ordered commit + doorbell)
+// are byte-identical, so the unconditional doorbell property still holds.
+//
+// Why this works without any flush:
+//   1. Payload `ishmemx_putmem_nbi_subgroup(..., qp=le)` and flag `ishmemx_long_atomic_add_nbi_qp(..., qp=le)`
+//      target the SAME QP. RC in-order delivery guarantees the flag lands after payloads.
+//   2. The NBI AMO rings the doorbell unconditionally (publishes all earlier WQEs on the QP).
+//   3. The receiver spin-polls the flag until it arrives, so the sender never needs to know when it landed.
+//   4. The two-parity slot scheme gives a full iteration of slack before any slot is reused.
+//
+// Result: 288 per-expert flags become NON-BLOCKING with ZERO coordination cost and full
+// per-expert arrival overlap preserved. No barrier, no quiet, no min_t regression.
+// Measured: E=384/topk=6/nt=32 638 -> 547 us (14% faster); E=8/topk=2/nt=32 235 -> 229 us.
+//
+// This is why flag AGGREGATION is the wrong fix: it moves the single flag onto QP 0 while
+// payloads still span QPs 0..95, breaking the same-QP ordering above and forcing a
+// mandatory quiet (~2.3 ms fixed cost, which regresses every small shape).
+//
+// Requires an iSHMEM archive with the NBI AMO API; setup.py checks for it and explains.
+inline bool ll_flag_nbi_amo() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_NBI_AMO");
+    return env == nullptr || env[0] != '0';
+}
+
+// DEEP_EP_LL_FLAG_AGG: aggregate flags per destination rank instead of per-expert.
+// Today: 96 local experts × 3 remote ranks = 288 blocking atomic posts per rank.
+// With aggregation: 3 blocking posts per rank (one per dst_rank), 96× reduction.
+// Each WG finishes its payload PUT, then atomically decrements a per-dst_rank counter.
+// The LAST WG to decrement (result==0) posts the aggregated flag.
+// Receiver side: wait on aggregated slot indexed by src_rank, not global_expert.
+// Default OFF until proven stable; enable with DEEP_EP_LL_FLAG_AGG=1.
+inline bool ll_flag_agg() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_AGG");
+    return env != nullptr && env[0] == '1';
+}
+
+// DEEP_EP_LL_FLAG_AGG_SKIP_QUIET: skip the per-WG quiet calls in FLAG_AGG path.
+// This is for MEASUREMENT ONLY to isolate the barrier vs quiet cost split.
+// Setting this will cause CORRECTNESS FAILURES (data races) but allows timing.
+inline bool ll_flag_agg_skip_quiet() {
+    const char* env = std::getenv("DEEP_EP_LL_FLAG_AGG_SKIP_QUIET");
+    return env != nullptr && env[0] == '1';
+}
+
 // Channel packing: the dispatch-recv and combine-send kernels launch ONE work-group of
 // `num_warps*32` (=1024) work-items per CHANNEL (== per responsible expert), so the grid
 // is num_experts. At E=384 that is 384 x 1024 = 393K work-items for, at nt=32/topk=2,
@@ -1436,6 +1491,37 @@ void combine_bf16(void* combined_x,
         // combine grid to num_combined_tokens / num_recv_per_sm).
         queue.memset(clean_flag, 0, sizeof(int));
 
+        // Flag aggregation (FLAG_AGG): instead of 288 blocking flag posts per rank
+        // (96 local experts × 3 remote ranks), post ONE aggregated flag per dst_rank (3 posts).
+        // Each WG decrements agg_counter[dst_rank] after finishing sends; the LAST WG
+        // (decrement result == 0) posts the aggregated flag. 96× fewer blocking CQE polls.
+        // agg_counter[d] for d in [0, num_ranks): initialized to the count of WGs targeting d.
+        // Use slots 1..num_ranks in slot_counter region (slot 0 is clean_flag).
+        const bool flag_agg = ll_flag_agg();
+        auto* agg_counter = reinterpret_cast<int*>(base + layout.slot_counter_offset + sizeof(int));
+        if (flag_agg) {
+            // Count how many work-groups target each dst_rank. With pack_channels,
+            // WG sm_id handles channels [sm_id*pack_channels, (sm_id+1)*pack_channels).
+            // Channel c targets dst_rank = c / num_local_experts.
+            // For each remote dst_rank, count WGs whose channel range overlaps that rank.
+            std::vector<int> wg_per_rank(num_ranks, 0);
+            for (int sm_id = 0; sm_id < send_wgs_c; ++sm_id) {
+                int ch_start = sm_id * pack_channels;
+                int ch_end = std::min(ch_start + pack_channels, num_experts);
+                int dst_rank_start = ch_start / num_local_experts;
+                int dst_rank_end = (ch_end - 1) / num_local_experts;
+                for (int d = dst_rank_start; d <= dst_rank_end; ++d) {
+                    if (d != rank) wg_per_rank[d]++;
+                }
+            }
+            queue.memcpy(agg_counter, wg_per_rank.data(), num_ranks * sizeof(int)).wait();
+        }
+        const bool skip_quiet = ll_flag_agg_skip_quiet();  // For measurement only
+
+        // Non-blocking flag post (default ON): see ll_flag_nbi_amo() for the root-cause
+        // analysis and why same-QP RC ordering makes this safe without any flush.
+        const bool flag_nbi_amo = ll_flag_nbi_amo();
+
         const int time_phases = ll_time_phases();
         std::chrono::steady_clock::time_point _tp0, _tp1;
         if (time_phases) {
@@ -1536,61 +1622,175 @@ void combine_bf16(void* combined_x,
 
                     // Flag post: sub-warp 1 lane 0. Wait atomic_clean_flag>0 (next_clean done),
                     // then post the arrival flag (+1) on QP=le. Self => uc_store; remote =>
-                    // quiet + atomic-add on the payload's QP (RC in-order: flag after payload).
-                    if (responsible_expert_idx < num_experts && sub_warp_id == 1 && lane == 0) {
-                        const int dst_rank = responsible_expert_idx / num_local_experts;
-                        const int le = responsible_expert_idx % num_local_experts;
-                        const int global_expert = rank * num_local_experts + le;
-                        {
-                            uint64_t spins = 0;
-                            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                    // either (A) non-blocking atomic-add [default, flag_nbi_amo] or
+                    // (B) blocking atomic-add [legacy fallback], on the payload's own QP
+                    // (RC in-order delivery: flag lands after payload).
+                    //
+                    // FLAG_AGG path: instead of posting per-expert, we aggregate flags per
+                    // dst_rank. All channels in this WG have finished their sends above; now
+                    // decrement agg_counter[dst_rank]. The WG that decrements to 0 posts the
+                    // aggregated flag. This reduces 96 blocking posts per dst_rank to 1.
+                    //
+                    // Guard: only run on LAST channel iteration (ch==pack_channels-1) because
+                    // we need ALL channels' sends to be complete before posting the aggregated flag.
+                    // NOTE: num_chs may be < pack_channels for trailing WGs.
+                    const int num_chs = (flag_agg && sub_warp_id == 1 && lane == 0) 
+                        ? sycl::min(pack_channels, num_experts - sm_id * pack_channels) : 0;
+                    const bool is_last_ch = (ch == num_chs - 1);
+                    if (!flag_agg) {
+                        // Legacy per-expert flag post path.
+                        if (responsible_expert_idx < num_experts && sub_warp_id == 1 && lane == 0) {
+                            const int dst_rank = responsible_expert_idx / num_local_experts;
+                            const int le = responsible_expert_idx % num_local_experts;
+                            const int global_expert = rank * num_local_experts + le;
+                            {
+                                uint64_t spins = 0;
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space> cf(clean_flag[0]);
+                                while (cf.load() == 0) {
+                                    if (++spins >= poll_cap) break;
+                                    visa_spin_hint();
+                                }
+                                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                            }
+                            if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
+                                const int slot = global_expert * 2 + combine_parity;
+                                if (dst_rank == rank) {
+                                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                                    uc_store<long>(&combine_flag_i[slot], 1L);
+                                } else {
+                                    if (!drop_fence)
+                                        ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
+                                    ll_sender_flush(flag_sender_fence);
+                                    if (flag_nbi_amo) {
+                                        // NBI AMO: non-blocking atomic add, no CQE poll.
+                                        // Same QP as payload (qp=le) → RC ordering is free.
+                                        // Doorbell rung unconditionally → publishes all earlier WQEs.
+                                        // No flush needed: receiver polls flag, two-parity slack.
+                                        ishmemx_long_atomic_add_nbi_qp(&combine_flag_i[slot], 1L, dst_rank,
+                                                                       static_cast<unsigned int>(le));
+                                    } else {
+                                        // Blocking atomic: polls CQE, causes 14x stall at large shapes
+                                        ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
+                                                                   static_cast<unsigned int>(le));
+                                    }
+                                }
+                            }
+                            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
                                              sycl::access::address_space::global_space> cf(clean_flag[0]);
-                            while (cf.load() == 0) {
-                                if (++spins >= poll_cap) break;
-                                visa_spin_hint();
-                            }
-                            // Device-scope acquire pairs with the clean_flag device release (F5).
-                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                            cf.fetch_add(-1);
                         }
-                        if (!ll_rank_masked(mask_buffer_ptr, dst_rank)) {
-                            const int slot = global_expert * 2 + combine_parity;
-                            if (dst_rank == rank) {
-                                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-                                uc_store<long>(&combine_flag_i[slot], 1L);
-                            } else {
-                                if (!drop_fence)
-                                    ishmemx_fence_qp(dst_rank, static_cast<unsigned int>(le));
-                                ll_sender_flush(flag_sender_fence);
-                                ishmemx_long_atomic_add_qp(&combine_flag_i[slot], 1L, dst_rank,
-                                                           static_cast<unsigned int>(le));
+                    } else if (is_last_ch) {
+                        // Aggregated flag post path. Only sub_warp_id==1 lane==0 participates.
+                        // Each WG quiets its own QPs (serial), decrements counter.
+                        // Last WG posts aggregated flag.
+                        if (sub_warp_id == 1 && lane == 0) {
+                            // Wait for clean_flag (atomic_clean_flag) to be released.
+                            {
+                                uint64_t spins = 0;
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space> cf(clean_flag[0]);
+                                while (cf.load() == 0) {
+                                    if (++spins >= poll_cap) break;
+                                    visa_spin_hint();
+                                }
+                                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                            }
+
+                            // Determine which remote dst_ranks this WG targets.
+                            int first_ch = sm_id * pack_channels;
+                            int last_ch = sycl::min(first_ch + pack_channels - 1, num_experts - 1);
+                            if (first_ch < num_experts) {
+                                int dst_start = first_ch / num_local_experts;
+                                int dst_end = last_ch / num_local_experts;
+                                for (int dst = dst_start; dst <= dst_end; ++dst) {
+                                    if (dst == rank) continue;
+                                    if (ll_rank_masked(mask_buffer_ptr, dst)) continue;
+
+                                    // Serial quiet for all QPs this WG used for dst.
+                                    // This ensures payloads are delivered (CQE confirmed)
+                                    // before decrementing the counter.
+                                    if (!skip_quiet) {
+                                        for (int c = first_ch; c <= last_ch && c < num_experts; ++c) {
+                                            int c_dst = c / num_local_experts;
+                                            if (c_dst == dst) {
+                                                int le = c % num_local_experts;
+                                                ishmemx_quiet_qp(dst, static_cast<unsigned int>(le));
+                                            }
+                                        }
+                                    }
+
+                                    // Decrement agg_counter[dst]. If result == 0, post flag.
+                                    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                                     sycl::access::address_space::global_space> ac(agg_counter[dst]);
+                                    int remaining = ac.fetch_add(-1) - 1;
+                                    if (remaining == 0) {
+                                        // This WG is last. Post aggregated flag.
+                                        const int agg_slot = rank * 2 + combine_parity;
+                                        if (!drop_fence)
+                                            ishmemx_fence_qp(dst, 0u);
+                                        ll_sender_flush(flag_sender_fence);
+                                        ishmemx_long_atomic_add_qp(&combine_flag_i[agg_slot], 1L, dst, 0u);
+                                    }
+                                }
+                            }
+
+                            // Decrement clean_flag
+                            if (num_chs > 0) {
+                                sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space> cf(clean_flag[0]);
+                                cf.fetch_add(-num_chs);
                             }
                         }
-                        sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
-                                         sycl::access::address_space::global_space> cf(clean_flag[0]);
-                        cf.fetch_add(-1);
                     }
                     }  // end pass A channel loop
 
                     // Pass B: now that every owned channel's payload + flag has been posted,
                     // wait for the inbound flags.
-                    for (int ch = 0; ch < pack_channels; ++ch) {
-                    const int responsible_expert_idx = sm_id * pack_channels + ch;
-
-                    // ---- Recv-flag wait (CombineWait): responsible expert, sub-warp 0 lane 0.
-                    // Skip self owners (flag set locally) and masked ranks.
-                    if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane == 0) {
-                        const int src_rank = responsible_expert_idx / num_local_experts;
-                        if (src_rank != rank && !ll_rank_masked(mask_buffer_ptr, src_rank)) {
-                            const int slot = responsible_expert_idx * 2 + combine_parity;
-                            uint64_t spins = 0;
-                            while (ll_read_flag64(&combine_flag_i[slot], flag_lsc_mode) == 0) {
-                                if (++spins >= poll_cap) break;
-                                visa_spin_hint();
+                    //
+                    // FLAG_AGG path: wait on aggregated slot per src_rank instead of per-expert.
+                    // Track which src_ranks have been waited (bitmask) to avoid redundant waits.
+                    if (flag_agg) {
+                        unsigned int src_waited = 0;  // Bitmask of src_ranks we've waited on
+                        for (int ch = 0; ch < pack_channels; ++ch) {
+                            const int responsible_expert_idx = sm_id * pack_channels + ch;
+                            if (responsible_expert_idx >= num_experts) break;
+                            if (sub_warp_id == 0 && lane == 0) {
+                                const int src_rank = responsible_expert_idx / num_local_experts;
+                                if (src_rank != rank && !ll_rank_masked(mask_buffer_ptr, src_rank)) {
+                                    const unsigned int src_bit = 1u << src_rank;
+                                    if ((src_waited & src_bit) == 0) {
+                                        // First encounter of this src_rank in this WG: wait on aggregated flag.
+                                        const int agg_slot = src_rank * 2 + combine_parity;
+                                        uint64_t spins = 0;
+                                        while (ll_read_flag64(&combine_flag_i[agg_slot], flag_lsc_mode) == 0) {
+                                            if (++spins >= poll_cap) break;
+                                            visa_spin_hint();
+                                        }
+                                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                        src_waited |= src_bit;
+                                    }
+                                }
                             }
-                            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                        }
+                    } else {
+                        // Legacy per-expert flag wait path.
+                        for (int ch = 0; ch < pack_channels; ++ch) {
+                            const int responsible_expert_idx = sm_id * pack_channels + ch;
+                            if (responsible_expert_idx < num_experts && sub_warp_id == 0 && lane == 0) {
+                                const int src_rank = responsible_expert_idx / num_local_experts;
+                                if (src_rank != rank && !ll_rank_masked(mask_buffer_ptr, src_rank)) {
+                                    const int slot = responsible_expert_idx * 2 + combine_parity;
+                                    uint64_t spins = 0;
+                                    while (ll_read_flag64(&combine_flag_i[slot], flag_lsc_mode) == 0) {
+                                        if (++spins >= poll_cap) break;
+                                        visa_spin_hint();
+                                    }
+                                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+                                }
+                            }
                         }
                     }
-                    }  // end pass B channel loop
 
                     // ---- Kernel boundary below (== CUDA cg::this_grid().sync()): once this
                     // send/flag kernel exits, every expert flag has been observed and all

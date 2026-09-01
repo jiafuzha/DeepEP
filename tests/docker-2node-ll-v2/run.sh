@@ -80,7 +80,18 @@ TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
 # working set into xe eviction over the copy engine, which silently runs ~100x
 # slower). A 256 MiB floor keeps small shapes at the original size.
 if [ -z "$ISHMEM_SYMMETRIC_SIZE" ]; then
-    _sym_need=$(( NUM_TOKENS * HIDDEN * 8 * NUM_EXPERTS ))
+    # Exact dominant terms of get_low_latency_buffer_layout(): dispatch_data
+    # (E*nt*msg) + rdma_x (nt*msg) + send_data (E*nt*hb) + combine_data (E*nt*hb),
+    # where msg = 16 + 2*hidden and hb = 2*hidden. Validated against the runtime's
+    # own report: E=384/nt=32/H7168 -> 529138176 here vs xpu_layout_bytes 529156992
+    # (the delta is alignment padding). Apply a 12% margin, NOT a fixed large factor:
+    # at big layouts an over-generous heap is what triggers the 5.7 eviction trap
+    # (E=384/nt=1024 needs 15.8 GiB; a 1.33x factor would reserve 21 GiB of a
+    # 22.7 GiB card and guarantee eviction).
+    _sym_msg=$(( 16 + 2 * HIDDEN ))
+    _sym_hb=$(( 2 * HIDDEN ))
+    _sym_need=$(( NUM_EXPERTS * NUM_TOKENS * (_sym_msg + 2 * _sym_hb) + NUM_TOKENS * _sym_msg ))
+    _sym_need=$(( _sym_need + _sym_need / 8 ))
     _sym_gran=$(( 64 * 1024 * 1024 ))
     _sym=$(( ( (_sym_need + _sym_gran - 1) / _sym_gran ) * _sym_gran ))
     [ "$_sym" -lt 268435456 ] && _sym=268435456
@@ -454,6 +465,10 @@ run_test() {
         -e DEEP_EP_SKIP_CHECK="${DEEP_EP_SKIP_CHECK:-0}" \
         -e DEEP_EP_LL_NUM_WARPS="${DEEP_EP_LL_NUM_WARPS:-}" \
         -e DEEP_EP_LL_DROP_FENCE="${DEEP_EP_LL_DROP_FENCE:-}" \
+        -e DEEP_EP_LL_FLAG_NBI="${DEEP_EP_LL_FLAG_NBI:-}" \
+        -e DEEP_EP_LL_FLAG_NBI_AMO="${DEEP_EP_LL_FLAG_NBI_AMO:-}" \
+        -e DEEP_EP_LL_FLAG_AGG="${DEEP_EP_LL_FLAG_AGG:-}" \
+        -e DEEP_EP_LL_FLAG_AGG_SKIP_QUIET="${DEEP_EP_LL_FLAG_AGG_SKIP_QUIET:-}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
         -e DEEP_EP_DBG_COMBINE="${DEEP_EP_DBG_COMBINE:-}" \
         -e DEEP_EP_TIME_WARMUP="${DEEP_EP_TIME_WARMUP:-}" \
@@ -543,6 +558,10 @@ run_test() {
                 -genv DEEP_EP_SKIP_CHECK \"\${DEEP_EP_SKIP_CHECK:-0}\" \
                 -genv DEEP_EP_LL_NUM_WARPS \"\${DEEP_EP_LL_NUM_WARPS:-}\" \
                 -genv DEEP_EP_LL_DROP_FENCE \"\${DEEP_EP_LL_DROP_FENCE:-}\" \
+                -genv DEEP_EP_LL_FLAG_NBI \"\${DEEP_EP_LL_FLAG_NBI:-}\" \
+                -genv DEEP_EP_LL_FLAG_NBI_AMO \"\${DEEP_EP_LL_FLAG_NBI_AMO:-}\" \
+                -genv DEEP_EP_LL_FLAG_AGG \"\${DEEP_EP_LL_FLAG_AGG:-}\" \
+                -genv DEEP_EP_LL_FLAG_AGG_SKIP_QUIET \"\${DEEP_EP_LL_FLAG_AGG_SKIP_QUIET:-}\" \
                 -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \
                 -genv DEEP_EP_NVL_RANKS $NUM_PROCESSES \
                 -genv DEEP_EP_NVL_BYTES $DEEP_EP_NVL_BYTES \
