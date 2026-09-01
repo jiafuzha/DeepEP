@@ -194,7 +194,7 @@ def test_main(num_tokens: int,
     expected_masked_ranks = set()
 
     # Check dispatch correctness
-    do_check = True
+    do_check = os.environ.get('DEEP_EP_SKIP_CHECK', '0') != '1'
     hash_value, num_times = 0, 0
     for current_x in x_list:
         for return_recv_hook in (False, True):
@@ -343,6 +343,7 @@ def test_main(num_tokens: int,
     avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
     print(
         f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+        f'peak (min_t-based) {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / min_t:.2f} GB/s, '
         f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
         flush=True)
     if get_accelerator_device_type() == 'xpu':
@@ -361,7 +362,15 @@ def test_main(num_tokens: int,
                                            use_logfmt=use_logfmt, return_recv_hook=False)
             d_avg, d_min, d_max = bench(_dispatch_only)
             c_avg, c_min, c_max = bench(_combine_only)
-            print(f'[rank {rank}] DISPATCH-only avg={d_avg*1e6:.2f} min={d_min*1e6:.2f} us | COMBINE-only avg={c_avg*1e6:.2f} min={c_min*1e6:.2f} us', flush=True)
+            print(
+                f'[rank {rank}] DISPATCH-only avg={d_avg*1e6:.2f} min={d_min*1e6:.2f} us | COMBINE-only avg={c_avg*1e6:.2f} min={c_min*1e6:.2f} us',
+                flush=True)
+            # Per-phase bandwidth (kineto's `Dispatch/Combine bandwidth` equivalent on XPU).
+            # `min` uses the fastest iteration, which excludes VRAM-eviction outliers.
+            print(
+                f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / d_avg:.2f} GB/s (min-based {num_dispatch_comm_bytes / 1e9 / d_min:.2f} GB/s) | '
+                f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / c_avg:.2f} GB/s (min-based {num_combine_comm_bytes / 1e9 / c_min:.2f} GB/s)',
+                flush=True)
         return hash_value
 
     # Separate profiling

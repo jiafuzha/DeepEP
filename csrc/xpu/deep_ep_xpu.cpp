@@ -447,10 +447,120 @@ size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int 
     const size_t signaling_buffer_bytes_aligned = align_up<size_t>(signaling_buffer_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
     const size_t legacy_hint =
         align_up<size_t>((send_buffer_bytes + recv_buffer_bytes + signaling_buffer_bytes_aligned) * 2, NUM_BUFFER_ALIGNMENT_BYTES);
-    const size_t xpu_layout_bytes =
-        get_low_latency_buffer_layout(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
-    std::cout << "xpu_layout_bytes: " << xpu_layout_bytes << ", legacy_hint: " << legacy_hint << std::endl;
-    return std::max(legacy_hint, xpu_layout_bytes);
+    const size_t xpu_layout_bytes = align_up<size_t>(
+        get_low_latency_buffer_layout(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes,
+        NUM_BUFFER_ALIGNMENT_BYTES);
+    // The XPU low-latency path carves EVERY region it uses out of the single
+    // `LowLatencyLayout` (see internode_ll.cpp::make_layout); the only size
+    // requirement enforced anywhere is
+    //     configure_low_latency_layout(): layout.total_bytes <= num_rdma_bytes.
+    // `legacy_hint` is the CUDA-era (send+recv+signaling)*2 formula, which is
+    // 26-35% LARGER than the XPU layout and is never used by any XPU kernel.
+    // Returning it made every caller reserve that surplus INSIDE the iSHMEM
+    // symmetric heap, so users had to raise ISHMEM_SYMMETRIC_SIZE accordingly.
+    // On a 23.9 GiB BMG card the symmetric heap competes directly with the torch
+    // XPU working set, and once heap + working set exceeds VRAM the xe driver
+    // starts evicting BOs to system memory over the blitter (bcs) engine: the LL
+    // collective does not fail, it just runs ~100x slower (the E=384/topk=6
+    // nt=136 -> nt=160 "cliff"). Handing back the honest requirement lowers the
+    // minimum viable symmetric heap by ~26% (nt=160 H=7168 E=384: 3.578 GB ->
+    // 2.646 GB; nt=256: 5.725 GB -> 4.233 GB) and also avoids memsetting ~1 GB of
+    // never-touched buffer at Buffer construction.
+    std::cout << "xpu_layout_bytes: " << xpu_layout_bytes << ", legacy_hint (unused on XPU): " << legacy_hint
+              << std::endl;
+    return xpu_layout_bytes;
+}
+
+// ---------------------------------------------------------------------------
+// VRAM over-commit guard (see get_low_latency_rdma_size_hint above).
+//
+// Over-committing device memory on the xe/Level-Zero stack does NOT raise an
+// error -- BOs silently migrate to system memory and every subsequent access
+// pays a PCIe round trip, which turns a ~3 ms LL iteration into ~300 ms+ and
+// looks exactly like a lost doorbell / never-arriving RDMA flag. That failure
+// mode cost days of kernel-level debugging, so report it explicitly instead.
+//
+// Emitted at most once per process, from configure_low_latency_layout().
+inline void ll_report_vram_budget(const sycl::device& dev, size_t layout_bytes, int num_ranks, int num_experts,
+                                  int num_max_dispatch_tokens_per_rank, int hidden) {
+    static bool reported = false;
+    if (reported) return;
+    reported = true;
+
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    size_t total_vram = 0;
+    try {
+        total_vram = dev.get_info<sycl::info::device::global_mem_size>();
+    } catch (...) {
+        return;  // no VRAM introspection -> stay silent rather than guess
+    }
+    if (total_vram == 0) return;
+
+    // Measured free VRAM is far more trustworthy than any static estimate of the
+    // framework working set. It needs ZES_ENABLE_SYSMAN=1 and is not implemented
+    // on every device/driver combination, so treat it as best-effort.
+    size_t free_vram = 0;
+    try {
+        free_vram = dev.get_info<sycl::ext::intel::info::device::free_memory>();
+    } catch (...) {
+        free_vram = 0;
+    }
+
+    size_t heap_bytes = 0;
+    if (const char* env = std::getenv("ISHMEM_SYMMETRIC_SIZE")) {
+        heap_bytes = static_cast<size_t>(std::strtoull(env, nullptr, 10));
+    }
+
+    // Dominant per-call tensor the LL dispatch hands back to Python:
+    // packed_recv_x is [num_local_experts, num_ranks * tokens, hidden] (bf16).
+    // Several of these are live at once (output + de-quantised copy + the
+    // DEEP_EP_LL_PERSIST_BUFFERS ping-pong slots), so it is a useful scale
+    // reference even though it is NOT the whole framework working set.
+    const size_t num_local_experts = static_cast<size_t>(num_experts) / std::max(num_ranks, 1);
+    const size_t packed_recv_bytes = num_local_experts * static_cast<size_t>(num_ranks) *
+                                     static_cast<size_t>(num_max_dispatch_tokens_per_rank) *
+                                     static_cast<size_t>(hidden) * sizeof(sycl::ext::oneapi::bfloat16);
+
+    char free_str[32];
+    if (free_vram != 0) {
+        std::snprintf(free_str, sizeof(free_str), "%.2f GiB", free_vram / kGiB);
+    } else {
+        std::snprintf(free_str, sizeof(free_str), "n/a");
+    }
+    std::fprintf(stderr,
+                 "[DeepEP] LL VRAM budget: device total %.2f GiB | free now %s | iSHMEM symmetric heap %.2f GiB "
+                 "| LL layout %.2f GiB (carved from the heap) | packed_recv_x %.2f GiB per live copy\n",
+                 total_vram / kGiB, free_str, heap_bytes / kGiB, layout_bytes / kGiB, packed_recv_bytes / kGiB);
+
+    // Warn on either unambiguous condition. Note DeepEP cannot predict the
+    // framework's peak working set (the caching allocator retains a segment per
+    // distinct output shape/dtype; measured peak for E=384/nt=160/H=7168 is
+    // ~13 GiB, i.e. ~16x packed_recv_x), so these are conservative triggers --
+    // ALWAYS read the budget line above when investigating an LL latency cliff.
+    const bool thin_measured = (free_vram != 0) && (free_vram < 8 * packed_recv_bytes);
+    const bool heap_too_big = (heap_bytes != 0) && (heap_bytes * 2 > total_vram);
+    if (thin_measured || heap_too_big) {
+        // The LL layout is a hard floor (configure_low_latency_layout() enforces
+        // layout.total_bytes <= num_rdma_bytes) and the heap serves no other
+        // purpose on the XPU path, so any slack beyond it is pure harm: it is
+        // reserved in full at init and is subtracted from the VRAM the torch
+        // allocator can use. Measured at E=384/nt=256/H=7168 (layout 3.94 GiB):
+        // a 4.6 GiB heap gives avg_t 32437 us, a 4.1 GiB heap gives avg_t 20770
+        // us, with min_t flat at ~5.6 ms in both. Keep the slack minimal.
+        const size_t suggested = layout_bytes + (layout_bytes / 25);  // layout + 4% slack
+        std::fprintf(stderr,
+                     "[DeepEP] *** WARNING: device memory is over-committed for this low-latency "
+                     "configuration. ***\n"
+                     "[DeepEP]     The Level-Zero/xe stack does NOT report an error when VRAM runs out: it "
+                     "evicts buffers to system memory over the copy (bcs) engine, so the low-latency "
+                     "dispatch/combine keeps working but runs ~100x slower. That looks exactly like a "
+                     "stalled RDMA flag / lost IBGDA doorbell, and is the usual cause of an LL latency "
+                     "'cliff' when tokens/hidden/num_experts are increased.\n"
+                     "[DeepEP]     The iSHMEM symmetric heap is reserved IN FULL at init, so shrink it: this "
+                     "configuration only needs %zu bytes (%.2f GiB) of low-latency layout; try "
+                     "ISHMEM_SYMMETRIC_SIZE=%zu (%.2f GiB).\n",
+                     layout_bytes, layout_bytes / kGiB, suggested, suggested / kGiB);
+    }
 }
 
 struct Buffer {
@@ -1940,6 +2050,8 @@ struct Buffer {
                     num_rdma_bytes);
         low_latency_mask_buffer_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_buffer_ptr) + layout.mask_offset);
         low_latency_sync_buffer_ptr = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_buffer_ptr) + layout.sync_offset);
+        ll_report_vram_budget(comm_stream.queue().get_device(), layout.total_bytes, num_ranks, num_experts,
+                              num_max_dispatch_tokens_per_rank, hidden);
         low_latency_num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank;
         low_latency_hidden = hidden;
         low_latency_num_experts = num_experts;

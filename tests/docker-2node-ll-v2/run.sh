@@ -431,12 +431,14 @@ run_test() {
         -e DEEP_EP_LL_MAX_PUT_KB="${DEEP_EP_LL_MAX_PUT_KB:-}" \
         -e DEEP_EP_LL_NUM_WGS="${DEEP_EP_LL_NUM_WGS:-}" \
         -e DEEP_EP_LL_SEND_WGS="${DEEP_EP_LL_SEND_WGS:-}" \
+        -e DEEP_EP_LL_PACK_CHANNELS="${DEEP_EP_LL_PACK_CHANNELS:-}" \
         -e DEEP_EP_LL_SEND_TOK_SPLIT="${DEEP_EP_LL_SEND_TOK_SPLIT:-}" \
         -e DEEP_EP_LL_SEND_TEAM_BARRIER="${DEEP_EP_LL_SEND_TEAM_BARRIER:-}" \
         -e DEEP_EP_LL_REDUCE_WGS="${DEEP_EP_LL_REDUCE_WGS:-}" \
         -e DEEP_EP_LL_FUSED_WGS="${DEEP_EP_LL_FUSED_WGS:-}" \
         -e DEEP_EP_SPLIT_DC="${DEEP_EP_SPLIT_DC:-0}" \
         -e DEEP_EP_QPP_DBG="${DEEP_EP_QPP_DBG:-0}" \
+        -e DEEP_EP_SKIP_CHECK="${DEEP_EP_SKIP_CHECK:-0}" \
         -e DEEP_EP_LL_NUM_WARPS="${DEEP_EP_LL_NUM_WARPS:-}" \
         -e DEEP_EP_LL_DROP_FENCE="${DEEP_EP_LL_DROP_FENCE:-}" \
         -e DEEP_EP_DBG_DISPATCH="${DEEP_EP_DBG_DISPATCH:-}" \
@@ -515,12 +517,14 @@ run_test() {
                 -genv DEEP_EP_LL_MAX_PUT_KB \"\${DEEP_EP_LL_MAX_PUT_KB:-}\" \
                 -genv DEEP_EP_LL_NUM_WGS \"\${DEEP_EP_LL_NUM_WGS:-}\" \
                 -genv DEEP_EP_LL_SEND_WGS \"\${DEEP_EP_LL_SEND_WGS:-}\" \
+                -genv DEEP_EP_LL_PACK_CHANNELS \"\${DEEP_EP_LL_PACK_CHANNELS:-}\" \
                 -genv DEEP_EP_LL_SEND_TOK_SPLIT \"\${DEEP_EP_LL_SEND_TOK_SPLIT:-}\" \
                 -genv DEEP_EP_LL_SEND_TEAM_BARRIER \"\${DEEP_EP_LL_SEND_TEAM_BARRIER:-}\" \
                 -genv DEEP_EP_LL_REDUCE_WGS \"\${DEEP_EP_LL_REDUCE_WGS:-}\" \
                 -genv DEEP_EP_LL_FUSED_WGS \"\${DEEP_EP_LL_FUSED_WGS:-}\" \
                 -genv DEEP_EP_SPLIT_DC \"\${DEEP_EP_SPLIT_DC:-0}\" \
                 -genv DEEP_EP_QPP_DBG \"\${DEEP_EP_QPP_DBG:-0}\" \
+                -genv DEEP_EP_SKIP_CHECK \"\${DEEP_EP_SKIP_CHECK:-0}\" \
                 -genv DEEP_EP_LL_NUM_WARPS \"\${DEEP_EP_LL_NUM_WARPS:-}\" \
                 -genv DEEP_EP_LL_DROP_FENCE \"\${DEEP_EP_LL_DROP_FENCE:-}\" \
                 -genv DEEP_EP_XPU_FAULT_MODE \"\${DEEP_EP_XPU_FAULT_MODE:-1}\" \

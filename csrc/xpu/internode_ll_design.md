@@ -41,23 +41,54 @@ one symmetric allocation serves both dtypes (`deep_ep_xpu.cpp::get_low_latency_b
 
 Combine sends raw BF16 hidden rows (no cast); reduction happens after receipt.
 
-### 1.2 Work-group geometry (CUDA parity)
+### 1.2 Work-group geometry (`num_experts` may exceed the SM count)
 
-Derived in both `dispatch_bf16` and `combine_bf16`, identical to the CUDA host code:
+The CUDA host code splits an oversized expert count across **warp groups** inside
+a fixed 1024-work-item WG (`num_warp_groups = ceil(num_experts / num_device_sms)`,
+`num_warps_per_group = 32 / num_warp_groups`). That shape is not reproducible on
+BMG, because a warp-group-scoped `bar.sync` has no reliable SYCL equivalent (§4).
 
-| Quantity | Formula | Value on B60 (exp ≤ 160) |
-|---|---|---|
-| `num_warp_groups` | `ceil(num_experts / num_device_sms)` | `1` |
-| `num_warps_per_group` | `32 / num_warp_groups` | `32` |
-| `num_warps` (sub-groups/WG) | `num_warp_groups * num_warps_per_group` | `32` |
-| `wg_size` | `num_warps * 32` | `1024` |
-| `num_sms` (commit-gated grid) | `ceil(num_experts / num_warp_groups)` | `num_experts` |
+The XPU port therefore takes the opposite decomposition: **`num_warp_groups` is
+forced to 1 and the grid is allowed to over-subscribe the SMs**, so one work-group
+still owns exactly one channel/expert and the whole-WG `sycl::group_barrier`
+remains the correct substitute for CUDA's `bar.sync`. `E > SMs` is supported by
+shrinking the *work-group*, not by subdividing it:
 
-A `TORCH_CHECK` enforces `num_warp_groups == 1`: with one warp group per WG the
-whole-WG `sycl::group_barrier` is the correct substitute for CUDA's warp-group-
-scoped `bar.sync`. `num_warp_groups > 1` would require the per-warp-group barrier
-that BMG cannot reliably express (see §4), and is the future reason to push the
-phase-split further (each warp group becomes its own WG).
+| Quantity | Formula | E=8 (fits) | E=384 (over-subscribed) |
+|---|---|---|---|
+| `num_warp_groups` | forced `1` | `1` | `1` |
+| `num_warps_per_group` | `ll_num_warps(num_topk, num_experts, num_device_sms)` | `32` | `8` |
+| `num_warps` (sub-groups/WG) | `num_warp_groups * num_warps_per_group` | `32` | `8` |
+| `wg_size` | `num_warps * 32` | `1024` | `256` |
+| `num_sms` (commit-gated grid) | `num_experts` | `8` | `384` |
+| `send_wgs` | `min(num_sms, num_device_sms)` | `8` | `160` |
+
+`ll_num_warps()` keeps CUDA-parity 32 warps while the grid fits in the CUs and
+drops to **8** once `num_experts > num_device_sms`, then rounds down to a power of
+two and enforces `num_topk < num_warps <= 32`. `DEEP_EP_LL_NUM_WARPS` overrides.
+
+**Why work-group *size*, not wave *count*, is the lever.** The grid is
+`num_experts` work-groups of `num_warps*32` work-items. Once `E` exceeds the 160
+CUs the WGs over-subscribe, and a 1024-work-item WG throttles occupancy: the
+scheduler cannot pack enough of them per CU to hide the RDMA latency. Measured on
+160 CUs at `topk=2, nt=32` (µs), the cost is flat in wave *count* but strongly
+dependent on WG *size*:
+
+| E | 32 warps | 16 warps | 8 warps | 4 warps |
+|---|---|---|---|---|
+| 384 | 820 | 718 | **578** | 590 |
+| 320 | 741 | 744 | **553** | — |
+| 8 | **323** | 325 | 348 | — |
+
+An E-sweep showed cost rising **linearly in E with no step at the 160/320
+wave boundaries**, which refutes wave-quantization/grid over-subscription as the
+cause and points at per-WG occupancy. At `E <= SMs` the trend reverses (fewer
+warps only costs parallelism), which is why the heuristic is conditional rather
+than a flat "always 8".
+
+`send_wgs` is additionally clamped to `num_device_sms`: a send grid wider than the
+CUs only adds launch overhead, saving `(num_experts - num_device_sms)` work-groups
+of pure overhead per dispatch at E=384.
 
 ---
 
@@ -74,10 +105,11 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
 
 ### 2.1 `LLDispatchSendKernel` — cast + put (commit-gated)
 
-- **Grid:** `send_wgs` work-groups (default `num_sms == num_experts`, tunable via
-  `DEEP_EP_LL_SEND_WGS`), `wg_size = 1024`.
+- **Grid:** `send_wgs` work-groups (default `min(num_experts, num_device_sms)`,
+  tunable via `DEEP_EP_LL_SEND_WGS`), `wg_size = num_warps*32` (1024 at `E ≤ SMs`,
+  256 once `E > SMs` — §1.2).
 - Each WG strides over tokens (`t = sm_id; t < num_tokens; t += send_wgs`). For
-  each token **all 32 warps cast the hidden row cooperatively** (`cast_token_fp8_strided`
+  each token **all `num_warps` warps cast the hidden row cooperatively** (`cast_token_fp8_strided`
   for FP8, `coop_copy_bytes` for BF16) into the token's send-staging slot, write
   the `src_idx` header, then a **device-scope release fence** + whole-WG barrier
   makes the bytes NIC-visible.
@@ -86,22 +118,33 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   `ishmemx_putmem_nbi_subgroup(..., force_db=false)` (self rank → `coop_copy_bytes_store_uc`).
 - **No counter warp, no finish-counter, no grid barrier.** Counting is deferred to
   the recv kernel; the kernel boundary provides the ordering the finish-counter
-  used to provide. `force_db=false` leaves the last doorbell batch deferred — the
-  recv kernel's `fence_qp` flushes it (advances `nic_wq_commit` and rings the
-  doorbell without waiting for CQEs; RC in-order delivery still lands the count
-  flag after the payloads on the target QP).
+  used to provide. `force_db=false` leaves the last doorbell batch deferred — with
+  the fence now dropped by default (§5.2), the recv kernel's flag AMO
+  (`ishmemx_long_atomic_add_qp`) is what flushes it: it rings the doorbell
+  unconditionally at `pi = wqe_idx + 1`, publishing every earlier `force_db=false`
+  WQE on that QP; RC in-order delivery still lands the count
+  flag after the payloads on the target QP.
 - Block 0 additionally zeroes the opposite-parity `rdma_recv_count` slots (CUDA
   `next_clean`).
 
 ### 2.2 `LLDispatchRecvKernel` — count flag + poll + copy
 
-- **Grid:** `num_sms == num_experts`, `wg_size = 1024`. WG `sm_id` owns the channel
-  `responsible_expert_idx = sm_id`.
+- **Grid:** `recv_wgs = ceil(num_experts / pack_channels)`, `wg_size = num_warps*32`.
+  WG `sm_id` owns channels `responsible_expert_idx = sm_id * pack_channels + ch`.
+- **Two-pass channel structure (required, not just an optimization):** the WG runs
+  Phase A for *all* its channels, then Phase B for *all* of them — two separate
+  `for (ch...)` loops rather than one loop doing post-then-wait per channel. With
+  `pack_channels > 1` the single-loop form **deadlocks**: channel 0 would block in
+  its flag-wait before channel 1 has posted its count flag, and the peer WG waiting
+  on channel 1 would never be released. Keeping the passes separate also stops each
+  channel's poll latency from serializing behind the previous channel's, which is
+  where most of the E=384 win comes from (§5.6).
 - **Phase A (count post):** warp 0 histograms `topk_idx == responsible_expert` and
   posts the count flag `(-count-1)` on QP `le`. Because the send kernel has fully
-  exited, all payload puts are already committed; `ishmemx_fence_qp(dst_rank, le)`
-  establishes a **QP-scoped ordering fence** (flushing any deferred doorbells and
-  publishing the ordered-commit watermark up to the current claim, §3.3), and the
+  exited, all payload puts are already committed. Historically
+  `ishmemx_fence_qp(dst_rank, le)` established a **QP-scoped ordering fence** here;
+  it is now **skipped by default** (`DEEP_EP_LL_DROP_FENCE=1`) because it is
+  redundant by construction — see §5.2 — and the
   subsequent RC-ordered `ishmemx_long_atomic_add_qp` is guaranteed by RC in-order
   delivery to land the flag *after* every prior payload put on the same QP. The
   self channel (`dst_rank == rank`) uses a system-release fence + `uc_store`.
@@ -121,8 +164,10 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
 
 ### 2.3 `LLCombineSendKernel` — per-token send + flag (commit-gated)
 
-- **Grid:** `num_sms == num_experts`, `wg_size = 1024`. WG owns
-  `responsible_expert_idx`.
+- **Grid:** `send_wgs_c = ceil(num_experts / pack_channels)`, `wg_size = num_warps*32`.
+  WG owns channels `responsible_expert_idx = sm_id * pack_channels + ch`, and uses
+  the same **two-pass** (post-all, then wait-all) structure as §2.2 for the same
+  deadlock-avoidance reason.
 - Block 0 zeroes the opposite-parity `combine_flag` slots (CUDA `next_clean`) and
   releases `atomic_clean_flag` (`clean_flag`, borrowed from the unused
   `slot_counter` cell) so flag posts wait for the clean.
@@ -130,9 +175,11 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   symmetric staging and `ishmemx_putmem_nbi_subgroup` it to the destination's original
   token slot (`src_idx`); self rank writes directly into local `combine_data`.
 - After a warp-group barrier, sub-warp 1 posts the arrival flag `+1` on QP `le`
-  (self → `uc_store`; remote → `fence_qp` + `atomic_add_qp` — RC in-order delivery
+  (self → `uc_store`; remote → `atomic_add_qp`, with the preceding `fence_qp`
+  dropped by default per §5.2 — RC in-order delivery
   guarantees the AMO lands after every prior payload put on the same QP without
-  waiting for their CQE completions), and sub-warp 0 waits on the incoming
+  waiting for their CQE completions), and sub-warp 0 waits — **in the second
+  channel pass** — on the incoming
   arrival flag for its channel. The kernel exit is the grid sync: once it
   returns, every flag has been observed and all `combine_data` is globally
   visible.
@@ -168,6 +215,10 @@ co-reside. The **token-parallel phases** (combine reduce over `num_combined_toke
 * hidden` elements; dispatch recv-copy) were therefore pinned to `num_experts`
 (=8) work-groups and could not grow with the token count — the reduce ran ~224
 grid-stride iterations per work-item at 256 tokens.
+
+(The `E > SMs` path shrinks the WG to 256 work-items, which raises the co-residency
+ceiling proportionally — but not to the `num_experts`=384 the grid would need, so
+the conclusion below is unchanged.)
 
 A **kernel boundary is a full device barrier with global memory visibility** that
 imposes **no co-residency requirement**: the send kernel drains completely (all
@@ -426,9 +477,14 @@ named barrier is usable in this kernel: they either deadlock (sub-groups only ha
 guaranteed concurrent forward progress at hardware barriers) or `DEVICE_LOST` when
 coexisting with the non-inlined iSHMEM RDC device library. The port therefore uses
 the whole-WG `sycl::group_barrier`, which is correct **only at `num_warp_groups ==
-1`**. Making each warp group its own work-group (the natural next step of the
-phase-split) is how `num_warp_groups > 1` (i.e. `num_experts > num_device_sms`)
-would eventually be supported.
+1`** — and `num_warp_groups` is therefore forced to `1` unconditionally.
+
+`num_experts > num_device_sms` is consequently **not** supported by reintroducing
+warp groups. Instead the grid over-subscribes the SMs (one WG per expert, as
+always) and the work-group is *shrunk* by `ll_num_warps` to protect occupancy
+(§1.2, §5.6). This sidesteps the missing warp-group barrier entirely, so the
+"make each warp group its own work-group" phase-split is no longer needed for
+large `E`; it remains only a hypothetical route to sub-expert parallelism.
 
 Note: `sycl::group_barrier` only fences at **work-group scope**, so every place the
 NIC or another WG must observe a write still needs an explicit
@@ -446,7 +502,7 @@ scope only for genuine cross-PE/NIC paths (flag flush, `rdma_recv_count` /
 |---|---|
 | `num_tokens` (`num_max_dispatch_tokens_per_rank`) | Dominant cost driver. Lengthens the send kernels' token loop (commit-gate bound — does **not** parallelize away) and the recv-copy / reduce work (token-parallel — scales with the consume grid). Also grows every symmetric buffer linearly. |
 | `num_topk` | More puts per token in dispatch (warps `0..num_topk-1` send) and more source rows per output in the combine reduce (`num_topk` reads/element). `TORCH_CHECK(num_topk + 1 <= num_warps)`. |
-| `num_experts` (`num_local_experts`) | Sets `num_sms` = the commit-gated send/flag grid width and the number of QPs (one per global expert). More experts ⇒ more parallel QPs (helps send concurrency up to the co-residency limit) but also more channels to poll and more per-expert histogram/flag work. Constrained to `num_experts <= num_device_sms` (`num_warp_groups == 1`). |
+| `num_experts` (`num_local_experts`) | Sets `num_sms` = the commit-gated send/flag grid width and the number of QPs (one per global expert). More experts ⇒ more parallel QPs (helps send concurrency up to the co-residency limit) but also more channels to poll and more per-expert histogram/flag work. **`num_experts > num_device_sms` is supported** (§1.2): the grid over-subscribes the SMs and `ll_num_warps` shrinks the work-group to 8 warps to protect occupancy. Cost is ~linear in `num_experts`. |
 | `hidden` | Bytes per message and per reduce element. Must be a multiple of 128 for FP8 scales. Larger `hidden` shifts the balance toward payload-copy/NIC bandwidth. |
 | `use_fp8` / `round_scale` / `use_ue8m0` | FP8-on-send halves NIC payload vs BF16; adds cast cost on send and scale handling on recv. |
 
@@ -454,7 +510,10 @@ scope only for genuine cross-PE/NIC paths (flag flush, `rdma_recv_count` /
 
 | Env var | Default | Scope | Guidance |
 |---|---|---|---|
-| `DEEP_EP_LL_SEND_WGS` | `num_sms` (= `num_experts`) | dispatch send grid | Raising it rarely helps (commit-gate bound) and **must not exceed resident WG capacity** — a spinning producer trips the GuC watchdog → `DEVICE_LOST`. Keep at default unless profiling shows cast-bound headroom. |
+| `DEEP_EP_LL_NUM_WARPS` | `32` if `num_experts <= num_device_sms`, else `8` | dispatch/combine WG size | The **primary knob for `E > SMs`** (§1.2). Overrides the occupancy heuristic; rounded down to a power of two and clamped to `(num_topk, 32]`. Leave on AUTO — verify an override actually took effect, since an empty string parses as `0`. |
+| `DEEP_EP_LL_DROP_FENCE` | `1` (fence dropped) | dispatch/combine flag AMO | Drops the per-QP fence between the payload put and the flag AMO. Redundant by construction — same QP + strict RC SQ ordering, and `ishmemx_long_atomic_add_qp` rings the doorbell unconditionally *and* blocks on its own completion, which is strictly stronger than the fence. Worth ~10% at E=384. `0` restores it. |
+| `DEEP_EP_LL_PACK_CHANNELS` | auto (`ceil(num_experts / num_device_sms)`) | dispatch-recv / combine-send | Packs C channels into one WG, cutting the grid to `ceil(num_experts/C)` for identical per-channel work. Measured to have **no effect** (C=1/3/6/12 all ≈929 µs at E=384), which is the evidence that per-WG *launch* cost is not the bottleneck — WG *size* is. Retained as a diagnostic; C=1 is bit-identical to the unpacked path. |
+| `DEEP_EP_LL_SEND_WGS` | `min(num_experts, num_device_sms)` | dispatch send grid | Raising it rarely helps (commit-gate bound) and **must not exceed resident WG capacity** — a spinning producer trips the GuC watchdog → `DEVICE_LOST`. Keep at default unless profiling shows cast-bound headroom. |
 | `DEEP_EP_LL_SEND_TOK_SPLIT` | `clamp(num_tokens/send_wgs, 1, num_warps/num_topk)` | dispatch send: tokens in flight per WG | Number of casting teams the send WG is split into; raises live put warps from `num_topk` to `tok_split*num_topk`. See §3.2.1. The auto default is optimal at 32–256 tokens; override only to A/B. `1` restores the pre-split behaviour. |
 | `DEEP_EP_LL_REDUCE_WGS` | `min(4*CU, 512)` capped by work-items | combine reduce grid (`ll_consume_wgs`) | The main scaling lever for combine. Increase toward the cap as `num_tokens`/`hidden` grow so the reduce is fully token-parallel; too small ⇒ long grid-stride loops. |
 | `DEEP_EP_LL_PUT_WGS` | device CU count | `ll_put_wgs` base for send-grid sizing | Rarely changed; underlies `ll_send_wgs`. |
@@ -488,7 +547,7 @@ degrades the barrier (≈32 ms/iter) or crashes the device.
 kernels key the destination QP by the LOCAL expert index (`qp_idx = le &
 (qps_per_pe - 1)`), so with `QPS_PER_PE=1` every expert's RDMA serializes through
 QP 0. Setting it to **`num_local_experts` (= `num_experts / num_ranks`, rounded up
-to a power of 2, clamped [1,16])** gives each expert an independent QP and lets the
+to a power of 2, clamped [1,128])** gives each expert an independent QP and lets the
 NIC drive them in parallel. DeepEP now auto-defaults this: `deep_ep/buffer.py`
 `os.environ.setdefault`s it from `num_qps_per_rank` for LL buffers, and the
 `docker-2node-ll-v2` harness derives it from `NUM_EXPERTS`/`NUM_PROCESSES`. A
@@ -515,6 +574,72 @@ constant is capped by the `num_local_experts` combine-QP count — more experts 
 a multi-QP combine with cross-QP quiet) would raise it further. `DEEP_EP_LL_SEND_WGS`
 and `DB_BATCH_SIZE>64` gave no further gain (dispatch-send and doorbell-rate are not
 the bottleneck at this scale).
+
+### 5.6 Large expert counts (`E > SMs`): root cause and measured gains
+
+At `E=384` on a 160-CU B60, LL was ~4× slower than `E=8` at the same token count.
+The cause was isolated by falsification rather than by tuning:
+
+| Hypothesis | Discriminating experiment | Verdict |
+|---|---|---|
+| Grid over-subscription / wave quantization | E-sweep across the 160 and 320 wave boundaries | **Refuted** — cost rises linearly in `E` with **no step** at either boundary |
+| QP contention | `QPS_PER_PE` sweep 1→128, run in **both** directions to cancel HW-state drift | **Partial** — explains only 1→16, saturates at ~3% |
+| Per-token/bandwidth cost | token sweep | **Refuted** — 8× tokens costs only +35%, i.e. a ~1050 µs token-independent floor |
+| Per-WG launch overhead | `DEEP_EP_LL_PACK_CHANNELS` C=1/3/6/12 | **Refuted** — all ≈929 µs |
+| **Work-group occupancy** | `DEEP_EP_LL_NUM_WARPS` sweep at fixed grid | **Confirmed** — 32w→8w is worth −30% at E=384 and is *negative* at E=8 |
+
+Four stacking fixes, all now defaults:
+
+| Fix | Mechanism | Gain at E=384 |
+|---|---|---|
+| `ll_num_warps` occupancy heuristic (§1.2) | 1024- → 256-work-item WG once `E > SMs` | −30% |
+| Two-pass channel restructure (§2.2/§2.3) | post-all-then-wait-all; stops poll latency serializing | −25% |
+| `ll_drop_fence` default ON (§5.2) | removes a provably redundant per-QP fence | −10% |
+| `QPS_PER_PE` clamp 16 → 128 | more experts get independent QPs | ~3% |
+
+**Net: E=384 / topk=2 / H7168 went 1246 µs → 575 µs (−54%, 2.17×)**, stable over a
+3-run soak, with `E=8` unregressed (317 → 321 µs).
+
+**Measured bandwidth, E=384 / topk=6 / H7168 / 4 ranks** (FP8 dispatch, BF16
+combine; per-phase figures come from `DEEP_EP_SPLIT_DC=1`, since the upstream
+`bench_kineto` per-phase path does not exist on XPU):
+
+| tokens | fused avg | fused peak (`min_t`) | dispatch | combine | avg_t / min_t |
+|---|---|---|---|---|---|
+| 32  | 4.20 GB/s | 4.31 GB/s | 5.96 GB/s | 3.83 GB/s | 942 / 918 µs |
+| 64  | 5.39 GB/s | 5.51 GB/s | 8.98 GB/s | 4.69 GB/s | 1508 / 1476 µs |
+| 128 | 5.49 GB/s | 5.62 GB/s | 11.06 GB/s | 4.71 GB/s | 3001 / 2935 µs |
+| 256 | 1.32 GB/s¹ | 5.92 GB/s | 12.55 GB/s | 4.92 GB/s | 25226 / 5608 µs |
+
+¹ The `avg` at 256 tokens is a **measurement artifact**, not kernel behaviour: the
+test walks 8 dtype/shape combos at 1.31 GiB per `packed_recv_x`, and the resulting
+VRAM eviction produces `max_t` = 148 ms against `min_t` = 5.6 ms. The `min_t`-based
+figure sits exactly on the 64→256 trend.
+
+**Combine is now the bottleneck, and it is an efficiency problem, not a volume
+one.** At 128 tokens combine moves only 1.94× dispatch's bytes but takes **4.55×**
+the time (~2.3× worse per byte) and accounts for 79% of fused latency. Dispatch
+amortizes its fixed cost cleanly (5.96 → 12.55 GB/s across the sweep) while combine
+plateaus at ~4.7–4.9 GB/s from 64 tokens on — a per-message rather than per-byte
+limit. Further LL tuning should target combine.
+
+### 5.7 Pitfall: an oversized `ISHMEM_SYMMETRIC_SIZE` is actively harmful
+
+The iSHMEM symmetric heap is reserved **in full at init**. Sizing it generously
+(e.g. a blanket 12 GiB on a 22.7 GiB card) starves torch's working set, and xe then
+**silently evicts buffers to system RAM over the copy (bcs) engine with no error
+returned**. Kernels keep producing correct results ~100× slower, which is
+indistinguishable from a stalled RDMA flag — this masqueraded as a "token-count
+cliff" until the cliff was shown to *move with heap size at constant token count*
+(nt=160 fails at 12 GiB but passes at 3 GiB; nt=136 passes at 12 GiB but fails at
+15 GiB). `dmesg` shows `Engine reset engine_class=bcs`.
+
+Size the heap from the `xpu_layout_bytes` value reported at startup (layout + 5–10%).
+`get_low_latency_rdma_size_hint()` now returns exactly the aligned XPU layout size
+instead of the 26–35% larger CUDA-era `legacy_hint`, and
+`ll_report_vram_budget()` prints total/free VRAM, heap size, layout size and
+`packed_recv_x` size, warning with a suggested `ISHMEM_SYMMETRIC_SIZE` on
+over-commit.
 
 ---
 

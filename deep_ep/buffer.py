@@ -248,7 +248,7 @@ class Buffer:
         # instead of serializing every expert through QP 0 (the old QPS_PER_PE=1 default).
         # Measured ~27-30% lower LL dispatch+combine latency (2.07 -> ~2.8 GB/s) across
         # 512..4096 tokens with no correctness regression once the combine per-QP
-        # producer race was fixed. iSHMEM rounds this to a power of 2 and clamps [1, 16];
+        # producer race was fixed. iSHMEM rounds this to a power of 2 and clamps [1, 128];
         # a user-provided ISHMEM_IBGDA_QPS_PER_PE always wins (setdefault).
         if low_latency_mode:
             qpp = max(1, min(int(num_qps_per_rank), 128))
