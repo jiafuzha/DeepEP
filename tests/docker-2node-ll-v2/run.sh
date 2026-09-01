@@ -64,19 +64,29 @@ NUM_EXPERTS="${NUM_EXPERTS:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-360}"
 
 # Auto-size the iSHMEM symmetric heap from the problem shape. The LL symmetric
-# buffers scale linearly with num_max_dispatch_tokens_per_rank, so the old flat
-# 256 MiB default hard-fails above ~256 tokens: at NUM_TOKENS=1024 / HIDDEN=7168 /
-# NUM_EXPERTS=8 the buffer alone is 477 MB and allocation aborts with
-# "ishmem_align failed for 477102336 bytes". Reserve next_pow2(tokens*hidden*2*48)
-# with a 256 MiB floor, which covers 32..4096 tokens (1024 -> 1 GiB, 2048 -> 2 GiB,
-# 4096 -> 4 GiB) while leaving small shapes at the original 256 MiB.
+# buffers scale linearly with BOTH num_max_dispatch_tokens_per_rank AND num_experts
+# (see deep_ep_xpu.cpp::get_low_latency_rdma_size_hint: the send and recv regions are
+# each num_experts * tokens * ~hidden*2 bytes), so the old flat 256 MiB default
+# hard-fails above ~256 tokens at E=8, e.g. NUM_TOKENS=1024 / HIDDEN=7168 →
+# "ishmem_align failed for 477102336 bytes".
+#
+# The previous formula (tokens*hidden*2*48) hard-coded the expert count: its magic
+# 48 is exactly 6*NUM_EXPERTS at NUM_EXPERTS=8, so it undersized by 48x at E=384 and
+# failed with "ishmem_align failed for 529156992 bytes" at NUM_TOKENS=32.
+# Scale with NUM_EXPERTS explicitly and keep a 8*E factor (~1.5-2x headroom over the
+# true layout). Round UP to a 64 MiB multiple rather than to the next power of two:
+# iSHMEM does not require a power-of-two heap, and an oversized heap is actively
+# HARMFUL (design doc 5.7 - it is reserved in full at init and pushes the torch
+# working set into xe eviction over the copy engine, which silently runs ~100x
+# slower). A 256 MiB floor keeps small shapes at the original size.
 if [ -z "$ISHMEM_SYMMETRIC_SIZE" ]; then
-    _sym_need=$(( NUM_TOKENS * HIDDEN * 2 * 48 ))
-    _sym=268435456
-    while [ "$_sym" -lt "$_sym_need" ]; do _sym=$(( _sym * 2 )); done
+    _sym_need=$(( NUM_TOKENS * HIDDEN * 8 * NUM_EXPERTS ))
+    _sym_gran=$(( 64 * 1024 * 1024 ))
+    _sym=$(( ( (_sym_need + _sym_gran - 1) / _sym_gran ) * _sym_gran ))
+    [ "$_sym" -lt 268435456 ] && _sym=268435456
     ISHMEM_SYMMETRIC_SIZE="$_sym"
     echo "===== ISHMEM_SYMMETRIC_SIZE auto-sized to $ISHMEM_SYMMETRIC_SIZE bytes "\
-         "(NUM_TOKENS=$NUM_TOKENS HIDDEN=$HIDDEN) ====="
+         "(NUM_TOKENS=$NUM_TOKENS HIDDEN=$HIDDEN NUM_EXPERTS=$NUM_EXPERTS) ====="
 fi
 
 # Auto-default the IBGDA multi-QP count to one QP per LOCAL expert (the LL send
@@ -435,6 +445,9 @@ run_test() {
         -e DEEP_EP_LL_SEND_TOK_SPLIT="${DEEP_EP_LL_SEND_TOK_SPLIT:-}" \
         -e DEEP_EP_LL_SEND_TEAM_BARRIER="${DEEP_EP_LL_SEND_TEAM_BARRIER:-}" \
         -e DEEP_EP_LL_REDUCE_WGS="${DEEP_EP_LL_REDUCE_WGS:-}" \
+        -e DEEP_EP_LL_TIME_PHASES="${DEEP_EP_LL_TIME_PHASES:-}" \
+        -e DEEP_EP_LL_REDUCE_VEC="${DEEP_EP_LL_REDUCE_VEC:-}" \
+        -e DEEP_EP_LL_REDUCE_ACQ="${DEEP_EP_LL_REDUCE_ACQ:-}" \
         -e DEEP_EP_LL_FUSED_WGS="${DEEP_EP_LL_FUSED_WGS:-}" \
         -e DEEP_EP_SPLIT_DC="${DEEP_EP_SPLIT_DC:-0}" \
         -e DEEP_EP_QPP_DBG="${DEEP_EP_QPP_DBG:-0}" \
@@ -521,6 +534,9 @@ run_test() {
                 -genv DEEP_EP_LL_SEND_TOK_SPLIT \"\${DEEP_EP_LL_SEND_TOK_SPLIT:-}\" \
                 -genv DEEP_EP_LL_SEND_TEAM_BARRIER \"\${DEEP_EP_LL_SEND_TEAM_BARRIER:-}\" \
                 -genv DEEP_EP_LL_REDUCE_WGS \"\${DEEP_EP_LL_REDUCE_WGS:-}\" \
+                -genv DEEP_EP_LL_TIME_PHASES \"\${DEEP_EP_LL_TIME_PHASES:-}\" \
+                -genv DEEP_EP_LL_REDUCE_VEC \"\${DEEP_EP_LL_REDUCE_VEC:-}\" \
+                -genv DEEP_EP_LL_REDUCE_ACQ \"\${DEEP_EP_LL_REDUCE_ACQ:-}\" \
                 -genv DEEP_EP_LL_FUSED_WGS \"\${DEEP_EP_LL_FUSED_WGS:-}\" \
                 -genv DEEP_EP_SPLIT_DC \"\${DEEP_EP_SPLIT_DC:-0}\" \
                 -genv DEEP_EP_QPP_DBG \"\${DEEP_EP_QPP_DBG:-0}\" \

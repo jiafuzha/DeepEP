@@ -1,4 +1,6 @@
 #include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <c10/util/Float8_e4m3fn.h>
 
 #include "xpu_kernels.hpp"
@@ -370,6 +372,69 @@ inline int ll_send_wgs(sycl::queue& q, int num_tokens) {
 // token count for exactly this reason (num_sms = max(num_experts,
 // num_combined_tokens / num_recv_per_sm)). Default to a generous multiple of the
 // device compute units capped at kLLConsumeMaxWGs; override via env.
+// DEEP_EP_LL_REDUCE_VEC: number of BF16 elements each work-item of the combine
+// reduce kernel handles per grid-stride step.
+//   1 = legacy scalar path (one 2-byte load per top-k source per element)
+//   8 = vectorized path (DEFAULT): one 16-byte (uint32x4) load per top-k source
+//       per 8 elements, and the per-token topk_idx / topk_weights lookups are
+//       amortized over 8 elements instead of repeated per element.
+// The legacy path issues 2-byte-per-lane loads, which on BMG only fills 64 B of a
+// 512 B sub-group memory request, and re-reads the (int64) topk_idx + fp32 weight
+// for EVERY output element. Requires hidden % 8 == 0 (7168 qualifies); otherwise
+// it silently falls back to the scalar path.
+constexpr int kLLReduceVecElems = 8;  // 8 bf16 == 16 B == one uint32x4
+inline int ll_reduce_vec(int hidden) {
+    int v = kLLReduceVecElems;
+    const char* e = std::getenv("DEEP_EP_LL_REDUCE_VEC");
+    if (e != nullptr && e[0] != '\0') {
+        const int t = std::atoi(e);
+        v = (t == 1) ? 1 : kLLReduceVecElems;
+    }
+    if (v > 1 && (hidden % kLLReduceVecElems) != 0) v = 1;
+    return v;
+}
+
+// DEEP_EP_LL_REDUCE_ACQ: at what granularity the combine reduce kernel issues the
+// system-scope acquire that makes the NIC-written combine_data visible.
+//   1 = once per WORK-ITEM (DEFAULT, legacy semantics -- see the caveat below).
+//   2 = once per SUB-GROUP (lane 0) + sub-group barrier  -- 32x fewer.
+//   3 = once per WORK-GROUP (leader) + WG barrier -- 512x fewer.
+//   0 = none (debug only; NOT correct against NIC-written data).
+// All variants are equally CORRECT for >=2: the acquire is a device/system cache
+// invalidate, and every work-item that reads combine_data still executes one
+// (transitively, via the barrier that follows its group's acquire) BEFORE any of
+// its loads.
+// MEASURED (E=384/topk=6/H7168/nt=128, with DEEP_EP_LL_REDUCE_VEC=8): mode 3 is
+// ~13% faster than mode 1 on the reduce kernel itself (269 vs 314 us min).
+// BUT at E=8/topk=2/nt=32 modes 2 and 3 reproducibly (4/4 runs) trigger a bimodal
+// fused-latency tail: min_t improves 216 -> 173 us while avg_t degrades 228 -> ~590 us
+// with max_t 7.7-23 ms. Phase instrumentation (DEEP_EP_LL_TIME_PHASES=1) localizes
+// those outliers ENTIRELY to LLCombineSendKernel (26/928 iterations > 1 ms, max
+// 318 ms) with the reduce kernel never exceeding 119 us -- i.e. it is a cross-rank
+// flag-wait skew stall that the slower reduce used to mask by pacing the ranks, not
+// a cost of the acquire change. Until that skew stall is fixed independently, the
+// default stays at 1 (no tail at any measured shape); 2/3 are opt-in.
+inline int ll_reduce_acq() {
+    const char* e = std::getenv("DEEP_EP_LL_REDUCE_ACQ");
+    if (e != nullptr && e[0] != '\0') {
+        const int v = std::atoi(e);
+        if (v >= 0 && v <= 3) return v;
+    }
+    return 1;
+}
+
+// DEEP_EP_LL_TIME_PHASES=1 -> host-side timing of the two combine sub-kernels
+// (LLCombineSendKernel vs LLCombineReduceKernel). Adds a queue.wait() between the
+// two submits, so it perturbs slightly, but it is the only way to attribute the
+// end-to-end combine cost measured by DEEP_EP_SPLIT_DC. Default 0 (no-op).
+inline int ll_time_phases() {
+    static const int v = [] {
+        const char* e = std::getenv("DEEP_EP_LL_TIME_PHASES");
+        return (e != nullptr && e[0] != '\0') ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+
 constexpr int kLLConsumeWGSize = 512;
 constexpr int kLLConsumeMaxWGs = 512;
 inline int ll_consume_wgs(sycl::queue& q, int units, int min_wgs) {
@@ -1371,6 +1436,13 @@ void combine_bf16(void* combined_x,
         // combine grid to num_combined_tokens / num_recv_per_sm).
         queue.memset(clean_flag, 0, sizeof(int));
 
+        const int time_phases = ll_time_phases();
+        std::chrono::steady_clock::time_point _tp0, _tp1;
+        if (time_phases) {
+            queue.wait();
+            _tp0 = std::chrono::steady_clock::now();
+        }
+
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<LLCombineSendKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(send_wgs_c) * wg_size), sycl::range<1>(wg_size)),
@@ -1528,16 +1600,23 @@ void combine_bf16(void* combined_x,
         });
 
         // ============================ REDUCE KERNEL ============================
+        if (time_phases) {
+            queue.wait();
+            _tp1 = std::chrono::steady_clock::now();
+        }
         // Grid-strided weighted top-k reduction into combined_x (CUDA CombineReduce
         // without SM90 TMA/LogFMT: read each topk source's combine_data row). Pure
         // local reads (no IBGDA/commit gate) => oversubscribable, token-parallel grid.
-        const int reduce_wgs = ll_consume_wgs(queue, static_cast<int>(reduce_work), 1);
+        const int red_vec = ll_reduce_vec(hidden);
+        const int red_acq = ll_reduce_acq();
+        const size_t reduce_units = reduce_work / static_cast<size_t>(red_vec);
+        const int reduce_wgs = ll_consume_wgs(queue, static_cast<int>(std::min<size_t>(reduce_units, 1u << 30)), 1);
         const int reduce_wg_size = kLLConsumeWGSize;
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for<LLCombineReduceKernel>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(reduce_wgs) * reduce_wg_size),
                                   sycl::range<1>(reduce_wg_size)),
-                [=](sycl::nd_item<1> item) {
+                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(32)]] {
                     const size_t global_id = item.get_global_id(0);
                     const size_t global_size = item.get_global_range(0);
                     auto* out = static_cast<sycl::ext::oneapi::bfloat16*>(combined_x);
@@ -1553,8 +1632,66 @@ void combine_bf16(void* combined_x,
                     // work-item then read cached (flag_recv_acq>=1, default, faster), or read
                     // every element uncached (flag_recv_acq==0 fallback).
                     const bool recv_uncached = (flag_recv_acq == 0);
-                    if (!recv_uncached)
-                        ll_recv_acquire(flag_recv_acq);
+                    // Acquire granularity (DEEP_EP_LL_REDUCE_ACQ): a system-scope acquire
+                    // is a cache INVALIDATE, so issuing one per work-item repeatedly
+                    // trashes the very lines the other work-groups are streaming.
+                    if (!recv_uncached) {
+                        if (red_acq == 1) {
+                            ll_recv_acquire(flag_recv_acq);
+                        } else if (red_acq == 2) {
+                            auto sg = item.get_sub_group();
+                            if (sg.get_local_linear_id() == 0) ll_recv_acquire(flag_recv_acq);
+                            sycl::group_barrier(sg);
+                        } else if (red_acq >= 3) {
+                            if (item.get_local_linear_id() == 0) ll_recv_acquire(flag_recv_acq);
+                            sycl::group_barrier(item.get_group());
+                        }
+                    }
+                    if (!recv_uncached && red_vec > 1) {
+                        // ---- Vectorized reduce (DEEP_EP_LL_REDUCE_VEC=8, default).
+                        // One 16-byte load per top-k source per 8 output elements, and the
+                        // topk_idx/topk_weight lookups amortized over those 8 elements.
+                        // BF16->float is a raw 16-bit shift (no conversion instruction).
+                        using v4u = sycl::vec<uint32_t, 4>;
+                        constexpr int kV = kLLReduceVecElems;
+                        const int vec_per_row = hidden / kV;
+                        const size_t vunits = static_cast<size_t>(num_combined_tokens) * vec_per_row;
+                        for (size_t u = global_id; u < vunits; u += global_size) {
+                            const int token_idx = static_cast<int>(u / vec_per_row);
+                            const int h0 = static_cast<int>(u % vec_per_row) * kV;
+                            float acc[kV];
+#pragma unroll
+                            for (int i = 0; i < kV; ++i) acc[i] = 0.0f;
+                            for (int k = 0; k < num_topk; ++k) {
+                                const int expert = static_cast<int>(topk_idx[token_idx * num_topk + k]);
+                                if (expert < 0 || expert >= num_experts) continue;
+                                const int src_rank = expert / num_local_experts;
+                                if (ll_rank_masked(mask_buffer_ptr, src_rank)) continue;
+                                const float w = topk_weights[token_idx * num_topk + k];
+                                const auto* row = reinterpret_cast<const uint32_t*>(
+                                    combine_data +
+                                    (static_cast<size_t>(expert) * num_max_dispatch_tokens_per_rank + token_idx) *
+                                        hidden_bytes);
+                                const v4u val = *reinterpret_cast<const v4u*>(row + (h0 >> 1));
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    const uint32_t b = val[j];
+                                    acc[j * 2 + 0] += w * sycl::bit_cast<float>(b << 16);
+                                    acc[j * 2 + 1] += w * sycl::bit_cast<float>(b & 0xFFFF0000u);
+                                }
+                            }
+                            v4u o;
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                const uint32_t lo = sycl::bit_cast<uint16_t>(bf16_from_float(acc[j * 2 + 0]));
+                                const uint32_t hi = sycl::bit_cast<uint16_t>(bf16_from_float(acc[j * 2 + 1]));
+                                o[j] = lo | (hi << 16);
+                            }
+                            auto* orow = reinterpret_cast<uint32_t*>(out + static_cast<size_t>(token_idx) * hidden);
+                            *reinterpret_cast<v4u*>(orow + (h0 >> 1)) = o;
+                        }
+                        return;
+                    }
                     for (size_t idx = global_id; idx < reduce_work; idx += global_size) {
                         const int token_idx = static_cast<int>(idx / hidden);
                         const int h = static_cast<int>(idx % hidden);
@@ -1577,6 +1714,13 @@ void combine_bf16(void* combined_x,
                 });
         });
         (void)combine_wait_recv_cost_stats;
+        if (time_phases) {
+            queue.wait();
+            auto _tp2 = std::chrono::steady_clock::now();
+            const double send_us = std::chrono::duration<double, std::micro>(_tp1 - _tp0).count();
+            const double red_us = std::chrono::duration<double, std::micro>(_tp2 - _tp1).count();
+            std::fprintf(stderr, "[LLPHASE] send_us=%.2f reduce_us=%.2f\n", send_us, red_us);
+        }
     }
 #endif
 }

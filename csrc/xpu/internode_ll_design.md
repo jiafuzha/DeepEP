@@ -191,9 +191,17 @@ combine_bf16:   LLCombineSendKernel   ──▶  LLCombineReduceKernel
   `wg_size = 512`.
 - Grid-strides over `reduce_work = num_combined_tokens * hidden` elements. Each
   work-item accumulates `sum_k weight_k * combine_data[expert_k row][h]` over the
-  token's top-k experts and writes one BF16 output element. Pure **cached local
+  token's top-k experts and writes BF16 output elements. Pure **cached local
   reads** — no IBGDA, no commit gate — so the grid scales freely with token count
   (mirrors CUDA sizing its combine grid to `num_combined_tokens / num_recv_per_sm`).
+- **Vectorized (`DEEP_EP_LL_REDUCE_VEC=8`, DEFAULT — see §5.8).** Each work-item
+  owns **8 contiguous BF16 elements (16 B)** instead of 1: one `uint32x4` load per
+  top-k source per 8 outputs, one `uint32x4` store, and the per-token `topk_idx`
+  (int64) / `topk_weights` (fp32) lookups amortized over 8 elements instead of
+  re-read per element. BF16→float is a raw bit shift (`b<<16` / `b & 0xFFFF0000`),
+  which is bit-exact, so the result is **bitwise identical** to the scalar path.
+  `DEEP_EP_LL_REDUCE_VEC=1` restores the scalar path; it is also the automatic
+  fallback when `hidden % 8 != 0`.
 
 ---
 
@@ -516,6 +524,9 @@ scope only for genuine cross-PE/NIC paths (flag flush, `rdma_recv_count` /
 | `DEEP_EP_LL_SEND_WGS` | `min(num_experts, num_device_sms)` | dispatch send grid | Raising it rarely helps (commit-gate bound) and **must not exceed resident WG capacity** — a spinning producer trips the GuC watchdog → `DEVICE_LOST`. Keep at default unless profiling shows cast-bound headroom. |
 | `DEEP_EP_LL_SEND_TOK_SPLIT` | `clamp(num_tokens/send_wgs, 1, num_warps/num_topk)` | dispatch send: tokens in flight per WG | Number of casting teams the send WG is split into; raises live put warps from `num_topk` to `tok_split*num_topk`. See §3.2.1. The auto default is optimal at 32–256 tokens; override only to A/B. `1` restores the pre-split behaviour. |
 | `DEEP_EP_LL_REDUCE_WGS` | `min(4*CU, 512)` capped by work-items | combine reduce grid (`ll_consume_wgs`) | The main scaling lever for combine. Increase toward the cap as `num_tokens`/`hidden` grow so the reduce is fully token-parallel; too small ⇒ long grid-stride loops. |
+| `DEEP_EP_LL_REDUCE_VEC` | `8` (falls back to `1` if `hidden % 8`) | combine reduce | BF16 elements per work-item. `8` = 16-byte vector loads + amortized top-k metadata (bitwise identical to `1`, **5.1x faster**, §5.8). `1` = legacy scalar path. |
+| `DEEP_EP_LL_REDUCE_ACQ` | `1` | combine reduce | Granularity of the system-scope acquire (cache invalidate) before reading NIC-written `combine_data`: `1` per work-item (default, tail-free), `2` per sub-group, `3` per work-group (13% faster kernel but unmasks a send-side skew tail at E=8/nt=32 — §5.8), `0` none (debug). |
+| `DEEP_EP_LL_TIME_PHASES` | `0` | diagnostics | `1` prints `[LLPHASE] send_us=.. reduce_us=..` per combine call (adds a `queue.wait()` between the two sub-kernels). The only way to attribute the `DEEP_EP_SPLIT_DC` combine number. |
 | `DEEP_EP_LL_PUT_WGS` | device CU count | `ll_put_wgs` base for send-grid sizing | Rarely changed; underlies `ll_send_wgs`. |
 | `DEEP_EP_LL_POLL_CAP` | large (`ll_poll_cap`) | flag-wait spin cap | Bounds spins on a missing cross-PE flag; on timeout the slot is treated as 0 tokens (graceful). A too-large cap masks a wedge instead of failing fast; a too-small cap risks undercount. |
 | `DEEP_EP_LL_FLAG_SENDER_FENCE` | `1` | flag flush | Flush `uc_store`-d flag bytes to the NIC domain before the AMO. Leave on; `0` only to reproduce the stale-flag race. |
@@ -623,6 +634,86 @@ amortizes its fixed cost cleanly (5.96 → 12.55 GB/s across the sweep) while co
 plateaus at ~4.7–4.9 GB/s from 64 tokens on — a per-message rather than per-byte
 limit. Further LL tuning should target combine.
 
+### 5.8 Combine is REDUCE-bound, not send-bound (2026-09) — vectorized reduce
+
+`DEEP_EP_SPLIT_DC=1` only measures combine **end-to-end**. Instrumenting the two
+sub-kernels separately (`DEEP_EP_LL_TIME_PHASES=1`, host timers + a `queue.wait()`
+between the two submits) settled where the time actually goes. At
+**E=384 / topk=6 / H7168 / nt=128 / 4 ranks** (per-iteration µs, `min` / `median`
+over 928 samples):
+
+| build | `LLCombineSendKernel` | `LLCombineReduceKernel` | combine-only avg |
+|---|---|---|---|
+| baseline (scalar reduce) | 424 / 734 | **1630 / 1710** | 3325 µs |
+| `REDUCE_VEC=8` | 435 / 738 | **314 / 336** | 1884 µs |
+| `REDUCE_VEC=8`, `REDUCE_ACQ=3` | 420 / 734 | **269 / 292** | 1608 µs |
+
+**The reduce was ~70–80% of combine, and the send kernel was never the problem.**
+That refutes the whole family of send-side hypotheses (token-split port, staging-copy
+pipelining, put granularity) as the primary lever — the send kernel is unchanged
+across all rows above.
+
+**Root cause of the slow reduce: per-element access granularity, not bandwidth.**
+The scalar path read 2 bytes per lane per top-k source, filling only 64 B of a 512 B
+sub-group memory request, and re-read the int64 `topk_idx` + fp32 weight for *every*
+output element (at topk=6 that is 6×8 B of index traffic per 2 B of payload). Moving
+to 16 B per lane (`sycl::vec<uint32_t,4>`) and hoisting the top-k metadata is worth
+**5.1×** on the kernel; the cache-invalidate granularity fix below adds ~13% on top.
+
+Two knobs, both in §5.2: `DEEP_EP_LL_REDUCE_VEC` (default 8) and
+`DEEP_EP_LL_REDUCE_ACQ` (default 1).
+
+**Why `REDUCE_ACQ` defaults to 1 even though 3 is faster.** The reduce issues a
+system-scope acquire (a cache invalidate) before reading NIC-written `combine_data`;
+mode 1 issues it per work-item (262144 of them), modes 2/3 once per sub-group /
+work-group behind a barrier. Mode 3 is 13% faster on the kernel, but at
+**E=8 / topk=2 / nt=32** modes 2 and 3 reproducibly (4/4 runs) turn a tight
+distribution into a bimodal one: `min_t` improves 216 → 173 µs while `avg_t`
+degrades 228 → ~590 µs with `max_t` 7.7–23 ms. Phase instrumentation localizes those
+outliers **entirely to the SEND kernel** (26/928 iterations > 1 ms, max 318 ms) with
+the reduce never exceeding 119 µs — i.e. it is a pre-existing cross-rank
+combine-flag-wait skew stall that the slow reduce used to *mask* by pacing the ranks,
+not a cost of the acquire change. (The same stall is already visible in the
+`DISPATCH-only` numbers of *every* arm, old and new: avg 560–615 µs against a
+min of 84 µs.) Until that skew stall is addressed independently, the default stays
+at the lower-tail-rate mode 1; 2/3 remain opt-in.
+
+**Mode 1 is lower-tail, NOT tail-free (independently verified).** A 5-run A/B of the
+shipping default against `REDUCE_VEC=1` on the same clean HW:
+
+| arm | runs | `avg_t` | `min_t` | `max_t` |
+|---|---|---|---|---|
+| `REDUCE_VEC=1` (legacy) | 4/4 | 320.4–322.7 µs | 309.8–312.4 | 333.5–339.2 (tight) |
+| `REDUCE_VEC=8` (default) | 4/5 | 227.0–230.5 µs | 212.7–219.2 | 244.7–248.9 (tight) |
+| `REDUCE_VEC=8` (default) | **1/5** | **555.5 µs** | 217.8 | **14862 µs** |
+
+So the same skew tail fires at roughly **1 run in 5 even at `ACQ=1`**, which the
+mechanism above predicts: *any* reduce speedup removes inter-rank pacing, and mode 3
+merely makes it near-certain rather than occasional. The change is still a clear win —
+`min_t` improves in **every** run (213–219 vs 310–312 µs), so the vectorized reduce is
+never slower; and even charging the outlier to the average, the expected 293 µs beats
+legacy's 321 µs. But the guard's `avg_t` is **not** reliably 1.4× better; it is 1.4×
+better ~80% of the time and ~1.7× worse otherwise. **Fixing the send-side skew stall
+is a prerequisite for making combine's tail trustworthy**, and would unlock `ACQ=3`.
+
+**Measured end-to-end (fused dispatch+combine `avg_t`, rank 0, correctness checking
+ON, `DEEP_EP_SPLIT_DC=1`, defaults otherwise):**
+
+| E | topk | tokens | before | after | speedup |
+|---|---|---|---|---|---|
+| 8   | 2 | 32  | 321 µs  | **229 µs**  | 1.40× |
+| 8   | 2 | 128 | 1002 µs | **582 µs**  | 1.72× |
+| 384 | 2 | 32  | 576 µs  | **489 µs**  | 1.18× |
+| 384 | 2 | 128 | 1142 µs | **724 µs**  | 1.58× |
+| 384 | 6 | 128 | 3979 µs | **1616 µs** | 2.46× |
+
+Combine-only at E=384/topk=6/nt=128: 3325 → 1043 µs (3.19×); combine bandwidth
+3.27 → 10.4 GB/s. `max_t` stays within ~5% of `avg_t` on all five shapes (no tail).
+
+**Consequence for future work: after this change the combine SEND kernel is again the
+larger half of combine**, and its dominant remaining cost is the cross-rank
+flag-wait skew documented above — a pacing/skew problem, not a per-byte one.
+
 ### 5.7 Pitfall: an oversized `ISHMEM_SYMMETRIC_SIZE` is actively harmful
 
 The iSHMEM symmetric heap is reserved **in full at init**. Sizing it generously
@@ -640,6 +731,23 @@ instead of the 26–35% larger CUDA-era `legacy_hint`, and
 `ll_report_vram_budget()` prints total/free VRAM, heap size, layout size and
 `packed_recv_x` size, warning with a suggested `ISHMEM_SYMMETRIC_SIZE` on
 over-commit.
+
+The `docker-2node-ll-v2/run.sh` auto-sizer computes this shape-aware. The true
+requirement is dominated by three `num_experts * tokens`-scaled regions
+(`dispatch_data`, `send_data`, `combine_data`), i.e.
+
+```
+bytes ~= num_experts * tokens * (msg_bytes + 2*hidden_bytes)   [~ E*nt*(6*hidden + 16)]
+```
+
+The original formula was `tokens*hidden*2*48`, whose magic `48` is exactly
+`6*num_experts` at `E=8` — it **ignored the expert count** and so undersized by up to
+48× at `E=384` (`ishmem_align failed for 529156992 bytes` at nt=32). It is now
+`tokens*hidden*8*num_experts` (1.28–1.40× headroom over the true layout), rounded up
+to a **64 MiB multiple rather than the next power of two** — iSHMEM does not require a
+power-of-two heap, and the pow2 ramp doubled an already-oversized reservation, which
+§5.7 shows is actively harmful. `E=8` sizing is unchanged in practice (nt=32 → the
+256 MiB floor; nt=4096 → 1792 MiB, down from 4096 MiB).
 
 ---
 
