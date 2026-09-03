@@ -6,8 +6,13 @@
 # from environment set by docker-compose.
 #
 # Compose sets per node (defaults = smc26):
-#   node0: ZE_AFFINITY_MASK=0,1  NODE_MLX5_HCAS=mlx5_0,mlx5_1  NODE_IB_IFACES=ens1006f0np0,ens1006f1np1  SIM_NODE_RANK=0
-#   node1: ZE_AFFINITY_MASK=2,3  NODE_MLX5_HCAS=mlx5_2,mlx5_3  NODE_IB_IFACES=ens2005f0np0,ens2005f1np1  SIM_NODE_RANK=1
+#   node0: ZE_AFFINITY_MASK=0,1  NODE_IB_IFACES=ens1006f0np0,ens1006f1np1  SIM_NODE_RANK=0
+#   node1: ZE_AFFINITY_MASK=2,3  NODE_IB_IFACES=ens2005f0np0,ens2005f1np1  SIM_NODE_RANK=1
+#
+# ens1006f* sit on the same PCIe switch as GPU 0,1; ens2005f* sit with GPU 2,3.
+# Pairing follows the PCIe switch, not the index number. NODE_MLX5_HCAS is only a
+# fallback for run.sh's preflight -- mlx5_N names are unstable across reboots, so
+# run.sh derives the real name from PCIe topology (derive_node_nic).
 set -uo pipefail
 
 # Restore per-node identity (SIM_NODE_RANK / ZE_AFFINITY_MASK / NODE_MLX5_HCAS /

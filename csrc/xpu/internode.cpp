@@ -66,6 +66,64 @@ SYCL_EXTERNAL inline void nvl_barrier(int** barrier_signal_ptrs, int rank, int s
 // the full CUDA<->SYCL mapping).  This is the only implementation; the historical
 // phase-split port is preserved untouched in csrc/xpu/internode_old.cpp.
 // ===========================================================================
+
+// --- Perf knobs ported from the LL kernel (csrc/xpu/internode_ll_design.md) ---
+//
+// Both default OFF and are read once on the host, then captured by value into
+// the kernel lambdas.  NOTE the atoi("") == 0 trap: an env var set to the empty
+// string must read as OFF, so we test the first character explicitly rather
+// than going through atoi().
+
+// Drop the per-QP fence between the payload put and the tail flag AMO.  The
+// fence is redundant by construction: the payload put and the AMO target the
+// SAME QP, an RC QP consumes WQEs in strict order (so flag-after-payload is
+// free), the payload put already used force_db=true (its doorbell has fired),
+// and ishmemx_long_atomic_add_qp rings the doorbell unconditionally anyway.
+// Scoped to the two tail-AMO sites ONLY -- the fences in
+// internode_notify_fused.inc are lone transport fences with no paired same-QP
+// AMO and must stay unconditional.
+// Default OFF (2026-09 REVERTED -- see the CORRECTNESS GATE below).  Must be
+// flipped TOGETHER with fused_flag_nbi_amo(): neither knob pays off alone
+// (dropping the fence only helps if the following AMO is also non-blocking,
+// otherwise the blocking AMO's CQE poll re-serialises exactly what the fence
+// did).  Set to "1" to enable.
+//
+// !!! CORRECTNESS GATE -- DO NOT DEFAULT THESE ON AGAIN WITHOUT A TOKEN SWEEP !!!
+// The pair was measured at ~-7% isolated dispatch and briefly shipped ON, but it
+// was only ever validated at num_tokens=32.  A token sweep at E=384/topk=6/
+// hidden=7168 then showed: 32/64/128/256 PASS, but **1024 HANGS** in dispatch
+// (GuC watchdog -> ccs engine reset -> the GPU can drop off the PCI bus).  The
+// same shape PASSES with both knobs "0", so this is the knobs, not HW.
+//
+// Mechanism: the flag AMOs are FLOW CONTROL, and the head-credit AMO
+// (internode_dispatch_fused.inc:1034, internode_combine_fused.inc:1169) is the
+// signal that tells the remote sender its receive slots were freed.  Unlike the
+// tail AMO it rides a DIFFERENT QP -- head uses (channel_id + num_channels) %
+// qps_per_pe, tail uses channel_id % qps_per_pe -- so it is NOT RC-ordered
+// behind the payload put, and it has no fence of its own.  The blocking AMO's
+// CQE poll was its ONLY completion guarantee; the NBI variant posts the WQE and
+// never confirms it.  Below ~256 tokens the receive buffer never fills, so the
+// sender never actually waits on credit and the missing guarantee is invisible.
+// At >=1024 tokens the buffer wraps and credit becomes load-bearing: a credit
+// update that is posted but not completed leaves the sender spinning forever.
+// Re-enabling therefore needs either a completion/quiet on the head-credit path
+// or a same-QP mapping for it -- and a full token sweep up to 4096, not just 32.
+inline bool fused_drop_fence() {
+    const char* env = std::getenv("DEEP_EP_FUSED_DROP_FENCE");
+    return env != nullptr && env[0] == '1';
+}
+
+// Post the tail/head flags with the non-blocking AMO (the blocking atomic minus
+// the CQE poll and ibuf result read; slot claim, WQE build and ordered commit +
+// doorbell are byte-identical, so the unconditional-doorbell property that the
+// payload publish relies on is preserved).
+// Default OFF, paired with fused_drop_fence() -- see the CORRECTNESS GATE there
+// before changing this.  Set to "1" to enable.
+inline bool fused_flag_nbi_amo() {
+    const char* env = std::getenv("DEEP_EP_FUSED_FLAG_NBI_AMO");
+    return env != nullptr && env[0] == '1';
+}
+
 #include "internode_dispatch_fused.inc"
 
 #include "internode_notify_fused.inc"

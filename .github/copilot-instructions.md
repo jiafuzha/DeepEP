@@ -190,6 +190,64 @@ poll cap masks wedge/hang instead of failing fast). Buffer sizes: `DEEP_EP_NVL_B
   (strips `/build/_install`), exports it, and `docker-compose.yml` bind-mounts
   `${ISHMEM_HOST_ROOT}` at the same host path in-container. Set `ISHMEM_DIR` and it just works.
 
+### Internode-NORMAL (HT) silent hang = under-provisioned buffers (2026-09)
+- `tests/docker-2node-v2` at `HIDDEN=7168` used to wedge in the first fused dispatch (rc=124, `ccs`
+  reset, `xe_guc_exec_queue_lr_cleanup`) — **indistinguishable from a HW wedge**. Cause: harness
+  buffer defaults (128 MiB NVL / 64 MiB RDMA / 256 MiB symmetric) only fit `HIDDEN=1024`.
+  Defaults are now **512 MiB NVL / 512 MiB RDMA / 2 GiB symmetric**.
+- UNDER-sizing hangs silently; OVER-sizing fails instantly with `ishmem_align failed for N bytes`.
+  **Fast bisect: drop to `HIDDEN=1024` — if it passes, it is sizing, not code or HW.**
+- The `buffer.py` HT QP clamp (`min(num_qps, 16)`, lockstep with the `[1,16]` kernel clamps) is
+  correct hygiene but was NOT the hang cause (`QPS_PER_PE=32` runs fine).
+
+### `timeout` orphan cascade — how to fabricate a fake hang
+- `timeout N` kills only the OUTER `mpirun`; the in-container `mpiexec.hydra` + 4 ranks survive and
+  hold GPU contexts/QPs/heap, so every later run hangs. **Gate before AND after every run:** zero
+  live `test_internode.py`, no deepep containers, no `/dev/shm/*ishmem*`, no
+  `/tmp/deep_ep_xpu_ipc_*.sock`. A non-zero post-count is a failed run to reap, not a datapoint.
+  Reap by explicit PID only. Strictly one sim, one repo, at a time.
+
+### GPU off the PCI bus: parent-bridge remove+rescan (no reboot)
+- 3-of-4 GPUs + `Failed to resize BAR2 to 32768M (-EINVAL)` + `pci resource is not valid`:
+  device-level remove/rescan and `resource2_resize` all fail. **Remove the GPU's parent PCIe bridge**
+  (`echo 1 > /sys/bus/pci/devices/0000:1e:01.0/remove`) → `sleep 8` → `echo 1 > /sys/bus/pci/rescan`
+  → `sleep 30`. BAR2 returns at 32 G and `xe` re-probes. Recurs; re-check before every campaign.
+
+### Fused-kernel knobs C and G: REVERTED to default OFF — they hang at ≥1024 tokens
+- `DEEP_EP_FUSED_DROP_FENCE` (C) + `DEEP_EP_FUSED_FLAG_NBI_AMO` (G) (`csrc/xpu/internode.cpp`).
+  Measured **−7% isolated dispatch** as a pair and were briefly shipped ON — but that A/B ran
+  **only at `num_tokens=32`**. A token sweep at E=384/topk=6/H=7168 then showed 32/64/128/256 PASS
+  but **1024 HANGS**, while the same shape PASSES with both knobs `0`. The hang drives a GuC
+  watchdog → `ccs` reset and twice knocked a GPU off the PCI bus. **Both are now default OFF; set
+  either to `1` to opt in.**
+- Mechanism: the flag AMOs are **flow control**, and the two sites are NOT equivalent. The tail AMO
+  (`internode_dispatch_fused.inc:794`) rides `channel_id % qps_per_pe` — the same QP as the payload
+  put, so it really is RC-ordered and C's premise holds. The **head-credit** AMO (`:1034`, combine
+  `:1169`) rides `(channel_id + num_channels) % qps_per_pe` — a **different** QP with no fence of
+  its own, and the blocking AMO's CQE poll was its ONLY completion guarantee. Below ~256 tokens the
+  recv buffer never fills so credit is never awaited and the gap is invisible; at ≥1024 the buffer
+  wraps, credit becomes load-bearing, and a posted-but-never-completed credit update leaves the
+  sender spinning forever. Re-enabling needs a completion/`quiet` or a same-QP mapping for the
+  head-credit path, **plus a full sweep to 4096**.
+- **GOLDEN RULE:** a perf tuning validated at ONE shape is NOT validated. Anything touching flow
+  control, credit, or completion must be **swept across the token range before shipping** — the
+  failure mode is a hang that is indistinguishable from a hardware fault.
+- The fences at `internode_notify_fused.inc:237` and `:286` are lone transport fences and must stay
+  unconditional.
+- Perf noise on this rig is **±10%** and bimodal — use interleaved paired A/B and prefer the
+  isolated-dispatch number (<1% within-arm spread) over round-trip.
+
+### Internode-normal token sweep baseline (knobs OFF, E=384, topk=6, H=7168, µs)
+| tokens | 32 | 64 | 128 | 256 | 1024 | 2048 | 4096 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| dispatch(iso) | 961.7 | 1105.2 | 1312.2 | 1687.9 | 3355.0 | 5356.8 | 9786.3 |
+| combine(iso) | 947.9 | 1006.4 | 1532.7 | 1772.1 | 3076.1 | 4464.0 | 6972.2 |
+| round-trip | 1431.5 | 1716.5 | 2466.4 | 3039.1 | 5877.0 | 9294.1 | 16290.1 |
+
+7/7 PASS. Latency-bound below ~1024 tokens (~1.4 ms floor), throughput-bound above. Buffers: 512M
+NVL / 512M RDMA / 2G symmetric up to 1024; 1G/1G/3G for 2048–4096. A 4 GiB heap aborts in NEO
+(`drm_neo.cpp:265`) — over-sizing is not free.
+
 ### Validation baselines & configs
 - LL (`tests/docker-2node-ll`): `NUM_PROCESSES=2 NUM_TOKENS=32 HIDDEN=7168 NUM_TOPK=2
   NUM_EXPERTS=8`. Good baseline ~1138 µs @ H7168 (~687 µs @ H2048). A ~32 ms/iter result means

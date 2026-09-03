@@ -756,6 +756,53 @@ reservation. Validate it against the runtime's own `xpu_layout_bytes:` line, whi
 should exceed by only the margin plus alignment padding. `E=8` sizing is unchanged in
 practice (nt=32 → the 256 MiB floor; nt=4096 → 1792 MiB, down from 4096 MiB).
 
+### 5.8b How the bandwidth numbers in this document are defined
+
+Every `GB/s` figure below (and every one printed by `tests/test_low_latency.py`) is
+**per-rank logical bandwidth**, computed by the upstream formula:
+
+```python
+num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
+for i in range(num_tokens):
+    num_selections = (topk_idx[i] != -1).sum().item()
+    num_dispatch_comm_bytes += num_fp8_bytes  * num_selections   # FP8 dispatch
+    num_combine_comm_bytes  += num_bf16_bytes * num_selections   # BF16 combine
+BW = (num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t
+```
+
+Four properties matter when reading or comparing any number here:
+
+1. **Per-rank, not aggregate.** Each rank prints its own figure from its own tokens
+   (`torch.manual_seed(seed + rank)`); they are neither summed nor averaged. Aggregate
+   traffic on the 4-rank sim is ≈ 4×.
+2. **Counted per expert selection, so it scales with `topk`.** A topk=6 table is ~3×
+   the bytes of a topk=2 table at the same token count — **never compare across
+   different `topk`/`E`**.
+3. **Logical, not wire, bandwidth.** Selections landing on a local expert are counted
+   even though they never reach the NIC. On this 4-rank/2-node sim roughly half of all
+   selections are node-local, so true wire bandwidth is well under the printed value.
+4. **`avg_t` vs `min_t`.** `peak BW` uses `min_t` and is the trustworthy column; a large
+   `avg_t`/`min_t` gap means tail jitter, not low throughput.
+
+**Comparing against the upstream V1 tables** (`docs/legacy.md`) — verified against
+`tests/legacy/test_{internode,low_latency}.py` on 2026-09-03:
+
+- The upstream **low-latency** table uses this exact formula, so it is directly
+  comparable *provided* `hidden`/`topk` match. Its numbers exceeding the 50 GB/s CX7
+  limit (98 and 127 GB/s at EP=8) is not an error: at EP=8 all 8 ranks are one H800
+  node, so **nothing crosses the NIC** and the figure is entirely NVLink/P2P-served
+  despite the "RDMA bandwidth" heading. Scaling the published numbers by the genuinely
+  off-node fraction `1 - 8/EP` yields a stable ~36–40 GB/s across EP=16..256, which is
+  the real CX7 rate. The apparent 98 → 39 GB/s "decline" with EP is just the local
+  fraction shrinking, not degradation.
+- The upstream **normal** table uses a *different* accounting and is **not** comparable
+  to the LL one: it dedups per destination **node** (`inplace_unique(rdma_idx,
+  num_nodes)`), counting one RDMA token per node rather than one per expert, and it
+  applies `fp8_factor = (1 + 4/128)/2` to a BF16 baseline. It also reports RDMA and NVL
+  as two separate byte counts over the *same* elapsed time — never summed. Its 58 GB/s
+  at EP=32 likewise includes the sender's own node (a local write, 1/4 of the bytes at
+  4 nodes × top-4 groups), giving ~43.5 GB/s on the wire.
+
 ### 5.9 Current token-scaling baseline (E=8, topk=2, H7168, 4 ranks, 2026-09)
 
 Post-vectorized-reduce, auto-sized heap, correctness checking ON. All 7 points PASS
@@ -933,6 +980,131 @@ wait — rather than the flag post. That is the open question. Concretely, nt=25
 default ON still PASSes with 0 `DEVICE_LOST` and improves end-to-end (avg 24498 →
 **20645 µs**, −16 %; peak BW 12.67 → **13.14 GB/s**, the best recorded on this stack),
 but `avg/min` remains ~8× (min 2526 µs, max 194 ms) — so the residual wait is real.
+
+---
+
+### 5.13 Environment failure mode: RoCE MTU mismatch silently kills IBGDA traffic (2026-09-02)
+
+A token-count mismatch in `test_low_latency.py` (`AssertionError: 19 != 33` at the
+`all_topk_idx` check) was traced **not** to kernel logic but to host NIC configuration.
+Record it here because the symptom looks exactly like a dispatch bug, survives a full
+rebuild of every software component, and costs hours otherwise.
+
+**Symptom.** LL dispatch under-delivers. The receiver's own accounting is fully
+self-consistent — `recv_count == cumulative_local_expert_recv_stats == (recv_layout_range &
+mask).sum()` all agree — so only the third assertion (against the all-gathered `topk_idx`)
+fires. Tokens genuinely never arrive; they are not miscounted. At `NUM_PROCESSES=1` the
+receiver gets **exactly its local half** (`3 != 6`), i.e. the remote PE contributes zero.
+There is no hang and no `DEVICE_LOST`, because the receive loop hits `DEEP_EP_LL_POLL_CAP`
+and proceeds with partial data.
+
+A second, closely-related symptom: `verify_nic_selection.sh` / `nic_pcie_check` hangs on
+attempt 1/3 (`rc=124`) with all four PEs stalled at exactly
+`ishmemi_memory_init` → `Heap allocation type: device` — iSHMEM's first collective over
+IBGDA cannot complete when its payload cannot cross. This appeared in **0 of 6** historical
+(passing) logs but **3 of 3** failing runs, and it disappears the moment the MTU is fixed.
+
+**Root cause: the two NIC cards had different RoCE MTUs.**
+
+```
+ens1006f0np0 / ens1006f1np1  (25:00.0/.1)  netdev mtu=1500 -> active_mtu=1024
+ens2005f0np0 / ens2005f1np1  (48:00.0/.1)  netdev mtu=4200 -> active_mtu=4096
+```
+
+`max_mtu=4096` on all four ports, so 1024 was purely an artifact of the 1500 netdev MTU.
+node0's GPUs (`1f`/`23`, switch `1b`) pair with the 25:00.x card (1024) and node1's GPUs
+(`42`/`46`, switch `3e`) pair with the 48:00.x card (4096), so **every cross-node RC QP was
+MTU-mismatched**. IBGDA programs its QPs directly through DEVX using the *local* port's
+`active_mtu` and never negotiates, so node1 emitted 4096-byte packets into a port that tops
+out at 1024 and they were silently dropped — hence "remote contributes exactly zero" while
+the local half arrives normally.
+
+**Why the obvious fabric check did not catch it.** `ib_write_bw` (and any rdma-core/CM
+path) negotiates the path MTU down to `min(local, remote)` during connection setup, so it
+reported a healthy 185–196 Gb/s on every pair — including the mismatched one — and falsely
+exonerated the fabric. **A passing `ib_write_bw` does NOT prove IBGDA can talk.** Compare
+`active_mtu` explicitly.
+
+**Why it appeared out of nowhere.** MTU set with `ip link` is **not persistent across
+reboot**. The passing runs predate a reboot after which `ens1006f*` reverted to the default
+1500 while `ens2005f*` retained 4200 from persisted config. No code changed — which is why
+rebuilding the *entire* last-known-good stack still failed (see the A/B row below).
+
+**Ruled out first, with evidence** (do not redo):
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Stale/mismatched iSHMEM archive | `.archive-stamp` + `barrier.cpp.o` md5 vs known-good | **Ruled out** — matches; fresh rebuild is byte-identical in size. |
+| The NBI AMO default (§5.12) | re-run with `DEEP_EP_LL_FLAG_NBI_AMO=0` | **Ruled out** — fails identically (`20 != 31`). |
+| NIC fabric / cabling unreachable pairs | `ib_write_bw` across every pair | **Misleading PASS** — 185–196 Gb/s everywhere because CM negotiates MTU. Do not trust this check. |
+| Kernel logic (E/topk/ranks-per-node) | `NUM_PROCESSES=1` | **Ruled out** — still fails, and fails as "remote contributes 0". |
+| Any of our Aug29–Sep1 commits | Rebuilt the **entire** last-known-good stack (DeepEP `d5e7d3b` + iSHMEM `f8af72cd`, the exact pair that passed 6/6) | **Ruled out** — fails today with the identical `19 != 33`. |
+| Patched force-UC `xe` driver | `journalctl -b -5` over the **passing** era | **Falsified** — 19,032 `NEEDS_UC` lines and 640 ccs resets on the day the tests passed 6/6. Force-UC is not sufficient to cause this; a reboot to stock `xe` would NOT have fixed it. |
+| Accumulated GPU wedge | `rmmod`/`insmod igub_vmem_drv`, re-run | **Ruled out** — fails identically. |
+| GPU↔NIC PCIe pairing | `nic_pcie_check` | **Ruled out** — all 4 ranks PASS, GPU and NIC share a switch. |
+| Driver binaries changed | mtime of `xe.ko.zst` / `igub_vmem_drv.ko` | **Ruled out** — Jul 15 / Jul 3, long predating the passing runs. |
+
+**Detection recipe** (run before trusting any LL correctness or perf result):
+
+```bash
+# All four ports MUST report the same active_mtu. Resolve by BDF, never by mlx5_N
+# (those names are not stable across reboots).
+for d in /sys/class/infiniband/*; do
+  n=$(basename $d); bdf=$(basename $(readlink -f $d/device))
+  echo "$n $bdf $(ibv_devinfo -d $n | grep -m1 active_mtu)"
+done
+```
+
+**Fix.** Raise the low ports so all four match (`4200` netdev → `4096` RoCE):
+
+```bash
+ip link set dev ens1006f0np0 mtu 4200
+ip link set dev ens1006f1np1 mtu 4200
+```
+
+This is **not reboot-persistent** — persist it in the network config, or rely on the
+`run.sh` preflight which fails fast when the four `active_mtu` values disagree.
+
+**Confirmed by direct A/B** (2026-09-02, E=8/topk=2/nt=32/H7168):
+
+| Stack | Before MTU fix | After MTU fix |
+|---|---|---|
+| Current (`cb3261f` + iSHMEM `40bcd4b6`) | FAIL `19 != 33` | **PASS, avg_t ≈ 231 µs** (matches the ~232 µs baseline) |
+| Aug-28 (`d5e7d3b` + iSHMEM `f8af72cd`) | FAIL `19 != 33` | **PASS, avg_t ≈ 322 µs** |
+| `nic_pcie_check` attempt 1/3 | hangs (`rc=124`) | no hang |
+
+Both stacks flipping from FAIL to PASS on an MTU change alone proves the failure was purely
+environmental. The 322 → 231 µs delta between the two stacks is the genuine gain from the
+Aug 31–Sep 1 perf work (§5.10–§5.12), measured on identical hardware.
+
+`run.sh` now runs `verify_mtu()` before every test, resolving ports by BDF and failing fast
+with remediation instructions if the `active_mtu` values disagree.
+
+**Build-script trap found alongside this.** `_build_ishmem.sh` shipped pointing at
+`/root/jiafuzha/code-repo/ishmem_ibgda`, whose source lacks `ishmemx_fence_qp`,
+`ishmemx_quiet_qp`, `ishmemx_putmem_nbi_subgroup` and `ishmemx_long_atomic_add_qp` — all
+required by `internode_ll.cpp`, so DeepEP cannot build against it. The canonical tree is
+`/root/jiafuzha/ishmem_ibgda` (what `_build_deepep.sh`, `run.sh` and the build guide all
+use). That tree also now requires `-DISHMEM_IBGDA_NIC_VENDOR=MLX5`.
+
+**Unrelated env gotcha found while auditing this failure: `mlx5_N` names are not
+stable across reboots.** GPU↔NIC pairing on this box is by **PCIe switch**, not by
+matching index numbers, and the kernel's mlx5 enumeration order changed across the
+2026-09-02 reboot (`25:00.x` and `48:00.x` swapped between `mlx5_0/1` and
+`mlx5_2/3`). Only PCI BDFs and the `ens<slot>f<func>` iface names are stable.
+Verified-correct topology (`nic_pcie_check` reports `PASS` for all 4 ranks, and
+iSHMEM's hwloc scoring gives `+1000` for a shared switch, distributing the two
+same-switch GPUs across the two NIC ports):
+
+```
+switch 1b:00.0  GPU 1f:00.0, 23:00.0 (idx 0,1)  NIC 25:00.0/.1 (ens1006f0/f1)
+switch 3e:00.0  GPU 42:00.0, 46:00.0 (idx 2,3)  NIC 48:00.0/.1 (ens2005f0/f1)
+```
+
+`run.sh` therefore no longer trusts the hardcoded `NODE_MLX5_HCAS`; `derive_node_nic()`
+resolves the name from PCIe topology at run time (same rule iSHMEM uses), so the
+preflight validates the NIC iSHMEM will actually bind. This was **not** a contributor
+to the token mismatch — it only affected which NIC the preflight health-checked.
 
 ---
 

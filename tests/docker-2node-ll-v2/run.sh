@@ -8,13 +8,24 @@
 #
 # Each container is a separate "node" with its own hostname and SSH port on the
 # host network namespace (defaults = smc26):
-#   deepep-ll-v2-node0: 127.0.0.1:2330, GPUs 0,1, NICs mlx5_0,mlx5_1
-#   deepep-ll-v2-node1: 127.0.0.1:2331, GPUs 2,3, NICs mlx5_2,mlx5_3
+#   deepep-ll-v2-node0: 127.0.0.1:2330, GPUs 0,1 + the 2 NICs on their PCIe switch
+#   deepep-ll-v2-node1: 127.0.0.1:2331, GPUs 2,3 + the 2 NICs on their PCIe switch
+#
+# GPU<->NIC pairing is by PCIe switch, NOT by matching index numbers, and the
+# mlx5_N kernel names are NOT stable across reboots (observed 2026-09-02: the two
+# cards swapped between mlx5_0/1 and mlx5_2/3). Only BDFs and the ens<slot>f<func>
+# iface names are stable. Never hardcode mlx5_N; run.sh derives it via
+# derive_node_nic(). Topology (stable, from sysfs):
+#   switch 1b:00.0 (Broadcom PEX890xx): GPU 1f:00.0 + 23:00.0 (= GPU 0,1)
+#                                       NIC 25:00.0 + 25:00.1 (= ens1006f0/f1)
+#   switch 3e:00.0 (Broadcom PEX890xx): GPU 42:00.0 + 46:00.0 (= GPU 2,3)
+#                                       NIC 48:00.0 + 48:00.1 (= ens2005f0/f1)
+# GPU index order is by PCI BDF because ZE_ENABLE_PCI_ID_DEVICE_ORDER=1.
 #
 # mpirun is launched INSIDE deepep-ll-v2-node0 (via docker exec) and spawns ranks
 # on deepep-ll-v2-node1 via SSH. With ppn=2 the topology is:
-#   - rank 0,1 on node0 -> local_rank 0,1 -> GPU 0,1 + NIC mlx5_0,mlx5_1
-#   - rank 2,3 on node1 -> local_rank 0,1 -> GPU 2,3 + NIC mlx5_2,mlx5_3
+#   - rank 0,1 on node0 -> local_rank 0,1 -> GPU 0,1 + the NICs on switch 1b:00.0
+#   - rank 2,3 on node1 -> local_rank 0,1 -> GPU 2,3 + the NICs on switch 3e:00.0
 #
 # test_low_latency.py runs under the MPI launcher (DEEP_EP_TEST_LOW_LATENCY_NO_MPIRUN=1
 # so it does NOT self-relaunch mpirun) with --disable-nvlink (RDMA-only). iSHMEM
@@ -249,6 +260,80 @@ ensure_up() {
     fi
 }
 
+# --- Verify all RoCE ports share one active_mtu -------------------------------
+# A mismatch silently kills IBGDA traffic: IBGDA programs its QPs via DEVX from the
+# LOCAL port's active_mtu and never negotiates, so a 4096-MTU port transmitting to a
+# 1024-MTU port has its packets dropped -- the LL test then under-delivers tokens
+# ("remote contributes exactly zero") instead of failing loudly. Root cause of the
+# 2026-09-02 `AssertionError: 19 != 33`; see internode_ll_design.md 5.13.
+# NOTE `ib_write_bw` CANNOT detect this -- rdma-core/CM negotiates the path MTU down
+# to min(local,remote), so it reports full bandwidth across a mismatched pair.
+# netdev MTU set via `ip link` is NOT reboot-persistent, so this must be re-checked
+# on every run. Ports are resolved by BDF because mlx5_N names are unstable.
+verify_mtu() {
+    echo "===== Verifying RoCE MTU consistency ====="
+    local report mtus n
+    report=$(docker exec "$NODE0_CONTAINER" bash -lc '
+        for d in /sys/class/infiniband/*; do
+            [ -e "$d" ] || continue
+            n=$(basename "$d"); bdf=$(basename "$(readlink -f "$d/device")")
+            am=$(ibv_devinfo -d "$n" 2>/dev/null | grep -m1 active_mtu | awk "{print \$2}")
+            echo "$bdf $n ${am:-unknown}"
+        done | sort')
+    [ -z "$report" ] && { echo "FAIL: could not read active_mtu from any IB port"; return 1; }
+    echo "$report" | while read -r bdf name am; do
+        printf "  %-14s %-8s active_mtu=%s\n" "$bdf" "$name" "$am"
+    done
+    mtus=$(echo "$report" | awk '{print $3}' | sort -u)
+    n=$(echo "$mtus" | wc -l)
+    if [ "$n" -ne 1 ] || [ "$mtus" = "unknown" ]; then
+        echo "FAIL: RoCE active_mtu differs across ports (values: $(echo $mtus | tr '\n' ' '))."
+        echo "      IBGDA does not negotiate MTU, so cross-node RDMA will be silently dropped"
+        echo "      and the LL test will under-deliver tokens. Raise the low port(s), e.g.:"
+        echo "        ip link set dev <iface> mtu 4200   # -> active_mtu 4096"
+        echo "      (not reboot-persistent; persist it in the network config)"
+        return 1
+    fi
+    echo "All RoCE ports agree: active_mtu=$mtus"
+}
+
+# --- Derive a node's local_rank-0 NIC from PCIe topology ---------------------
+# The mlx5_N kernel names are NOT stable across reboots (observed 2026-09-02:
+# 25:00.x and 48:00.x swapped between mlx5_0/1 and mlx5_2/3 across a reboot),
+# so NODE_MLX5_HCAS must never be trusted as a hardcoded value. PCI BDFs and the
+# ens<slot>f<func> iface names ARE stable. This resolves the name at runtime by
+# picking the NIC that shares a PCIe switch with the node's first GPU -- the same
+# rule iSHMEM's hwloc scoring uses, so the preflight validates what iSHMEM will
+# actually bind. Falls back to NODE_MLX5_HCAS if derivation fails.
+derive_node_nic() {
+    local container="$1" derived
+    derived=$(docker exec "$container" bash -lc '
+        # PCIe switch id = 3rd component of the sysfs device path
+        swid() { local p; p=$(readlink -f /sys/bus/pci/devices/$1) || return 1
+                 local IFS=/; local -a a=(${p#/sys/devices/}); echo "${a[2]}"; }
+        # Intel GPUs bound to xe, in PCI BDF order (ZE_ENABLE_PCI_ID_DEVICE_ORDER=1)
+        mapfile -t gpus < <(for d in /sys/bus/pci/devices/*; do
+            [ "$(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null)" = xe ] \
+                && basename "$d"
+        done | sort)
+        idx=${ZE_AFFINITY_MASK%%,*}; idx=${idx:-0}
+        [ -n "${gpus[$idx]:-}" ] || exit 1
+        gsw=$(swid "${gpus[$idx]}") || exit 1
+        for d in /sys/class/infiniband/*; do
+            [ -e "$d" ] || continue
+            bdf=$(basename "$(readlink -f "$d/device")")
+            [ "$(swid "$bdf")" = "$gsw" ] && echo "$bdf $(basename "$d")"
+        done | sort | head -1 | awk "{print \$2}"
+    ' 2>/dev/null)
+    if [ -n "$derived" ]; then
+        echo "$derived"
+    else
+        echo "WARNING: PCIe-topology NIC derivation failed for $container;" \
+             "falling back to NODE_MLX5_HCAS" >&2
+        docker exec "$container" bash -lc 'echo ${NODE_MLX5_HCAS%%,*}'
+    fi
+}
+
 # --- Verify RDMA accessibility between the two containers (RoCE over physical NICs) ---
 verify_rdma() {
     echo "===== Verifying RDMA accessibility ====="
@@ -264,8 +349,9 @@ verify_rdma() {
     done
 
     local n0_nic n1_nic
-    n0_nic=$(docker exec "$NODE0_CONTAINER" bash -lc 'echo ${NODE_MLX5_HCAS%%,*}')
-    n1_nic=$(docker exec "$NODE1_CONTAINER" bash -lc 'echo ${NODE_MLX5_HCAS%%,*}')
+    n0_nic=$(derive_node_nic "$NODE0_CONTAINER")
+    n1_nic=$(derive_node_nic "$NODE1_CONTAINER")
+    echo "Topology-derived NICs: $NODE0_CONTAINER=$n0_nic  $NODE1_CONTAINER=$n1_nic"
     if ! docker exec "$NODE0_CONTAINER" bash -lc "ibv_devinfo -d $n0_nic 2>/dev/null | grep -q PORT_ACTIVE"; then
         echo "FAIL: $NODE0_CONTAINER $n0_nic port not active"
         return 1
@@ -418,6 +504,7 @@ run_test() {
     ensure_up
     sync_torch_metadata
     verify_rdma || { echo "RDMA accessibility check failed; aborting test." >&2; return 1; }
+    verify_mtu || { echo "RoCE MTU consistency check failed; aborting test." >&2; return 1; }
     if [ -n "${SKIP_NIC_CHECK:-}" ]; then
         echo "SKIP_NIC_CHECK set: skipping iSHMEM auto NIC selection pre-flight." >&2
     else
@@ -499,7 +586,7 @@ run_test() {
             timeout $TIMEOUT_SEC mpirun \
                 -n $TOTAL_RANKS -ppn $NUM_PROCESSES \
                 -hosts $NODE0_CONTAINER,$NODE1_CONTAINER \
-                -genv ISHMEM_IB_ENABLE_IBGDA 1 \
+                -genv ISHMEM_IB_ENABLE_IBGDA ${ISHMEM_IB_ENABLE_IBGDA:-1} \
                 -genv ISHMEM_IBGDA_DIRECT_DOORBELL ${ISHMEM_IBGDA_DIRECT_DOORBELL:-1} \
                 -genv ISHMEM_ENABLE_GPU_IPC ${ISHMEM_ENABLE_GPU_IPC:-1} \
                 -genv ISHMEM_ENABLE_ACCESSIBLE_HOST_HEAP 0 \

@@ -305,9 +305,25 @@ class Buffer:
             # clamp that C=1 forces costs far more than the extra per-QP flags.
             # See .github/agents/cuda-to-xpu-internode-normal-migration.agent.md 24.2.1.
             # `setdefault` semantics preserved: an explicit user/harness value still wins.
-            qpp = max(1, min(int(num_qps_per_rank), 128))
+            #
+            # 2026-09 LOCKSTEP INVARIANT (do not raise this clamp in isolation).  The
+            # fused internode-normal kernels read this same env back through
+            # `fused_qps_per_pe_env()` (csrc/xpu/internode.cpp) and
+            # `fused_qps_per_pe()` (internode_dispatch_fused.inc), BOTH of which clamp
+            # to [1, 16].  So any value above 16 is provisioned by iSHMEM (more QPs +
+            # CQs per PE, set up during IBGDA init) but can never be addressed by the
+            # kernel -- pure cost, zero benefit, and it regressed the HT path to an
+            # IBGDA-init hang.  A low-latency-motivated clamp raise to 128 was applied
+            # to this branch by mistake; the LL branch above legitimately uses 128
+            # because the LL kernels key the QP by local expert index and have no such
+            # 16-way clamp.  Keep this value == the kernel clamp; if you raise one,
+            # raise all three together and re-validate the internode-normal harness.
+            qpp = max(1, min(int(num_qps_per_rank), 16))
             qpp = 1 << (qpp - 1).bit_length() if qpp > 1 else 1
             os.environ.setdefault('ISHMEM_IBGDA_QPS_PER_PE', str(qpp))
+            if os.getenv('DEEP_EP_QPP_DBG', '0') == '1':
+                print(f'[DeepEP] QPP DBG (HT/normal): num_qps_per_rank={num_qps_per_rank} computed_qpp={qpp} '
+                      f'effective ISHMEM_IBGDA_QPS_PER_PE={os.environ.get("ISHMEM_IBGDA_QPS_PER_PE")}', flush=True)
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
         # Register for abnormal-exit GPU/NIC drain on external SIGTERM/SIGINT, so a

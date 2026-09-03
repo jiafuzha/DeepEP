@@ -464,6 +464,27 @@ def test_main(args: argparse.Namespace,
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
                     combine_bf16_rdma_recv_bytes = dispatch_bf16_rdma_send_bytes
 
+                    # --- LOGICAL token accounting (transport-agnostic) ---
+                    # Counts what this rank must move, without caring whether a
+                    # given copy leaves over NVL/PCIe or over RDMA.  The existing
+                    # counters above are per-transport and therefore each undercount
+                    # the kernel's real work: `rdma_send` dedups destinations to one
+                    # per NODE, and `nvl_recv` is the receive side only.
+                    #
+                    #   dispatch: this rank pushes each local token to EVERY rank
+                    #             that owns one of its top-k experts, so the unit of
+                    #             work is the (token, dst_rank) pair.  A token
+                    #             selected on 3 ranks is 3 logical sends.
+                    #   combine:  the exact reverse -- this rank sends back the rows
+                    #             it received during dispatch, one copy each.
+                    dispatch_logical_tokens_sent = int(is_token_in_rank.sum().item())
+                    combine_logical_tokens_sent = int(recv_x.size(0))
+                    # bf16 hidden payload; topk_idx/weights ride along but are
+                    # ~0.1% of the bytes at hidden=7168 and are excluded so the
+                    # number stays comparable across topk settings.
+                    dispatch_logical_bytes = dispatch_logical_tokens_sent * hidden * 2
+                    combine_logical_bytes = combine_logical_tokens_sent * hidden * 2
+
                     if local_rank == 0:
                         print(' passed', flush=True)
     if local_rank == 0:
@@ -499,6 +520,25 @@ def test_main(args: argparse.Namespace,
             f'combine(iso): {c_avg * 1e6:.1f} us (min {c_min * 1e6:.1f}, max {c_max * 1e6:.1f}), '
             f'rdma_recv={combine_bf16_rdma_recv_bytes / 1e6:.3f} MB @ {combine_bf16_rdma_recv_bytes / 1e9 / c_avg:.4f} GB/s, '
             f'nvl_send={combine_bf16_nvl_send_bytes / 1e6:.3f} MB @ {combine_bf16_nvl_send_bytes / 1e9 / c_avg:.4f} GB/s',
+            flush=True)
+        # Transport-agnostic logical bandwidth: bytes this rank must move divided
+        # by the kernel wall time.  Reported on BOTH avg and min wall so the
+        # best-case (min) number can be compared against the per-transport
+        # figures above, which are avg-based.
+        print(
+            f'[LOGICAL rank={rank}] num_tokens={num_tokens} hidden={hidden} topk={num_topk} | '
+            f'dispatch: tokens={dispatch_logical_tokens_sent} '
+            f'({dispatch_logical_tokens_sent / max(num_tokens, 1):.2f} copies/token), '
+            f'{dispatch_logical_bytes / 1e6:.3f} MB, '
+            f'wall_avg={d_avg * 1e6:.1f} us @ {dispatch_logical_bytes / 1e9 / d_avg:.4f} GB/s, '
+            f'wall_min={d_min * 1e6:.1f} us @ {dispatch_logical_bytes / 1e9 / d_min:.4f} GB/s | '
+            f'combine: tokens={combine_logical_tokens_sent}, '
+            f'{combine_logical_bytes / 1e6:.3f} MB, '
+            f'wall_avg={c_avg * 1e6:.1f} us @ {combine_logical_bytes / 1e9 / c_avg:.4f} GB/s, '
+            f'wall_min={c_min * 1e6:.1f} us @ {combine_logical_bytes / 1e9 / c_min:.4f} GB/s | '
+            f'round_trip: {(dispatch_logical_bytes + combine_logical_bytes) / 1e6:.3f} MB, '
+            f'wall_avg={rt_avg * 1e6:.1f} us @ '
+            f'{(dispatch_logical_bytes + combine_logical_bytes) / 1e9 / rt_avg:.4f} GB/s',
             flush=True)
 
     if skip_benchmark:

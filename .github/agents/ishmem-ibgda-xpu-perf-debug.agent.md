@@ -257,7 +257,96 @@ DeepEP LL flags: `DEEP_EP_LL_FLAG_SENDER_FENCE=1`, `DEEP_EP_LL_FLAG_RECV_ACQ=1`,
 - NIC selection must be same-PCIe-switch per rank; the harness has a strict gate
   (`NIC_SELECTION_STRICT=1`). Node0 GPUs 0,1 + mlx5_0,1; node1 GPUs 2,3 + mlx5_2,3.
 
+## Internode-NORMAL (HT) silent hang = UNDER-PROVISIONED BUFFERS (2026-09, ROOT-CAUSED)
+- **Symptom:** `tests/docker-2node-v2` at `HIDDEN=7168` wedges in the FIRST fused dispatch →
+  mpirun rc=124, dmesg `ccs` Engine reset + `Schedule disable failed to respond` +
+  `xe_guc_exec_queue_lr_cleanup`. **Indistinguishable from a lost doorbell / HW wedge**, which is
+  why it was serially misattributed to the patched `xe`, the GPUs, and a QP-clamp change.
+- **Cause:** `run.sh` defaulted to 128 MiB NVL / 64 MiB RDMA / 256 MiB symmetric — only enough for
+  `HIDDEN=1024`. `launch_fused_dispatch` spins forever instead of erroring. Fixed defaults are now
+  **512 MiB NVL / 512 MiB RDMA / 2 GiB symmetric**; both guard and target shapes PASS.
+- **Asymmetry:** UNDER-sizing hangs silently; OVER-sizing fails loudly and instantly with
+  `RuntimeError: ishmem_align failed for N bytes` (symmetric heap must exceed RDMA+NVL).
+- **1-minute bisect:** drop to `HIDDEN=1024`. If it passes, it is a sizing problem — not code, not HW.
+- The `buffer.py` QP clamp (HT branch `min(num_qps, 16)`, lockstep with the `[1,16]` kernel clamps in
+  `internode.cpp:543` / `internode_dispatch_fused.inc:175`) is a correct hygiene fix but was NEVER
+  the hang cause — `ISHMEM_IBGDA_QPS_PER_PE=32` runs fine (verified in a QP sweep). Keep the clamp;
+  >16 is pure iSHMEM-side over-provisioning the kernel can never address.
+
+## `timeout` orphan cascade — the #1 way to fabricate a fake hang
+- `timeout N` kills only the OUTER `mpirun` inside `docker exec`. The **in-container
+  `mpiexec.hydra` and its 4 Python ranks SURVIVE** holding GPU contexts, IBGDA QPs and the
+  symmetric heap. Every later run stacks on them and hangs, spawning 4 more orphans.
+- **Mandatory gate BEFORE and AFTER every run:** `ps -eo stat,args --no-headers |
+  grep '[t]est_internode.py' | grep -vc Z` must be **0**, no deepep containers, no
+  `/dev/shm/*ishmem*`, no `/tmp/deep_ep_xpu_ipc_*.sock`. A non-zero POST count is a failed run to
+  be reaped, **not a datapoint**. Reap by explicit PID only, one `kill -9 <PID>` at a time.
+- Strictly serial, one repo at a time. Never use a second `COMPOSE_PROJECT_NAME` to parallelise.
+
+## GPU falls off the PCI bus — parent-bridge remove+rescan (no reboot needed)
+- Symptom: only 3 of 4 GPUs enumerate; dmesg `Failed to resize BAR2 to 32768M (-EINVAL)` +
+  `*ERROR* pci resource is not valid`; `ZE_AFFINITY_MASK=3` segfaults in `libze_intel_gpu.so`.
+- Device-level `remove`+`rescan`, driver `bind`, and `resource2_resize` all FAIL.
+- **Working recipe:** remove the GPU's *parent PCIe bridge* (`echo 1 >
+  /sys/bus/pci/devices/0000:1e:01.0/remove`, it has only the GPU behind it — no NICs) →
+  `sleep 8` → `echo 1 > /sys/bus/pci/rescan` → `sleep 30`. The bridge window is re-sized, BAR2
+  returns at 32 G, `xe` re-probes clean. Verify: `lspci -s 1f:00.0 -vv | grep 'Region 2'` = 32G and
+  `sycl-ls | grep -c 'level_zero.*gpu'` = 4. This recurs — re-check before every campaign.
+
+## Perf measurement methodology on this rig
+- **Real noise band is ±10%, not ±2.5%.** All arms are strongly bimodal (~1100 vs ~1330 cluster),
+  so unpaired n=5 medians are NOT decisive (an apparent 4.6% "regression" vanished to +0.65% at n=10).
+- Use **interleaved paired A/B** (alternate arms run by run) to cancel drift, and prefer the
+  **isolated dispatch** number over round-trip — its within-arm spread is <1%, so it resolves a
+  10% effect cleanly where round-trip cannot.
+
+## Fused-kernel knobs C + G — REVERTED to DEFAULT OFF: they hang at ≥1024 tokens (2026-09)
+- `DEEP_EP_FUSED_DROP_FENCE` (C) and `DEEP_EP_FUSED_FLAG_NBI_AMO` (G), `internode.cpp:~88/~120`.
+- They measured **−7..10% isolated dispatch as a pair** and were briefly shipped ON. **That A/B ran
+  only at `num_tokens=32`.** A token sweep at E=384/topk=6/H=7168 then gave 32/64/128/256 PASS but
+  **1024 HANG**, and the identical shape PASSES with both knobs `0`. The hang → GuC watchdog →
+  `ccs` engine reset, and twice took GPU `0000:1f:00.0` off the PCI bus. **Both are default OFF
+  now** (`env != nullptr && env[0] == '1'`); set either to `1` to opt in.
+- **Why C's premise only half-holds.** The two AMO sites are not equivalent:
+  - tail AMO (`internode_dispatch_fused.inc:794`) — QP `channel_id % qps_per_pe`, i.e. the SAME QP
+    as the payload put, so it is genuinely RC-ordered and the fence really is redundant there.
+  - head-credit AMO (`:1034`, combine `:1169`) — QP `(channel_id + num_channels) % qps_per_pe`, a
+    **different** QP, with **no fence of its own**. The blocking AMO's CQE poll was its ONLY
+    completion guarantee, and G removed it.
+- **Why it only shows up at scale.** The head credit is the flow-control signal telling the remote
+  sender its receive slots were freed. Below ~256 tokens the recv buffer never fills, so the sender
+  never waits on credit and the missing guarantee is invisible. At ≥1024 the buffer wraps, credit
+  becomes load-bearing, and a posted-but-never-completed credit update leaves the sender spinning
+  forever.
+- To re-enable: give the head-credit path a completion/`quiet` or a same-QP mapping, then sweep the
+  full token range to 4096 — not just 32.
+- **GOLDEN RULE:** a perf tuning validated at ONE shape is NOT validated. An A/B at a shape that
+  never exercises the modified path is structurally incapable of finding the bug. Sweep anything
+  touching flow control / credit / completion before shipping; the failure mode is a hang that is
+  indistinguishable from a hardware fault and can genuinely wedge PCI state.
+- **Trap:** `internode_notify_fused.inc:237` and `:286` are LONE transport fences with no paired
+  same-QP AMO — they MUST stay unconditional. Verify after any edit to these files.
+
 ## Validation configs & baselines
+- Normal internode HT (`tests/docker-2node-v2`): guard `NUM_TOKENS=32 HIDDEN=7168 NUM_TOPK=2
+  NUM_EXPERTS=8`, target `... NUM_TOPK=6 NUM_EXPERTS=384`. Both PASS with the 512/512/2G defaults.
+- **Token sweep baseline** (knobs OFF, E=384/topk=6/H=7168, µs, 7/7 PASS):
+
+  | tokens | 32 | 64 | 128 | 256 | 1024 | 2048 | 4096 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | dispatch(iso) | 961.7 | 1105.2 | 1312.2 | 1687.9 | 3355.0 | 5356.8 | 9786.3 |
+  | combine(iso) | 947.9 | 1006.4 | 1532.7 | 1772.1 | 3076.1 | 4464.0 | 6972.2 |
+  | round-trip | 1431.5 | 1716.5 | 2466.4 | 3039.1 | 5877.0 | 9294.1 | 16290.1 |
+
+  Latency-bound below ~1024 (~1.4 ms fixed floor), throughput-bound above. Dispatch overtakes
+  combine at large shapes → dispatch is the right optimisation target. Buffers: 512M/512M/2G up to
+  1024 tokens, 1G/1G/3G for 2048–4096; a 4 GiB heap aborts in NEO (`drm_neo.cpp:265`), so
+  over-sizing is not free either.
+- `run.sh` had TWO harness bugs that faked hangs, both fixed: `ensure_up()` matched container names
+  by **substring**, so a leftover `deepep-v2-node0-stuck-zombie` made it skip `up` entirely and fail
+  with a misleading "no IB devices visible"; and the `ibv_devices` probe had no retry, so a cold
+  container read empty. Also gate every run on live (non-`Z`) rank/mpi counts being 0 — `timeout`
+  reaps only the outer `mpirun`, leaving in-container ranks holding GPUs and QPs.
 - LL (`tests/docker-2node-ll`): `NUM_PROCESSES=2 NUM_TOKENS=32 HIDDEN=7168 NUM_TOPK=2
   NUM_EXPERTS=8` → good ~1138 µs @ H7168 (~687 µs @ H2048). ~32 ms/iter ⇒ wrong iSHMEM archive.
 - Normal internode (`tests/docker-2node`): `NUM_PROCESSES=2 NUM_TOKENS=32 HIDDEN=1024 NUM_TOPK=2

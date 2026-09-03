@@ -48,6 +48,117 @@ def finalize_mpi_and_exit():
     os._exit(0)
 
 
+def _sysfs_pci_path(bdf: str):
+    """Absolute sysfs device path of a PCI BDF, split into components.
+
+    e.g. 0000:1f:00.0 -> ['pci0000:1a', '0000:1a:01.0', '0000:1b:00.0', ...]
+    The FIRST component is the PCI host bridge / root complex; later components
+    are the switch hierarchy. Returns None if the device does not exist.
+    """
+    try:
+        real = os.path.realpath(f'/sys/bus/pci/devices/{bdf}')
+    except OSError:
+        return None
+    prefix = '/sys/devices/'
+    if not real.startswith(prefix):
+        return None
+    return real[len(prefix):].split('/')
+
+
+def _enumerate_xpu_pci_bdfs():
+    """Intel GPUs bound to xe/i915, in PCI BDF order.
+
+    ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 makes Level Zero enumerate devices in this
+    exact order, so ZE_AFFINITY_MASK index N == this list's index N.
+    """
+    gpus = []
+    try:
+        entries = sorted(os.listdir('/sys/bus/pci/devices'))
+    except OSError:
+        return gpus
+    for bdf in entries:
+        try:
+            drv = os.path.basename(os.path.realpath(f'/sys/bus/pci/devices/{bdf}/driver'))
+        except OSError:
+            continue
+        if drv in ('xe', 'i915'):
+            gpus.append(bdf)
+    return gpus
+
+
+def _enumerate_ib_devices():
+    """[(ibdev_name, pci_bdf)] for every RDMA device visible to this container."""
+    out = []
+    try:
+        names = sorted(os.listdir('/sys/class/infiniband'))
+    except OSError:
+        return out
+    for name in names:
+        try:
+            bdf = os.path.basename(os.path.realpath(f'/sys/class/infiniband/{name}/device'))
+        except OSError:
+            continue
+        out.append((name, bdf))
+    return out
+
+
+def resolve_ibgda_nic_by_pcie_topology(gpu_index: int, local_rank: int):
+    """Resolve the ibdev that shares the most PCIe hierarchy with a GPU.
+
+    ROOT CAUSE THIS FIXES (2026-09-02): this function used to be
+    `f'mlx5_{physical_devices[local_rank]}'`, i.e. it hardcoded the assumption
+    that mlx5_N sits next to GPU N. The mlx5_N kernel names are NOT stable
+    across reboots -- on smc26 the two dual-port cards swapped names across the
+    2026-09-02 reboot (0000:25:00.x went from mlx5_0/1 to mlx5_2/3), which
+    silently pinned EVERY rank to the NIC on the *other* PCIe root complex:
+
+        PE0 GPU 0000:1f:00.0 (pci0000:1a) -> mlx5_0 = 0000:48:00.0 (pci0000:3d)
+
+    IBGDA needs true peer-to-peer between the GPU and the NIC (GPU MMIO stores
+    into the NIC UAR doorbell page + NIC DMA reads of the GPU VRAM symmetric
+    heap via dma-buf). Across two different root complexes that P2P does not
+    work on this platform: the doorbells/DMA silently do not complete, so no
+    remote payload and no remote count flag ever lands. The receiver then times
+    out its flag poll (DEEP_EP_LL_POLL_CAP), decodes the missing flag as
+    "0 tokens" and proceeds with a *self-consistent* undercount -- which is the
+    `AssertionError: 19 != 33` at test_low_latency.py:239. Host-initiated RDMA
+    (ib_write_bw) keeps working because it uses host memory, not GPU P2P.
+
+    Fix: never trust the mlx5_N name. Score each ibdev by the depth of the PCIe
+    sysfs path it shares with the GPU (identical root complex + switch wins),
+    and round-robin `local_rank` over equally-scored ports of the same card --
+    exactly the rule iSHMEM's own hwloc auto-selection uses. Returns None when
+    derivation is not possible (caller then keeps the legacy behaviour).
+    """
+    gpus = _enumerate_xpu_pci_bdfs()
+    if gpu_index >= len(gpus):
+        return None
+    gpu_path = _sysfs_pci_path(gpus[gpu_index])
+    if not gpu_path:
+        return None
+
+    scored = []
+    for name, bdf in _enumerate_ib_devices():
+        nic_path = _sysfs_pci_path(bdf)
+        if not nic_path:
+            continue
+        depth = 0
+        for a, b in zip(gpu_path, nic_path):
+            if a != b:
+                break
+            depth += 1
+        # depth == 0 -> different PCI root complex: never usable for IBGDA P2P.
+        if depth == 0:
+            continue
+        scored.append((depth, name, bdf))
+    if not scored:
+        return None
+
+    best = max(s[0] for s in scored)
+    tied = sorted((s for s in scored if s[0] == best), key=lambda s: s[2])
+    return tied[local_rank % len(tied)][1]
+
+
 def configure_xpu_rank_affinity(local_rank: int):
     if not is_xpu_direct_doorbell_run():
         return
@@ -59,8 +170,28 @@ def configure_xpu_rank_affinity(local_rank: int):
     os.environ.setdefault('ZE_AFFINITY_MASK', device_ids)
 
     physical_devices = [device.strip() for device in device_ids.split(',') if device.strip()]
-    if local_rank < len(physical_devices):
-        os.environ.setdefault('ISHMEM_IBGDA_NIC', f'mlx5_{physical_devices[local_rank]}')
+    if local_rank >= len(physical_devices):
+        return
+
+    # Do NOT hardcode mlx5_<gpu index>: the kernel names are unstable across
+    # reboots. Derive the NIC that shares the GPU's PCIe hierarchy instead.
+    # See resolve_ibgda_nic_by_pcie_topology() for the full root-cause note.
+    nic = None
+    try:
+        nic = resolve_ibgda_nic_by_pcie_topology(int(physical_devices[local_rank]), local_rank)
+    except (ValueError, OSError):
+        nic = None
+
+    if nic is None:
+        # Derivation failed (non-Linux sysfs layout / no RDMA devices). Leave the
+        # NIC unset so iSHMEM's own hwloc topology auto-selection picks it; that
+        # is strictly safer than re-introducing the mlx5_N index assumption.
+        print(f'[rank {local_rank}] WARNING: could not derive an IBGDA NIC sharing GPU '
+              f'{physical_devices[local_rank]}\'s PCIe hierarchy; leaving ISHMEM_IBGDA_NIC '
+              f'unset for iSHMEM auto-selection', flush=True)
+        return
+
+    os.environ.setdefault('ISHMEM_IBGDA_NIC', nic)
 
 
 def maybe_launch_xpu_direct_doorbell_with_mpirun(args: argparse.Namespace):
@@ -236,8 +367,16 @@ def test_main(num_tokens: int,
                             assert num_valid_tokens == (
                                 recv_layout_range
                                 & int_mask).sum().item(), f'{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()'
-                            assert num_valid_tokens == (all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status == 0].sum().item(
-                            ), f'{num_valid_tokens} != {(all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status==0].sum().item()}'
+                            expected_total = (all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status == 0].sum().item()
+                            if num_valid_tokens != expected_total:
+                                # Per-source-rank breakdown: which peer's tokens went missing?
+                                got_per_src = (recv_layout_range & int_mask).tolist()
+                                exp_per_src = (all_topk_idx == expert_id).sum(dim=[1, 2]).tolist()
+                                print(f'[rank {rank}] LOSS expert_id={expert_id} local_expert={i} '
+                                      f'fp8={dispatch_use_fp8} round_scale={round_scale} ue8m0={use_ue8m0} '
+                                      f'hook={return_recv_hook} got={num_valid_tokens} expected={expected_total} '
+                                      f'| per-src got={got_per_src} expected={exp_per_src}', flush=True)
+                            assert num_valid_tokens == expected_total, f'{num_valid_tokens} != {expected_total}'
 
                             if num_valid_tokens == 0:
                                 continue

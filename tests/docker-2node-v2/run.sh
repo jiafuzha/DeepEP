@@ -44,10 +44,25 @@ NODE1_PORT=2321
 # igub_vmem BAR-bridge driver (loaded on host so containers stay lib/module-free).
 DEEP_EP_IGUB_KO="${DEEP_EP_IGUB_KO:-/root/jiafuzha/code-repo/intel_gpu_uar_bridge/driver/igub_vmem_drv.ko}"
 
-# DeepEP buffer sizes (defaults work for 2-node x 2-GPU layout)
-DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-134217728}"   # 128 MiB
-DEEP_EP_RDMA_BYTES="${DEEP_EP_RDMA_BYTES:-67108864}"  # 64 MiB
-ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-268435456}"  # 256 MiB
+# DeepEP buffer sizes.
+#
+# 2026-09 HANG ROOT CAUSE -- DO NOT LOWER THESE WITHOUT RE-VALIDATING AT HIDDEN=7168.
+# The previous defaults (128 MiB NVL / 64 MiB RDMA / 256 MiB symmetric) are only
+# large enough for the small HIDDEN=1024 smoke shape. At HIDDEN=7168 the fused
+# internode-normal channel buffers do not fit, and the failure mode is NOT an
+# error: launch_fused_dispatch simply spins forever in its first chunk, the GuC
+# watchdog then fires ("Schedule disable failed to respond" ->
+# xe_guc_exec_queue_lr_cleanup -> ccs Engine reset), and the run dies as an
+# mpirun rc=124 timeout that looks exactly like a lost-doorbell / HW wedge. That
+# misdiagnosis cost multiple sessions (it was blamed on the patched xe driver, on
+# the GPUs, and on an ISHMEM_IBGDA_QPS_PER_PE clamp) before an A/B against the
+# Aug-28 known-good tree (DeepEP d5e7d3b + iSHMEM f8af72cd) reproduced the SAME
+# hang -- proving it was never a code regression, just under-provisioned buffers.
+# Validated 2026-09-03: HIDDEN=7168 x {topk=2,E=8} and {topk=6,E=384} both PASS,
+# 60/60 runs, with the values below.
+DEEP_EP_NVL_BYTES="${DEEP_EP_NVL_BYTES:-536870912}"    # 512 MiB
+DEEP_EP_RDMA_BYTES="${DEEP_EP_RDMA_BYTES:-536870912}"  # 512 MiB
+ISHMEM_SYMMETRIC_SIZE="${ISHMEM_SYMMETRIC_SIZE:-2147483648}"  # 2 GiB (must exceed RDMA+NVL)
 
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -155,7 +170,16 @@ down() {
 ensure_up() {
     stop_peer_containers
     ensure_igub_driver
-    if ! docker ps --format '{{.Names}}' | grep -q "$NODE0_CONTAINER"; then
+    # Exact-match (grep -qx), NOT substring.  An unanchored `grep -q
+    # "$NODE0_CONTAINER"` also matches unrelated containers whose name merely
+    # STARTS with it -- e.g. a leftover "deepep-v2-node0-stuck-zombie" from a
+    # previous wedged run.  That made ensure_up believe the stack was already
+    # running, skip `up` entirely, and then every downstream step failed with a
+    # badly misleading "no IB devices visible" (the containers did not exist at
+    # all).  Require BOTH nodes to be running under their exact names.
+    local running
+    running=$(docker ps --format '{{.Names}}')
+    if ! grep -qx "$NODE0_CONTAINER" <<<"$running" || ! grep -qx "$NODE1_CONTAINER" <<<"$running"; then
         echo "Starting containers..."
         up
     fi
@@ -167,9 +191,20 @@ verify_rdma() {
 
     for c in "$NODE0_CONTAINER" "$NODE1_CONTAINER"; do
         local devs
-        devs=$(docker exec "$c" bash -lc 'ibv_devices 2>/dev/null | awk "NR>2 {print \$1}" | tr "\n" "," ' 2>/dev/null)
+        # STARTUP RACE (2026-09): when the container was just created by
+        # `docker compose up -d`, this probe can run before the container's
+        # userspace RDMA stack is ready, and `ibv_devices` comes back EMPTY even
+        # though /dev/infiniband is mapped correctly and the host shows all four
+        # mlx5 devices.  That produced a bogus "no IB devices visible" abort on
+        # every cold start, while a warm container passed instantly.  Retry
+        # briefly instead of failing on the first sample.
+        for _ in $(seq 1 15); do
+            devs=$(docker exec "$c" bash -lc 'ibv_devices 2>/dev/null | awk "NR>2 {print \$1}" | tr "\n" "," ' 2>/dev/null)
+            [ -n "$devs" ] && break
+            sleep 2
+        done
         if [ -z "$devs" ]; then
-            echo "FAIL: $c has no IB devices visible (ibv_devices empty)"
+            echo "FAIL: $c has no IB devices visible (ibv_devices empty after 30s)"
             return 1
         fi
         echo "$c IB devices: $devs"
@@ -336,6 +371,9 @@ run_test() {
     _add_opt_genv DEEP_EP_SEL_X                "${DEEP_EP_SEL_X:-}"
     _add_opt_genv DEEP_EP_SEL_TOPK             "${DEEP_EP_SEL_TOPK:-}"
     _add_opt_genv DEEP_EP_SKIP_CACHED          "${DEEP_EP_SKIP_CACHED:-}"
+    _add_opt_genv DEEP_EP_QPP_DBG              "${DEEP_EP_QPP_DBG:-}"
+    _add_opt_genv DEEP_EP_FUSED_DROP_FENCE     "${DEEP_EP_FUSED_DROP_FENCE:-}"
+    _add_opt_genv DEEP_EP_FUSED_FLAG_NBI_AMO   "${DEEP_EP_FUSED_FLAG_NBI_AMO:-}"
     _add_opt_genv DEEP_EP_EXTRA_DISPATCH       "${DEEP_EP_EXTRA_DISPATCH:-}"
     _add_opt_genv DEEP_EP_RDMA_RECV            "${DEEP_EP_RDMA_RECV:-}"
     _add_opt_genv DEEP_EP_NUM_SMS             "${DEEP_EP_NUM_SMS:-}"

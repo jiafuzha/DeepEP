@@ -329,6 +329,8 @@ void launch_fused_dispatch(void* recv_x,
     const int hidden_bytes = hidden_int4 * static_cast<int>(sizeof(int4_t));
     const int scale_bytes = num_scales * static_cast<int>(sizeof(float));
     const unsigned qps_per_pe = fused_qps_per_pe();
+    const int drop_fence = fused_drop_fence() ? 1 : 0;
+    const int flag_nbi_amo = fused_flag_nbi_amo() ? 1 : 0;
 
     const int num_sms = num_channels * 2;
 
@@ -788,11 +790,18 @@ void launch_fused_dispatch(void* recv_x,
                                     t.fetch_add(static_cast<uint64_t>(num_tokens_to_issue));
                                 } else {
                                     // RC-ordered behind the payload put on the SAME qp.
-                                    ishmemx_fence_qp(dst_pe, qp);
-                                    ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
-                                                               static_cast<long>(num_tokens_to_issue),
-                                                               dst_pe,
-                                                               qp);
+                                    if (!drop_fence) ishmemx_fence_qp(dst_pe, qp);
+                                    if (flag_nbi_amo) {
+                                        ishmemx_long_atomic_add_nbi_qp(reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                                                       static_cast<long>(num_tokens_to_issue),
+                                                                       dst_pe,
+                                                                       qp);
+                                    } else {
+                                        ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                                                   static_cast<long>(num_tokens_to_issue),
+                                                                   dst_pe,
+                                                                   qp);
+                                    }
                                 }
                             }
                             sycl::group_barrier(sg);
@@ -1022,10 +1031,17 @@ void launch_fused_dispatch(void* recv_x,
                                     h(*rdma_channel_head.buffer(rdma_rank));
                                 h.fetch_add(static_cast<uint64_t>(min_head - last_head));
                             } else {
-                                ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
-                                                           static_cast<long>(min_head - last_head),
-                                                           dst_pe,
-                                                           qp);
+                                if (flag_nbi_amo) {
+                                    ishmemx_long_atomic_add_nbi_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
+                                                                   static_cast<long>(min_head - last_head),
+                                                                   dst_pe,
+                                                                   qp);
+                                } else {
+                                    ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
+                                                               static_cast<long>(min_head - last_head),
+                                                               dst_pe,
+                                                               qp);
+                                }
                             }
                             last_head = min_head;
                         }

@@ -403,6 +403,8 @@ void launch_fused_combine(void* combined_x,
         }
     }
     const unsigned qps_per_pe = fused_qps_per_pe();
+    const int drop_fence = fused_drop_fence() ? 1 : 0;
+    const int flag_nbi_amo = fused_flag_nbi_amo() ? 1 : 0;
     const int num_sms = num_channels * 2;
 
 #ifdef DEEP_EP_COMBINE_TELEMETRY
@@ -970,10 +972,16 @@ void launch_fused_combine(void* combined_x,
                                 ishmemx_putmem_nbi_subgroup(dst_ptr, src_ptr, num_bytes_per_msg, dst_pe, qp, true, sg, true);
                                 sycl::group_barrier(sg);
                                 if (lane_id == 0) {
-                                    ishmemx_fence_qp(dst_pe, qp);
-                                    ishmemx_long_atomic_add_qp(
-                                        reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
-                                        static_cast<long>(num_chunked_tokens), dst_pe, qp);
+                                    if (!drop_fence) ishmemx_fence_qp(dst_pe, qp);
+                                    if (flag_nbi_amo) {
+                                        ishmemx_long_atomic_add_nbi_qp(
+                                            reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                            static_cast<long>(num_chunked_tokens), dst_pe, qp);
+                                    } else {
+                                        ishmemx_long_atomic_add_qp(
+                                            reinterpret_cast<long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                            static_cast<long>(num_chunked_tokens), dst_pe, qp);
+                                    }
                                 }
                             } else {
                                 sycl::group_barrier(sg);
@@ -1158,8 +1166,13 @@ void launch_fused_combine(void* combined_x,
                                 const unsigned qp =
                                     static_cast<unsigned>(channel_id + num_channels) % qps_per_pe;
                                 if (dst_rdma_rank != rdma_rank) {
-                                    ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
-                                                              static_cast<long>(min_head - last_rdma_head), dst_pe, qp);
+                                    if (flag_nbi_amo) {
+                                        ishmemx_long_atomic_add_nbi_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
+                                                                       static_cast<long>(min_head - last_rdma_head), dst_pe, qp);
+                                    } else {
+                                        ishmemx_long_atomic_add_qp(reinterpret_cast<long*>(rdma_channel_head.buffer(rdma_rank)),
+                                                                  static_cast<long>(min_head - last_rdma_head), dst_pe, qp);
+                                    }
                                 } else {
                                     sycl::atomic_ref<uint64_t, sycl::memory_order::acq_rel, sycl::memory_scope::system,
                                                      sycl::access::address_space::global_space>
